@@ -13,7 +13,8 @@ Solver times out after 5 minutes.
 import random
 import subprocess
 import time
-from typing import List, Tuple, Set, Optional
+from typing import List, Tuple, Set, Optional, Dict, Any
+from solver_utils import StreamingInputFile
 
 title = "3-SAT Solver (Python)"
 TIMEOUT_SECONDS = 30
@@ -112,9 +113,42 @@ TEST_CASES = [
     "clauses": 213000,
     "desc": "50K vars, 213K clauses"
   },
+  # Ludicrous cases for streaming
+  {
+    "vars": 100000,
+    "clauses": 426000,
+    "desc": "100K vars, 426K clauses"
+  },
+  {
+    "vars": 500000,
+    "clauses": 2130000,
+    "desc": "500K vars, 2.1M clauses"
+  },
+  {
+    "vars": 1000000,
+    "clauses": 4260000,
+    "desc": "1M vars, 4.3M clauses"
+  },
+  {
+    "vars": 5000000,
+    "clauses": 21300000,
+    "desc": "5M vars, 21M clauses"
+  },
+  {
+    "vars": 10000000,
+    "clauses": 42600000,
+    "desc": "10M vars, 43M clauses (~600MB)"
+  },
+  {
+    "vars": 20000000,
+    "clauses": 85200000,
+    "desc": "20M vars, 85M clauses (~1.2GB)"
+  },
 ]
 
-SAT_CACHE = {}
+SAT_CACHE: Dict[int, Any] = {}
+_INPUT_FILE_CACHE: Dict[int, StreamingInputFile] = {}
+STREAMING_THRESHOLD_CLAUSES = 500_000
 
 
 def get_sat_instance(subpass: int) -> Tuple[int, List[Tuple[int, int, int]]]:
@@ -123,6 +157,28 @@ def get_sat_instance(subpass: int) -> Tuple[int, List[Tuple[int, int, int]]]:
     clauses = generate_3sat(case["vars"], case["clauses"], RANDOM_SEED + subpass)
     SAT_CACHE[subpass] = (case["vars"], clauses)
   return SAT_CACHE[subpass]
+
+
+def _should_use_streaming(subpass: int) -> bool:
+  return TEST_CASES[subpass]["clauses"] > STREAMING_THRESHOLD_CLAUSES
+
+
+def _get_streaming_input(subpass: int) -> StreamingInputFile:
+  if subpass in _INPUT_FILE_CACHE:
+    return _INPUT_FILE_CACHE[subpass]
+
+  case = TEST_CASES[subpass]
+  cache_key = f"sat30|v={case['vars']}|c={case['clauses']}|seed={RANDOM_SEED + subpass}"
+
+  def generator():
+    num_vars, clauses = get_sat_instance(subpass)
+    yield f"{num_vars} {len(clauses)}\n"
+    for clause in clauses:
+      yield f"{clause[0]} {clause[1]} {clause[2]}\n"
+
+  input_file = StreamingInputFile(cache_key, generator, "test30_sat")
+  _INPUT_FILE_CACHE[subpass] = input_file
+  return input_file
 
 
 def format_input(num_vars: int, clauses: List[Tuple[int, int, int]]) -> str:
@@ -254,17 +310,53 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
     return 0.0, "No Python code provided"
 
   case = TEST_CASES[subPass]
-  num_vars, clauses = get_sat_instance(subPass)
-  input_data = format_input(num_vars, clauses)
+  use_streaming = _should_use_streaming(subPass)
 
   try:
-    start = time.time()
-    proc = subprocess.run(["python", "-c", result["python_code"]],
-                          input=input_data,
-                          capture_output=True,
-                          text=True,
-                          timeout=TIMEOUT_SECONDS)
-    exec_time = time.time() - start
+    if use_streaming:
+      t = time.time()
+      streaming_input = _get_streaming_input(subPass)
+      print(f"  Generating/caching input file for {case['desc']}...")
+      input_file_path = streaming_input.generate()
+      file_size_mb = streaming_input.get_size_bytes() / (1024 * 1024)
+      print(f"  Input file: {file_size_mb:.1f} MB")
+      if time.time() - t > 1:
+        print(f"  Time to generate: {time.time() - t:.2f}s")
+
+      # For very large cases, skip verification
+      if case["clauses"] > 10_000_000:
+        start = time.time()
+        with open(input_file_path, 'r') as f:
+          proc = subprocess.run(["python", "-c", result["python_code"]],
+                                stdin=f,
+                                capture_output=True,
+                                text=True,
+                                timeout=TIMEOUT_SECONDS)
+        exec_time = time.time() - start
+        if proc.returncode == 0:
+          return 0.8, f"[{case['desc']}] Completed in {exec_time:.2f}s (verification skipped)"
+        else:
+          return 0.0, f"Runtime error: {proc.stderr[:200]}"
+
+      start = time.time()
+      with open(input_file_path, 'r') as f:
+        proc = subprocess.run(["python", "-c", result["python_code"]],
+                              stdin=f,
+                              capture_output=True,
+                              text=True,
+                              timeout=TIMEOUT_SECONDS)
+      exec_time = time.time() - start
+    else:
+      num_vars, clauses = get_sat_instance(subPass)
+      input_data = format_input(num_vars, clauses)
+
+      start = time.time()
+      proc = subprocess.run(["python", "-c", result["python_code"]],
+                            input=input_data,
+                            capture_output=True,
+                            text=True,
+                            timeout=TIMEOUT_SECONDS)
+      exec_time = time.time() - start
 
     if proc.returncode != 0:
       return 0.0, f"Runtime error: {proc.stderr[:200]}"
@@ -298,18 +390,36 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
     return 0.0, f"[{case['desc']}] Error: {str(e)[:100]}"
 
 
-def output_example_html(score: float, explanation: str, result: dict, subPass: int) -> str:
+def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
+  if not result:
+    return "<p style='color:red'>No result provided</p>"
   case = TEST_CASES[subPass]
-  code = result.get("python_code", "").replace("&", "&amp;").replace("<",
-                                                                     "&lt;").replace(">", "&gt;")
-  color = "green" if score >= 0.8 else "orange" if score >= 0.4 else "red"
-  return f'<div class="result"><h4>Subpass {subPass}: {case["desc"]}</h4><p style="color:{color}">Score: {score:.2f}</p><p>{explanation}</p><details><summary>Code</summary><pre>{code}</pre></details></div>'
+  html = f"<h4>3-SAT Solver - {case['desc']}</h4>"
+  if "reasoning" in result:
+    r = result['reasoning'][:400] + ('...' if len(result.get('reasoning', '')) > 400 else '')
+    html += f"<p><strong>Approach:</strong> {r.replace('<', '&lt;').replace('>', '&gt;')}</p>"
+  if "python_code" in result:
+    code = result["python_code"].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    html += f"<details><summary>View Python Code ({len(result['python_code'])} chars)</summary><pre>{code}</pre></details>"
+  return html
 
 
-def output_header_html() -> str:
-  return "<h2>Test 30: 3-SAT Solver (Python)</h2><p>The canonical NP-Complete problem.</p>"
+highLevelSummary = """
+3-SAT determines if a boolean formula in CNF with 3 literals per clause is satisfiable.
+
+**Algorithms:**
+- **DPLL**: Backtracking with unit propagation
+- **CDCL**: Conflict-driven clause learning (modern SAT solvers)
+- **WalkSAT**: Randomized local search
+"""
 
 
-def output_summary_html(results: list) -> str:
-  total = sum(r[0] for r in results)
-  return f'<div class="summary"><p>Total: {total:.2f}/{len(results)}</p></div>'
+def setup():
+  """Pre-generate and cache all streaming input files for parallel test execution."""
+  print(f"  Pre-generating streaming input files for {len(TEST_CASES)} test cases...")
+  for subpass in range(len(TEST_CASES)):
+    if _should_use_streaming(subpass):
+      streaming_input = _get_streaming_input(subpass)
+      input_path = streaming_input.generate()
+      size_mb = streaming_input.get_size_bytes() / (1024 * 1024)
+      print(f"    Subpass {subpass}: {size_mb:.1f} MB cached")

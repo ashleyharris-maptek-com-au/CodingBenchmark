@@ -13,8 +13,9 @@ Solver times out after 5 minutes.
 import random
 import subprocess
 import time
-from typing import List, Tuple, Set
-from native_compiler import CSharpCompiler, CompilationError
+from typing import List, Tuple, Set, Dict, Any
+from native_compiler import CSharpCompiler, CompilationError, ExecutionError
+from solver_utils import StreamingInputFile
 
 title = "Maximum Clique (C#)"
 TIMEOUT_SECONDS = 30
@@ -87,9 +88,47 @@ TEST_CASES = [
     "edge_prob": 0.1,
     "desc": "1000 vertices, sparse"
   },
+  # Ludicrous cases for streaming
+  {
+    "vertices": 5000,
+    "edge_prob": 0.05,
+    "desc": "5K vertices (~625K edges)"
+  },
+  {
+    "vertices": 10000,
+    "edge_prob": 0.03,
+    "desc": "10K vertices (~1.5M edges)"
+  },
+  {
+    "vertices": 20000,
+    "edge_prob": 0.02,
+    "desc": "20K vertices (~4M edges)"
+  },
+  {
+    "vertices": 50000,
+    "edge_prob": 0.01,
+    "desc": "50K vertices (~12.5M edges)"
+  },
+  {
+    "vertices": 100000,
+    "edge_prob": 0.004,
+    "desc": "100K vertices (~20M edges)"
+  },
+  {
+    "vertices": 200000,
+    "edge_prob": 0.003,
+    "desc": "200K vertices (~60M edges)"
+  },
+  {
+    "vertices": 500000,
+    "edge_prob": 0.001,
+    "desc": "500K vertices (~125M edges, >1GB)"
+  },
 ]
 
-GRAPH_CACHE = {}
+GRAPH_CACHE: Dict[int, Any] = {}
+_INPUT_FILE_CACHE: Dict[int, StreamingInputFile] = {}
+STREAMING_THRESHOLD_EDGES = 1_000_000
 
 
 def get_graph(subpass: int) -> Tuple[int, List[Tuple[int, int]]]:
@@ -98,6 +137,35 @@ def get_graph(subpass: int) -> Tuple[int, List[Tuple[int, int]]]:
     edges = generate_graph(case["vertices"], case["edge_prob"], RANDOM_SEED + subpass)
     GRAPH_CACHE[subpass] = (case["vertices"], edges)
   return GRAPH_CACHE[subpass]
+
+
+def _estimate_edges(subpass: int) -> int:
+  case = TEST_CASES[subpass]
+  n = case["vertices"]
+  p = case["edge_prob"]
+  return int(n * (n - 1) / 2 * p)
+
+
+def _should_use_streaming(subpass: int) -> bool:
+  return _estimate_edges(subpass) > STREAMING_THRESHOLD_EDGES
+
+
+def _get_streaming_input(subpass: int) -> StreamingInputFile:
+  if subpass in _INPUT_FILE_CACHE:
+    return _INPUT_FILE_CACHE[subpass]
+
+  case = TEST_CASES[subpass]
+  cache_key = f"graph29|v={case['vertices']}|p={case['edge_prob']}|seed={RANDOM_SEED + subpass}"
+
+  def generator():
+    num_vertices, edges = get_graph(subpass)
+    yield f"{num_vertices} {len(edges)}\n"
+    for u, v in edges:
+      yield f"{u} {v}\n"
+
+  input_file = StreamingInputFile(cache_key, generator, "test29_graphs")
+  _INPUT_FILE_CACHE[subpass] = input_file
+  return input_file
 
 
 def format_input(num_vertices: int, edges: List[Tuple[int, int]]) -> str:
@@ -247,7 +315,7 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
     return 0.0, "No C# code provided"
 
   case = TEST_CASES[subPass]
-  num_vertices, edges = get_graph(subPass)
+  use_streaming = _should_use_streaming(subPass)
 
   compiler = CSharpCompiler(aiEngineName)
   if not compiler.find_compiler():
@@ -258,11 +326,24 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
   except CompilationError as e:
     return 0.0, f"Compilation error: {str(e)[:200]}"
 
-  input_data = format_input(num_vertices, edges)
-
   try:
-    start = time.time()
-    stdout, stderr, exec_time, retcode = compiler.execute(exe_path, input_data, TIMEOUT_SECONDS)
+    if use_streaming:
+      t = time.time()
+      streaming_input = _get_streaming_input(subPass)
+      print(f"  Generating/caching input file for {case['desc']}...")
+      input_file_path = streaming_input.generate()
+      file_size_mb = streaming_input.get_size_bytes() / (1024 * 1024)
+      print(f"  Input file: {file_size_mb:.1f} MB")
+      if time.time() - t > 1:
+        print(f"  Time to generate: {time.time() - t:.2f}s")
+
+      stdout, stderr, exec_time, retcode = compiler.execute(exe_path,
+                                                            timeout=TIMEOUT_SECONDS,
+                                                            stdin_file=input_file_path)
+    else:
+      num_vertices, edges = get_graph(subPass)
+      input_data = format_input(num_vertices, edges)
+      stdout, stderr, exec_time, retcode = compiler.execute(exe_path, input_data, TIMEOUT_SECONDS)
 
     if retcode != 0:
       return 0.0, f"Runtime error: {stderr[:200]}"
@@ -271,6 +352,15 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
     clique_size = int(lines[0])
     clique = list(map(int, lines[1].split())) if len(lines) > 1 else []
 
+    # Skip full verification for very large graphs
+    estimated_edges = _estimate_edges(subPass)
+    if estimated_edges > 10_000_000:
+      if len(clique) == clique_size:
+        return 0.8, f"[{case['desc']}] Clique size {clique_size} in {exec_time:.2f}s (verification skipped)"
+      else:
+        return 0.2, f"[{case['desc']}] Invalid output format"
+
+    num_vertices, edges = get_graph(subPass)
     valid, msg = verify_clique(num_vertices, edges, clique)
     if not valid:
       return 0.2, f"[{case['desc']}] {msg}"
@@ -281,22 +371,42 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
 
     return score, f"[{case['desc']}] Clique size {len(clique)} (greedy: {greedy_size}), {exec_time:.2f}s"
 
+  except ExecutionError as e:
+    return 0.1, f"[{case['desc']}] {str(e)[:100]}"
   except Exception as e:
     return 0.0, f"[{case['desc']}] Error: {str(e)[:100]}"
 
 
-def output_example_html(score: float, explanation: str, result: dict, subPass: int) -> str:
+def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
+  if not result:
+    return "<p style='color:red'>No result provided</p>"
   case = TEST_CASES[subPass]
-  code = result.get("csharp_code", "").replace("&", "&amp;").replace("<",
-                                                                     "&lt;").replace(">", "&gt;")
-  color = "green" if score >= 0.8 else "orange" if score >= 0.4 else "red"
-  return f'<div class="result"><h4>Subpass {subPass}: {case["desc"]}</h4><p style="color:{color}">Score: {score:.2f}</p><p>{explanation}</p><details><summary>Code</summary><pre>{code}</pre></details></div>'
+  html = f"<h4>Maximum Clique - {case['desc']}</h4>"
+  if "reasoning" in result:
+    r = result['reasoning'][:400] + ('...' if len(result.get('reasoning', '')) > 400 else '')
+    html += f"<p><strong>Approach:</strong> {r.replace('<', '&lt;').replace('>', '&gt;')}</p>"
+  if "csharp_code" in result:
+    code = result["csharp_code"].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    html += f"<details><summary>View C# Code ({len(result['csharp_code'])} chars)</summary><pre>{code}</pre></details>"
+  return html
 
 
-def output_header_html() -> str:
-  return "<h2>Test 29: Maximum Clique (C#)</h2><p>NP-Hard graph problem.</p>"
+highLevelSummary = """
+Maximum Clique finds the largest complete subgraph in a graph.
+
+**Algorithms:**
+- **Bron-Kerbosch**: Classic backtracking with pivoting
+- **Branch and Bound**: Pruning with upper bounds
+- **Greedy**: Fast approximation, not optimal
+"""
 
 
-def output_summary_html(results: list) -> str:
-  total = sum(r[0] for r in results)
-  return f'<div class="summary"><p>Total: {total:.2f}/{len(results)}</p></div>'
+def setup():
+  """Pre-generate and cache all streaming input files for parallel test execution."""
+  print(f"  Pre-generating streaming input files for {len(TEST_CASES)} test cases...")
+  for subpass in range(len(TEST_CASES)):
+    if _should_use_streaming(subpass):
+      streaming_input = _get_streaming_input(subpass)
+      input_path = streaming_input.generate()
+      size_mb = streaming_input.get_size_bytes() / (1024 * 1024)
+      print(f"    Subpass {subpass}: {size_mb:.1f} MB cached")

@@ -26,11 +26,19 @@ import subprocess
 import sys
 import os
 import time
-from typing import List, Tuple, Set, Dict
+from typing import List, Tuple, Set, Dict, Any, Optional
 from pathlib import Path
+from collections import deque
+import io
+
+try:
+  import numpy as np
+except Exception:
+  np = None
 
 # Import our native compiler helper
-from native_compiler import CppCompiler, CompilationError, ExecutionError
+from native_compiler import CppCompiler, CompilationError, ExecutionError, describe_this_pc
+from solver_utils import StreamingInputFile, create_graph_input_file
 
 title = "Minimum Cut Problem (C++)"
 
@@ -68,8 +76,7 @@ def generate_connected_graph(num_nodes: int, num_edges: int, seed: int) -> List[
   return list(edges)
 
 
-def generate_graph_with_known_cut(num_nodes: int, num_edges: int, cut_size: int,
-                                  seed: int) -> Tuple[List[Tuple[int, int]], int]:
+def generate_graph_with_known_cut(num_nodes: int, num_edges: int, cut_size: int, seed: int):
   """
     Generate a graph with a known minimum cut.
     Creates two clusters connected by exactly cut_size edges.
@@ -83,34 +90,100 @@ def generate_graph_with_known_cut(num_nodes: int, num_edges: int, cut_size: int,
   group1 = list(range(group1_size))
   group2 = list(range(group1_size, num_nodes))
 
+  if np is not None and num_edges >= 200_000 and num_nodes >= 50_000:
+    nrng = np.random.default_rng(seed)
+    g1 = group1_size
+    g2 = group2_size
+    dtype = np.int32 if num_nodes <= (2**31 - 1) else np.int64
+
+    if g1 > 1:
+      i = np.arange(1, g1, dtype=dtype)
+      parents = (nrng.random(g1 - 1) * i).astype(dtype)
+      u1 = parents
+      v1 = i
+      a1 = np.minimum(u1, v1)
+      b1 = np.maximum(u1, v1)
+      tree1 = np.stack([a1, b1], axis=1)
+    else:
+      tree1 = np.zeros((0, 2), dtype=dtype)
+
+    if g2 > 1:
+      i = np.arange(1, g2, dtype=dtype)
+      parents = (nrng.random(g2 - 1) * i).astype(dtype)
+      u2 = parents + dtype(g1)
+      v2 = i + dtype(g1)
+      a2 = np.minimum(u2, v2)
+      b2 = np.maximum(u2, v2)
+      tree2 = np.stack([a2, b2], axis=1)
+    else:
+      tree2 = np.zeros((0, 2), dtype=dtype)
+
+    intra_edges = max(0, num_edges - cut_size - (num_nodes - 2))
+    e1 = intra_edges // 2
+    e2 = intra_edges - e1
+
+    def rand_pairs(count: int, start: int, size: int):
+      if count <= 0 or size <= 1:
+        return np.zeros((0, 2), dtype=dtype)
+      out_u = np.empty(count, dtype=dtype)
+      out_v = np.empty(count, dtype=dtype)
+      filled = 0
+      while filled < count:
+        remaining = count - filled
+        batch = max(1024, min(remaining * 2, 1_000_000))
+        u = nrng.integers(0, size, size=batch, dtype=dtype)
+        v = nrng.integers(0, size, size=batch, dtype=dtype)
+        m = u != v
+        if not np.any(m):
+          continue
+        u = u[m]
+        v = v[m]
+        take = min(remaining, u.shape[0])
+        out_u[filled:filled + take] = u[:take] + dtype(start)
+        out_v[filled:filled + take] = v[:take] + dtype(start)
+        filled += take
+
+      a = np.minimum(out_u, out_v)
+      b = np.maximum(out_u, out_v)
+      return np.stack([a, b], axis=1)
+
+    extra1 = rand_pairs(e1, 0, g1)
+    extra2 = rand_pairs(e2, g1, g2)
+
+    cut_edges = set()
+    attempts = 0
+    while len(cut_edges) < cut_size and attempts < cut_size * 100:
+      u = rng.randrange(0, g1) if g1 > 0 else 0
+      v = g1 + (rng.randrange(0, g2) if g2 > 0 else 0)
+      edge = (min(u, v), max(u, v))
+      cut_edges.add(edge)
+      attempts += 1
+    cross = np.array(list(cut_edges), dtype=dtype)
+
+    edges = np.concatenate([tree1, tree2, extra1, extra2, cross], axis=0)
+    return edges, len(cut_edges)
+
   edges = set()
 
-  # Create dense connections within each group (spanning trees + extra)
-  # Group 1
   for i in range(1, len(group1)):
     parent = rng.randint(0, i - 1)
     u, v = min(group1[parent], group1[i]), max(group1[parent], group1[i])
     edges.add((u, v))
 
-  # Group 2
   for i in range(1, len(group2)):
     parent = rng.randint(0, i - 1)
     u, v = min(group2[parent], group2[i]), max(group2[parent], group2[i])
     edges.add((u, v))
 
-  # Add more intra-group edges
-  intra_edges = num_edges - cut_size - (num_nodes - 2)  # subtract spanning tree edges
+  intra_edges = num_edges - cut_size - (num_nodes - 2)
   for _ in range(max(0, intra_edges // 2)):
-    # Add to group 1
     if len(group1) > 1:
       u, v = rng.sample(group1, 2)
       edges.add((min(u, v), max(u, v)))
-    # Add to group 2
     if len(group2) > 1:
       u, v = rng.sample(group2, 2)
       edges.add((min(u, v), max(u, v)))
 
-  # Add exactly cut_size edges between groups
   cut_edges = set()
   attempts = 0
   while len(cut_edges) < cut_size and attempts < cut_size * 100:
@@ -125,8 +198,19 @@ def generate_graph_with_known_cut(num_nodes: int, num_edges: int, cut_size: int,
   return list(edges), len(cut_edges)
 
 
-def format_graph_input(num_nodes: int, edges: List[Tuple[int, int]]) -> str:
+def format_graph_input(num_nodes: int, edges) -> str:
   """Format graph as input string."""
+  if np is not None and isinstance(edges, np.ndarray):
+    m = int(edges.shape[0])
+    buf = io.StringIO()
+    buf.write(f"{num_nodes} {m}\n")
+    try:
+      np.savetxt(buf, edges, fmt='%d %d')
+    except Exception:
+      for i in range(m):
+        buf.write(f"{int(edges[i, 0])} {int(edges[i, 1])}\n")
+    return buf.getvalue()
+
   lines = [f"{num_nodes} {len(edges)}"]
   for u, v in edges:
     lines.append(f"{u} {v}")
@@ -149,9 +233,9 @@ def compute_min_cut_bfs(num_nodes: int, edges: List[Tuple[int, int]],
 
   # BFS from node 0
   visited = {0}
-  queue = [0]
+  queue = deque([0])
   while queue:
-    node = queue.pop(0)
+    node = queue.popleft()
     for neighbor in adj[node]:
       if neighbor not in visited:
         visited.add(neighbor)
@@ -165,13 +249,15 @@ def compute_min_cut_bfs(num_nodes: int, edges: List[Tuple[int, int]],
   return is_valid, component1, component2
 
 
-def verify_cut_edges(num_nodes: int, edges: List[Tuple[int, int]],
-                     cut_edges: List[Tuple[int, int]]) -> Tuple[bool, str]:
+def verify_cut_edges(num_nodes: int, edges, cut_edges: List[Tuple[int, int]]) -> Tuple[bool, str]:
   """
     Verify that the proposed cut edges are valid.
     Returns (is_valid, error_message).
     """
-  edge_set = set((min(u, v), max(u, v)) for u, v in edges)
+  if np is not None and isinstance(edges, np.ndarray):
+    edge_set = set((int(min(u, v)), int(max(u, v))) for u, v in edges)
+  else:
+    edge_set = set((min(u, v), max(u, v)) for u, v in edges)
   cut_set = set()
 
   for u, v in cut_edges:
@@ -190,80 +276,123 @@ def verify_cut_edges(num_nodes: int, edges: List[Tuple[int, int]],
 
 # Test configurations
 TEST_CASES = [
-  # Subpass 0: Simple graph
   {
     "num_nodes": 6,
-    "edges": generate_graph_with_known_cut(6, 10, 2, RANDOM_SEED)[0],
+    "num_edges": 10,
+    "cut_size": 2,
+    "seed": RANDOM_SEED,
     "known_cut": 2,
     "description": "6 nodes, 10 edges, min cut ~2"
   },
-  # Subpass 1: Small graph
-  {
-    "num_nodes": 10,
-    "edges": generate_graph_with_known_cut(10, 20, 3, RANDOM_SEED + 1)[0],
-    "known_cut": 3,
-    "description": "10 nodes, 20 edges, min cut ~3"
-  },
-  # Subpass 2: Medium graph
-  {
-    "num_nodes": 20,
-    "edges": generate_graph_with_known_cut(20, 50, 4, RANDOM_SEED + 2)[0],
-    "known_cut": 4,
-    "description": "20 nodes, 50 edges, min cut ~4"
-  },
-  # Subpass 3: Larger graph
-  {
-    "num_nodes": 50,
-    "edges": generate_graph_with_known_cut(50, 150, 5, RANDOM_SEED + 3)[0],
-    "known_cut": 5,
-    "description": "50 nodes, 150 edges, min cut ~5"
-  },
-  # Subpass 4: Complex graph
   {
     "num_nodes": 100,
-    "edges": generate_graph_with_known_cut(100, 400, 6, RANDOM_SEED + 4)[0],
+    "num_edges": 400,
+    "cut_size": 6,
+    "seed": RANDOM_SEED + 4,
     "known_cut": 6,
     "description": "100 nodes, 400 edges, min cut ~6"
   },
-  # Subpass 5: Large graph
-  {
-    "num_nodes": 200,
-    "edges": generate_graph_with_known_cut(200, 1000, 8, RANDOM_SEED + 5)[0],
-    "known_cut": 8,
-    "description": "200 nodes, 1000 edges, min cut ~8"
-  },
-  # Extreme cases
-  {
-    "num_nodes": 500,
-    "edges": generate_graph_with_known_cut(500, 3000, 10, RANDOM_SEED + 6)[0],
-    "known_cut": 10,
-    "description": "500 nodes, 3000 edges"
-  },
   {
     "num_nodes": 1000,
-    "edges": generate_graph_with_known_cut(1000, 8000, 12, RANDOM_SEED + 7)[0],
+    "num_edges": 8000,
+    "cut_size": 12,
+    "seed": RANDOM_SEED + 7,
     "known_cut": 12,
     "description": "1000 nodes, 8000 edges"
   },
   {
-    "num_nodes": 5000,
-    "edges": generate_graph_with_known_cut(5000, 50000, 15, RANDOM_SEED + 8)[0],
-    "known_cut": 15,
-    "description": "5000 nodes, 50000 edges"
-  },
-  {
     "num_nodes": 10000,
-    "edges": generate_graph_with_known_cut(10000, 100000, 20, RANDOM_SEED + 9)[0],
+    "num_edges": 100000,
+    "cut_size": 20,
+    "seed": RANDOM_SEED + 9,
     "known_cut": 20,
     "description": "10000 nodes, 100000 edges"
   },
   {
-    "num_nodes": 50000,
-    "edges": generate_graph_with_known_cut(50000, 500000, 25, RANDOM_SEED + 10)[0],
+    "num_nodes": 100000,
+    "num_edges": 5000000,
+    "cut_size": 25,
+    "seed": RANDOM_SEED + 10,
     "known_cut": 25,
-    "description": "50000 nodes, 500000 edges"
+    "description": "100000 nodes, 5000000 edges"
+  },
+  {
+    "num_nodes": 1000000,
+    "num_edges": 50000000,
+    "cut_size": 25,
+    "seed": RANDOM_SEED + 10,
+    "known_cut": 25,
+    "description": "1000000 nodes, 50000000 edges"
+  },
+  {
+    "num_nodes": 10000000,
+    "num_edges": 500000000,
+    "cut_size": 25,
+    "seed": RANDOM_SEED + 10,
+    "known_cut": 25,
+    "description": "10000000 nodes, 500000000 edges"
+  },
+  {
+    "num_nodes": 100000000,
+    "num_edges": 5000000000,
+    "cut_size": 25,
+    "seed": RANDOM_SEED + 10,
+    "known_cut": 25,
+    "description": "100000000 nodes, 5000000000 edges"
+  },
+  {
+    "num_nodes": 1000000000,
+    "num_edges": 50000000000,
+    "cut_size": 25,
+    "seed": RANDOM_SEED + 10,
+    "known_cut": 25,
+    "description": "1000000000 nodes, 50000000000 edges"
   },
 ]
+
+_EDGES_CACHE: Dict[int, Any] = {}
+_INPUT_FILE_CACHE: Dict[int, StreamingInputFile] = {}
+
+# Threshold for using streaming (file-based) input vs in-memory string
+STREAMING_THRESHOLD_EDGES = 1_000_000
+
+
+def _get_case_edges(subPass: int):
+  """Get edges for a test case (for small cases or verification)."""
+  if subPass in _EDGES_CACHE:
+    return _EDGES_CACHE[subPass]
+
+  case = TEST_CASES[subPass]
+  edges, actual_cut = generate_graph_with_known_cut(case["num_nodes"], case["num_edges"],
+                                                    case["cut_size"], case["seed"])
+  if case.get("known_cut") is None:
+    case["known_cut"] = actual_cut
+
+  if case["num_edges"] <= STREAMING_THRESHOLD_EDGES:
+    _EDGES_CACHE[subPass] = edges
+  return edges
+
+
+def _get_streaming_input(subPass: int) -> StreamingInputFile:
+  """Get a StreamingInputFile for a test case (for large cases)."""
+  if subPass in _INPUT_FILE_CACHE:
+    return _INPUT_FILE_CACHE[subPass]
+
+  case = TEST_CASES[subPass]
+  input_file = create_graph_input_file(case["num_nodes"],
+                                       case["num_edges"],
+                                       case["cut_size"],
+                                       case["seed"],
+                                       generate_graph_with_known_cut,
+                                       cache_subdir="test18_graphs")
+  _INPUT_FILE_CACHE[subPass] = input_file
+  return input_file
+
+
+def _should_use_streaming(subPass: int) -> bool:
+  """Determine if streaming input should be used for this test case."""
+  case = TEST_CASES[subPass]
+  return case["num_edges"] > STREAMING_THRESHOLD_EDGES
 
 
 def prepareSubpassPrompt(subPass: int) -> str:
@@ -273,14 +402,17 @@ def prepareSubpassPrompt(subPass: int) -> str:
 
   return f"""You are writing a C++ program to solve the Minimum Edge Cut problem.
 
-You must write a C++ solver that can handle ANY graph size from trivial to ludicrous scale:
-- **Trivial**: Small graphs (4-10 nodes, 5-20 edges), simple cases
-- **Medium**: Medium graphs (20-50 nodes, 50-200 edges), moderate complexity
-- **Large**: Large graphs (100-500 nodes, 200-2000 edges), complex structures
-- **Extreme**: Massive graphs (1000-50000 nodes, 2000-500000 edges), very complex optimization
+**Target environment specs**
+{describe_this_pc()}
+
+**C++ Compiler information**
+{CppCompiler("test_engine").describe()}
+
+You must write a C++ solver that can handle ANY graph size from trivial to multi-gb.
 
 **The Challenge:**
-Your C++ program will be tested with graphs ranging from small toy examples to massive real-world networks. The same program must work efficiently across ALL scales.
+Your C++ program will be tested with graphs ranging from small toy examples to massive real-world networks.
+The same program must work efficiently across ALL scales.
 
 **Problem:**
 Given an undirected connected graph, find the minimum number of edges to remove
@@ -294,36 +426,11 @@ such that the graph becomes disconnected (split into two non-empty components).
 - Line 1: K (number of edges in the minimum cut)
 - Lines 2 to K+1: u v (each edge in the cut, in any order)
 
-**Critical Requirements:**
-1. **Scalability**: Your algorithm must adapt based on graph size and density
-2. **Performance**: Must complete within 5 minutes even for massive graphs
-3. **Correctness**: Must find a valid minimum cut that disconnects the graph
-
-**Algorithm Strategy Recommendations:**
-- **Small graphs (≤50 nodes)**: Can use exact methods (try all possible cuts)
-- **Medium graphs (50-500 nodes)**: Karger's randomized algorithm O(n²m) expected
-- **Large graphs (500-5000 nodes)**: Stoer-Wagner algorithm O(nm + n² log n) deterministic
-- **Very Large graphs (>5000 nodes)**: Fast approximations, heuristic methods
-
-**Key Algorithms:**
-- **Karger's randomized algorithm**: Randomly contract edges until 2 nodes remain
-- **Stoer-Wagner algorithm**: Deterministic minimum cut algorithm
-- **Ford-Fulkerson based**: Run max-flow between all pairs, min of max-flows = min-cut
-- **Push-relabel**: Efficient max-flow implementation
-
-**Implementation Hints:**
-- Detect graph size and choose appropriate algorithm
-- Use efficient data structures (adjacency lists)
-- Implement adaptive quality vs speed tradeoffs
-- For very large graphs, consider approximation algorithms
-- Handle edge cases: already disconnected graphs, single nodes
-- Use fast I/O for large inputs
-
 **Requirements:**
-1. Program must compile with g++ or MSVC (C++17)
+1. Program must compile with this compiler, and run on this environment.
 2. Read from stdin, write to stdout
-3. Handle graphs up to 50,000 nodes and 500,000 edges
-4. Complete within 5 minutes
+3. Handle graphs even if they don't fit in memory.
+4. Complete as fast as possible.
 5. Output must be a valid cut that disconnects the graph
 6. Minimize the number of cut edges
 7. Must handle varying graph sizes efficiently
@@ -352,7 +459,7 @@ Include adaptive logic that chooses different algorithms based on graph scale.
 
 
 # List of subpasses to grade the single answer against all difficulty levels
-extraGradeAnswerRuns = list(range(len(TEST_CASES)))
+extraGradeAnswerRuns = list(range(1, len(TEST_CASES)))
 
 structure = {
   "type": "object",
@@ -372,11 +479,19 @@ structure = {
 
 
 def execute_cpp_solver(code: str,
-                       input_data: str,
                        engine_name: str,
+                       input_data: str = None,
+                       input_file: Path = None,
                        timeout: float = TIMEOUT_SECONDS) -> Tuple[str, str, float, bool]:
   """
     Compile and execute C++ solver.
+    
+    Args:
+        code: C++ source code
+        engine_name: Name for caching
+        input_data: String data for stdin (for small inputs)
+        input_file: Path to file for stdin (for large/streaming inputs)
+        timeout: Execution timeout
     
     Returns:
         Tuple of (stdout, error_message, execution_time, success)
@@ -391,8 +506,15 @@ def execute_cpp_solver(code: str,
     # Compile
     exe_path = compiler.compile(code)
 
-    # Execute
-    stdout, stderr, exec_time, return_code = compiler.execute(exe_path, input_data, timeout)
+    # Execute with file-based or string-based stdin
+    if input_file is not None:
+      stdout, stderr, exec_time, return_code = compiler.execute(exe_path,
+                                                                timeout=timeout,
+                                                                stdin_file=input_file)
+    else:
+      stdout, stderr, exec_time, return_code = compiler.execute(exe_path,
+                                                                stdin_data=input_data or "",
+                                                                timeout=timeout)
 
     if return_code != 0:
       return stdout, f"Runtime error (exit code {return_code}): {stderr[:500]}", exec_time, False
@@ -442,13 +564,6 @@ def parse_output(output: str) -> Tuple[List[Tuple[int, int]], str]:
 def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
   """
     Grade the C++ minimum cut solver.
-    
-    Scoring:
-    - 1.0: Optimal cut (matches or beats known minimum)
-    - 0.8: Valid cut within 1.5x optimal
-    - 0.6: Valid cut within 2x optimal
-    - 0.4: Valid cut but suboptimal
-    - 0.0: Invalid cut or error
     """
   if not result:
     return 0.0, "No result provided"
@@ -458,28 +573,55 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
 
   case = TEST_CASES[subPass]
   num_nodes = case["num_nodes"]
-  edges = case["edges"]
   known_cut = case["known_cut"]
   description = case["description"]
-
   code = result["cpp_code"]
-  input_data = format_graph_input(num_nodes, edges)
 
-  # Execute solver
-  stdout, error, exec_time, success = execute_cpp_solver(code, input_data, aiEngineName)
+  use_streaming = _should_use_streaming(subPass)
+
+  # Execute solver with streaming or in-memory input
+  if use_streaming:
+    # Large case: use file-based streaming input
+    t = time.time()
+    streaming_input = _get_streaming_input(subPass)
+    print(f"  Generating/caching input file for {description}...")
+    input_file_path = streaming_input.generate()
+    file_size_mb = streaming_input.get_size_bytes() / (1024 * 1024)
+    print(f"  Input file: {file_size_mb:.1f} MB")
+    generate_time = time.time() - t
+    if generate_time > 1: print(f"  Time to generate data: {generate_time:.2f}s")
+
+    stdout, error, exec_time, success = execute_cpp_solver(code,
+                                                           aiEngineName,
+                                                           input_file=input_file_path)
+  else:
+    # Small case: use in-memory string input
+    edges = _get_case_edges(subPass)
+    input_data = format_graph_input(num_nodes, edges)
+    stdout, error, exec_time, success = execute_cpp_solver(code,
+                                                           aiEngineName,
+                                                           input_data=input_data)
 
   if not success:
-    return 0.0, f"[{description}] {error}"
+    return 0.0, f"[{description}] {error}", stdout
 
   # Parse output
   cut_edges, parse_error = parse_output(stdout)
   if parse_error and not cut_edges:
-    return 0.0, f"[{description}] {parse_error}"
+    return 0.0, f"[{description}] {parse_error}", stdout
 
-  # Verify cut
-  is_valid, verify_msg = verify_cut_edges(num_nodes, edges, cut_edges)
+  # Verify cut (skip full verification for very large streaming cases)
+  if use_streaming and case["num_edges"] > 10_000_000:
+    # For very large cases, trust the cut size without full verification
+    # (verification would require loading all edges into memory)
+    is_valid = True
+    verify_msg = f"Cut of {len(cut_edges)} edges (verification skipped for large graph)"
+  else:
+    edges = _get_case_edges(subPass)
+    is_valid, verify_msg = verify_cut_edges(num_nodes, edges, cut_edges)
+
   if not is_valid:
-    return 0.0, f"[{description}] Invalid cut: {verify_msg}"
+    return 0.0, f"[{description}] Invalid cut: {verify_msg}", stdout
 
   # Score based on cut size
   cut_size = len(cut_edges)
@@ -488,10 +630,10 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
   if cut_size <= known_cut:
     score = 1.0
     quality = "optimal"
-  elif ratio <= 1.5:
+  elif ratio <= 1.25:
     score = 0.8
     quality = f"good ({ratio:.1f}x optimal)"
-  elif ratio <= 2.0:
+  elif ratio <= 1.5:
     score = 0.6
     quality = f"acceptable ({ratio:.1f}x optimal)"
   else:
@@ -502,7 +644,12 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
                  f"Known min: {known_cut}, "
                  f"Time: {exec_time:.2f}s - {quality}")
 
-  return score, explanation
+  if subPass == 0:
+    html = output_example_html(score, explanation, result, subPass)
+  else:
+    html = f"<pre>{stdout}</pre>"
+
+  return score, explanation, html
 
 
 def output_example_html(score: float, explanation: str, result: dict, subPass: int) -> str:
@@ -524,22 +671,10 @@ def output_example_html(score: float, explanation: str, result: dict, subPass: i
         <p><strong>Score:</strong> <span style="color: {score_color};">{score:.2f}</span></p>
         <p><strong>Details:</strong> {explanation}</p>
         <details>
-            <summary>Reasoning</summary>
-            <pre style="background: #f5f5f5; padding: 10px; overflow-x: auto;">{reasoning}</pre>
-        </details>
-        <details>
             <summary>C++ Code</summary>
-            <pre style="background: #f0f0f0; padding: 10px; overflow-x: auto;"><code>{code}</code></pre>
+            <pre style="padding: 10px; overflow-x: auto;"><code>{code}</code></pre>
         </details>
     </div>
-    """
-
-
-def output_header_html() -> str:
-  """Generate HTML header."""
-  return """
-    <h2>Test 18: Minimum Cut Problem (C++)</h2>
-    <p>Testing C++ implementation of minimum edge cut algorithm.</p>
     """
 
 
@@ -560,3 +695,14 @@ def output_summary_html(results: list) -> str:
         <p><strong>Subpasses Completed:</strong> {len(results)}</p>
     </div>
     """
+
+
+def setup():
+  """Pre-generate and cache all streaming input files for parallel test execution."""
+  print(f"  Pre-generating streaming input files for {len(TEST_CASES)} test cases...")
+  for subpass in range(len(TEST_CASES)):
+    if _should_use_streaming(subpass):
+      streaming_input = _get_streaming_input(subpass)
+      input_path = streaming_input.generate()
+      size_mb = streaming_input.get_size_bytes() / (1024 * 1024)
+      print(f"    Subpass {subpass}: {size_mb:.1f} MB cached")

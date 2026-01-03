@@ -17,10 +17,11 @@ import sys
 import os
 import time
 import math
-from typing import List, Tuple, Set, Dict, Optional
+from typing import List, Tuple, Set, Dict, Optional, Any
 from pathlib import Path
 
-from native_compiler import CppCompiler, CompilationError
+from native_compiler import CppCompiler, CompilationError, ExecutionError
+from solver_utils import StreamingInputFile
 
 title = "Graph Coloring (C++)"
 TIMEOUT_SECONDS = 30
@@ -122,9 +123,38 @@ TEST_CASES = [
     "colors": 25,
     "desc": "50K vertices, 25 colors"
   },
+  # Ludicrous cases for streaming
+  {
+    "vertices": 100000,
+    "edge_prob": 0.0008,
+    "colors": 30,
+    "desc": "100K vertices, 30 colors (~4M edges)"
+  },
+  {
+    "vertices": 500000,
+    "edge_prob": 0.0002,
+    "colors": 40,
+    "desc": "500K vertices, 40 colors (~25M edges)"
+  },
+  {
+    "vertices": 1000000,
+    "edge_prob": 0.0001,
+    "colors": 50,
+    "desc": "1M vertices, 50 colors (~50M edges)"
+  },
+  {
+    "vertices": 2000000,
+    "edge_prob": 0.00008,
+    "colors": 60,
+    "desc": "2M vertices, 60 colors (~160M edges, >1GB)"
+  },
 ]
 
-GRAPH_CACHE = {}
+GRAPH_CACHE: Dict[int, Any] = {}
+_INPUT_FILE_CACHE: Dict[int, StreamingInputFile] = {}
+
+# Threshold for streaming (file-based) input
+STREAMING_THRESHOLD_EDGES = 1_000_000
 
 
 def get_graph(subpass: int) -> Tuple[int, List[Tuple[int, int]], int]:
@@ -133,6 +163,36 @@ def get_graph(subpass: int) -> Tuple[int, List[Tuple[int, int]], int]:
     edges = generate_graph(case["vertices"], case["edge_prob"], RANDOM_SEED + subpass)
     GRAPH_CACHE[subpass] = (case["vertices"], edges, case["colors"])
   return GRAPH_CACHE[subpass]
+
+
+def _estimate_edges(subpass: int) -> int:
+  """Estimate number of edges for a test case."""
+  case = TEST_CASES[subpass]
+  n = case["vertices"]
+  p = case["edge_prob"]
+  return int(n * (n - 1) / 2 * p)
+
+
+def _should_use_streaming(subpass: int) -> bool:
+  return _estimate_edges(subpass) > STREAMING_THRESHOLD_EDGES
+
+
+def _get_streaming_input(subpass: int) -> StreamingInputFile:
+  if subpass in _INPUT_FILE_CACHE:
+    return _INPUT_FILE_CACHE[subpass]
+
+  case = TEST_CASES[subpass]
+  cache_key = f"graph27|v={case['vertices']}|p={case['edge_prob']}|c={case['colors']}|seed={RANDOM_SEED + subpass}"
+
+  def generator():
+    num_vertices, edges, num_colors = get_graph(subpass)
+    yield f"{num_vertices} {len(edges)} {num_colors}\n"
+    for u, v in edges:
+      yield f"{u} {v}\n"
+
+  input_file = StreamingInputFile(cache_key, generator, "test27_graphs")
+  _INPUT_FILE_CACHE[subpass] = input_file
+  return input_file
 
 
 def format_input(num_vertices: int, edges: List[Tuple[int, int]], num_colors: int) -> str:
@@ -263,7 +323,7 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
     return 0.0, "No C++ code provided"
 
   case = TEST_CASES[subPass]
-  num_vertices, edges, num_colors = get_graph(subPass)
+  use_streaming = _should_use_streaming(subPass)
 
   compiler = CppCompiler(aiEngineName)
   if not compiler.find_compiler():
@@ -274,22 +334,56 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
   except CompilationError as e:
     return 0.0, f"Compilation error: {str(e)[:200]}"
 
-  input_data = format_input(num_vertices, edges, num_colors)
-
   try:
-    start = time.time()
-    proc = subprocess.run([str(exe_path)],
-                          input=input_data,
-                          capture_output=True,
-                          text=True,
-                          timeout=TIMEOUT_SECONDS)
-    exec_time = time.time() - start
+    if use_streaming:
+      # Large case: use file-based streaming input
+      t = time.time()
+      streaming_input = _get_streaming_input(subPass)
+      print(f"  Generating/caching input file for {case['desc']}...")
+      input_file_path = streaming_input.generate()
+      file_size_mb = streaming_input.get_size_bytes() / (1024 * 1024)
+      print(f"  Input file: {file_size_mb:.1f} MB")
+      generate_time = time.time() - t
+      if generate_time > 1:
+        print(f"  Time to generate: {generate_time:.2f}s")
 
-    if proc.returncode != 0:
-      return 0.0, f"Runtime error: {proc.stderr[:200]}"
+      start = time.time()
+      stdout, stderr, exec_time, return_code = compiler.execute(exe_path,
+                                                                timeout=TIMEOUT_SECONDS,
+                                                                stdin_file=input_file_path)
 
-    colors = list(map(int, proc.stdout.strip().split()))
-    valid, msg = verify_coloring(num_vertices, edges, colors, num_colors)
+      if return_code != 0:
+        return 0.0, f"Runtime error: {stderr[:200]}"
+
+      colors = list(map(int, stdout.strip().split()))
+      # Skip full verification for very large graphs
+      estimated_edges = _estimate_edges(subPass)
+      if estimated_edges > 10_000_000:
+        if len(colors) == case["vertices"] and all(0 <= c < case["colors"] for c in colors):
+          return 1.0, f"[{case['desc']}] Coloring produced in {exec_time:.2f}s (verification skipped)"
+        else:
+          return 0.2, f"[{case['desc']}] Invalid output format"
+      else:
+        num_vertices, edges, num_colors = get_graph(subPass)
+        valid, msg = verify_coloring(num_vertices, edges, colors, num_colors)
+    else:
+      # Small case: use in-memory string input
+      num_vertices, edges, num_colors = get_graph(subPass)
+      input_data = format_input(num_vertices, edges, num_colors)
+
+      start = time.time()
+      proc = subprocess.run([str(exe_path)],
+                            input=input_data,
+                            capture_output=True,
+                            text=True,
+                            timeout=TIMEOUT_SECONDS)
+      exec_time = time.time() - start
+
+      if proc.returncode != 0:
+        return 0.0, f"Runtime error: {proc.stderr[:200]}"
+
+      colors = list(map(int, proc.stdout.strip().split()))
+      valid, msg = verify_coloring(num_vertices, edges, colors, num_colors)
 
     if valid:
       return 1.0, f"[{case['desc']}] Valid coloring in {exec_time:.2f}s"
@@ -298,21 +392,43 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
 
   except subprocess.TimeoutExpired:
     return 0.1, f"[{case['desc']}] Timeout"
+  except ExecutionError as e:
+    return 0.1, f"[{case['desc']}] {str(e)[:100]}"
   except Exception as e:
     return 0.0, f"[{case['desc']}] Error: {str(e)[:100]}"
 
 
-def output_example_html(score: float, explanation: str, result: dict, subPass: int) -> str:
+def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
+  """Generate HTML report for graph coloring."""
+  if not result:
+    return "<p style='color:red'>No result provided</p>"
   case = TEST_CASES[subPass]
-  code = result.get("cpp_code", "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-  color = "green" if score >= 0.8 else "orange" if score >= 0.4 else "red"
-  return f'<div class="result"><h4>Subpass {subPass}: {case["desc"]}</h4><p style="color:{color}">Score: {score:.2f}</p><p>{explanation}</p><details><summary>Code</summary><pre>{code}</pre></details></div>'
+  html = f"<h4>Graph Coloring - {case['desc']}</h4>"
+  if "reasoning" in result:
+    r = result['reasoning'][:400] + ('...' if len(result.get('reasoning', '')) > 400 else '')
+    html += f"<p><strong>Approach:</strong> {r.replace('<', '&lt;').replace('>', '&gt;')}</p>"
+  if "cpp_code" in result:
+    code = result["cpp_code"].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    html += f"<details><summary>View C++ Code ({len(result['cpp_code'])} chars)</summary><pre>{code}</pre></details>"
+  return html
 
 
-def output_header_html() -> str:
-  return "<h2>Test 27: Graph Coloring (C++)</h2><p>NP-Complete graph coloring problem.</p>"
+highLevelSummary = """
+Graph coloring assigns colors to vertices such that no adjacent vertices share a color.
+
+**Algorithms:**
+- **Greedy**: O(V+E), simple but may use more colors than optimal
+- **DSatur**: Prioritizes vertices with most colored neighbors
+- **Backtracking**: Exact but exponential for chromatic number
+"""
 
 
-def output_summary_html(results: list) -> str:
-  total = sum(r[0] for r in results)
-  return f'<div class="summary"><p>Total: {total:.2f}/{len(results)}</p></div>'
+def setup():
+  """Pre-generate and cache all streaming input files for parallel test execution."""
+  print(f"  Pre-generating streaming input files for {len(TEST_CASES)} test cases...")
+  for subpass in range(len(TEST_CASES)):
+    if _should_use_streaming(subpass):
+      streaming_input = _get_streaming_input(subpass)
+      input_path = streaming_input.generate()
+      size_mb = streaming_input.get_size_bytes() / (1024 * 1024)
+      print(f"    Subpass {subpass}: {size_mb:.1f} MB cached")

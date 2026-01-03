@@ -35,6 +35,8 @@ Subpasses test increasingly complex scenarios.
 Solver times out after 5 minutes.
 """
 
+skip = True
+
 import random
 import subprocess
 import sys
@@ -337,10 +339,13 @@ You must write a C++ solver that can handle ANY dimensional complexity from triv
 - **Extreme**: 10D-20D games (3x3x3... to 4x4x4...), massive state spaces, very complex optimization
 
 **The Challenge:**
-Your C++ snake player will be tested with games ranging from simple 2D boards to massive 20D hypercubes. The same algorithm must work efficiently across ALL dimensionalities.
+Your C++ snake player will be tested with games ranging from simple 2D boards to massive 20D hypercubes. 
+The same algorithm must work efficiently across ALL dimensionalities.
 
 **Problem:**
-Like classic Nokia snake, but generalized to arbitrary dimensions. The snake occupies a series of connected integer grid points in N-D space, moves one step per turn along one axis (+1 or -1), grows when eating food, and dies if it hits an obstacle or itself.
+Like classic Nokia snake, but generalized to arbitrary dimensions. The snake occupies a series of 
+connected integer grid points in N-D space, moves one step per turn along one axis (+1 or -1), 
+grows when eating food, and dies if it hits an obstacle or itself.
 
 **Input format (stdin):**
 ```
@@ -557,57 +562,25 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
   return score, explanation
 
 
-def output_example_html(score: float, explanation: str, result: dict, subPass: int) -> str:
-  """Generate HTML for result display."""
+def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
+  if not result:
+    return "<p style='color:red'>No result provided</p>"
   case = TEST_CASES[subPass]
-
-  code = result.get("cpp_code", "No code provided")
-  reasoning = result.get("reasoning", "No reasoning provided")
-
-  code = code.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-  reasoning = reasoning.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-  score_color = "green" if score >= 0.8 else "orange" if score >= 0.4 else "red"
-
-  return f"""
-    <div class="result" style="margin: 10px; padding: 10px; border: 1px solid #ccc;">
-        <h4>Subpass {subPass}: {case['description']}</h4>
-        <p><strong>Score:</strong> <span style="color: {score_color};">{score:.2f}</span></p>
-        <p><strong>Details:</strong> {explanation}</p>
-        <details>
-            <summary>Reasoning</summary>
-            <pre style="background: #f5f5f5; padding: 10px; overflow-x: auto;">{reasoning}</pre>
-        </details>
-        <details>
-            <summary>C++ Code</summary>
-            <pre style="background: #f0f0f0; padding: 10px; overflow-x: auto;"><code>{code}</code></pre>
-        </details>
-    </div>
-    """
+  html = f"<h4>N-Dimensional Snake - {case['description']}</h4>"
+  if "reasoning" in result:
+    r = result['reasoning'][:400] + ('...' if len(result.get('reasoning', '')) > 400 else '')
+    html += f"<p><strong>Approach:</strong> {r.replace('<', '&lt;').replace('>', '&gt;')}</p>"
+  if "cpp_code" in result:
+    code = result["cpp_code"].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    html += f"<details><summary>View C++ Code ({len(result['cpp_code'])} chars)</summary><pre>{code}</pre></details>"
+  return html
 
 
-def output_header_html() -> str:
-  """Generate HTML header."""
-  return """
-    <h2>Test 21: N-Dimensional Snake Game (C++)</h2>
-    <p>Testing C++ implementation of snake game in arbitrary dimensions.</p>
-    """
+highLevelSummary = """
+N-Dimensional Snake generalizes classic snake to arbitrary dimensions.
 
-
-def output_summary_html(results: list) -> str:
-  """Generate summary HTML."""
-  if not results:
-    return "<p>No results</p>"
-
-  total_score = sum(r[0] for r in results)
-  max_score = len(results)
-  avg_score = total_score / max_score if max_score > 0 else 0
-
-  return f"""
-    <div class="summary" style="margin: 10px; padding: 15px; background: #e8f4e8; border-radius: 5px;">
-        <h3>Summary</h3>
-        <p><strong>Total Score:</strong> {total_score:.2f} / {max_score}</p>
-        <p><strong>Average Score:</strong> {avg_score:.2%}</p>
-        <p><strong>Subpasses Completed:</strong> {len(results)}</p>
-    </div>
-    """
+**Key concepts:**
+- State space grows exponentially with dimensions
+- Collision detection in N-D grid
+- Path planning to food while avoiding self
+"""

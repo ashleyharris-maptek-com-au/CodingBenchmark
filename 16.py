@@ -159,14 +159,13 @@ def prepareSubpassPrompt(subPass: int) -> str:
 
   return f"""You are solving a Job-Shop Scheduling problem.
 
-You must write a Python solver that can handle ANY problem size from trivial to ludicrous scale:
+You must write a Python solver that can handle ANY problem size from trivial to extremely large scale:
 - **Trivial**: 2-3 jobs, 2-3 machines, 5-10 tasks total (simple cases)
-- **Medium**: 4-6 jobs, 3-5 machines, 15-30 tasks total (moderate complexity)
-- **Large**: 8-15 jobs, 5-8 machines, 50-100 tasks total (complex scheduling)
-- **Extreme**: 20+ jobs, 10+ machines, 200+ tasks total (very complex optimization)
+- **Extreme**: 1000+ jobs, 50+ machines, 50k+ tasks total (massive optimization)
 
 **The Challenge:**
-Your `schedule_jobs(jobs, num_machines)` function will be tested with problems ranging from simple 2-job schedules to complex 20+ job schedules. The same function must work efficiently across ALL scales.
+Your `schedule_jobs(jobs, num_machines)` function will be tested with problems ranging in scope.
+The same function must work efficiently across ALL scales.
 
 **Input:**
 - `jobs`: List of jobs, each job is a list of tasks with machine and duration
@@ -182,31 +181,11 @@ Your `schedule_jobs(jobs, num_machines)` function will be tested with problems r
 2. **Performance**: Must complete within 5 minutes even for very large scheduling problems
 3. **Quality**: Minimize makespan while respecting all constraints
 
-**Algorithm Strategy Recommendations:**
-- **Small problems (≤10 tasks)**: Can use exact methods (branch and bound)
-- **Medium problems (10-50 tasks)**: Heuristic algorithms (list scheduling, priority rules)
-- **Large problems (50-100 tasks)**: Advanced heuristics, local search
-- **Very Large problems (>100 tasks)**: Fast heuristics, approximation algorithms
-
 **Key Constraints:**
 1. Each task in a job must run on its specified machine
 2. Tasks within a job must execute in order (task i before task i+1)
 3. A machine can only run one task at a time
 4. Tasks cannot be interrupted once started
-
-**Key Techniques:**
-- **List scheduling**: Sort tasks by priority, schedule earliest possible
-- **Priority rules**: SPT, LPT, FIFO, Most Work Remaining
-- **Shifting Bottleneck**: Solve one-machine problems iteratively
-- **Genetic algorithms**: Evolve permutation of operations
-- **Local search**: Improve initial schedules through local optimization
-
-**Implementation Hints:**
-- Detect problem size and choose appropriate algorithm
-- Use efficient data structures for machine availability tracking
-- Implement adaptive quality vs speed tradeoffs
-- For very large problems, consider greedy heuristics
-- Handle edge cases: empty jobs, zero-duration tasks
 
 **Example output:**
 ```python
@@ -220,7 +199,7 @@ Your `schedule_jobs(jobs, num_machines)` function will be tested with problems r
 ```
 
 **Constraints:**
-- Use only Python standard library
+- Use only Python standard library or numpy
 - Must handle varying numbers of jobs, machines, and tasks efficiently
 - Must respect all scheduling constraints
 - Minimize makespan (total completion time)
@@ -475,15 +454,16 @@ def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
 
   html = f"<h4>Job-Shop Scheduling - {case['description']}</h4>"
 
-  if "reasoning" in result:
-    reasoning = result['reasoning'][:500] + ('...'
-                                             if len(result.get('reasoning', '')) > 500 else '')
-    html += f"<p><strong>Algorithm:</strong> {reasoning}</p>"
+  if subPass == 0:
+    if "reasoning" in result:
+      reasoning = result['reasoning'][:500] + ('...'
+                                               if len(result.get('reasoning', '')) > 500 else '')
+      html += f"<p><strong>Algorithm:</strong> {reasoning}</p>"
 
-  if "python_code" in result:
-    code = result["python_code"]
-    code_escaped = code.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    html += f"<details><summary>View Code ({len(code)} chars)</summary><pre>{code_escaped}</pre></details>"
+    if "python_code" in result:
+      code = result["python_code"]
+      code_escaped = code.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+      html += f"<details><summary>View Code ({len(code)} chars)</summary><pre>{code_escaped}</pre></details>"
 
   return html
 

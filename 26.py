@@ -520,55 +520,60 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
   return score, explanation
 
 
-def output_example_html(score: float, explanation: str, result: dict, subPass: int) -> str:
-  """Generate HTML for result display."""
+def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
+  """Generate HTML report with clustering visualization."""
+  if not result:
+    return "<p style='color:red'>No result provided</p>"
+
   case = TEST_CASES[subPass]
+  html = f"<h4>3D Point Clustering - {case['description']}</h4>"
 
-  code = result.get("rust_code", "No code provided")
-  reasoning = result.get("reasoning", "No reasoning provided")
+  if "reasoning" in result:
+    reasoning = result['reasoning'][:500] + ('...'
+                                             if len(result.get('reasoning', '')) > 500 else '')
+    reasoning_escaped = reasoning.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    html += f"<p><strong>Approach:</strong> {reasoning_escaped}</p>"
 
-  code = code.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-  reasoning = reasoning.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+  if "rust_code" in result:
+    code = result["rust_code"]
+    code_escaped = code.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    html += f"<details><summary>View Rust Code ({len(code)} chars)</summary><pre>{code_escaped}</pre></details>"
 
-  score_color = "green" if score >= 0.8 else "orange" if score >= 0.4 else "red"
-
-  return f"""
-    <div class="result" style="margin: 10px; padding: 10px; border: 1px solid #ccc;">
-        <h4>Subpass {subPass}: {case['description']}</h4>
-        <p><strong>Score:</strong> <span style="color: {score_color};">{score:.2f}</span></p>
-        <p><strong>Details:</strong> {explanation}</p>
-        <details>
-            <summary>Reasoning</summary>
-            <pre style="background: #f5f5f5; padding: 10px; overflow-x: auto;">{reasoning}</pre>
-        </details>
-        <details>
-            <summary>Rust Code</summary>
-            <pre style="background: #f0f0f0; padding: 10px; overflow-x: auto;"><code>{code}</code></pre>
-        </details>
-    </div>
-    """
+  # SVG clustering visualization
+  html += _generate_clustering_svg(case)
+  return html
 
 
-def output_header_html() -> str:
-  return """
-    <h2>Test 26: 3D Point Clustering (Rust)</h2>
-    <p>Testing Rust implementation of large-scale 3D point clustering.</p>
-    """
+def _generate_clustering_svg(case: dict) -> str:
+  """Generate SVG showing clustering concept."""
+  return f'''
+  <details>
+    <summary>📊 Clustering Diagram</summary>
+    <svg viewBox="0 0 300 200" style="max-width:300px; margin:10px auto; display:block; background:#f8f8f8; border-radius:8px;">
+      <circle cx="50" cy="50" r="25" fill="none" stroke="#4488ff" stroke-width="2" stroke-dasharray="4"/>
+      <circle cx="45" cy="45" r="3" fill="#4488ff"/><circle cx="55" cy="50" r="3" fill="#4488ff"/>
+      <circle cx="50" cy="58" r="3" fill="#4488ff"/><circle cx="42" cy="52" r="3" fill="#4488ff"/>
+      <circle cx="150" cy="80" r="30" fill="none" stroke="#44aa44" stroke-width="2" stroke-dasharray="4"/>
+      <circle cx="145" cy="75" r="3" fill="#44aa44"/><circle cx="155" cy="82" r="3" fill="#44aa44"/>
+      <circle cx="148" cy="90" r="3" fill="#44aa44"/><circle cx="160" cy="72" r="3" fill="#44aa44"/>
+      <circle cx="250" cy="120" r="20" fill="none" stroke="#ff8844" stroke-width="2" stroke-dasharray="4"/>
+      <circle cx="245" cy="115" r="3" fill="#ff8844"/><circle cx="255" cy="122" r="3" fill="#ff8844"/>
+      <circle cx="250" cy="128" r="3" fill="#ff8844"/>
+      <text x="150" y="180" fill="#666" font-size="11" text-anchor="middle">K={case.get('num_clusters', '?')} clusters | {case.get('num_points', '?')} points</text>
+    </svg>
+  </details>
+  '''
 
 
-def output_summary_html(results: list) -> str:
-  if not results:
-    return "<p>No results</p>"
+highLevelSummary = """
+3D point clustering partitions spatial data into meaningful groups.
 
-  total_score = sum(r[0] for r in results)
-  max_score = len(results)
-  avg_score = total_score / max_score if max_score > 0 else 0
+**Algorithms:**
+- **K-means**: Iterative centroid optimization, O(nki) per iteration
+- **K-means++**: Smart initialization for better convergence
+- **DBSCAN**: Density-based clustering, handles arbitrary shapes
 
-  return f"""
-    <div class="summary" style="margin: 10px; padding: 15px; background: #e8f4e8; border-radius: 5px;">
-        <h3>Summary</h3>
-        <p><strong>Total Score:</strong> {total_score:.2f} / {max_score}</p>
-        <p><strong>Average Score:</strong> {avg_score:.2%}</p>
-        <p><strong>Subpasses Completed:</strong> {len(results)}</p>
-    </div>
-    """
+**Key metrics:**
+- WCSS (Within-Cluster Sum of Squares): Lower is better
+- Silhouette score: Measures cluster separation
+"""

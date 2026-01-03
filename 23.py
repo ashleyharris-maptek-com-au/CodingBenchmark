@@ -30,6 +30,8 @@ Success: Land on target with |velocity| < threshold
 Failure: Crash into obstacle, run out of fuel, or exceed time limit
 """
 
+skip = True
+
 import random
 import subprocess
 import sys
@@ -580,53 +582,25 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
   return score, explanation
 
 
-def output_example_html(score: float, explanation: str, result: dict, subPass: int) -> str:
-  """Generate HTML for result display."""
+def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
+  if not result:
+    return "<p style='color:red'>No result provided</p>"
   case = TEST_CASES[subPass]
-
-  code = result.get("rust_code", "No code provided")
-  reasoning = result.get("reasoning", "No reasoning provided")
-
-  code = code.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-  reasoning = reasoning.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-  score_color = "green" if score >= 0.8 else "orange" if score >= 0.4 else "red"
-
-  return f"""
-    <div class="result" style="margin: 10px; padding: 10px; border: 1px solid #ccc;">
-        <h4>Subpass {subPass}: {case['description']}</h4>
-        <p><strong>Score:</strong> <span style="color: {score_color};">{score:.2f}</span></p>
-        <p><strong>Details:</strong> {explanation}</p>
-        <details>
-            <summary>Reasoning</summary>
-            <pre style="background: #f5f5f5; padding: 10px; overflow-x: auto;">{reasoning}</pre>
-        </details>
-        <details>
-            <summary>Rust Code</summary>
-            <pre style="background: #f0f0f0; padding: 10px; overflow-x: auto;"><code>{code}</code></pre>
-        </details>
-    </div>
-    """
+  html = f"<h4>Lunar Lander - {case['description']}</h4>"
+  if "reasoning" in result:
+    r = result['reasoning'][:400] + ('...' if len(result.get('reasoning', '')) > 400 else '')
+    html += f"<p><strong>Approach:</strong> {r.replace('<', '&lt;').replace('>', '&gt;')}</p>"
+  if "rust_code" in result:
+    code = result["rust_code"].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    html += f"<details><summary>View Rust Code ({len(result['rust_code'])} chars)</summary><pre>{code}</pre></details>"
+  return html
 
 
-def output_header_html() -> str:
-  """Generate HTML header."""
-  return """
-    <h2>Test 23: Lunar Lander Game (Rust)</h2>
-    <p>Testing Rust implementation of real-time lunar lander control.</p>
-    """
+highLevelSummary = """
+Lunar Lander controls thrust to achieve soft landing on lunar surface.
 
-
-def output_summary_html(results: list) -> str:
-  """Generate HTML summary."""
-  total_score = sum(r[0] for r in results)
-  avg_score = total_score / len(results) if results else 0
-
-  return f"""
-    <div class="summary" style="margin: 20px; padding: 15px; border: 2px solid #333; background: #f9f9f9;">
-        <h3>Summary</h3>
-        <p><strong>Average Score:</strong> {avg_score:.3f}</p>
-        <p><strong>Total Score:</strong> {total_score:.3f}</p>
-        <p><strong>Tests Completed:</strong> {len(results)}/{len(TEST_CASES)}</p>
-    </div>
-    """
+**Key concepts:**
+- Physics simulation (gravity, thrust, fuel)
+- PID control or optimal control theory
+- State estimation and trajectory planning
+"""

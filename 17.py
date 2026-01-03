@@ -122,19 +122,18 @@ def prepareSubpassPrompt(subPass: int) -> str:
 
   return f"""You are solving a 3D Bin Packing problem with axis-aligned boxes.
 
-You must write a Python solver that can handle ANY problem size from trivial to ludicrous scale:
-- **Trivial**: Small containers (5x5x5), few boxes (5-10), simple packing
-- **Medium**: Medium containers (10x10x10-20x20x20), moderate number of boxes (10-50)
-- **Large**: Large containers (50x50x50-100x100x100), many boxes (50-200)
-- **Extreme**: Massive containers (200x200x200-500x500x500), very many boxes (200-1000+)
+Need a function that works on all scales, from: 10,000 boxes in 1,000,000 cubic units,
+down to 4 boxes in a 10x10x10
 
 **The Challenge:**
-Your `pack_boxes(boxes, container)` function will be tested with containers ranging from 5x5x5 to 500x500x500 and varying numbers of boxes. The same function must work efficiently across ALL scales.
+Your `pack_boxes(boxes, container)` function will be tested with containers ranging 
+from 5x5x5 to 500x500x500 and varying numbers of boxes. The same function must work efficiently 
+across ALL scales, from small to very large problems.
 
 **Input:**
 - `boxes`: List of (width, height, depth) tuples
 - `container`: (W, H, D) tuple for container dimensions
-- Container origin at (0, 0, 0), extends to container dimensions
+- Container origin at (0, 0, 0), extends to (W, H, D)
 
 **Output:**
 - Dict with:
@@ -149,34 +148,14 @@ Your `pack_boxes(boxes, container)` function will be tested with containers rang
 2. **Performance**: Must complete within 5 minutes even for very large containers
 3. **Quality**: Maximize number of boxes packed while ensuring valid placements
 
-**Algorithm Strategy Recommendations:**
-- **Small problems (≤10 boxes)**: Can use exact placement, try all orientations
-- **Medium problems (10-50 boxes)**: Heuristic placement, limited rotation search
-- **Large problems (50-200 boxes)**: Fast heuristics, simplified rotation handling
-- **Very Large problems (>200 boxes)**: Very fast heuristics, possibly no rotation
-
-**Key Techniques:**
-- **First Fit Decreasing (FFD)**: Sort by volume, place each in first valid position
-- **Bottom-Left-Back**: Place each box at lowest, leftmost, backmost valid position
-- **Extreme Points**: Track corner points where new boxes can be placed
-- **Guillotine**: Recursively split remaining space
-
 **Rotation Options:**
 - (0, 0, 0): No rotation - (w, h, d) as given
 - (1, 0, 0): Swap height and depth - (w, d, h)
 - (0, 1, 0): Swap width and depth - (d, h, w)
 - etc. (6 possible orientations for a box)
 
-**Implementation Hints:**
-- Detect container volume and choose appropriate algorithm
-- Use efficient collision detection (AABB checks)
-- Implement adaptive quality vs speed tradeoffs
-- For very large containers, consider simplified placement strategies
-- Handle edge cases: empty boxes, oversized boxes
-- For simplicity, you can ignore rotation for very large problems
-
 **Constraints:**
-- Use only Python standard library
+- Use only Python standard library and numpy
 - Boxes must be entirely within container bounds
 - No two boxes may overlap
 - Boxes are axis-aligned (no arbitrary rotation)
@@ -184,7 +163,6 @@ Your `pack_boxes(boxes, container)` function will be tested with containers rang
 - Must handle varying container sizes and box counts efficiently
 
 Write complete, runnable Python code with the pack_boxes function.
-Include adaptive logic that chooses different strategies based on problem scale.
 """
 
 
@@ -472,15 +450,18 @@ def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
 
   html = f"<h4>3D AABB Packing - {case['description']}</h4>"
 
-  if "reasoning" in result:
-    reasoning = result['reasoning'][:500] + ('...'
-                                             if len(result.get('reasoning', '')) > 500 else '')
-    html += f"<p><strong>Algorithm:</strong> {reasoning}</p>"
+  if subPass == 0:
+    if "reasoning" in result:
+      reasoning = result['reasoning'][:500] + ('...'
+                                               if len(result.get('reasoning', '')) > 500 else '')
+      html += f"<p><strong>Algorithm:</strong> {reasoning}</p>"
 
-  if "python_code" in result:
-    code = result["python_code"]
-    code_escaped = code.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    html += f"<details><summary>View Code ({len(code)} chars)</summary><pre>{code_escaped}</pre></details>"
+    if "python_code" in result:
+      code = result["python_code"]
+      code_escaped = code.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+      html += f"<details><summary>View Code ({len(code)} chars)</summary><pre>{code_escaped}</pre></details>"
+
+  # TODO: Add three.js rendering here, for at least the trivial cases.
 
   return html
 

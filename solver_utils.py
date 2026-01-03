@@ -2,6 +2,9 @@
 Common utilities for executing LLM solver code with debugger isolation.
 This module provides a unified approach to running subprocesses safely,
 preventing debugger interference across all test files.
+
+Also provides streaming data infrastructure for large test cases that
+don't fit in memory.
 """
 
 import os
@@ -13,6 +16,208 @@ import tempfile
 import platform
 import json
 import signal
+import hashlib
+from pathlib import Path
+from typing import Generator, Callable, Optional, Union, Any, Iterator
+
+try:
+  import numpy as np
+except ImportError:
+  np = None
+
+# Directory for cached streaming data
+STREAMING_CACHE_DIR = Path(tempfile.gettempdir()) / "codingbenchmark_streaming_cache"
+
+
+class StreamingInputFile:
+  """
+  Manages streaming input data that may be too large to fit in memory.
+  
+  Supports:
+  - Caching generated data to temp files
+  - Lazy generation via generators/callables
+  - Automatic cache invalidation via content hash
+  - File handle access for subprocess stdin
+  """
+
+  def __init__(self,
+               cache_key: str,
+               generator: Callable[[], Generator[str, None, None]],
+               cache_subdir: str = "default"):
+    """
+    Args:
+      cache_key: Unique key for caching (should include all parameters that affect output)
+      generator: Callable that returns a generator yielding string chunks
+      cache_subdir: Subdirectory within cache for organization
+    """
+    self.cache_key = cache_key
+    self.generator = generator
+    self.cache_subdir = cache_subdir
+    self._file_path: Optional[Path] = None
+    self._is_generated = False
+
+  @property
+  def cache_dir(self) -> Path:
+    return STREAMING_CACHE_DIR / self.cache_subdir
+
+  @property
+  def cache_path(self) -> Path:
+    key_hash = hashlib.sha256(self.cache_key.encode('utf-8')).hexdigest()[:24]
+    return self.cache_dir / f"{key_hash}.txt"
+
+  def _ensure_cache_dir(self):
+    self.cache_dir.mkdir(parents=True, exist_ok=True)
+
+  def is_cached(self) -> bool:
+    return self.cache_path.exists()
+
+  def generate(self, force: bool = False) -> Path:
+    """
+    Generate the data file if not cached.
+    
+    Args:
+      force: If True, regenerate even if cached
+      
+    Returns:
+      Path to the data file
+    """
+    if not force and self.is_cached():
+      self._file_path = self.cache_path
+      self._is_generated = True
+      return self._file_path
+
+    self._ensure_cache_dir()
+    tmp_path = self.cache_path.with_suffix('.tmp')
+
+    try:
+      with open(tmp_path, 'w', encoding='utf-8', newline='\n') as f:
+        for chunk in self.generator():
+          f.write(chunk)
+
+      # Atomic rename
+      os.replace(tmp_path, self.cache_path)
+      self._file_path = self.cache_path
+      self._is_generated = True
+      return self._file_path
+
+    except Exception:
+      # Clean up partial file
+      try:
+        tmp_path.unlink(missing_ok=True)
+      except Exception:
+        pass
+      raise
+
+  def get_file_path(self) -> Path:
+    """Get path to data file, generating if needed."""
+    if not self._is_generated:
+      self.generate()
+    return self._file_path
+
+  def open_for_read(self):
+    """Open the data file for reading (for subprocess stdin)."""
+    return open(self.get_file_path(), 'r', encoding='utf-8')
+
+  def get_size_bytes(self) -> int:
+    """Get file size in bytes."""
+    return self.get_file_path().stat().st_size
+
+  def delete_cache(self):
+    """Delete the cached file."""
+    try:
+      self.cache_path.unlink(missing_ok=True)
+    except Exception:
+      pass
+    self._is_generated = False
+    self._file_path = None
+
+
+def streaming_graph_generator(num_nodes: int,
+                              num_edges: int,
+                              edge_generator: Callable[[], Iterator[tuple]],
+                              chunk_size: int = 10000) -> Generator[str, None, None]:
+  """
+  Generator that yields graph data in chunks suitable for streaming.
+  
+  Args:
+    num_nodes: Number of nodes
+    num_edges: Number of edges  
+    edge_generator: Callable returning iterator of (u, v) edge tuples
+    chunk_size: Number of edges per chunk
+    
+  Yields:
+    String chunks of graph data
+  """
+  # Header line
+  yield f"{num_nodes} {num_edges}\n"
+
+  # Edge lines in chunks
+  buffer = []
+  for u, v in edge_generator():
+    buffer.append(f"{u} {v}\n")
+    if len(buffer) >= chunk_size:
+      yield ''.join(buffer)
+      buffer.clear()
+
+  # Remaining edges
+  if buffer:
+    yield ''.join(buffer)
+
+
+def create_graph_input_file(num_nodes: int,
+                            num_edges: int,
+                            cut_size: int,
+                            seed: int,
+                            graph_generator_func: Callable,
+                            cache_subdir: str = "graphs") -> StreamingInputFile:
+  """
+  Create a StreamingInputFile for graph data.
+  
+  Args:
+    num_nodes: Number of nodes
+    num_edges: Number of edges
+    cut_size: Size of the known cut
+    seed: Random seed
+    graph_generator_func: Function(num_nodes, num_edges, cut_size, seed) -> (edges, actual_cut)
+    cache_subdir: Cache subdirectory
+    
+  Returns:
+    StreamingInputFile that can generate/cache the graph data
+  """
+  cache_key = f"graph|n={num_nodes}|m={num_edges}|cut={cut_size}|seed={seed}"
+
+  def generator():
+    edges, _ = graph_generator_func(num_nodes, num_edges, cut_size, seed)
+
+    yield f"{num_nodes} {len(edges) if hasattr(edges, '__len__') else num_edges}\n"
+
+    # Handle both numpy arrays and lists of tuples
+    if np is not None and hasattr(edges, 'shape'):
+      # NumPy array - iterate efficiently
+      for i in range(edges.shape[0]):
+        yield f"{int(edges[i, 0])} {int(edges[i, 1])}\n"
+    else:
+      # List of tuples
+      for u, v in edges:
+        yield f"{u} {v}\n"
+
+  return StreamingInputFile(cache_key, generator, cache_subdir)
+
+
+def clean_streaming_cache(subdir: str = None):
+  """
+  Clean streaming cache.
+  
+  Args:
+    subdir: Specific subdirectory to clean, or None for all
+  """
+  if subdir:
+    target = STREAMING_CACHE_DIR / subdir
+  else:
+    target = STREAMING_CACHE_DIR
+
+  if target.exists():
+    shutil.rmtree(target)
 
 
 def create_isolated_environment():
@@ -74,13 +279,32 @@ def execute_solver_code(code_content, temp_file_content, timeout=30):
 
   process = None
   try:
-    start_time = time.time()
-
     # Create isolated environment
     clean_env = create_isolated_environment()
 
+    # Pre-generate .pyc outside the timed section to reduce first-run compile overhead
+    try:
+      if platform.system() == 'Windows':
+        compile_cmd = [
+          'cmd', '/c', sys.executable, '-Xfrozen_modules=off', '-m', 'py_compile', temp_path
+        ]
+      else:
+        compile_cmd = [sys.executable, '-Xfrozen_modules=off', '-S', '-m', 'py_compile', temp_path]
+
+      subprocess.run(compile_cmd,
+                     stdout=subprocess.DEVNULL,
+                     stderr=subprocess.PIPE,
+                     text=True,
+                     env=clean_env,
+                     cwd=tempfile.gettempdir(),
+                     timeout=min(10, max(1, timeout // 3)))
+    except Exception:
+      pass
+
     # Build command with debugger bypass
     cmd_args = build_python_command(temp_path)
+
+    start_time = time.time()
 
     # Start the process
     if platform.system() == 'Windows':

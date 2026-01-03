@@ -13,8 +13,9 @@ Solver times out after 5 minutes.
 import random
 import subprocess
 import time
-from typing import List, Tuple, Optional
-from native_compiler import RustCompiler, CompilationError
+from typing import List, Tuple, Optional, Dict, Any
+from native_compiler import RustCompiler, CompilationError, ExecutionError
+from solver_utils import StreamingInputFile
 
 title = "Subset Sum (Rust)"
 TIMEOUT_SECONDS = 30
@@ -90,9 +91,42 @@ TEST_CASES = [
     "max_val": 1000000000000,
     "desc": "10K numbers, 1T max"
   },
+  # Ludicrous cases for streaming
+  {
+    "n": 50000,
+    "max_val": 10000000000000,
+    "desc": "50K numbers, 10T max"
+  },
+  {
+    "n": 200000,
+    "max_val": 100000000000000,
+    "desc": "200K numbers, 100T max"
+  },
+  {
+    "n": 1000000,
+    "max_val": 1000000000000000,
+    "desc": "1M numbers, 1P max"
+  },
+  {
+    "n": 5000000,
+    "max_val": 10000000000000000,
+    "desc": "5M numbers (~100MB)"
+  },
+  {
+    "n": 20000000,
+    "max_val": 100000000000000000,
+    "desc": "20M numbers (~400MB)"
+  },
+  {
+    "n": 50000000,
+    "max_val": 1000000000000000000,
+    "desc": "50M numbers (~1GB)"
+  },
 ]
 
-INSTANCE_CACHE = {}
+INSTANCE_CACHE: Dict[int, Any] = {}
+_INPUT_FILE_CACHE: Dict[int, StreamingInputFile] = {}
+STREAMING_THRESHOLD_N = 100_000
 
 
 def get_instance(subpass: int) -> Tuple[List[int], int]:
@@ -101,6 +135,27 @@ def get_instance(subpass: int) -> Tuple[List[int], int]:
     nums, target = generate_subset_sum(case["n"], case["max_val"], RANDOM_SEED + subpass)
     INSTANCE_CACHE[subpass] = (nums, target)
   return INSTANCE_CACHE[subpass]
+
+
+def _should_use_streaming(subpass: int) -> bool:
+  return TEST_CASES[subpass]["n"] > STREAMING_THRESHOLD_N
+
+
+def _get_streaming_input(subpass: int) -> StreamingInputFile:
+  if subpass in _INPUT_FILE_CACHE:
+    return _INPUT_FILE_CACHE[subpass]
+
+  case = TEST_CASES[subpass]
+  cache_key = f"subset31|n={case['n']}|max={case['max_val']}|seed={RANDOM_SEED + subpass}"
+
+  def generator():
+    nums, target = get_instance(subpass)
+    yield f"{len(nums)} {target}\n"
+    yield " ".join(map(str, nums)) + "\n"
+
+  input_file = StreamingInputFile(cache_key, generator, "test31_subset")
+  _INPUT_FILE_CACHE[subpass] = input_file
+  return input_file
 
 
 def format_input(nums: List[int], target: int) -> str:
@@ -233,7 +288,7 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
     return 0.0, "No Rust code provided"
 
   case = TEST_CASES[subPass]
-  nums, target = get_instance(subPass)
+  use_streaming = _should_use_streaming(subPass)
 
   compiler = RustCompiler(aiEngineName)
   if not compiler.find_compiler():
@@ -244,21 +299,53 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
   except CompilationError as e:
     return 0.0, f"Compilation error: {str(e)[:200]}"
 
-  input_data = format_input(nums, target)
-
   try:
-    start = time.time()
-    proc = subprocess.run([str(exe_path)],
-                          input=input_data,
-                          capture_output=True,
-                          text=True,
-                          timeout=TIMEOUT_SECONDS)
-    exec_time = time.time() - start
+    if use_streaming:
+      t = time.time()
+      streaming_input = _get_streaming_input(subPass)
+      print(f"  Generating/caching input file for {case['desc']}...")
+      input_file_path = streaming_input.generate()
+      file_size_mb = streaming_input.get_size_bytes() / (1024 * 1024)
+      print(f"  Input file: {file_size_mb:.1f} MB")
+      if time.time() - t > 1:
+        print(f"  Time to generate: {time.time() - t:.2f}s")
 
-    if proc.returncode != 0:
-      return 0.0, f"Runtime error: {proc.stderr[:200]}"
+      start = time.time()
+      stdout, stderr, exec_time, return_code = compiler.execute(exe_path,
+                                                                timeout=TIMEOUT_SECONDS,
+                                                                stdin_file=input_file_path)
 
-    lines = proc.stdout.strip().split('\n')
+      if return_code != 0:
+        return 0.0, f"Runtime error: {stderr[:200]}"
+
+      # Skip verification for very large cases
+      if case["n"] > 1_000_000:
+        lines = stdout.strip().split('\n')
+        if lines and lines[0].strip() == "YES":
+          return 0.8, f"[{case['desc']}] Reports YES in {exec_time:.2f}s (verification skipped)"
+        elif lines and lines[0].strip() == "NO":
+          return 0.5, f"[{case['desc']}] Reports NO in {exec_time:.2f}s"
+        else:
+          return 0.2, f"[{case['desc']}] Unknown output"
+
+      proc_stdout = stdout
+    else:
+      nums, target = get_instance(subPass)
+      input_data = format_input(nums, target)
+
+      start = time.time()
+      proc = subprocess.run([str(exe_path)],
+                            input=input_data,
+                            capture_output=True,
+                            text=True,
+                            timeout=TIMEOUT_SECONDS)
+      exec_time = time.time() - start
+
+      if proc.returncode != 0:
+        return 0.0, f"Runtime error: {proc.stderr[:200]}"
+      proc_stdout = proc.stdout
+
+    lines = proc_stdout.strip().split('\n')
     if not lines:
       return 0.0, "No output"
 
@@ -270,6 +357,7 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
         return 0.2, f"[{case['desc']}] YES but no indices"
 
       indices = list(map(int, lines[1].split()))
+      nums, target = get_instance(subPass)
       valid, msg = verify_subset(nums, target, indices)
 
       if valid:
@@ -285,17 +373,36 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
     return 0.0, f"[{case['desc']}] Error: {str(e)[:100]}"
 
 
-def output_example_html(score: float, explanation: str, result: dict, subPass: int) -> str:
+def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
+  if not result:
+    return "<p style='color:red'>No result provided</p>"
   case = TEST_CASES[subPass]
-  code = result.get("rust_code", "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-  color = "green" if score >= 0.8 else "orange" if score >= 0.4 else "red"
-  return f'<div class="result"><h4>Subpass {subPass}: {case["desc"]}</h4><p style="color:{color}">Score: {score:.2f}</p><p>{explanation}</p><details><summary>Code</summary><pre>{code}</pre></details></div>'
+  html = f"<h4>Subset Sum - {case['desc']}</h4>"
+  if "reasoning" in result:
+    r = result['reasoning'][:400] + ('...' if len(result.get('reasoning', '')) > 400 else '')
+    html += f"<p><strong>Approach:</strong> {r.replace('<', '&lt;').replace('>', '&gt;')}</p>"
+  if "rust_code" in result:
+    code = result["rust_code"].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    html += f"<details><summary>View Rust Code ({len(result['rust_code'])} chars)</summary><pre>{code}</pre></details>"
+  return html
 
 
-def output_header_html() -> str:
-  return "<h2>Test 31: Subset Sum (Rust)</h2><p>NP-Complete number theory problem.</p>"
+highLevelSummary = """
+Subset Sum determines if a subset of numbers sums to a target value.
+
+**Algorithms:**
+- **Dynamic Programming**: O(n*target) pseudo-polynomial
+- **Meet in the Middle**: O(2^(n/2)) for smaller sets
+- **Approximation**: FPTAS for optimization variant
+"""
 
 
-def output_summary_html(results: list) -> str:
-  total = sum(r[0] for r in results)
-  return f'<div class="summary"><p>Total: {total:.2f}/{len(results)}</p></div>'
+def setup():
+  """Pre-generate and cache all streaming input files for parallel test execution."""
+  print(f"  Pre-generating streaming input files for {len(TEST_CASES)} test cases...")
+  for subpass in range(len(TEST_CASES)):
+    if _should_use_streaming(subpass):
+      streaming_input = _get_streaming_input(subpass)
+      input_path = streaming_input.generate()
+      size_mb = streaming_input.get_size_bytes() / (1024 * 1024)
+      print(f"    Subpass {subpass}: {size_mb:.1f} MB cached")

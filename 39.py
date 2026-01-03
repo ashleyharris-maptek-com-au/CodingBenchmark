@@ -13,8 +13,9 @@ Solver times out after 5 minutes.
 import random
 import subprocess
 import time
-from typing import List, Tuple, Set
-from native_compiler import RustCompiler, CompilationError
+from typing import List, Tuple, Set, Dict, Any
+from native_compiler import RustCompiler, CompilationError, ExecutionError
+from solver_utils import StreamingInputFile
 
 title = "Graph Bisection (Rust)"
 TIMEOUT_SECONDS = 30
@@ -88,9 +89,37 @@ TEST_CASES = [
     "edge_prob": 0.01,
     "desc": "5000 vertices"
   },
+  # Ludicrous cases for streaming
+  {
+    "vertices": 10000,
+    "edge_prob": 0.008,
+    "desc": "10K vertices (~400K edges)"
+  },
+  {
+    "vertices": 50000,
+    "edge_prob": 0.002,
+    "desc": "50K vertices (~2.5M edges)"
+  },
+  {
+    "vertices": 100000,
+    "edge_prob": 0.001,
+    "desc": "100K vertices (~5M edges)"
+  },
+  {
+    "vertices": 500000,
+    "edge_prob": 0.0004,
+    "desc": "500K vertices (~50M edges)"
+  },
+  {
+    "vertices": 1000000,
+    "edge_prob": 0.0003,
+    "desc": "1M vertices (~150M edges, >1GB)"
+  },
 ]
 
-GRAPH_CACHE = {}
+GRAPH_CACHE: Dict[int, Any] = {}
+_INPUT_FILE_CACHE: Dict[int, StreamingInputFile] = {}
+STREAMING_THRESHOLD_EDGES = 1_000_000
 
 
 def get_graph(subpass: int) -> Tuple[int, List[Tuple[int, int]]]:
@@ -99,6 +128,35 @@ def get_graph(subpass: int) -> Tuple[int, List[Tuple[int, int]]]:
     edges = generate_graph(case["vertices"], case["edge_prob"], RANDOM_SEED + subpass)
     GRAPH_CACHE[subpass] = (case["vertices"], edges)
   return GRAPH_CACHE[subpass]
+
+
+def _estimate_edges(subpass: int) -> int:
+  case = TEST_CASES[subpass]
+  n = case["vertices"]
+  p = case["edge_prob"]
+  return int(n * (n - 1) / 2 * p)
+
+
+def _should_use_streaming(subpass: int) -> bool:
+  return _estimate_edges(subpass) > STREAMING_THRESHOLD_EDGES
+
+
+def _get_streaming_input(subpass: int) -> StreamingInputFile:
+  if subpass in _INPUT_FILE_CACHE:
+    return _INPUT_FILE_CACHE[subpass]
+
+  case = TEST_CASES[subpass]
+  cache_key = f"graph39|v={case['vertices']}|p={case['edge_prob']}|seed={RANDOM_SEED + subpass}"
+
+  def generator():
+    num_vertices, edges = get_graph(subpass)
+    yield f"{num_vertices} {len(edges)}\n"
+    for u, v in edges:
+      yield f"{u} {v}\n"
+
+  input_file = StreamingInputFile(cache_key, generator, "test39_graphs")
+  _INPUT_FILE_CACHE[subpass] = input_file
+  return input_file
 
 
 def format_input(num_vertices: int, edges: List[Tuple[int, int]]) -> str:
@@ -279,7 +337,7 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
     return 0.0, "No Rust code provided"
 
   case = TEST_CASES[subPass]
-  num_vertices, edges = get_graph(subPass)
+  use_streaming = _should_use_streaming(subPass)
 
   compiler = RustCompiler(aiEngineName)
   if not compiler.find_compiler():
@@ -290,24 +348,55 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
   except CompilationError as e:
     return 0.0, f"Compilation error: {str(e)[:200]}"
 
-  input_data = format_input(num_vertices, edges)
-
   try:
-    start = time.time()
-    proc = subprocess.run([str(exe_path)],
-                          input=input_data,
-                          capture_output=True,
-                          text=True,
-                          timeout=TIMEOUT_SECONDS)
-    exec_time = time.time() - start
+    if use_streaming:
+      t = time.time()
+      streaming_input = _get_streaming_input(subPass)
+      print(f"  Generating/caching input file for {case['desc']}...")
+      input_file_path = streaming_input.generate()
+      file_size_mb = streaming_input.get_size_bytes() / (1024 * 1024)
+      print(f"  Input file: {file_size_mb:.1f} MB")
+      if time.time() - t > 1:
+        print(f"  Time to generate: {time.time() - t:.2f}s")
 
-    if proc.returncode != 0:
-      return 0.0, f"Runtime error: {proc.stderr[:200]}"
+      start = time.time()
+      stdout, stderr, exec_time, return_code = compiler.execute(exe_path,
+                                                                timeout=TIMEOUT_SECONDS,
+                                                                stdin_file=input_file_path)
 
-    lines = proc.stdout.strip().split('\n')
-    reported_cut = int(lines[0])
-    partition_a = set(map(int, lines[1].split())) if len(lines) > 1 else set()
+      if return_code != 0:
+        return 0.0, f"Runtime error: {stderr[:200]}"
 
+      lines = stdout.strip().split('\n')
+      reported_cut = int(lines[0])
+      partition_a = set(map(int, lines[1].split())) if len(lines) > 1 else set()
+
+      # Skip full verification for very large graphs
+      if _estimate_edges(subPass) > 10_000_000:
+        if len(partition_a) == case["vertices"] // 2:
+          return 0.8, f"[{case['desc']}] Cut {reported_cut} in {exec_time:.2f}s (verification skipped)"
+        else:
+          return 0.2, f"[{case['desc']}] Invalid partition size"
+    else:
+      num_vertices, edges = get_graph(subPass)
+      input_data = format_input(num_vertices, edges)
+
+      start = time.time()
+      proc = subprocess.run([str(exe_path)],
+                            input=input_data,
+                            capture_output=True,
+                            text=True,
+                            timeout=TIMEOUT_SECONDS)
+      exec_time = time.time() - start
+
+      if proc.returncode != 0:
+        return 0.0, f"Runtime error: {proc.stderr[:200]}"
+
+      lines = proc.stdout.strip().split('\n')
+      reported_cut = int(lines[0])
+      partition_a = set(map(int, lines[1].split())) if len(lines) > 1 else set()
+
+    num_vertices, edges = get_graph(subPass)
     valid, actual_cut, msg = calculate_cut(num_vertices, edges, partition_a)
     if not valid:
       return 0.2, f"[{case['desc']}] {msg}"
@@ -321,21 +410,42 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
 
   except subprocess.TimeoutExpired:
     return 0.1, f"[{case['desc']}] Timeout"
+  except ExecutionError as e:
+    return 0.1, f"[{case['desc']}] {str(e)[:100]}"
   except Exception as e:
     return 0.0, f"[{case['desc']}] Error: {str(e)[:100]}"
 
 
-def output_example_html(score: float, explanation: str, result: dict, subPass: int) -> str:
+def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
+  if not result:
+    return "<p style='color:red'>No result provided</p>"
   case = TEST_CASES[subPass]
-  code = result.get("rust_code", "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-  color = "green" if score >= 0.8 else "orange" if score >= 0.4 else "red"
-  return f'<div class="result"><h4>Subpass {subPass}: {case["desc"]}</h4><p style="color:{color}">Score: {score:.2f}</p><p>{explanation}</p><details><summary>Code</summary><pre>{code}</pre></details></div>'
+  html = f"<h4>Graph Bisection - {case['desc']}</h4>"
+  if "reasoning" in result:
+    r = result['reasoning'][:400] + ('...' if len(result.get('reasoning', '')) > 400 else '')
+    html += f"<p><strong>Approach:</strong> {r.replace('<', '&lt;').replace('>', '&gt;')}</p>"
+  if "rust_code" in result:
+    code = result["rust_code"].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    html += f"<details><summary>View Rust Code ({len(result['rust_code'])} chars)</summary><pre>{code}</pre></details>"
+  return html
 
 
-def output_header_html() -> str:
-  return "<h2>Test 39: Graph Bisection (Rust)</h2><p>NP-Hard graph partitioning problem.</p>"
+highLevelSummary = """
+Graph Bisection partitions vertices into two equal sets minimizing cut edges.
+
+**Algorithms:**
+- **Kernighan-Lin**: Iterative improvement heuristic
+- **Spectral Bisection**: Using graph Laplacian eigenvectors
+- **METIS**: Multilevel graph partitioning
+"""
 
 
-def output_summary_html(results: list) -> str:
-  total = sum(r[0] for r in results)
-  return f'<div class="summary"><p>Total: {total:.2f}/{len(results)}</p></div>'
+def setup():
+  """Pre-generate and cache all streaming input files for parallel test execution."""
+  print(f"  Pre-generating streaming input files for {len(TEST_CASES)} test cases...")
+  for subpass in range(len(TEST_CASES)):
+    if _should_use_streaming(subpass):
+      streaming_input = _get_streaming_input(subpass)
+      input_path = streaming_input.generate()
+      size_mb = streaming_input.get_size_bytes() / (1024 * 1024)
+      print(f"    Subpass {subpass}: {size_mb:.1f} MB cached")

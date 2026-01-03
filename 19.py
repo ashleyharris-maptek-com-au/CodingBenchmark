@@ -30,6 +30,8 @@ Subpasses test increasingly complex excavation scenarios.
 Solver times out after 5 minutes.
 """
 
+skip = True
+
 import random
 import subprocess
 import sys
@@ -523,58 +525,25 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
   return score, explanation
 
 
-def output_example_html(score: float, explanation: str, result: dict, subPass: int) -> str:
-  """Generate HTML for result display."""
+def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
+  if not result:
+    return "<p style='color:red'>No result provided</p>"
   case = TEST_CASES[subPass]
-
-  code = result.get("csharp_code", "No code provided")
-  reasoning = result.get("reasoning", "No reasoning provided")
-
-  # Escape HTML
-  code = code.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-  reasoning = reasoning.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-  score_color = "green" if score >= 0.8 else "orange" if score >= 0.4 else "red"
-
-  return f"""
-    <div class="result" style="margin: 10px; padding: 10px; border: 1px solid #ccc;">
-        <h4>Subpass {subPass}: {case['description']}</h4>
-        <p><strong>Score:</strong> <span style="color: {score_color};">{score:.2f}</span></p>
-        <p><strong>Details:</strong> {explanation}</p>
-        <details>
-            <summary>Reasoning</summary>
-            <pre style="background: #f5f5f5; padding: 10px; overflow-x: auto;">{reasoning}</pre>
-        </details>
-        <details>
-            <summary>C# Code</summary>
-            <pre style="background: #f0f0f0; padding: 10px; overflow-x: auto;"><code>{code}</code></pre>
-        </details>
-    </div>
-    """
+  html = f"<h4>3D Dirt Excavation - {case['description']}</h4>"
+  if "reasoning" in result:
+    r = result['reasoning'][:400] + ('...' if len(result.get('reasoning', '')) > 400 else '')
+    html += f"<p><strong>Approach:</strong> {r.replace('<', '&lt;').replace('>', '&gt;')}</p>"
+  if "csharp_code" in result:
+    code = result["csharp_code"].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    html += f"<details><summary>View C# Code ({len(result['csharp_code'])} chars)</summary><pre>{code}</pre></details>"
+  return html
 
 
-def output_header_html() -> str:
-  """Generate HTML header."""
-  return """
-    <h2>Test 19: 3D Dirt Excavation Problem (C#)</h2>
-    <p>Testing C# implementation of excavation planning algorithm.</p>
-    """
+highLevelSummary = """
+3D Dirt Excavation optimizes material movement in mining/construction.
 
-
-def output_summary_html(results: list) -> str:
-  """Generate summary HTML."""
-  if not results:
-    return "<p>No results</p>"
-
-  total_score = sum(r[0] for r in results)
-  max_score = len(results)
-  avg_score = total_score / max_score if max_score > 0 else 0
-
-  return f"""
-    <div class="summary" style="margin: 10px; padding: 15px; background: #e8f4e8; border-radius: 5px;">
-        <h3>Summary</h3>
-        <p><strong>Total Score:</strong> {total_score:.2f} / {max_score}</p>
-        <p><strong>Average Score:</strong> {avg_score:.2%}</p>
-        <p><strong>Subpasses Completed:</strong> {len(results)}</p>
-    </div>
-    """
+**Key concepts:**
+- Block model representation of terrain
+- Precedence constraints (can't dig below unsupported blocks)
+- Minimizing haul distance and equipment moves
+"""

@@ -185,6 +185,9 @@ EXTREME_MAZE_SIZES = [
   (1000, 1000),  # Subpass 8: 1000x1000
   (5000, 5000),  # Subpass 9: 5000x5000
   (10000, 10000),  # Subpass 10: 10000x10000 - 100 million cells
+  (20000, 20000),  # Subpass 11: 20000x20000 - 400 million cells
+  (50000, 50000),  # Subpass 12: 50000x50000 - 2.5 billion cells
+  (100000, 100000),  # Subpass 13: 100000x100000 - 10 billion cells
 ]
 
 
@@ -524,8 +527,9 @@ def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
       code_escaped = code.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
       html += f"<details><summary>View Code ({len(code)} chars)</summary><pre>{code_escaped}</pre></details>"
 
-  html += threeJs_visualisation(lastPath, info['width'], info['height'], info['start'], info['end'],
-                                maze)
+  if info['width'] <= 100:
+    html += threeJs_visualisation(lastPath, info['width'], info['height'], info['start'],
+                                  info['end'], maze)
 
   return html
 

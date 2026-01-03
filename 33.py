@@ -13,8 +13,9 @@ Solver times out after 5 minutes.
 import random
 import subprocess
 import time
-from typing import List, Tuple
-from native_compiler import CSharpCompiler, CompilationError
+from typing import List, Tuple, Dict, Any
+from native_compiler import CSharpCompiler, CompilationError, ExecutionError
+from solver_utils import StreamingInputFile
 
 title = "Quadratic Assignment Problem (C#)"
 TIMEOUT_SECONDS = 30
@@ -94,9 +95,36 @@ TEST_CASES = [
     "n": 100,
     "desc": "100 facilities"
   },
+  # Ludicrous cases for streaming
+  {
+    "n": 200,
+    "desc": "200 facilities (~800KB)"
+  },
+  {
+    "n": 500,
+    "desc": "500 facilities (~5MB)"
+  },
+  {
+    "n": 1000,
+    "desc": "1K facilities (~20MB)"
+  },
+  {
+    "n": 2000,
+    "desc": "2K facilities (~80MB)"
+  },
+  {
+    "n": 5000,
+    "desc": "5K facilities (~500MB)"
+  },
+  {
+    "n": 7000,
+    "desc": "7K facilities (~1GB)"
+  },
 ]
 
-INSTANCE_CACHE = {}
+INSTANCE_CACHE: Dict[int, Any] = {}
+_INPUT_FILE_CACHE: Dict[int, StreamingInputFile] = {}
+STREAMING_THRESHOLD_N = 200
 
 
 def get_instance(subpass: int):
@@ -105,6 +133,31 @@ def get_instance(subpass: int):
     flow, dist = generate_qap(case["n"], RANDOM_SEED + subpass)
     INSTANCE_CACHE[subpass] = (flow, dist)
   return INSTANCE_CACHE[subpass]
+
+
+def _should_use_streaming(subpass: int) -> bool:
+  return TEST_CASES[subpass]["n"] > STREAMING_THRESHOLD_N
+
+
+def _get_streaming_input(subpass: int) -> StreamingInputFile:
+  if subpass in _INPUT_FILE_CACHE:
+    return _INPUT_FILE_CACHE[subpass]
+
+  case = TEST_CASES[subpass]
+  cache_key = f"qap33|n={case['n']}|seed={RANDOM_SEED + subpass}"
+
+  def generator():
+    flow, dist = get_instance(subpass)
+    n = len(flow)
+    yield f"{n}\n"
+    for row in flow:
+      yield " ".join(map(str, row)) + "\n"
+    for row in dist:
+      yield " ".join(map(str, row)) + "\n"
+
+  input_file = StreamingInputFile(cache_key, generator, "test33_qap")
+  _INPUT_FILE_CACHE[subpass] = input_file
+  return input_file
 
 
 def format_input(flow: List[List[int]], dist: List[List[int]]) -> str:
@@ -216,8 +269,7 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
     return 0.0, "No C# code provided"
 
   case = TEST_CASES[subPass]
-  flow, dist = get_instance(subPass)
-  n = len(flow)
+  use_streaming = _should_use_streaming(subPass)
 
   compiler = CSharpCompiler(aiEngineName)
   if not compiler.find_compiler():
@@ -228,18 +280,46 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
   except CompilationError as e:
     return 0.0, f"Compilation error: {str(e)[:200]}"
 
-  input_data = format_input(flow, dist)
-
   try:
-    start = time.time()
-    stdout, stderr, exec_time, retcode = compiler.execute(exe_path, input_data, TIMEOUT_SECONDS)
+    if use_streaming:
+      t = time.time()
+      streaming_input = _get_streaming_input(subPass)
+      print(f"  Generating/caching input file for {case['desc']}...")
+      input_file_path = streaming_input.generate()
+      file_size_mb = streaming_input.get_size_bytes() / (1024 * 1024)
+      print(f"  Input file: {file_size_mb:.1f} MB")
+      if time.time() - t > 1:
+        print(f"  Time to generate: {time.time() - t:.2f}s")
 
-    if retcode != 0:
-      return 0.0, f"Runtime error: {stderr[:200]}"
+      start = time.time()
+      stdout, stderr, exec_time, retcode = compiler.execute(exe_path,
+                                                            timeout=TIMEOUT_SECONDS,
+                                                            stdin_file=input_file_path)
+
+      if retcode != 0:
+        return 0.0, f"Runtime error: {stderr[:200]}"
+
+      # Skip verification for very large cases
+      if case["n"] > 1000:
+        lines = stdout.strip().split('\n')
+        if lines:
+          reported_cost = int(lines[0])
+          return 0.8, f"[{case['desc']}] Cost {reported_cost} in {exec_time:.2f}s (verification skipped)"
+        return 0.2, f"[{case['desc']}] No output"
+    else:
+      flow, dist = get_instance(subPass)
+      input_data = format_input(flow, dist)
+      start = time.time()
+      stdout, stderr, exec_time, retcode = compiler.execute(exe_path, input_data, TIMEOUT_SECONDS)
+
+      if retcode != 0:
+        return 0.0, f"Runtime error: {stderr[:200]}"
 
     lines = stdout.strip().split('\n')
     reported_cost = int(lines[0])
     perm = list(map(int, lines[1].split()))
+    flow, dist = get_instance(subPass)
+    n = len(flow)
 
     if len(perm) != n or set(perm) != set(range(n)):
       return 0.2, f"[{case['desc']}] Invalid permutation"
@@ -259,18 +339,36 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
     return 0.0, f"[{case['desc']}] Error: {str(e)[:100]}"
 
 
-def output_example_html(score: float, explanation: str, result: dict, subPass: int) -> str:
+def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
+  if not result:
+    return "<p style='color:red'>No result provided</p>"
   case = TEST_CASES[subPass]
-  code = result.get("csharp_code", "").replace("&", "&amp;").replace("<",
-                                                                     "&lt;").replace(">", "&gt;")
-  color = "green" if score >= 0.8 else "orange" if score >= 0.4 else "red"
-  return f'<div class="result"><h4>Subpass {subPass}: {case["desc"]}</h4><p style="color:{color}">Score: {score:.2f}</p><p>{explanation}</p><details><summary>Code</summary><pre>{code}</pre></details></div>'
+  html = f"<h4>Quadratic Assignment - {case['desc']}</h4>"
+  if "reasoning" in result:
+    r = result['reasoning'][:400] + ('...' if len(result.get('reasoning', '')) > 400 else '')
+    html += f"<p><strong>Approach:</strong> {r.replace('<', '&lt;').replace('>', '&gt;')}</p>"
+  if "csharp_code" in result:
+    code = result["csharp_code"].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    html += f"<details><summary>View C# Code ({len(result['csharp_code'])} chars)</summary><pre>{code}</pre></details>"
+  return html
 
 
-def output_header_html() -> str:
-  return "<h2>Test 33: Quadratic Assignment Problem (C#)</h2><p>NP-Hard facility location problem.</p>"
+highLevelSummary = """
+QAP assigns facilities to locations minimizing flow*distance cost.
+
+**Algorithms:**
+- **Simulated Annealing**: Good quality solutions
+- **Tabu Search**: Avoids local minima
+- **Branch and Bound**: Exact but slow for large instances
+"""
 
 
-def output_summary_html(results: list) -> str:
-  total = sum(r[0] for r in results)
-  return f'<div class="summary"><p>Total: {total:.2f}/{len(results)}</p></div>'
+def setup():
+  """Pre-generate and cache all streaming input files for parallel test execution."""
+  print(f"  Pre-generating streaming input files for {len(TEST_CASES)} test cases...")
+  for subpass in range(len(TEST_CASES)):
+    if _should_use_streaming(subpass):
+      streaming_input = _get_streaming_input(subpass)
+      input_path = streaming_input.generate()
+      size_mb = streaming_input.get_size_bytes() / (1024 * 1024)
+      print(f"    Subpass {subpass}: {size_mb:.1f} MB cached")

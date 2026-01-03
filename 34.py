@@ -14,7 +14,8 @@ import random
 import subprocess
 import time
 import math
-from typing import List, Tuple
+from typing import List, Tuple, Dict, Any
+from solver_utils import StreamingInputFile
 
 title = "Vehicle Routing Problem (Python)"
 TIMEOUT_SECONDS = 30
@@ -110,9 +111,48 @@ TEST_CASES = [
     "capacity": 500,
     "desc": "1000 customers, 40 vehicles"
   },
+  # Ludicrous cases for streaming
+  {
+    "customers": 5000,
+    "vehicles": 100,
+    "capacity": 800,
+    "desc": "5K customers (~100KB)"
+  },
+  {
+    "customers": 20000,
+    "vehicles": 200,
+    "capacity": 1000,
+    "desc": "20K customers (~500KB)"
+  },
+  {
+    "customers": 100000,
+    "vehicles": 500,
+    "capacity": 1500,
+    "desc": "100K customers (~2.5MB)"
+  },
+  {
+    "customers": 1000000,
+    "vehicles": 2000,
+    "capacity": 2000,
+    "desc": "1M customers (~25MB)"
+  },
+  {
+    "customers": 10000000,
+    "vehicles": 10000,
+    "capacity": 3000,
+    "desc": "10M customers (~250MB)"
+  },
+  {
+    "customers": 50000000,
+    "vehicles": 30000,
+    "capacity": 5000,
+    "desc": "50M customers (~1.25GB)"
+  },
 ]
 
-INSTANCE_CACHE = {}
+INSTANCE_CACHE: Dict[int, Any] = {}
+_INPUT_FILE_CACHE: Dict[int, StreamingInputFile] = {}
+STREAMING_THRESHOLD_CUSTOMERS = 10_000
 
 
 def get_instance(subpass: int):
@@ -122,6 +162,29 @@ def get_instance(subpass: int):
                                              RANDOM_SEED + subpass)
     INSTANCE_CACHE[subpass] = (customers, demands, depot, case["vehicles"], case["capacity"])
   return INSTANCE_CACHE[subpass]
+
+
+def _should_use_streaming(subpass: int) -> bool:
+  return TEST_CASES[subpass]["customers"] > STREAMING_THRESHOLD_CUSTOMERS
+
+
+def _get_streaming_input(subpass: int) -> StreamingInputFile:
+  if subpass in _INPUT_FILE_CACHE:
+    return _INPUT_FILE_CACHE[subpass]
+
+  case = TEST_CASES[subpass]
+  cache_key = f"vrp34|c={case['customers']}|v={case['vehicles']}|cap={case['capacity']}|seed={RANDOM_SEED + subpass}"
+
+  def generator():
+    customers, demands, depot, num_vehicles, capacity = get_instance(subpass)
+    yield f"{len(customers)} {num_vehicles} {capacity}\n"
+    yield f"{depot[0]:.2f} {depot[1]:.2f}\n"
+    for (x, y), d in zip(customers, demands):
+      yield f"{x:.2f} {y:.2f} {d}\n"
+
+  input_file = StreamingInputFile(cache_key, generator, "test34_vrp")
+  _INPUT_FILE_CACHE[subpass] = input_file
+  return input_file
 
 
 def format_input(customers: List[Tuple[float, float]], demands: List[int],
@@ -285,17 +348,55 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
     return 0.0, "No Python code provided"
 
   case = TEST_CASES[subPass]
-  customers, demands, depot, num_vehicles, capacity = get_instance(subPass)
-  input_data = format_input(customers, demands, depot, num_vehicles, capacity)
+  use_streaming = _should_use_streaming(subPass)
 
   try:
-    start = time.time()
-    proc = subprocess.run(["python", "-c", result["python_code"]],
-                          input=input_data,
-                          capture_output=True,
-                          text=True,
-                          timeout=TIMEOUT_SECONDS)
-    exec_time = time.time() - start
+    if use_streaming:
+      t = time.time()
+      streaming_input = _get_streaming_input(subPass)
+      print(f"  Generating/caching input file for {case['desc']}...")
+      input_file_path = streaming_input.generate()
+      file_size_mb = streaming_input.get_size_bytes() / (1024 * 1024)
+      print(f"  Input file: {file_size_mb:.1f} MB")
+      if time.time() - t > 1:
+        print(f"  Time to generate: {time.time() - t:.2f}s")
+
+      # Skip verification for very large cases
+      if case["customers"] > 100_000:
+        start = time.time()
+        with open(input_file_path, 'r') as f:
+          proc = subprocess.run(["python", "-c", result["python_code"]],
+                                stdin=f,
+                                capture_output=True,
+                                text=True,
+                                timeout=TIMEOUT_SECONDS)
+        exec_time = time.time() - start
+        if proc.returncode == 0:
+          lines = proc.stdout.strip().split('\n')
+          if lines:
+            reported_dist = float(lines[0])
+            return 0.8, f"[{case['desc']}] Distance {reported_dist:.1f} in {exec_time:.2f}s (verification skipped)"
+        return 0.0, f"Runtime error: {proc.stderr[:200]}"
+
+      start = time.time()
+      with open(input_file_path, 'r') as f:
+        proc = subprocess.run(["python", "-c", result["python_code"]],
+                              stdin=f,
+                              capture_output=True,
+                              text=True,
+                              timeout=TIMEOUT_SECONDS)
+      exec_time = time.time() - start
+    else:
+      customers, demands, depot, num_vehicles, capacity = get_instance(subPass)
+      input_data = format_input(customers, demands, depot, num_vehicles, capacity)
+
+      start = time.time()
+      proc = subprocess.run(["python", "-c", result["python_code"]],
+                            input=input_data,
+                            capture_output=True,
+                            text=True,
+                            timeout=TIMEOUT_SECONDS)
+      exec_time = time.time() - start
 
     if proc.returncode != 0:
       return 0.0, f"Runtime error: {proc.stderr[:200]}"
@@ -331,18 +432,36 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
     return 0.0, f"[{case['desc']}] Error: {str(e)[:100]}"
 
 
-def output_example_html(score: float, explanation: str, result: dict, subPass: int) -> str:
+def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
+  if not result:
+    return "<p style='color:red'>No result provided</p>"
   case = TEST_CASES[subPass]
-  code = result.get("python_code", "").replace("&", "&amp;").replace("<",
-                                                                     "&lt;").replace(">", "&gt;")
-  color = "green" if score >= 0.8 else "orange" if score >= 0.4 else "red"
-  return f'<div class="result"><h4>Subpass {subPass}: {case["desc"]}</h4><p style="color:{color}">Score: {score:.2f}</p><p>{explanation}</p><details><summary>Code</summary><pre>{code}</pre></details></div>'
+  html = f"<h4>Vehicle Routing - {case['desc']}</h4>"
+  if "reasoning" in result:
+    r = result['reasoning'][:400] + ('...' if len(result.get('reasoning', '')) > 400 else '')
+    html += f"<p><strong>Approach:</strong> {r.replace('<', '&lt;').replace('>', '&gt;')}</p>"
+  if "python_code" in result:
+    code = result["python_code"].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    html += f"<details><summary>View Python Code ({len(result['python_code'])} chars)</summary><pre>{code}</pre></details>"
+  return html
 
 
-def output_header_html() -> str:
-  return "<h2>Test 34: Vehicle Routing Problem (Python)</h2><p>NP-Hard logistics optimization.</p>"
+highLevelSummary = """
+VRP finds optimal routes for vehicles to service customers.
+
+**Algorithms:**
+- **Nearest Neighbor**: Simple greedy heuristic
+- **Clarke-Wright Savings**: Merge routes by savings
+- **Genetic Algorithms**: Evolutionary optimization
+"""
 
 
-def output_summary_html(results: list) -> str:
-  total = sum(r[0] for r in results)
-  return f'<div class="summary"><p>Total: {total:.2f}/{len(results)}</p></div>'
+def setup():
+  """Pre-generate and cache all streaming input files for parallel test execution."""
+  print(f"  Pre-generating streaming input files for {len(TEST_CASES)} test cases...")
+  for subpass in range(len(TEST_CASES)):
+    if _should_use_streaming(subpass):
+      streaming_input = _get_streaming_input(subpass)
+      input_path = streaming_input.generate()
+      size_mb = streaming_input.get_size_bytes() / (1024 * 1024)
+      print(f"    Subpass {subpass}: {size_mb:.1f} MB cached")

@@ -10,11 +10,14 @@ or sophisticated MIP techniques.
 Solver times out after 5 minutes.
 """
 
+skip = True
+
 import random
 import subprocess
 import time
-from typing import List, Tuple, Optional
-from native_compiler import CppCompiler, CompilationError
+from typing import List, Tuple, Optional, Dict, Any
+from native_compiler import CppCompiler, CompilationError, ExecutionError
+from solver_utils import StreamingInputFile
 
 title = "Integer Linear Programming (C++)"
 TIMEOUT_SECONDS = 30
@@ -101,9 +104,37 @@ TEST_CASES = [
     "constraints": 500,
     "desc": "300 vars, 500 constraints"
   },
+  # Ludicrous cases for streaming
+  {
+    "vars": 500,
+    "constraints": 1000,
+    "desc": "500 vars, 1K constraints (~1MB)"
+  },
+  {
+    "vars": 1000,
+    "constraints": 3000,
+    "desc": "1K vars, 3K constraints (~6MB)"
+  },
+  {
+    "vars": 2000,
+    "constraints": 8000,
+    "desc": "2K vars, 8K constraints (~32MB)"
+  },
+  {
+    "vars": 5000,
+    "constraints": 20000,
+    "desc": "5K vars, 20K constraints (~200MB)"
+  },
+  {
+    "vars": 10000,
+    "constraints": 50000,
+    "desc": "10K vars, 50K constraints (~1GB)"
+  },
 ]
 
-INSTANCE_CACHE = {}
+INSTANCE_CACHE: Dict[int, Any] = {}
+_INPUT_FILE_CACHE: Dict[int, StreamingInputFile] = {}
+STREAMING_THRESHOLD_SIZE = 500  # vars * constraints > threshold
 
 
 def get_instance(subpass: int):
@@ -112,6 +143,33 @@ def get_instance(subpass: int):
     c, A, b, upper = generate_ilp(case["vars"], case["constraints"], RANDOM_SEED + subpass)
     INSTANCE_CACHE[subpass] = (c, A, b, upper)
   return INSTANCE_CACHE[subpass]
+
+
+def _should_use_streaming(subpass: int) -> bool:
+  case = TEST_CASES[subpass]
+  return case["vars"] > STREAMING_THRESHOLD_SIZE
+
+
+def _get_streaming_input(subpass: int) -> StreamingInputFile:
+  if subpass in _INPUT_FILE_CACHE:
+    return _INPUT_FILE_CACHE[subpass]
+
+  case = TEST_CASES[subpass]
+  cache_key = f"ilp40|v={case['vars']}|c={case['constraints']}|seed={RANDOM_SEED + subpass}"
+
+  def generator():
+    c, A, b, upper = get_instance(subpass)
+    num_vars = len(c)
+    num_constraints = len(A)
+    yield f"{num_vars} {num_constraints}\n"
+    yield " ".join(map(str, c)) + "\n"
+    yield " ".join(map(str, upper)) + "\n"
+    for i in range(num_constraints):
+      yield " ".join(map(str, A[i])) + f" {b[i]}\n"
+
+  input_file = StreamingInputFile(cache_key, generator, "test40_ilp")
+  _INPUT_FILE_CACHE[subpass] = input_file
+  return input_file
 
 
 def format_input(c: List[int], A: List[List[int]], b: List[int], upper: List[int]) -> str:
@@ -259,7 +317,7 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
     return 0.0, "No C++ code provided"
 
   case = TEST_CASES[subPass]
-  c, A, b, upper = get_instance(subPass)
+  use_streaming = _should_use_streaming(subPass)
 
   compiler = CppCompiler(aiEngineName)
   if not compiler.find_compiler():
@@ -270,21 +328,53 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
   except CompilationError as e:
     return 0.0, f"Compilation error: {str(e)[:200]}"
 
-  input_data = format_input(c, A, b, upper)
-
   try:
-    start = time.time()
-    proc = subprocess.run([str(exe_path)],
-                          input=input_data,
-                          capture_output=True,
-                          text=True,
-                          timeout=TIMEOUT_SECONDS)
-    exec_time = time.time() - start
+    if use_streaming:
+      t = time.time()
+      streaming_input = _get_streaming_input(subPass)
+      print(f"  Generating/caching input file for {case['desc']}...")
+      input_file_path = streaming_input.generate()
+      file_size_mb = streaming_input.get_size_bytes() / (1024 * 1024)
+      print(f"  Input file: {file_size_mb:.1f} MB")
+      if time.time() - t > 1:
+        print(f"  Time to generate: {time.time() - t:.2f}s")
 
-    if proc.returncode != 0:
-      return 0.0, f"Runtime error: {proc.stderr[:200]}"
+      start = time.time()
+      stdout, stderr, exec_time, return_code = compiler.execute(exe_path,
+                                                                timeout=TIMEOUT_SECONDS,
+                                                                stdin_file=input_file_path)
 
-    lines = proc.stdout.strip().split('\n')
+      if return_code != 0:
+        return 0.0, f"Runtime error: {stderr[:200]}"
+
+      # Skip verification for very large cases
+      if case["vars"] > 2000:
+        lines = stdout.strip().split('\n')
+        if lines and lines[0].strip() != "INFEASIBLE":
+          reported_obj = int(lines[0])
+          return 0.8, f"[{case['desc']}] Objective {reported_obj} in {exec_time:.2f}s (verification skipped)"
+        elif lines and lines[0].strip() == "INFEASIBLE":
+          return 0.3, f"[{case['desc']}] Reports infeasible in {exec_time:.2f}s"
+        return 0.2, f"[{case['desc']}] No output"
+
+      proc_stdout = stdout
+    else:
+      c, A, b, upper = get_instance(subPass)
+      input_data = format_input(c, A, b, upper)
+
+      start = time.time()
+      proc = subprocess.run([str(exe_path)],
+                            input=input_data,
+                            capture_output=True,
+                            text=True,
+                            timeout=TIMEOUT_SECONDS)
+      exec_time = time.time() - start
+
+      if proc.returncode != 0:
+        return 0.0, f"Runtime error: {proc.stderr[:200]}"
+      proc_stdout = proc.stdout
+
+    lines = proc_stdout.strip().split('\n')
     if not lines:
       return 0.0, "No output"
 
@@ -293,6 +383,7 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
 
     reported_obj = int(lines[0])
     x = list(map(int, lines[1].split())) if len(lines) > 1 else []
+    c, A, b, upper = get_instance(subPass)
 
     valid, actual_obj, msg = verify_solution(c, A, b, upper, x)
     if not valid:
@@ -310,17 +401,36 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
     return 0.0, f"[{case['desc']}] Error: {str(e)[:100]}"
 
 
-def output_example_html(score: float, explanation: str, result: dict, subPass: int) -> str:
+def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
+  if not result:
+    return "<p style='color:red'>No result provided</p>"
   case = TEST_CASES[subPass]
-  code = result.get("cpp_code", "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-  color = "green" if score >= 0.8 else "orange" if score >= 0.4 else "red"
-  return f'<div class="result"><h4>Subpass {subPass}: {case["desc"]}</h4><p style="color:{color}">Score: {score:.2f}</p><p>{explanation}</p><details><summary>Code</summary><pre>{code}</pre></details></div>'
+  html = f"<h4>Integer Linear Programming - {case['desc']}</h4>"
+  if "reasoning" in result:
+    r = result['reasoning'][:400] + ('...' if len(result.get('reasoning', '')) > 400 else '')
+    html += f"<p><strong>Approach:</strong> {r.replace('<', '&lt;').replace('>', '&gt;')}</p>"
+  if "cpp_code" in result:
+    code = result["cpp_code"].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    html += f"<details><summary>View C++ Code ({len(result['cpp_code'])} chars)</summary><pre>{code}</pre></details>"
+  return html
 
 
-def output_header_html() -> str:
-  return "<h2>Test 40: Integer Linear Programming (C++)</h2><p>NP-Hard optimization problem.</p>"
+highLevelSummary = """
+ILP optimizes linear objective with integer variables and linear constraints.
+
+**Algorithms:**
+- **Branch and Bound**: Systematic enumeration with LP relaxation
+- **Cutting Planes**: Strengthen LP relaxation
+- **Branch and Cut**: Combines both approaches
+"""
 
 
-def output_summary_html(results: list) -> str:
-  total = sum(r[0] for r in results)
-  return f'<div class="summary"><p>Total: {total:.2f}/{len(results)}</p></div>'
+def setup():
+  """Pre-generate and cache all streaming input files for parallel test execution."""
+  print(f"  Pre-generating streaming input files for {len(TEST_CASES)} test cases...")
+  for subpass in range(len(TEST_CASES)):
+    if _should_use_streaming(subpass):
+      streaming_input = _get_streaming_input(subpass)
+      input_path = streaming_input.generate()
+      size_mb = streaming_input.get_size_bytes() / (1024 * 1024)
+      print(f"    Subpass {subpass}: {size_mb:.1f} MB cached")

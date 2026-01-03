@@ -10,6 +10,7 @@ Subpasses test different polyhedra and box sizes.
 Solver times out after 5 minutes.
 """
 
+import json
 import math
 import random
 import subprocess
@@ -517,6 +518,11 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
   # Execute solver
   solution, error, exec_time = execute_solver(code, poly, container)
 
+  global lastSolution
+  global lastCase
+  lastSolution = solution
+  lastCase = case
+
   if error:
     return 0.0, f"[{description}] {error}"
 
@@ -567,6 +573,10 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
   return score, explanation
 
 
+lastSolution = None
+lastCase = None
+
+
 def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
   """Generate HTML report."""
   if not result:
@@ -587,8 +597,148 @@ def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
       code_escaped = code.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
       html += f"<details><summary>View Code ({len(code)} chars)</summary><pre>{code_escaped}</pre></details>"
 
-  # Add Three.js visualization here (placeholder for actual 3D rendering)
-  html += "<p><em>3D visualization would be generated here using Three.js</em></p>"
+  global lastSolution
+  if lastSolution and isinstance(lastSolution, dict):
+    try:
+      placements = lastSolution.get('placements')
+      if isinstance(placements, list) and len(placements) > 0:
+        poly = case['polyhedron']
+        container = case['container']
+
+        max_show = 200
+        if len(placements) > max_show:
+          viz_placements = random.sample(placements, max_show)
+        else:
+          viz_placements = placements
+
+        viz_id = f"binpack3d_{subPass}_{abs(hash((aiEngineName, subPass, time.time()))) % 10000000}"
+
+        poly_vertices = json.dumps(poly.get('vertices', []))
+        poly_faces = json.dumps(poly.get('faces', []))
+        placements_data = json.dumps(viz_placements)
+        container_data = json.dumps(list(container))
+
+        html += f"""
+        <div class="binpack3d-visualization" style="margin: 15px 0;">
+            <details>
+                <summary style="cursor: pointer; padding: 8px; background: #e8e8e8; border-radius: 4px; font-weight: bold; color: #333; border: 1px solid #ccc;">
+                    3D Visualization: {len(viz_placements)}/{len(placements)} placements
+                </summary>
+                <div style="margin-top: 10px;">
+                    <div id="binpack3d-renderer-{viz_id}" style="width: 100%; height: 500px; border: 1px solid #ccc; background: #fafafa; border-radius: 4px;"></div>
+                    <div style="margin-top: 8px; font-size: 12px; color: #666; background: #f8f8f8; padding: 5px; border-radius: 3px;">
+                        Left-drag rotate, Right-drag pan, Scroll zoom
+                    </div>
+                </div>
+            </details>
+        </div>
+
+        <script src="https://cdn.jsdelivr.net/npm/three@0.132.2/build/three.min.js"></script>
+        <script src="https://cdn.jsdelivr.net/npm/three@0.132.2/examples/js/controls/OrbitControls.js"></script>
+        <script>
+        (function() {{
+            if (typeof THREE === 'undefined') return;
+            const containerEl = document.getElementById('binpack3d-renderer-{viz_id}');
+            if (!containerEl) return;
+
+            const containerSize = {container_data};
+            const polyVertices = {poly_vertices};
+            const polyFaces = {poly_faces};
+            const placements = {placements_data};
+
+            const scene = new THREE.Scene();
+            scene.background = new THREE.Color(0xf0f0f0);
+
+            const renderer = new THREE.WebGLRenderer({{ antialias: true }});
+            renderer.setSize(containerEl.clientWidth, containerEl.clientHeight);
+            containerEl.appendChild(renderer.domElement);
+
+            const camera = new THREE.PerspectiveCamera(60, containerEl.clientWidth / containerEl.clientHeight, 0.1, 100000);
+            camera.position.set(1, 1, 1);
+
+            const controls = new THREE.OrbitControls(camera, renderer.domElement);
+            controls.enableDamping = true;
+            controls.dampingFactor = 0.05;
+
+            const ambient = new THREE.AmbientLight(0xffffff, 0.6);
+            scene.add(ambient);
+            const dir = new THREE.DirectionalLight(0xffffff, 0.8);
+            dir.position.set(1, 2, 3);
+            scene.add(dir);
+
+            const root = new THREE.Group();
+            scene.add(root);
+            root.position.set(-containerSize[0] / 2, -containerSize[1] / 2, -containerSize[2] / 2);
+
+            const boxGeom = new THREE.BoxGeometry(containerSize[0], containerSize[1], containerSize[2]);
+            const boxEdges = new THREE.EdgesGeometry(boxGeom);
+            const boxMat = new THREE.LineBasicMaterial({{ color: 0x333333 }});
+            const boxLines = new THREE.LineSegments(boxEdges, boxMat);
+            boxLines.position.set(containerSize[0] / 2, containerSize[1] / 2, containerSize[2] / 2);
+            root.add(boxLines);
+
+            const positions = [];
+            for (let i = 0; i < polyVertices.length; i++) {{
+                const v = polyVertices[i];
+                positions.push(v[0], v[1], v[2]);
+            }}
+            const indices = [];
+            for (let i = 0; i < polyFaces.length; i++) {{
+                const f = polyFaces[i];
+                if (f.length >= 3) {{
+                    indices.push(f[0], f[1], f[2]);
+                }}
+            }}
+
+            const geom = new THREE.BufferGeometry();
+            geom.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+            geom.setIndex(indices);
+            geom.computeVertexNormals();
+
+            for (let i = 0; i < placements.length; i++) {{
+                const p = placements[i] || {{}};
+                const t = p.translation || [0, 0, 0];
+                const q = p.quaternion || [1, 0, 0, 0];
+                const color = new THREE.Color().setHSL((i * 37 % 360) / 360, 0.6, 0.55);
+                const mat = new THREE.MeshPhongMaterial({{ color: color, transparent: true, opacity: 0.75, side: THREE.DoubleSide }});
+                const m = new THREE.Mesh(geom, mat);
+                m.position.set(t[0], t[1], t[2]);
+                m.quaternion.set(q[1], q[2], q[3], q[0]);
+                root.add(m);
+            }}
+
+            const box = new THREE.Box3().setFromObject(root);
+            const center = box.getCenter(new THREE.Vector3());
+            const size = box.getSize(new THREE.Vector3());
+            const maxDim = Math.max(size.x, size.y, size.z);
+            const fov = camera.fov * Math.PI / 180;
+            let cameraZ = Math.abs(maxDim / 2 / Math.tan(fov / 2));
+            cameraZ *= 1.6;
+            camera.position.set(center.x + cameraZ, center.y + cameraZ, center.z + cameraZ);
+            camera.lookAt(center);
+            controls.target.copy(center);
+            controls.update();
+
+            function handleResize() {{
+                const w = containerEl.clientWidth;
+                const h = containerEl.clientHeight;
+                camera.aspect = w / h;
+                camera.updateProjectionMatrix();
+                renderer.setSize(w, h);
+            }}
+            window.addEventListener('resize', handleResize);
+
+            function animate() {{
+                requestAnimationFrame(animate);
+                controls.update();
+                renderer.render(scene, camera);
+            }}
+            animate();
+        }})();
+        </script>
+        """
+    except Exception as e:
+      html += f"<p style='color:orange;'>3D visualization error: {str(e)}</p>"
 
   return html
 

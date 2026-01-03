@@ -107,70 +107,71 @@ def string_to_board(s: str) -> List[List[str]]:
 
 
 # Test configurations
-TEST_CASES = [
-  # Subpass 0: Small board
-  {
-    "board": generate_minesweeper_board(8, 8, 10, 0.4, RANDOM_SEED)[0],
-    "safe_cells": generate_minesweeper_board(8, 8, 10, 0.4, RANDOM_SEED)[1],
-    "description": "8x8 board, 10 mines"
-  },
-  # Subpass 1: Medium board
-  {
-    "board": generate_minesweeper_board(12, 12, 20, 0.35, RANDOM_SEED + 1)[0],
-    "safe_cells": generate_minesweeper_board(12, 12, 20, 0.35, RANDOM_SEED + 1)[1],
-    "description": "12x12 board, 20 mines"
-  },
-  # Subpass 2: Larger board
-  {
-    "board": generate_minesweeper_board(16, 16, 40, 0.3, RANDOM_SEED + 2)[0],
-    "safe_cells": generate_minesweeper_board(16, 16, 40, 0.3, RANDOM_SEED + 2)[1],
-    "description": "16x16 board, 40 mines"
-  },
-  # Subpass 3: Large board
-  {
-    "board": generate_minesweeper_board(24, 24, 80, 0.25, RANDOM_SEED + 3)[0],
-    "safe_cells": generate_minesweeper_board(24, 24, 80, 0.25, RANDOM_SEED + 3)[1],
-    "description": "24x24 board, 80 mines"
-  },
-  # Subpass 4: Very large board
-  {
-    "board": generate_minesweeper_board(32, 32, 150, 0.2, RANDOM_SEED + 4)[0],
-    "safe_cells": generate_minesweeper_board(32, 32, 150, 0.2, RANDOM_SEED + 4)[1],
-    "description": "32x32 board, 150 mines"
-  },
-  # Subpass 5: Huge board (requires efficient algorithm)
-  {
-    "board": generate_minesweeper_board(50, 50, 400, 0.15, RANDOM_SEED + 5)[0],
-    "safe_cells": generate_minesweeper_board(50, 50, 400, 0.15, RANDOM_SEED + 5)[1],
-    "description": "50x50 board, 400 mines"
-  },
-  # Extreme cases
-  {
-    "board": generate_minesweeper_board(100, 100, 1500, 0.1, RANDOM_SEED + 6)[0],
-    "safe_cells": generate_minesweeper_board(100, 100, 1500, 0.1, RANDOM_SEED + 6)[1],
-    "description": "100x100 board, 1500 mines"
-  },
-  {
-    "board": generate_minesweeper_board(200, 200, 6000, 0.08, RANDOM_SEED + 7)[0],
-    "safe_cells": generate_minesweeper_board(200, 200, 6000, 0.08, RANDOM_SEED + 7)[1],
-    "description": "200x200 board, 6000 mines"
-  },
-  {
-    "board": generate_minesweeper_board(500, 500, 40000, 0.05, RANDOM_SEED + 8)[0],
-    "safe_cells": generate_minesweeper_board(500, 500, 40000, 0.05, RANDOM_SEED + 8)[1],
-    "description": "500x500 board, 40000 mines"
-  },
-  {
-    "board": generate_minesweeper_board(1000, 1000, 150000, 0.03, RANDOM_SEED + 9)[0],
-    "safe_cells": generate_minesweeper_board(1000, 1000, 150000, 0.03, RANDOM_SEED + 9)[1],
-    "description": "1000x1000 board, 150000 mines (1M cells)"
-  },
-  {
-    "board": generate_minesweeper_board(2000, 2000, 600000, 0.02, RANDOM_SEED + 10)[0],
-    "safe_cells": generate_minesweeper_board(2000, 2000, 600000, 0.02, RANDOM_SEED + 10)[1],
-    "description": "2000x2000 board, 600000 mines (4M cells)"
-  },
-]
+TEST_CASES = [{
+  "board": lambda: generate_minesweeper_board(8, 8, 10, 0.4, RANDOM_SEED)[0],
+  "safe_cells": lambda: generate_minesweeper_board(8, 8, 10, 0.4, RANDOM_SEED)[1],
+  "description": "8x8 board, 10 mines"
+}, {
+  "board": lambda: generate_minesweeper_board(24, 24, 80, 0.25, RANDOM_SEED + 3)[0],
+  "safe_cells": lambda: generate_minesweeper_board(24, 24, 80, 0.25, RANDOM_SEED + 3)[1],
+  "description": "24x24 board, 80 mines"
+}, {
+  "board":
+  lambda: generate_minesweeper_board(50, 50, 400, 0.15, RANDOM_SEED + 5)[0],
+  "safe_cells":
+  lambda: generate_minesweeper_board(50, 50, 400, 0.15, RANDOM_SEED + 5)[1],
+  "description":
+  "50x50 board, 400 mines"
+}, {
+  "board":
+  lambda: generate_minesweeper_board(100, 100, 1500, 0.1, RANDOM_SEED + 6)[0],
+  "safe_cells":
+  lambda: generate_minesweeper_board(100, 100, 1500, 0.1, RANDOM_SEED + 6)[1],
+  "description":
+  "100x100 board, 1500 mines"
+}, {
+  "board":
+  lambda: generate_minesweeper_board(200, 200, 6000, 0.08, RANDOM_SEED + 7)[0],
+  "safe_cells":
+  lambda: generate_minesweeper_board(200, 200, 6000, 0.08, RANDOM_SEED + 7)[1],
+  "description":
+  "200x200 board, 6000 mines"
+}, {
+  "board":
+  lambda: generate_minesweeper_board(500, 500, 40000, 0.05, RANDOM_SEED + 8)[0],
+  "safe_cells":
+  lambda: generate_minesweeper_board(500, 500, 40000, 0.05, RANDOM_SEED + 8)[1],
+  "description":
+  "500x500 board, 40000 mines"
+}, {
+  "board":
+  lambda: generate_minesweeper_board(1000, 1000, 150000, 0.03, RANDOM_SEED + 9)[0],
+  "safe_cells":
+  lambda: generate_minesweeper_board(1000, 1000, 150000, 0.03, RANDOM_SEED + 9)[1],
+  "description":
+  "1000x1000 board, 150000 mines (1M cells)"
+}, {
+  "board":
+  lambda: generate_minesweeper_board(2000, 2000, 600000, 0.02, RANDOM_SEED + 10)[0],
+  "safe_cells":
+  lambda: generate_minesweeper_board(2000, 2000, 600000, 0.02, RANDOM_SEED + 10)[1],
+  "description":
+  "2000x2000 board, 600000 mines (4M cells)"
+}, {
+  "board":
+  lambda: generate_minesweeper_board(5000, 5000, 1000000, 0.02, RANDOM_SEED + 11)[0],
+  "safe_cells":
+  lambda: generate_minesweeper_board(5000, 5000, 1000000, 0.02, RANDOM_SEED + 11)[1],
+  "description":
+  "5000x5000 board, 1000000 mines (25M cells)"
+}, {
+  "board":
+  lambda: generate_minesweeper_board(10000, 10000, 5000000, 0.005, RANDOM_SEED + 12)[0],
+  "safe_cells":
+  lambda: generate_minesweeper_board(10000, 10000, 5000000, 0.005, RANDOM_SEED + 12)[1],
+  "description":
+  "10000x10000 board, 5000000 mines (100M cells)"
+}]
 
 
 def prepareSubpassPrompt(subPass: int) -> str:
@@ -178,11 +179,10 @@ def prepareSubpassPrompt(subPass: int) -> str:
   if subPass != 0:
     raise StopIteration
 
-  return f"""You are writing a Minesweeper solver that must handle ANY board complexity from trivial to ludicrous scale:
+  return f"""You are writing a Minesweeper solver that must handle ANY board complexity from trivial 
+  to ludicrous scale:
 
 - **Trivial**: Small boards (5x5-8x8), simple patterns, few mines
-- **Medium**: Medium boards (10x10-16x16), moderate complexity, some constraint chains
-- **Large**: Large boards (20x20-30x30), complex patterns, many interlocking constraints
 - **Extreme**: Massive boards (50x50-100x100), very complex constraint satisfaction problems
 
 **The Challenge:**
@@ -202,30 +202,6 @@ Your `solve_minesweeper(board)` function will be tested with boards ranging from
 - Only return cells that are currently unknown (' ') and provably safe
 - Do NOT guess - only return cells you can prove are safe
 
-**Critical Requirements:**
-1. **Scalability**: Your algorithm must adapt based on board size and complexity
-2. **Performance**: Must complete within 5 minutes even for 100x100 boards
-3. **Correctness**: Never return a cell that could be a mine
-
-**Algorithm Strategy Recommendations:**
-- **Small boards (≤10x10)**: Can use exhaustive constraint satisfaction
-- **Medium boards (10x10-20x20)**: Basic constraint propagation with subset analysis
-- **Large boards (20x20-50x50)**: Optimized constraint solvers, heuristic pruning
-- **Very Large boards (>50x50)**: Fast constraint propagation, limited search depth
-
-**Key Techniques:**
-- **Satisfied constraint**: If numbered cell has exactly that many flagged mines adjacent, all other adjacent unknown cells are safe
-- **Subset analysis**: Compare unknown neighbor sets between adjacent numbered cells
-- **Constraint propagation**: Apply rules iteratively until no more deductions possible
-- **Pattern recognition**: Identify common Minesweeper patterns for fast deductions
-
-**Implementation Hints:**
-- Detect board size and choose appropriate algorithm complexity
-- Use efficient data structures for neighbor tracking
-- Implement adaptive search depth based on board complexity
-- For very large boards, focus on local constraint propagation
-- Handle edge cases: empty boards, fully revealed boards, contradictory information
-
 **Example:**
 ```
   012
@@ -236,7 +212,7 @@ Your `solve_minesweeper(board)` function will be tested with boards ranging from
 Cell (0,0) shows '1' and has one adjacent mine at (1,0). So (0,1) and (0,2) are guaranteed safe.
 
 **Constraints:**
-- Use only Python standard library
+- Use only Python standard library or numpy
 - Return as many provably safe cells as possible
 - Never return a cell that could be a mine
 - Must handle varying board sizes and mine densities efficiently
@@ -393,8 +369,14 @@ def execute_solver(code: str, board: List[List[str]], timeout: int = TIMEOUT_SEC
     return None, f"Invalid move format: {e}", exec_time
 
 
+lastGame = None
+
+
 def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
   """Grade the Minesweeper solver."""
+
+  global lastGame
+
   if not result:
     return 0.0, "No result provided"
 
@@ -402,8 +384,8 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
     return 0.0, "No Python code provided"
 
   case = TEST_CASES[subPass]
-  board = case["board"]
-  safe_cells = case["safe_cells"]
+  board = case["board"]()
+  safe_cells = case["safe_cells"]()
   description = case["description"]
   code = result["python_code"]
 
@@ -415,6 +397,8 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
 
   # Validate solution
   is_valid, validation_error, correct, incorrect = validate_solution(moves, board, safe_cells)
+
+  lastGame = (board, moves, correct, incorrect)
 
   if not is_valid:
     return 0.0, f"[{description}] {validation_error}"
@@ -466,15 +450,25 @@ def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
 
   html = f"<h4>Minesweeper Solver - {case['description']}</h4>"
 
-  if "reasoning" in result:
-    reasoning = result['reasoning'][:500] + ('...'
-                                             if len(result.get('reasoning', '')) > 500 else '')
-    html += f"<p><strong>Algorithm:</strong> {reasoning}</p>"
+  if subPass == 0:
+    if "reasoning" in result:
+      reasoning = result['reasoning'][:500] + ('...'
+                                               if len(result.get('reasoning', '')) > 500 else '')
+      html += f"<p><strong>Algorithm:</strong> {reasoning}</p>"
 
-  if "python_code" in result:
-    code = result["python_code"]
-    code_escaped = code.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    html += f"<details><summary>View Code ({len(code)} chars)</summary><pre>{code_escaped}</pre></details>"
+    if "python_code" in result:
+      code = result["python_code"]
+      code_escaped = code.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+      html += f"<details><summary>View Code ({len(code)} chars)</summary><pre>{code_escaped}</pre></details>"
+
+  if lastGame:
+    (board, moves, correct, incorrect) = lastGame
+    if len(board) < 1000:
+      html += "<p>Table map of the game board goes here.</p>"
+    else:
+      html += "<p>Board too large to display.</p>"
+
+    html += f"<p>Moves: {len(moves)}, Correct: {correct}, Incorrect: {incorrect}</p>"
 
   return html
 

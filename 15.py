@@ -15,6 +15,7 @@ Goals:
 Solver times out after 5 minutes.
 """
 
+import json
 import math
 import random
 import subprocess
@@ -112,14 +113,14 @@ TEST_CASES = [
     "description": "50x50 rectangle"
   },
   {
-    "polygon": make_rectangle_poly(100, 100),
+    "polygon": make_hexagon_poly(100),
     "sun_vector": [0, 0, -1],
-    "description": "100x100 rectangle"
+    "description": "100x100 hexagon"
   },
   {
-    "polygon": make_rectangle_poly(500, 500),
+    "polygon": make_triangle_poly(500, 500),
     "sun_vector": [0.2, 0.2, -1],
-    "description": "500x500 rectangle"
+    "description": "500x500 triangle"
   },
   {
     "polygon": make_rectangle_poly(1000, 1000),
@@ -127,9 +128,9 @@ TEST_CASES = [
     "description": "1000x1000 rectangle"
   },
   {
-    "polygon": make_rectangle_poly(5000, 5000),
-    "sun_vector": [0, 0, -1],
-    "description": "5000x5000 rectangle (~25M sq units)"
+    "polygon": make_hexagon_poly(5000),
+    "sun_vector": [0.3, 0, -1],
+    "description": "5000x5000 hexagon (~25M sq units)"
   },
 ]
 
@@ -164,14 +165,10 @@ def prepareSubpassPrompt(subPass: int) -> str:
 
   return f"""You are solving a Shadow Covering problem with tetrahedrons.
 
-You must write a Python solver that can handle ANY problem size from trivial to ludicrous scale:
-- **Trivial**: Small polygons (simple shapes, 10-50 area units), basic sun angles
-- **Medium**: Medium polygons (moderate complexity, 50-200 area units), varied sun angles
-- **Large**: Complex polygons (irregular shapes, 200-1000 area units), challenging sun angles
-- **Extreme**: Very complex polygons (1000-5000+ area units), difficult sun angles, tight optimization
-
 **The Challenge:**
-Your `solve_shadow_cover(target_polygon, sun_vector)` function will be tested with polygons ranging from simple shapes to very complex geometries. The same function must work efficiently across ALL scales.
+Your `solve_shadow_cover(target_polygon, sun_vector)` function will be tested with polygons 
+ranging from simple shapes to very complex geometries. The same function must work efficiently 
+across ALL scales.
 
 **Input:**
 - `target_polygon`: List of (x, y) vertices defining 2D polygon on z=0 plane
@@ -183,34 +180,6 @@ Your `solve_shadow_cover(target_polygon, sun_vector)` function will be tested wi
   - `"placements"`: List of placement dicts:
     - `"position"`: [x, y, z] - center position of tetrahedron
     - `"quaternion"`: [w, x, y, z] - rotation (w is scalar)
-    - `"scale"`: float - uniform scale factor (default 1.0)
-
-**Critical Requirements:**
-1. **Scalability**: Your algorithm must adapt based on polygon complexity and area
-2. **Performance**: Must complete within 5 minutes even for very complex polygons
-3. **Quality**: Minimize tetrahedrons while ensuring complete coverage
-
-**Algorithm Strategy Recommendations:**
-- **Small polygons (≤50 area)**: Can use exact placement, optimization
-- **Medium polygons (50-200 area)**: Grid-based placement, local optimization
-- **Large polygons (200-1000 area)**: Coarse grid placement, heuristics
-- **Very Large polygons (>1000 area)**: Very coarse placement, approximation methods
-
-**Key Techniques:**
-- **Shadow projection**: Point P along sun vector S onto z=0 plane
-  - shadow_x = P.x - P.z * (S.x / S.z)
-  - shadow_y = P.y - P.z * (S.y / S.z)
-- **Convex hull**: Tetrahedron shadow is convex hull of its 4 vertex shadows
-- **Grid-based placement**: Regular spacing for efficient coverage
-- **Collision detection**: Ensure tetrahedrons don't intersect in 3D
-
-**Implementation Hints:**
-- Detect polygon area and choose appropriate algorithm
-- Use efficient shadow computation and coverage checking
-- Implement adaptive quality vs speed tradeoffs
-- For very large polygons, consider simplified placement strategies
-- Handle various sun angles (vertical, angled, etc.)
-- Use numpy for efficient geometric computations
 
 **Standard Tetrahedron Reference:**
 ```python
@@ -223,7 +192,7 @@ tetra_vertices = [
 ```
 
 **Constraints:**
-- Libraries allowed: numpy, scipy
+- Libraries allowed: numpy, scipy, python standard library
 - Combined shadows must completely cover target polygon
 - Tetrahedrons must not intersect each other in 3D
 - Minimize number of tetrahedrons
@@ -523,6 +492,11 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
   # Execute solver
   solution, error, exec_time = execute_solver(code, target, sun)
 
+  global lastSolution
+  global lastCase
+  lastSolution = solution
+  lastCase = case
+
   if error:
     return 0.0, f"[{description}] {error}"
 
@@ -551,6 +525,10 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
   return coverage_score, explanation
 
 
+lastSolution = None
+lastCase = None
+
+
 def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
   """Generate HTML report."""
   if not result:
@@ -560,15 +538,180 @@ def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
 
   html = f"<h4>Shadow Covering - {case['description']}</h4>"
 
-  if "reasoning" in result:
-    reasoning = result['reasoning'][:500] + ('...'
-                                             if len(result.get('reasoning', '')) > 500 else '')
-    html += f"<p><strong>Algorithm:</strong> {reasoning}</p>"
+  if subPass == 0:
 
-  if "python_code" in result:
-    code = result["python_code"]
-    code_escaped = code.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    html += f"<details><summary>View Code ({len(code)} chars)</summary><pre>{code_escaped}</pre></details>"
+    if "reasoning" in result:
+      reasoning = result['reasoning'][:500] + ('...'
+                                               if len(result.get('reasoning', '')) > 500 else '')
+      html += f"<p><strong>Algorithm:</strong> {reasoning}</p>"
+
+    if "python_code" in result:
+      code = result["python_code"]
+      code_escaped = code.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+      html += f"<details><summary>View Code ({len(code)} chars)</summary><pre>{code_escaped}</pre></details>"
+
+  global lastSolution
+  if lastSolution and isinstance(lastSolution, dict):
+    try:
+      placements = lastSolution.get('placements')
+      if isinstance(placements, list) and len(placements) > 0:
+        target_poly = case.get('polygon', [])
+        sun = case.get('sun_vector', [0, 0, -1])
+
+        max_show = 200
+        if len(placements) > max_show:
+          viz_placements = random.sample(placements, max_show)
+        else:
+          viz_placements = placements
+
+        bounds = polygon_bounds(target_poly) if target_poly else (0.0, 0.0, 1.0, 1.0)
+        min_x, min_y, max_x, max_y = bounds
+        cx = (min_x + max_x) / 2.0
+        cy = (min_y + max_y) / 2.0
+
+        viz_id = f"shadow3d_{subPass}_{abs(hash((aiEngineName, subPass, time.time()))) % 10000000}"
+
+        poly_data = json.dumps([list(p) for p in target_poly])
+        placements_data = json.dumps(viz_placements)
+        sun_data = json.dumps(list(sun))
+        tetra_data = json.dumps([list(v) for v in TETRA_VERTICES])
+
+        html += f"""
+        <div class="shadow-visualization" style="margin: 15px 0;">
+            <details>
+                <summary style="cursor: pointer; padding: 8px; background: #e8e8e8; border-radius: 4px; font-weight: bold; color: #333; border: 1px solid #ccc;">
+                    3D Visualization: {len(viz_placements)}/{len(placements)} tetrahedrons
+                </summary>
+                <div style="margin-top: 10px;">
+                    <div id="shadow3d-renderer-{viz_id}" style="width: 100%; height: 500px; border: 1px solid #ccc; background: #fafafa; border-radius: 4px;"></div>
+                    <div style="margin-top: 8px; font-size: 12px; color: #666; background: #f8f8f8; padding: 5px; border-radius: 3px;">
+                        Left-drag rotate, Right-drag pan, Scroll zoom
+                    </div>
+                </div>
+            </details>
+        </div>
+
+        <script src="https://cdn.jsdelivr.net/npm/three@0.132.2/build/three.min.js"></script>
+        <script src="https://cdn.jsdelivr.net/npm/three@0.132.2/examples/js/controls/OrbitControls.js"></script>
+        <script>
+        (function() {{
+            if (typeof THREE === 'undefined') return;
+            const containerEl = document.getElementById('shadow3d-renderer-{viz_id}');
+            if (!containerEl) return;
+
+            const targetPoly = {poly_data};
+            const placements = {placements_data};
+            const sunVector = {sun_data};
+            const tetraVerts = {tetra_data};
+            const centerXY = [{cx}, {cy}];
+
+            const scene = new THREE.Scene();
+            scene.background = new THREE.Color(0xf0f0f0);
+
+            const renderer = new THREE.WebGLRenderer({{ antialias: true }});
+            renderer.setSize(containerEl.clientWidth, containerEl.clientHeight);
+            containerEl.appendChild(renderer.domElement);
+
+            const camera = new THREE.PerspectiveCamera(60, containerEl.clientWidth / containerEl.clientHeight, 0.1, 1e12);
+
+            const controls = new THREE.OrbitControls(camera, renderer.domElement);
+            controls.enableDamping = true;
+            controls.dampingFactor = 0.05;
+
+            const ambient = new THREE.AmbientLight(0xffffff, 0.6);
+            scene.add(ambient);
+            const dir = new THREE.DirectionalLight(0xffffff, 0.8);
+            dir.position.set(1, 2, 3);
+            scene.add(dir);
+
+            const root = new THREE.Group();
+            scene.add(root);
+            root.position.set(-centerXY[0], -centerXY[1], 0);
+
+            if (targetPoly && targetPoly.length >= 3) {{
+                const pts = [];
+                for (let i = 0; i < targetPoly.length; i++) {{
+                    const p = targetPoly[i];
+                    pts.push(new THREE.Vector3(p[0], p[1], 0));
+                }}
+                const geomLine = new THREE.BufferGeometry().setFromPoints(pts);
+                const matLine = new THREE.LineBasicMaterial({{ color: 0x111111 }});
+                const line = new THREE.LineLoop(geomLine, matLine);
+                root.add(line);
+
+                const minx = {min_x}, miny = {min_y}, maxx = {max_x}, maxy = {max_y};
+                const planeW = Math.max(1, (maxx - minx) * 1.1);
+                const planeH = Math.max(1, (maxy - miny) * 1.1);
+                const grid = new THREE.GridHelper(Math.max(planeW, planeH), 20, 0x999999, 0xcccccc);
+                grid.rotation.x = Math.PI / 2;
+                grid.position.set(centerXY[0], centerXY[1], 0);
+                root.add(grid);
+            }}
+
+            const positions = [];
+            for (let i = 0; i < tetraVerts.length; i++) {{
+                const v = tetraVerts[i];
+                positions.push(v[0], v[1], v[2]);
+            }}
+            const indices = [0, 1, 2, 0, 2, 3, 0, 3, 1, 1, 3, 2];
+            const tetraGeom = new THREE.BufferGeometry();
+            tetraGeom.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+            tetraGeom.setIndex(indices);
+            tetraGeom.computeVertexNormals();
+
+            for (let i = 0; i < placements.length; i++) {{
+                const p = placements[i] || {{}};
+                const pos = p.position || [0, 0, 1];
+                const q = p.quaternion || [1, 0, 0, 0];
+                const s = (p.scale === undefined) ? 1.0 : p.scale;
+                const color = new THREE.Color().setHSL((i * 37 % 360) / 360, 0.6, 0.55);
+                const mat = new THREE.MeshPhongMaterial({{ color: color, transparent: true, opacity: 0.75, side: THREE.DoubleSide }});
+                const m = new THREE.Mesh(tetraGeom, mat);
+                m.position.set(pos[0], pos[1], pos[2]);
+                m.quaternion.set(q[1], q[2], q[3], q[0]);
+                m.scale.set(s, s, s);
+                root.add(m);
+            }}
+
+            const sunDir = new THREE.Vector3(sunVector[0], sunVector[1], sunVector[2]);
+            if (sunDir.length() > 0) {{
+                sunDir.normalize();
+                const arrow = new THREE.ArrowHelper(sunDir.clone().multiplyScalar(-1), new THREE.Vector3(centerXY[0], centerXY[1], 0), Math.max(1, Math.max({max_x} - {min_x}, {max_y} - {min_y}) * 0.25), 0xff8800);
+                root.add(arrow);
+            }}
+
+            const box = new THREE.Box3().setFromObject(root);
+            const center = box.getCenter(new THREE.Vector3());
+            const size = box.getSize(new THREE.Vector3());
+            const maxDim = Math.max(size.x, size.y, size.z);
+            const fov = camera.fov * Math.PI / 180;
+            let cameraZ = Math.abs(maxDim / 2 / Math.tan(fov / 2));
+            cameraZ *= 1.6;
+            camera.position.set(center.x + cameraZ, center.y + cameraZ, center.z + cameraZ);
+            camera.lookAt(center);
+            controls.target.copy(center);
+            controls.update();
+
+            function handleResize() {{
+                const w = containerEl.clientWidth;
+                const h = containerEl.clientHeight;
+                camera.aspect = w / h;
+                camera.updateProjectionMatrix();
+                renderer.setSize(w, h);
+            }}
+            window.addEventListener('resize', handleResize);
+
+            function animate() {{
+                requestAnimationFrame(animate);
+                controls.update();
+                renderer.render(scene, camera);
+            }}
+            animate();
+        }})();
+        </script>
+        """
+    except Exception as e:
+      html += f"<p style='color:orange;'>3D visualization error: {str(e)}</p>"
 
   return html
 

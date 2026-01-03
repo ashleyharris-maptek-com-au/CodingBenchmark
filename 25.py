@@ -39,7 +39,7 @@ from typing import List, Tuple, Dict, Optional
 from pathlib import Path
 
 # Import our native compiler helper
-from native_compiler import CSharpCompiler, CompilationError, ExecutionError
+from native_compiler import CSharpCompiler, CompilationError, ExecutionError, describe_this_pc
 
 title = "Asteroid Interception (C#)"
 
@@ -408,17 +408,15 @@ def prepareSubpassPrompt(subPass: int) -> str:
 
   return f"""You are writing C# code to calculate an asteroid interception trajectory.
 
-You must write a C# solver that can handle ANY interception scenario from trivial to ludicrous scale:
-- **Trivial**: Short warning times (1-2 years), large impactors, generous delta-v, simple trajectories
-- **Medium**: Moderate warning times (5-10 years), medium impactors, limited delta-v, basic flybys
-- **Large**: Long warning times (15-25 years), small impactors, tight delta-v, complex multi-flyby trajectories
-- **Extreme**: Very long warning times (30-50 years), very small impactors, very tight delta-v, advanced trajectory optimization
-
-**The Challenge:**
-Your C# asteroid interceptor will be tested with scenarios ranging from simple deflection missions to complex multi-flyby interception missions. The same algorithm must work efficiently across ALL mission complexities and constraints.
+You must write a C# solver that can handle ANY interception and redirection scenarios, from
+short warning times (1-2 years), large impactors, generous delta-v, simple trajectories to 
+very long warning times (30-50 years), very small impactors, very tight delta-v, 
+advanced trajectory optimization with multi-flyby maneuvers and gravitational assist sequences required.
 
 **Problem:**
-Calculate a spacecraft trajectory to intercept and deflect an asteroid on collision course with Earth using kinetic impact. The simulation uses a simplified N-body model of the solar system with Sun, Earth, Moon, and major planets.
+Calculate a spacecraft trajectory to intercept and deflect an asteroid on collision course 
+with Earth using kinetic impact. The simulation uses a simplified N-body model of the solar system 
+with Sun, Earth, Moon, and major planets.
 
 **The solver must output:**
 1. Launch window and initial trajectory
@@ -441,32 +439,6 @@ correction_time1 burn_dv_x burn_dv_y burn_dv_z
 impact_time impact_dv_x impact_dv_y impact_dv_z
 ```
 
-**Critical Requirements:**
-1. **Scalability**: Your algorithm must adapt based on warning time and delta-v constraints
-2. **Performance**: Must complete within 5 minutes even for complex trajectory optimization
-3. **Quality**: Successfully intercept asteroid and deflect it sufficiently to miss Earth
-
-**Algorithm Strategy Recommendations:**
-- **Short warning times (≤5 years)**: Direct intercept trajectories, high-thrust burns
-- **Medium warning times (5-15 years)**: Basic gravity assists, moderate optimization
-- **Long warning times (15-30 years)**: Complex multi-flyby trajectories, advanced optimization
-- **Very long warning times (>30 years)**: Advanced trajectory optimization, multiple assists
-
-**Key Techniques:**
-- **N-body simulation**: Accurate gravitational modeling
-- **Trajectory optimization**: Find optimal intercept trajectory
-- **Gravity assists**: Use planetary flybys for delta-v savings
-- **Kinetic impact modeling**: Calculate deflection effectiveness
-- **Launch window analysis**: Find optimal launch times
-
-**Implementation Hints:**
-- Detect mission complexity and choose appropriate trajectory planning method
-- Use efficient numerical integration for N-body simulation
-- Implement adaptive optimization based on delta-v constraints
-- For very complex missions, use advanced trajectory optimization techniques
-- Handle edge cases: impossible missions, insufficient delta-v
-- Use fast I/O for large trajectory calculations
-
 **Success Criteria:**
 - Spacecraft intercepts asteroid before Earth impact
 - Kinetic impact deflects asteroid sufficiently to miss Earth
@@ -479,15 +451,20 @@ impact_time impact_dv_x impact_dv_y impact_dv_z
 - Exceed delta-v budget
 - Launch window missed
 
+**Simulation host environment**
+{describe_this_pc()}
+
+**C# Compiler**
+{CSharpCompiler("test").describe()}
+
 **Requirements:**
-1. Program must compile with .NET/csc
+1. Program must compile with C# .NET/csc
 2. Read from stdin, write to stdout
 3. Handle variable warning times and delta-v budgets
 4. Complete within 5 minutes
 5. Must handle varying mission complexities efficiently
 
-Write complete, compilable C# code with a Main method.
-Include adaptive logic that chooses different strategies based on mission complexity.
+Write complete, compilable C# code with a static void Main method.
 """
 
 
@@ -696,55 +673,72 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
   return score, explanation
 
 
-def output_example_html(score: float, explanation: str, result: dict, subPass: int) -> str:
-  """Generate HTML for result display."""
+def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
+  """Generate HTML report with orbital trajectory visualization."""
+  if not result:
+    return "<p style='color:red'>No result provided</p>"
+
   case = TEST_CASES[subPass]
+  html = f"<h4>Asteroid Interception - {case['description']}</h4>"
 
-  code = result.get("csharp_code", "No code provided")
-  reasoning = result.get("reasoning", "No reasoning provided")
+  # Show reasoning summary
+  if "reasoning" in result:
+    reasoning = result['reasoning'][:500] + ('...'
+                                             if len(result.get('reasoning', '')) > 500 else '')
+    reasoning_escaped = reasoning.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    html += f"<p><strong>Strategy:</strong> {reasoning_escaped}</p>"
 
-  code = code.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-  reasoning = reasoning.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+  # Show code in collapsible
+  if "csharp_code" in result:
+    code = result["csharp_code"]
+    code_escaped = code.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    html += f"<details><summary>View C# Code ({len(code)} chars)</summary><pre>{code_escaped}</pre></details>"
 
-  score_color = "green" if score >= 0.8 else "orange" if score >= 0.4 else "red"
+  # Simple SVG orbital diagram
+  html += _generate_orbit_svg(case)
 
-  return f"""
-    <div class="result" style="margin: 10px; padding: 10px; border: 1px solid #ccc;">
-        <h4>Subpass {subPass}: {case['description']}</h4>
-        <p><strong>Score:</strong> <span style="color: {score_color};">{score:.2f}</span></p>
-        <p><strong>Details:</strong> {explanation}</p>
-        <details>
-            <summary>Reasoning</summary>
-            <pre style="background: #f5f5f5; padding: 10px; overflow-x: auto;">{reasoning}</pre>
-        </details>
-        <details>
-            <summary>C# Code</summary>
-            <pre style="background: #f0f0f0; padding: 10px; overflow-x: auto;"><code>{code}</code></pre>
-        </details>
-    </div>
-    """
+  return html
 
 
-def output_header_html() -> str:
-  return """
-    <h2>Test 25: Asteroid Interception (C#)</h2>
-    <p>Testing C# implementation of N-body trajectory planning for asteroid deflection.</p>
-    """
+def _generate_orbit_svg(case: dict) -> str:
+  """Generate simple SVG showing orbital mechanics concept."""
+  svg = f'''
+  <details>
+    <summary>🚀 Mission Diagram</summary>
+    <svg viewBox="0 0 400 400" style="max-width:400px; margin:10px auto; display:block; background:#0a0a20; border-radius:8px;">
+      <!-- Sun -->
+      <circle cx="200" cy="200" r="20" fill="#ffcc00"/>
+      <!-- Earth orbit -->
+      <circle cx="200" cy="200" r="80" fill="none" stroke="#4488ff" stroke-width="1" stroke-dasharray="4,4"/>
+      <!-- Earth -->
+      <circle cx="280" cy="200" r="8" fill="#4488ff"/>
+      <text x="280" y="185" fill="#fff" font-size="10" text-anchor="middle">Earth</text>
+      <!-- Asteroid path -->
+      <line x1="50" y1="50" x2="280" y2="200" stroke="#ff4444" stroke-width="2" stroke-dasharray="6,3"/>
+      <circle cx="120" cy="100" r="5" fill="#ff4444"/>
+      <text x="120" y="90" fill="#ff4444" font-size="10" text-anchor="middle">Asteroid</text>
+      <!-- Intercept trajectory -->
+      <path d="M 280 200 Q 200 150 120 100" fill="none" stroke="#44ff44" stroke-width="2"/>
+      <text x="180" y="140" fill="#44ff44" font-size="9" text-anchor="middle">Intercept</text>
+      <!-- Mission params -->
+      <text x="200" y="380" fill="#aaa" font-size="10" text-anchor="middle">Warning: {case['warning_days']} days | ΔV budget: {case['delta_v']} m/s</text>
+    </svg>
+  </details>
+  '''
+  return svg
 
 
-def output_summary_html(results: list) -> str:
-  if not results:
-    return "<p>No results</p>"
+highLevelSummary = """
+Asteroid interception is a trajectory optimization problem requiring N-body gravitational simulation.
 
-  total_score = sum(r[0] for r in results)
-  max_score = len(results)
-  avg_score = total_score / max_score if max_score > 0 else 0
+**Key Concepts:**
+- **N-body simulation**: Accurate modeling of gravitational forces from Sun, planets
+- **Lambert's problem**: Computing transfer orbits between two positions
+- **Gravity assists**: Using planetary flybys to save delta-V
+- **Kinetic impactor**: Deflecting asteroid by momentum transfer
 
-  return f"""
-    <div class="summary" style="margin: 10px; padding: 15px; background: #e8f4e8; border-radius: 5px;">
-        <h3>Summary</h3>
-        <p><strong>Total Score:</strong> {total_score:.2f} / {max_score}</p>
-        <p><strong>Average Score:</strong> {avg_score:.2%}</p>
-        <p><strong>Subpasses Completed:</strong> {len(results)}</p>
-    </div>
-    """
+**Algorithm approaches:**
+- Direct trajectory optimization for short warning times
+- Multi-flyby planning for longer missions with tight delta-V
+- Patched conics for initial trajectory estimation
+"""

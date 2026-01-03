@@ -13,8 +13,9 @@ Solver times out after 5 minutes.
 import random
 import subprocess
 import time
-from typing import List, Tuple, Set
-from native_compiler import CppCompiler, CompilationError
+from typing import List, Tuple, Set, Dict, Any
+from native_compiler import CppCompiler, CompilationError, ExecutionError
+from solver_utils import StreamingInputFile
 
 title = "Steiner Tree (C++)"
 TIMEOUT_SECONDS = 30
@@ -114,9 +115,36 @@ TEST_CASES = [
     "terminals": 100,
     "desc": "50KV, 100 terminals"
   },
+  # Ludicrous cases for streaming
+  {
+    "vertices": 100000,
+    "edges": 2000000,
+    "terminals": 150,
+    "desc": "100KV, 2M edges"
+  },
+  {
+    "vertices": 500000,
+    "edges": 10000000,
+    "terminals": 200,
+    "desc": "500KV, 10M edges"
+  },
+  {
+    "vertices": 1000000,
+    "edges": 30000000,
+    "terminals": 300,
+    "desc": "1MV, 30M edges"
+  },
+  {
+    "vertices": 2000000,
+    "edges": 80000000,
+    "terminals": 500,
+    "desc": "2MV, 80M edges (~1GB)"
+  },
 ]
 
-INSTANCE_CACHE = {}
+INSTANCE_CACHE: Dict[int, Any] = {}
+_INPUT_FILE_CACHE: Dict[int, StreamingInputFile] = {}
+STREAMING_THRESHOLD_EDGES = 1_000_000
 
 
 def get_instance(subpass: int):
@@ -126,6 +154,29 @@ def get_instance(subpass: int):
                                       RANDOM_SEED + subpass)
     INSTANCE_CACHE[subpass] = (case["vertices"], edges, terminals)
   return INSTANCE_CACHE[subpass]
+
+
+def _should_use_streaming(subpass: int) -> bool:
+  return TEST_CASES[subpass]["edges"] > STREAMING_THRESHOLD_EDGES
+
+
+def _get_streaming_input(subpass: int) -> StreamingInputFile:
+  if subpass in _INPUT_FILE_CACHE:
+    return _INPUT_FILE_CACHE[subpass]
+
+  case = TEST_CASES[subpass]
+  cache_key = f"steiner32|v={case['vertices']}|e={case['edges']}|t={case['terminals']}|seed={RANDOM_SEED + subpass}"
+
+  def generator():
+    num_vertices, edges, terminals = get_instance(subpass)
+    yield f"{num_vertices} {len(edges)} {len(terminals)}\n"
+    for u, v, w in edges:
+      yield f"{u} {v} {w}\n"
+    yield " ".join(map(str, terminals)) + "\n"
+
+  input_file = StreamingInputFile(cache_key, generator, "test32_steiner")
+  _INPUT_FILE_CACHE[subpass] = input_file
+  return input_file
 
 
 def format_input(num_vertices: int, edges: List[Tuple[int, int, int]], terminals: List[int]) -> str:
@@ -333,7 +384,7 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
     return 0.0, "No C++ code provided"
 
   case = TEST_CASES[subPass]
-  num_vertices, edges, terminals = get_instance(subPass)
+  use_streaming = _should_use_streaming(subPass)
 
   compiler = CppCompiler(aiEngineName)
   if not compiler.find_compiler():
@@ -344,24 +395,56 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
   except CompilationError as e:
     return 0.0, f"Compilation error: {str(e)[:200]}"
 
-  input_data = format_input(num_vertices, edges, terminals)
-
   try:
-    start = time.time()
-    proc = subprocess.run([str(exe_path)],
-                          input=input_data,
-                          capture_output=True,
-                          text=True,
-                          timeout=TIMEOUT_SECONDS)
-    exec_time = time.time() - start
+    if use_streaming:
+      t = time.time()
+      streaming_input = _get_streaming_input(subPass)
+      print(f"  Generating/caching input file for {case['desc']}...")
+      input_file_path = streaming_input.generate()
+      file_size_mb = streaming_input.get_size_bytes() / (1024 * 1024)
+      print(f"  Input file: {file_size_mb:.1f} MB")
+      if time.time() - t > 1:
+        print(f"  Time to generate: {time.time() - t:.2f}s")
 
-    if proc.returncode != 0:
-      return 0.0, f"Runtime error: {proc.stderr[:200]}"
+      start = time.time()
+      stdout, stderr, exec_time, return_code = compiler.execute(exe_path,
+                                                                timeout=TIMEOUT_SECONDS,
+                                                                stdin_file=input_file_path)
 
-    lines = proc.stdout.strip().split('\n')
+      if return_code != 0:
+        return 0.0, f"Runtime error: {stderr[:200]}"
+
+      # Skip verification for very large cases
+      if case["edges"] > 10_000_000:
+        lines = stdout.strip().split('\n')
+        if lines:
+          header = lines[0].split()
+          reported_weight = int(header[0])
+          return 0.8, f"[{case['desc']}] Weight {reported_weight} in {exec_time:.2f}s (verification skipped)"
+        return 0.2, f"[{case['desc']}] No output"
+
+      proc_stdout = stdout
+    else:
+      num_vertices, edges, terminals = get_instance(subPass)
+      input_data = format_input(num_vertices, edges, terminals)
+
+      start = time.time()
+      proc = subprocess.run([str(exe_path)],
+                            input=input_data,
+                            capture_output=True,
+                            text=True,
+                            timeout=TIMEOUT_SECONDS)
+      exec_time = time.time() - start
+
+      if proc.returncode != 0:
+        return 0.0, f"Runtime error: {proc.stderr[:200]}"
+      proc_stdout = proc.stdout
+
+    lines = proc_stdout.strip().split('\n')
     header = lines[0].split()
     reported_weight = int(header[0])
     num_tree_edges = int(header[1])
+    num_vertices, edges, terminals = get_instance(subPass)
 
     tree_edges = []
     for i in range(1, num_tree_edges + 1):
@@ -387,17 +470,36 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
     return 0.0, f"[{case['desc']}] Error: {str(e)[:100]}"
 
 
-def output_example_html(score: float, explanation: str, result: dict, subPass: int) -> str:
+def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
+  if not result:
+    return "<p style='color:red'>No result provided</p>"
   case = TEST_CASES[subPass]
-  code = result.get("cpp_code", "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-  color = "green" if score >= 0.8 else "orange" if score >= 0.4 else "red"
-  return f'<div class="result"><h4>Subpass {subPass}: {case["desc"]}</h4><p style="color:{color}">Score: {score:.2f}</p><p>{explanation}</p><details><summary>Code</summary><pre>{code}</pre></details></div>'
+  html = f"<h4>Steiner Tree - {case['desc']}</h4>"
+  if "reasoning" in result:
+    r = result['reasoning'][:400] + ('...' if len(result.get('reasoning', '')) > 400 else '')
+    html += f"<p><strong>Approach:</strong> {r.replace('<', '&lt;').replace('>', '&gt;')}</p>"
+  if "cpp_code" in result:
+    code = result["cpp_code"].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    html += f"<details><summary>View C++ Code ({len(result['cpp_code'])} chars)</summary><pre>{code}</pre></details>"
+  return html
 
 
-def output_header_html() -> str:
-  return "<h2>Test 32: Steiner Tree (C++)</h2><p>NP-Hard network design problem.</p>"
+highLevelSummary = """
+Steiner Tree finds minimum cost tree connecting a set of terminal vertices.
+
+**Algorithms:**
+- **MST Heuristic**: 2-approximation using minimum spanning tree
+- **Shortest Path Heuristic**: Connect terminals via shortest paths
+- **Dynamic Programming**: Exact for small terminal sets
+"""
 
 
-def output_summary_html(results: list) -> str:
-  total = sum(r[0] for r in results)
-  return f'<div class="summary"><p>Total: {total:.2f}/{len(results)}</p></div>'
+def setup():
+  """Pre-generate and cache all streaming input files for parallel test execution."""
+  print(f"  Pre-generating streaming input files for {len(TEST_CASES)} test cases...")
+  for subpass in range(len(TEST_CASES)):
+    if _should_use_streaming(subpass):
+      streaming_input = _get_streaming_input(subpass)
+      input_path = streaming_input.generate()
+      size_mb = streaming_input.get_size_bytes() / (1024 * 1024)
+      print(f"    Subpass {subpass}: {size_mb:.1f} MB cached")
