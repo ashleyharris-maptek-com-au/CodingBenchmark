@@ -89,6 +89,17 @@ def generate_threejs_csg_visualization(mesh_a: Dict,
           """
     return geom
 
+  # Convert mesh data to JSON for lazy initialization
+  def mesh_to_json(mesh):
+    return {
+      'vertices': mesh['vertices'],
+      'faces': mesh['faces']
+    }
+  
+  mesh_a_json = json.dumps(mesh_to_json(mesh_a))
+  mesh_b_json = json.dumps(mesh_to_json(mesh_b))
+  result_mesh_json = json.dumps(mesh_to_json(result_mesh))
+
   html = f"""
     <div class="csg-visualization" style="margin: 15px 0;">
         <details>
@@ -97,7 +108,9 @@ def generate_threejs_csg_visualization(mesh_a: Dict,
             </summary>
             <div style="margin-top: 10px;">
                 <div id="csg-container-{viz_id}" style="width: 100%; height: 500px; position: relative;">
-                    <div id="csg-renderer-{viz_id}" style="width: 100%; height: 100%; border: 1px solid #ccc; background: #fafafa; border-radius: 4px;"></div>
+                    <div id="csg-renderer-{viz_id}" style="width: 100%; height: 100%; border: 1px solid #ccc; background: #fafafa; border-radius: 4px; display: flex; align-items: center; justify-content: center; color: #999;">
+                        <span class="viz-placeholder">Scroll here to activate 3D view</span>
+                    </div>
                     <div style="position: absolute; top: 10px; left: 10px; background: rgba(255,255,255,0.9); padding: 5px; border-radius: 3px; border: 1px solid #ddd;">
                         <button onclick="toggleWireframeA{viz_id}()" style="padding: 4px 8px; margin-right: 5px; background: #ffe6e6; border: 1px solid #ccc; border-radius: 3px; cursor: pointer;">Toggle A</button>
                         <button onclick="toggleWireframeB{viz_id}()" style="padding: 4px 8px; margin-right: 5px; background: #e6e6ff; border: 1px solid #ccc; border-radius: 3px; cursor: pointer;">Toggle B</button>
@@ -120,115 +133,235 @@ def generate_threejs_csg_visualization(mesh_a: Dict,
     <script src="https://cdn.jsdelivr.net/npm/three@0.132.2/build/three.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/three@0.132.2/examples/js/controls/OrbitControls.js"></script>
     <script>
-        // Scene setup
-        const scene{viz_id} = new THREE.Scene();
-        scene{viz_id}.background = new THREE.Color(0xf0f0f0);
+    (function() {{
+        const vizId = '{viz_id}';
+        const meshAData = {mesh_a_json};
+        const meshBData = {mesh_b_json};
+        const resultMeshData = {result_mesh_json};
         
-        // Camera
-        const container{viz_id} = document.getElementById('csg-renderer-{viz_id}');
-        const camera{viz_id} = new THREE.PerspectiveCamera(75, container{viz_id}.clientWidth / container{viz_id}.clientHeight, 0.1, 1000);
-        camera{viz_id}.position.set(5, 5, 5);
-        camera{viz_id}.lookAt(0, 0, 0);
+        let scene, camera, renderer, controls, animationId;
+        let isActive = false;
         
-        // Renderer
-        const renderer{viz_id} = new THREE.WebGLRenderer({{ antialias: true }});
-        renderer{viz_id}.setSize(container{viz_id}.clientWidth, container{viz_id}.clientHeight);
-        container{viz_id}.appendChild(renderer{viz_id}.domElement);
-        
-        // Controls
-        const controls{viz_id} = new THREE.OrbitControls(camera{viz_id}, renderer{viz_id}.domElement);
-        controls{viz_id}.enableDamping = true;
-        controls{viz_id}.dampingFactor = 0.05;
-        
-        // Lighting
-        const ambientLight{viz_id} = new THREE.AmbientLight(0x404040);
-        scene{viz_id}.add(ambientLight{viz_id});
-        
-        const directionalLight1{viz_id} = new THREE.DirectionalLight(0xffffff, 0.8);
-        directionalLight1{viz_id}.position.set(1, 1, 1);
-        scene{viz_id}.add(directionalLight1{viz_id});
-        
-        const directionalLight2{viz_id} = new THREE.DirectionalLight(0xffffff, 0.5);
-        directionalLight2{viz_id}.position.set(-1, -1, -1);
-        scene{viz_id}.add(directionalLight2{viz_id});
-        
-        // Add coordinate axes
-        const axesHelper{viz_id} = new THREE.AxesHelper(5);
-        scene{viz_id}.add(axesHelper{viz_id});
-        
-        // Add meshes
-        {mesh_to_three_js(mesh_a, "ff0000", True, f"_{viz_id}_a")}
-        {mesh_to_three_js(mesh_b, "0000ff", True, f"_{viz_id}_b")}
-        {mesh_to_three_js(result_mesh, "00aa00", False, f"_{viz_id}_result")}
-        {mesh_to_three_js(result_mesh, "00aa00", True, f"_{viz_id}_result_wire")}
-        
-        // Hide result wireframe by default
-        const resultWireframe{viz_id} = scene{viz_id}.getObjectByName('{viz_id}result_wire');
-        if (resultWireframe{viz_id}) {{
-            resultWireframe{viz_id}.visible = false;
+        function meshToThreeJs(mesh, color, isWireframe, meshSuffix) {{
+            const vertices = mesh.vertices;
+            const faces = mesh.faces;
+            
+            const verts = [];
+            for (const v of vertices) {{
+                verts.push(v[0], v[1], v[2]);
+            }}
+            
+            if (isWireframe) {{
+                const edges = new Set();
+                for (const face of faces) {{
+                    if (face.length >= 3) {{
+                        for (let i = 0; i < face.length; i++) {{
+                            const v1 = face[i];
+                            const v2 = face[(i + 1) % face.length];
+                            const edge = v1 < v2 ? v1 + '_' + v2 : v2 + '_' + v1;
+                            edges.add(edge);
+                        }}
+                    }}
+                }}
+                
+                const lineIndices = [];
+                for (const edge of edges) {{
+                    const [v1, v2] = edge.split('_').map(Number);
+                    lineIndices.push(v1, v2);
+                }}
+                
+                const geometry = new THREE.BufferGeometry();
+                geometry.setAttribute('position', new THREE.Float32BufferAttribute(verts, 3));
+                geometry.setIndex(lineIndices);
+                
+                const material = new THREE.LineBasicMaterial({{color: parseInt(color, 16), transparent: true, opacity: 0.8}});
+                const wireframe = new THREE.LineSegments(geometry, material);
+                wireframe.name = vizId + meshSuffix;
+                return wireframe;
+            }} else {{
+                const indices = [];
+                for (const face of faces) {{
+                    if (face.length === 3) {{
+                        indices.push(...face);
+                    }} else if (face.length > 3) {{
+                        for (let i = 1; i < face.length - 1; i++) {{
+                            indices.push(face[0], face[i], face[i + 1]);
+                        }}
+                    }}
+                }}
+                
+                const geometry = new THREE.BufferGeometry();
+                geometry.setAttribute('position', new THREE.Float32BufferAttribute(verts, 3));
+                geometry.setIndex(indices);
+                geometry.computeVertexNormals();
+                
+                const material = new THREE.MeshPhongMaterial({{color: parseInt(color, 16), side: THREE.DoubleSide, flatShading: true, transparent: true, opacity: 0.8}});
+                const mesh = new THREE.Mesh(geometry, material);
+                mesh.name = vizId + meshSuffix;
+                return mesh;
+            }}
         }}
         
-        // Handle window resize
-        window.addEventListener('resize', onWindowResize{viz_id}, false);
-        
-        function onWindowResize{viz_id}() {{
-            const width = container{viz_id}.clientWidth;
-            const height = container{viz_id}.clientHeight;
-            camera{viz_id}.aspect = width / height;
-            camera{viz_id}.updateProjectionMatrix();
-            renderer{viz_id}.setSize(width, height);
+        function activate() {{
+            if (isActive) return;
+            isActive = true;
+            
+            const container = document.getElementById('csg-renderer-' + vizId);
+            if (!container || typeof THREE === 'undefined') return;
+            
+            // Clear placeholder
+            const placeholder = container.querySelector('.viz-placeholder');
+            if (placeholder) placeholder.style.display = 'none';
+            
+            // Scene setup
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0xf0f0f0);
+            
+            // Camera
+            camera = new THREE.PerspectiveCamera(75, container.clientWidth / container.clientHeight, 0.1, 1000);
+            camera.position.set(5, 5, 5);
+            camera.lookAt(0, 0, 0);
+            
+            // Renderer
+            renderer = new THREE.WebGLRenderer({{ antialias: true }});
+            renderer.setSize(container.clientWidth, container.clientHeight);
+            container.appendChild(renderer.domElement);
+            
+            // Controls
+            controls = new THREE.OrbitControls(camera, renderer.domElement);
+            controls.enableDamping = true;
+            controls.dampingFactor = 0.05;
+            
+            // Lighting
+            const ambientLight = new THREE.AmbientLight(0x404040);
+            scene.add(ambientLight);
+            
+            const directionalLight1 = new THREE.DirectionalLight(0xffffff, 0.8);
+            directionalLight1.position.set(1, 1, 1);
+            scene.add(directionalLight1);
+            
+            const directionalLight2 = new THREE.DirectionalLight(0xffffff, 0.5);
+            directionalLight2.position.set(-1, -1, -1);
+            scene.add(directionalLight2);
+            
+            // Add coordinate axes
+            const axesHelper = new THREE.AxesHelper(5);
+            scene.add(axesHelper);
+            
+            // Add meshes
+            scene.add(meshToThreeJs(meshAData, 'ff0000', true, 'a'));
+            scene.add(meshToThreeJs(meshBData, '0000ff', true, 'b'));
+            scene.add(meshToThreeJs(resultMeshData, '00aa00', false, 'result'));
+            const resultWire = meshToThreeJs(resultMeshData, '00aa00', true, 'result_wire');
+            resultWire.visible = false;
+            scene.add(resultWire);
+            
+            // Animation loop
+            function animate() {{
+                if (!isActive) return;
+                animationId = requestAnimationFrame(animate);
+                controls.update();
+                renderer.render(scene, camera);
+            }}
+            animate();
         }}
         
-        // Animation loop
-        function animate{viz_id}() {{
-            requestAnimationFrame(animate{viz_id});
-            controls{viz_id}.update();
-            renderer{viz_id}.render(scene{viz_id}, camera{viz_id});
+        function dispose() {{
+            if (!isActive) return;
+            isActive = false;
+            
+            if (animationId) {{
+                cancelAnimationFrame(animationId);
+                animationId = null;
+            }}
+            
+            const container = document.getElementById('csg-renderer-' + vizId);
+            
+            if (renderer) {{
+                renderer.dispose();
+                if (renderer.domElement && renderer.domElement.parentNode) {{
+                    renderer.domElement.parentNode.removeChild(renderer.domElement);
+                }}
+                renderer = null;
+            }}
+            
+            if (scene) {{
+                scene.traverse(function(object) {{
+                    if (object.geometry) object.geometry.dispose();
+                    if (object.material) {{
+                        if (Array.isArray(object.material)) {{
+                            object.material.forEach(m => m.dispose());
+                        }} else {{
+                            object.material.dispose();
+                        }}
+                    }}
+                }});
+                scene = null;
+            }}
+            
+            camera = null;
+            controls = null;
+            
+            // Show placeholder again
+            if (container) {{
+                const placeholder = container.querySelector('.viz-placeholder');
+                if (placeholder) placeholder.style.display = '';
+            }}
         }}
-        animate{viz_id}();
         
-        // Reset camera
+        // Global functions for buttons
         window.resetCamera{viz_id} = function() {{
-            camera{viz_id}.position.set(5, 5, 5);
-            camera{viz_id}.lookAt(0, 0, 0);
-            controls{viz_id}.update();
+            if (camera && controls) {{
+                camera.position.set(5, 5, 5);
+                camera.lookAt(0, 0, 0);
+                controls.update();
+            }}
         }};
         
-        // Toggle wireframe A
         window.toggleWireframeA{viz_id} = function() {{
-            const wireframeA{viz_id} = scene{viz_id}.getObjectByName('{viz_id}a');
-            if (wireframeA{viz_id}) {{
-                wireframeA{viz_id}.visible = !wireframeA{viz_id}.visible;
+            if (scene) {{
+                const obj = scene.getObjectByName(vizId + 'a');
+                if (obj) obj.visible = !obj.visible;
             }}
         }};
         
-        // Toggle wireframe B
         window.toggleWireframeB{viz_id} = function() {{
-            const wireframeB{viz_id} = scene{viz_id}.getObjectByName('{viz_id}b');
-            if (wireframeB{viz_id}) {{
-                wireframeB{viz_id}.visible = !wireframeB{viz_id}.visible;
+            if (scene) {{
+                const obj = scene.getObjectByName(vizId + 'b');
+                if (obj) obj.visible = !obj.visible;
             }}
         }};
         
-        // Change result mode
         window.changeResultMode{viz_id} = function(mode) {{
-            const resultSolid{viz_id} = scene{viz_id}.getObjectByName('{viz_id}result');
-            const resultWireframe{viz_id} = scene{viz_id}.getObjectByName('{viz_id}result_wire');
+            if (!scene) return;
+            const solid = scene.getObjectByName(vizId + 'result');
+            const wire = scene.getObjectByName(vizId + 'result_wire');
             
             if (mode === 'solid') {{
-                if (resultSolid{viz_id}) resultSolid{viz_id}.visible = true;
-                if (resultWireframe{viz_id}) resultWireframe{viz_id}.visible = false;
+                if (solid) solid.visible = true;
+                if (wire) wire.visible = false;
             }} else if (mode === 'wireframe') {{
-                if (resultSolid{viz_id}) resultSolid{viz_id}.visible = false;
-                if (resultWireframe{viz_id}) resultWireframe{viz_id}.visible = true;
+                if (solid) solid.visible = false;
+                if (wire) wire.visible = true;
             }} else if (mode === 'hidden') {{
-                if (resultSolid{viz_id}) resultSolid{viz_id}.visible = false;
-                if (resultWireframe{viz_id}) resultWireframe{viz_id}.visible = false;
+                if (solid) solid.visible = false;
+                if (wire) wire.visible = false;
             }}
         }};
         
-        // Initial camera position
-        resetCamera{viz_id}();
+        // Register with VizManager
+        if (window.VizManager) {{
+            window.VizManager.register({{
+                id: vizId,
+                containerId: 'csg-renderer-' + vizId,
+                activate: activate,
+                dispose: dispose
+            }});
+        }} else {{
+            // Fallback: activate immediately if no VizManager
+            activate();
+        }}
+    }})();
     </script>
     """
   return html
@@ -265,7 +398,9 @@ def generate_threejs_maze_visualization(path,
         <details>
             <summary style=\"cursor: pointer; padding: 8px; background: #e8e8e8; border-radius: 4px; font-weight: bold; color: #333; border: 1px solid #ccc;\">🧩 {name}: {width}x{height} (path {path_len})</summary>
             <div style=\"margin-top: 10px;\">
-                <div id=\"maze-renderer-{viz_id}\" style=\"width: 100%; height: 420px; border: 1px solid #ccc; background: #fafafa; border-radius: 4px; position: relative;\"></div>
+                <div id=\"maze-renderer-{viz_id}\" style=\"width: 100%; height: 420px; border: 1px solid #ccc; background: #fafafa; border-radius: 4px; position: relative; display: flex; align-items: center; justify-content: center; color: #999;\">
+                    <span class="viz-placeholder">Scroll here to activate 3D view</span>
+                </div>
                 <div style=\"margin-top: 8px; font-size: 12px; color: #666; background: #f8f8f8; padding: 5px; border-radius: 3px;\">A=start, B=end, black=wall, white=open, purple=path</div>
             </div>
         </details>
@@ -275,140 +410,196 @@ def generate_threejs_maze_visualization(path,
     <script src=\"https://cdn.jsdelivr.net/npm/three@0.132.2/examples/js/controls/OrbitControls.js\"></script>
     <script>
     (function() {{
-        if (typeof THREE === 'undefined') return;
-        const container = document.getElementById('maze-renderer-{viz_id}');
-        if (!container) return;
-
-        const width = {width};
-        const height = {height};
+        const vizId = 'maze_{viz_id}';
+        const mazeWidth = {width};
+        const mazeHeight = {height};
         const maze = {maze_data};
-        const path = {path_data};
-        const start = {start_data};
-        const end = {end_data};
+        const pathData = {path_data};
+        const startData = {start_data};
+        const endData = {end_data};
+        
+        let scene, camera, renderer, controls, animationId, texture;
+        let isActive = false;
+        
+        function activate() {{
+            if (isActive) return;
+            isActive = true;
+            
+            if (typeof THREE === 'undefined') return;
+            const container = document.getElementById('maze-renderer-{viz_id}');
+            if (!container) return;
+            
+            // Clear placeholder
+            const placeholder = container.querySelector('.viz-placeholder');
+            if (placeholder) placeholder.style.display = 'none';
 
-        const maxCanvas = 2048;
-        const maxDim = Math.max(width, height);
-        const cellSize = Math.max(1, Math.floor(maxCanvas / maxDim));
+            const maxCanvas = 2048;
+            const maxDim = Math.max(mazeWidth, mazeHeight);
+            const cellSize = Math.max(1, Math.floor(maxCanvas / maxDim));
 
-        const canvas = document.createElement('canvas');
-        canvas.width = width * cellSize;
-        canvas.height = height * cellSize;
-        const ctx = canvas.getContext('2d');
+            const canvas = document.createElement('canvas');
+            canvas.width = mazeWidth * cellSize;
+            canvas.height = mazeHeight * cellSize;
+            const ctx = canvas.getContext('2d');
 
-        ctx.fillStyle = '#ffffff';
-        ctx.fillRect(0, 0, canvas.width, canvas.height);
+            ctx.fillStyle = '#ffffff';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-        for (let y = 0; y < height; y++) {{
-            const row = (maze[y] || '');
-            for (let x = 0; x < width; x++) {{
-                const ch = row[x] || '#';
-                if (ch === '#') {{
-                    ctx.fillStyle = '#111111';
-                }} else {{
-                    ctx.fillStyle = '#ffffff';
+            for (let y = 0; y < mazeHeight; y++) {{
+                const row = (maze[y] || '');
+                for (let x = 0; x < mazeWidth; x++) {{
+                    const ch = row[x] || '#';
+                    if (ch === '#') {{
+                        ctx.fillStyle = '#111111';
+                    }} else {{
+                        ctx.fillStyle = '#ffffff';
+                    }}
+                    ctx.fillRect(x * cellSize, y * cellSize, cellSize, cellSize);
                 }}
-                ctx.fillRect(x * cellSize, y * cellSize, cellSize, cellSize);
             }}
-        }}
 
-        if (path && path.length) {{
-            ctx.fillStyle = '#7c3aed';
-            for (let i = 0; i < path.length; i++) {{
-                const p = path[i];
-                const x = p[0];
-                const y = p[1];
-                ctx.fillRect(x * cellSize, y * cellSize, cellSize, cellSize);
+            if (pathData && pathData.length) {{
+                ctx.fillStyle = '#7c3aed';
+                for (let i = 0; i < pathData.length; i++) {{
+                    const p = pathData[i];
+                    const x = p[0];
+                    const y = p[1];
+                    ctx.fillRect(x * cellSize, y * cellSize, cellSize, cellSize);
+                }}
             }}
-        }}
 
-        if (start) {{
-            ctx.fillStyle = '#22c55e';
-            ctx.fillRect(start[0] * cellSize, start[1] * cellSize, cellSize, cellSize);
-        }}
-        if (end) {{
-            ctx.fillStyle = '#ef4444';
-            ctx.fillRect(end[0] * cellSize, end[1] * cellSize, cellSize, cellSize);
-        }}
-
-        const texture = new THREE.CanvasTexture(canvas);
-        texture.magFilter = THREE.NearestFilter;
-        texture.minFilter = THREE.NearestFilter;
-        texture.needsUpdate = true;
-
-        const scene = new THREE.Scene();
-        scene.background = new THREE.Color(0xf0f0f0);
-
-        const renderer = new THREE.WebGLRenderer({{ antialias: true }});
-        renderer.setSize(container.clientWidth, container.clientHeight);
-        container.appendChild(renderer.domElement);
-
-        const aspect = container.clientWidth / container.clientHeight;
-        let viewW = width;
-        let viewH = height;
-        if (viewW / viewH < aspect) {{
-            viewW = viewH * aspect;
-        }} else {{
-            viewH = viewW / aspect;
-        }}
-
-        const camera = new THREE.OrthographicCamera(-viewW / 2, viewW / 2, viewH / 2, -viewH / 2, 0.1, 1000);
-        camera.position.set(0, 0, 100);
-        camera.lookAt(0, 0, 0);
-
-        const controls = new THREE.OrbitControls(camera, renderer.domElement);
-        controls.enableRotate = false;
-        controls.enableDamping = true;
-        controls.dampingFactor = 0.05;
-        controls.screenSpacePanning = true;
-
-        const planeGeom = new THREE.PlaneGeometry(width, height);
-        const planeMat = new THREE.MeshBasicMaterial({{ map: texture }});
-        const plane = new THREE.Mesh(planeGeom, planeMat);
-        scene.add(plane);
-
-        if (path && path.length) {{
-            const positions = new Float32Array(path.length * 3);
-            for (let i = 0; i < path.length; i++) {{
-                const p = path[i];
-                const px = p[0] - width / 2 + 0.5;
-                const py = height / 2 - p[1] - 0.5;
-                positions[i * 3 + 0] = px;
-                positions[i * 3 + 1] = py;
-                positions[i * 3 + 2] = 0.2;
+            if (startData) {{
+                ctx.fillStyle = '#22c55e';
+                ctx.fillRect(startData[0] * cellSize, startData[1] * cellSize, cellSize, cellSize);
             }}
-            const pathGeom = new THREE.BufferGeometry();
-            pathGeom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-            const pathMat = new THREE.LineBasicMaterial({{ color: 0x7c3aed }});
-            const pathLine = new THREE.Line(pathGeom, pathMat);
-            scene.add(pathLine);
-        }}
+            if (endData) {{
+                ctx.fillStyle = '#ef4444';
+                ctx.fillRect(endData[0] * cellSize, endData[1] * cellSize, cellSize, cellSize);
+            }}
 
-        function handleResize() {{
-            const w = container.clientWidth;
-            const h = container.clientHeight;
-            const a = w / h;
-            let vw = width;
-            let vh = height;
-            if (vw / vh < a) {{
-                vw = vh * a;
+            texture = new THREE.CanvasTexture(canvas);
+            texture.magFilter = THREE.NearestFilter;
+            texture.minFilter = THREE.NearestFilter;
+            texture.needsUpdate = true;
+
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0xf0f0f0);
+
+            renderer = new THREE.WebGLRenderer({{ antialias: true }});
+            renderer.setSize(container.clientWidth, container.clientHeight);
+            container.appendChild(renderer.domElement);
+
+            const aspect = container.clientWidth / container.clientHeight;
+            let viewW = mazeWidth;
+            let viewH = mazeHeight;
+            if (viewW / viewH < aspect) {{
+                viewW = viewH * aspect;
             }} else {{
-                vh = vw / a;
+                viewH = viewW / aspect;
             }}
-            camera.left = -vw / 2;
-            camera.right = vw / 2;
-            camera.top = vh / 2;
-            camera.bottom = -vh / 2;
-            camera.updateProjectionMatrix();
-            renderer.setSize(w, h);
-        }}
-        window.addEventListener('resize', handleResize);
 
-        function animate() {{
-            requestAnimationFrame(animate);
-            controls.update();
-            renderer.render(scene, camera);
+            camera = new THREE.OrthographicCamera(-viewW / 2, viewW / 2, viewH / 2, -viewH / 2, 0.1, 1000);
+            camera.position.set(0, 0, 100);
+            camera.lookAt(0, 0, 0);
+
+            controls = new THREE.OrbitControls(camera, renderer.domElement);
+            controls.enableRotate = false;
+            controls.enableDamping = true;
+            controls.dampingFactor = 0.05;
+            controls.screenSpacePanning = true;
+
+            const planeGeom = new THREE.PlaneGeometry(mazeWidth, mazeHeight);
+            const planeMat = new THREE.MeshBasicMaterial({{ map: texture }});
+            const plane = new THREE.Mesh(planeGeom, planeMat);
+            scene.add(plane);
+
+            if (pathData && pathData.length) {{
+                const positions = new Float32Array(pathData.length * 3);
+                for (let i = 0; i < pathData.length; i++) {{
+                    const p = pathData[i];
+                    const px = p[0] - mazeWidth / 2 + 0.5;
+                    const py = mazeHeight / 2 - p[1] - 0.5;
+                    positions[i * 3 + 0] = px;
+                    positions[i * 3 + 1] = py;
+                    positions[i * 3 + 2] = 0.2;
+                }}
+                const pathGeom = new THREE.BufferGeometry();
+                pathGeom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+                const pathMat = new THREE.LineBasicMaterial({{ color: 0x7c3aed }});
+                const pathLine = new THREE.Line(pathGeom, pathMat);
+                scene.add(pathLine);
+            }}
+
+            function animate() {{
+                if (!isActive) return;
+                animationId = requestAnimationFrame(animate);
+                controls.update();
+                renderer.render(scene, camera);
+            }}
+            animate();
         }}
-        animate();
+        
+        function dispose() {{
+            if (!isActive) return;
+            isActive = false;
+            
+            if (animationId) {{
+                cancelAnimationFrame(animationId);
+                animationId = null;
+            }}
+            
+            const container = document.getElementById('maze-renderer-{viz_id}');
+            
+            if (texture) {{
+                texture.dispose();
+                texture = null;
+            }}
+            
+            if (renderer) {{
+                renderer.dispose();
+                if (renderer.domElement && renderer.domElement.parentNode) {{
+                    renderer.domElement.parentNode.removeChild(renderer.domElement);
+                }}
+                renderer = null;
+            }}
+            
+            if (scene) {{
+                scene.traverse(function(object) {{
+                    if (object.geometry) object.geometry.dispose();
+                    if (object.material) {{
+                        if (object.material.map) object.material.map.dispose();
+                        if (Array.isArray(object.material)) {{
+                            object.material.forEach(m => m.dispose());
+                        }} else {{
+                            object.material.dispose();
+                        }}
+                    }}
+                }});
+                scene = null;
+            }}
+            
+            camera = null;
+            controls = null;
+            
+            // Show placeholder again
+            if (container) {{
+                const placeholder = container.querySelector('.viz-placeholder');
+                if (placeholder) placeholder.style.display = '';
+            }}
+        }}
+        
+        // Register with VizManager
+        if (window.VizManager) {{
+            window.VizManager.register({{
+                id: vizId,
+                containerId: 'maze-renderer-{viz_id}',
+                activate: activate,
+                dispose: dispose
+            }});
+        }} else {{
+            // Fallback: activate immediately if no VizManager
+            activate();
+        }}
     }})();
     </script>
   """
@@ -446,7 +637,9 @@ def generate_threejs_tetrahedron_visualization(container_vertices: List[Tuple[fl
                 📊 3D Visualization: {container_name} ({len(placements)} tetrahedrons)
             </summary>
             <div style="margin-top: 10px;">
-                <div id="{viz_id}" style="width: 100%; height: 400px; border: 1px solid #ccc; background: #fafafa; border-radius: 4px;"></div>
+                <div id="{viz_id}" style="width: 100%; height: 400px; border: 1px solid #ccc; background: #fafafa; border-radius: 4px; display: flex; align-items: center; justify-content: center; color: #999;">
+                    <span class="viz-placeholder">Scroll here to activate 3D view</span>
+                </div>
                 <div style="margin-top: 8px; font-size: 12px; color: #666;">
                     🖱️ Left click + drag to rotate | Right click + drag to pan | Scroll to zoom
                 </div>
@@ -457,252 +650,251 @@ def generate_threejs_tetrahedron_visualization(container_vertices: List[Tuple[fl
     <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
     <script>
     (function() {{
-        // Only initialize if Three.js is available and element exists
-        if (typeof THREE === 'undefined' || !document.getElementById('{viz_id}')) return;
-        
+        const vizId = '{viz_id}';
         const containerVertices = {container_data};
-        const placements = {placements_data};
-        const edgeLength = {edge_length};
+        const placementsData = {placements_data};
+        const edgeLengthData = {edge_length};
         
-        // Debug output
-        console.log('Container vertices:', containerVertices.length, containerVertices);
-        console.log('Placements:', placements.length, placements);
-        console.log('Edge length:', edgeLength);
+        let scene, camera, renderer, animationId, sceneCenter;
+        let isActive = false;
         
-        // Scene setup
-        const scene = new THREE.Scene();
-        scene.background = new THREE.Color(0xf8f8f8);
-        
-        // Camera setup
-        const container = document.getElementById('{viz_id}');
-        const camera = new THREE.PerspectiveCamera(75, container.clientWidth / 400, 0.1, 1000);
-        
-        // Renderer setup
-        const renderer = new THREE.WebGLRenderer({{ antialias: true }});
-        renderer.setSize(container.clientWidth, 400);
-        container.appendChild(renderer.domElement);
-        
-        // Lighting
-        const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
-        scene.add(ambientLight);
-        const directionalLight = new THREE.DirectionalLight(0xffffff, 0.4);
-        directionalLight.position.set(10, 10, 5);
-        scene.add(directionalLight);
-        
-        // Container wireframe - create proper edges for convex polyhedron
-        const containerEdges = [];
-        
-        // Helper function to check if two vertices should be connected by an edge
-        // For convex polyhedra, edges connect vertices that are "visible" to each other
-        function shouldConnect(v1, v2, allVertices) {{
-            const dist = Math.sqrt(
-                Math.pow(v1[0] - v2[0], 2) +
-                Math.pow(v1[1] - v2[1], 2) +
-                Math.pow(v1[2] - v2[2], 2)
-            );
+        function activate() {{
+            if (isActive) return;
+            isActive = true;
             
-            // Calculate all pairwise distances to find reasonable edge length
-            const distances = [];
-            for (let i = 0; i < allVertices.length; i++) {{
-                for (let j = i + 1; j < allVertices.length; j++) {{
-                    const d = Math.sqrt(
-                        Math.pow(allVertices[i][0] - allVertices[j][0], 2) +
-                        Math.pow(allVertices[i][1] - allVertices[j][1], 2) +
-                        Math.pow(allVertices[i][2] - allVertices[j][2], 2)
-                    );
-                    distances.push(d);
-                }}
-            }}
+            if (typeof THREE === 'undefined') return;
+            const container = document.getElementById(vizId);
+            if (!container) return;
             
-            // Sort distances to find the most common edge lengths
-            distances.sort((a, b) => a - b);
+            // Clear placeholder
+            const placeholder = container.querySelector('.viz-placeholder');
+            if (placeholder) placeholder.style.display = 'none';
             
-            // Find the shortest distances (these are likely the real edges)
-            const shortestDistances = distances.slice(0, Math.min(allVertices.length * 2, distances.length));
-            const avgShortDist = shortestDistances.reduce((a, b) => a + b, 0) / shortestDistances.length;
+            // Scene setup
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0xf8f8f8);
             
-            // Connect if distance is close to the shortest distances (actual edges)
-            return dist < avgShortDist * 1.2; // Allow 20% tolerance
-        }}
-        
-        // Generate container edges
-        for (let i = 0; i < containerVertices.length; i++) {{
-            for (let j = i + 1; j < containerVertices.length; j++) {{
-                if (shouldConnect(containerVertices[i], containerVertices[j], containerVertices)) {{
-                    containerEdges.push([containerVertices[i], containerVertices[j]]);
-                }}
-            }}
-        }}
-        
-        // Create line segments for container
-        const edgePositions = [];
-        containerEdges.forEach(edge => {{
-            edgePositions.push(...edge[0], ...edge[1]);
-        }});
-        
-        const containerGeometry = new THREE.BufferGeometry();
-        containerGeometry.setAttribute('position', new THREE.Float32BufferAttribute(edgePositions, 3));
-        const containerMaterial = new THREE.LineBasicMaterial({{ color: 0x333333, linewidth: 2 }});
-        const containerMesh = new THREE.LineSegments(containerGeometry, containerMaterial);
-        scene.add(containerMesh);
-        
-        // Tetrahedron geometry
-        function createTetrahedron(center, rotation, edgeLength) {{
-            const a = edgeLength / Math.sqrt(2);
-            const vertices = [
-                [a, 0, -a / Math.sqrt(2)],
-                [-a, 0, -a / Math.sqrt(2)],
-                [0, a, a / Math.sqrt(2)],
-                [0, -a, a / Math.sqrt(2)]
-            ];
+            // Camera setup
+            camera = new THREE.PerspectiveCamera(75, container.clientWidth / 400, 0.1, 1000);
             
-            const geometry = new THREE.BufferGeometry();
-            const positions = [];
-            const indices = [];
-            
-            // Tetrahedron faces (triangles)
-            const faces = [
-                [0, 1, 2], [0, 2, 3], [0, 3, 1], [1, 3, 2]
-            ];
-            
-            vertices.forEach(v => positions.push(...v));
-            faces.forEach(face => indices.push(...face));
-            
-            geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
-            geometry.setIndex(indices);
-            geometry.computeVertexNormals();
-            
-            // Create mesh with more visible material
-            const mesh = new THREE.Mesh(geometry, new THREE.MeshPhongMaterial({{ 
-                color: 0x4488ff, 
-                transparent: true, 
-                opacity: 0.8,
-                side: THREE.DoubleSide,
-                shininess: 100,
-                specular: 0x222222
-            }}));
-            
-            // Add wireframe overlay for better visibility
-            const wireframeGeometry = new THREE.BufferGeometry();
-            wireframeGeometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
-            wireframeGeometry.setIndex(indices);
-            const wireframeMaterial = new THREE.LineBasicMaterial({{ color: 0x000088, linewidth: 1 }});
-            const wireframe = new THREE.LineSegments(wireframeGeometry, wireframeMaterial);
-            
-            // Apply rotation and translation
-            mesh.position.set(...center);
-            wireframe.position.set(...center);
-            
-            if (rotation && rotation.length >= 3) {{
-                mesh.rotation.set(rotation[0], rotation[1], rotation[2]);
-                wireframe.rotation.set(rotation[0], rotation[1], rotation[2]);
-            }}
-            
-            // Return group containing both mesh and wireframe
-            const group = new THREE.Group();
-            group.add(mesh);
-            group.add(wireframe);
-            
-            return group;
-        }}
-        
-        // Add tetrahedrons
-        placements.forEach((placement, index) => {{
-            const tetrahedron = createTetrahedron(placement.center, placement.rotation || [0, 0, 0], edgeLength);
-            // Vary color slightly for visual distinction
-            const hue = (index * 30) % 360;
-            // Apply color to the mesh (first child of the group)
-            if (tetrahedron.children[0] && tetrahedron.children[0].material) {{
-                tetrahedron.children[0].material.color.setHSL(hue / 360, 0.6, 0.5);
-            }}
-            scene.add(tetrahedron);
-        }});
-        
-        // Camera positioning
-        const box = new THREE.Box3().setFromObject(scene);
-        const center = box.getCenter(new THREE.Vector3());
-        const size = box.getSize(new THREE.Vector3());
-        const maxDim = Math.max(size.x, size.y, size.z);
-        const fov = camera.fov * (Math.PI / 180);
-        let cameraZ = Math.abs(maxDim / 2 / Math.tan(fov / 2));
-        cameraZ *= 1.5; // Add some padding
-        camera.position.set(center.x + cameraZ, center.y + cameraZ, center.z + cameraZ);
-        camera.lookAt(center);
-        
-        // Controls
-        let mouseDown = false;
-        let mouseX = 0;
-        let mouseY = 0;
-        let isRightClick = false;
-        
-        container.addEventListener('mousedown', (e) => {{
-            mouseDown = true;
-            mouseX = e.clientX;
-            mouseY = e.clientY;
-            isRightClick = e.button === 2;
-        }});
-        
-        container.addEventListener('contextmenu', (e) => e.preventDefault());
-        
-        container.addEventListener('mousemove', (e) => {{
-            if (!mouseDown) return;
-            
-            const deltaX = e.clientX - mouseX;
-            const deltaY = e.clientY - mouseY;
-            
-            if (isRightClick) {{
-                // Pan
-                const panSpeed = 0.01;
-                camera.position.x -= deltaX * panSpeed;
-                camera.position.y += deltaY * panSpeed;
-            }} else {{
-                // Rotate around center
-                const rotateSpeed = 0.005;
-                const spherical = new THREE.Spherical();
-                spherical.setFromVector3(camera.position.clone().sub(center));
-                spherical.theta -= deltaX * rotateSpeed;
-                spherical.phi += deltaY * rotateSpeed;
-                spherical.phi = Math.max(0.1, Math.min(Math.PI - 0.1, spherical.phi));
-                camera.position.copy(center).add(new THREE.Vector3().setFromSpherical(spherical));
-                camera.lookAt(center);
-            }}
-            
-            mouseX = e.clientX;
-            mouseY = e.clientY;
-        }});
-        
-        container.addEventListener('mouseup', () => {{
-            mouseDown = false;
-        }});
-        
-        container.addEventListener('wheel', (e) => {{
-            e.preventDefault();
-            const zoomSpeed = 0.1;
-            const scale = e.deltaY > 0 ? (1 + zoomSpeed) : (1 - zoomSpeed);
-            camera.position.multiplyScalar(scale);
-        }});
-        
-        // Handle resize
-        function handleResize() {{
-            camera.aspect = container.clientWidth / 400;
-            camera.updateProjectionMatrix();
+            // Renderer setup
+            renderer = new THREE.WebGLRenderer({{ antialias: true }});
             renderer.setSize(container.clientWidth, 400);
+            container.appendChild(renderer.domElement);
+            
+            // Lighting
+            const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+            scene.add(ambientLight);
+            const directionalLight = new THREE.DirectionalLight(0xffffff, 0.4);
+            directionalLight.position.set(10, 10, 5);
+            scene.add(directionalLight);
+            
+            // Container wireframe - create proper edges for convex polyhedron
+            const containerEdges = [];
+            
+            function shouldConnect(v1, v2, allVertices) {{
+                const dist = Math.sqrt(
+                    Math.pow(v1[0] - v2[0], 2) +
+                    Math.pow(v1[1] - v2[1], 2) +
+                    Math.pow(v1[2] - v2[2], 2)
+                );
+                
+                const distances = [];
+                for (let i = 0; i < allVertices.length; i++) {{
+                    for (let j = i + 1; j < allVertices.length; j++) {{
+                        const d = Math.sqrt(
+                            Math.pow(allVertices[i][0] - allVertices[j][0], 2) +
+                            Math.pow(allVertices[i][1] - allVertices[j][1], 2) +
+                            Math.pow(allVertices[i][2] - allVertices[j][2], 2)
+                        );
+                        distances.push(d);
+                    }}
+                }}
+                
+                distances.sort((a, b) => a - b);
+                const shortestDistances = distances.slice(0, Math.min(allVertices.length * 2, distances.length));
+                const avgShortDist = shortestDistances.reduce((a, b) => a + b, 0) / shortestDistances.length;
+                
+                return dist < avgShortDist * 1.2;
+            }}
+            
+            for (let i = 0; i < containerVertices.length; i++) {{
+                for (let j = i + 1; j < containerVertices.length; j++) {{
+                    if (shouldConnect(containerVertices[i], containerVertices[j], containerVertices)) {{
+                        containerEdges.push([containerVertices[i], containerVertices[j]]);
+                    }}
+                }}
+            }}
+            
+            const edgePositions = [];
+            containerEdges.forEach(edge => {{
+                edgePositions.push(...edge[0], ...edge[1]);
+            }});
+            
+            const containerGeometry = new THREE.BufferGeometry();
+            containerGeometry.setAttribute('position', new THREE.Float32BufferAttribute(edgePositions, 3));
+            const containerMaterial = new THREE.LineBasicMaterial({{ color: 0x333333, linewidth: 2 }});
+            const containerMesh = new THREE.LineSegments(containerGeometry, containerMaterial);
+            scene.add(containerMesh);
+            
+            function createTetrahedron(center, rotation, edgeLength) {{
+                const a = edgeLength / Math.sqrt(2);
+                const vertices = [
+                    [a, 0, -a / Math.sqrt(2)],
+                    [-a, 0, -a / Math.sqrt(2)],
+                    [0, a, a / Math.sqrt(2)],
+                    [0, -a, a / Math.sqrt(2)]
+                ];
+                
+                const geometry = new THREE.BufferGeometry();
+                const positions = [];
+                const indices = [];
+                
+                const faces = [[0, 1, 2], [0, 2, 3], [0, 3, 1], [1, 3, 2]];
+                
+                vertices.forEach(v => positions.push(...v));
+                faces.forEach(face => indices.push(...face));
+                
+                geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+                geometry.setIndex(indices);
+                geometry.computeVertexNormals();
+                
+                const mesh = new THREE.Mesh(geometry, new THREE.MeshPhongMaterial({{ 
+                    color: 0x4488ff, transparent: true, opacity: 0.8,
+                    side: THREE.DoubleSide, shininess: 100, specular: 0x222222
+                }}));
+                
+                const wireframeGeometry = new THREE.BufferGeometry();
+                wireframeGeometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+                wireframeGeometry.setIndex(indices);
+                const wireframeMaterial = new THREE.LineBasicMaterial({{ color: 0x000088, linewidth: 1 }});
+                const wireframe = new THREE.LineSegments(wireframeGeometry, wireframeMaterial);
+                
+                mesh.position.set(...center);
+                wireframe.position.set(...center);
+                
+                if (rotation && rotation.length >= 3) {{
+                    mesh.rotation.set(rotation[0], rotation[1], rotation[2]);
+                    wireframe.rotation.set(rotation[0], rotation[1], rotation[2]);
+                }}
+                
+                const group = new THREE.Group();
+                group.add(mesh);
+                group.add(wireframe);
+                return group;
+            }}
+            
+            placementsData.forEach((placement, index) => {{
+                const tetrahedron = createTetrahedron(placement.center, placement.rotation || [0, 0, 0], edgeLengthData);
+                const hue = (index * 30) % 360;
+                if (tetrahedron.children[0] && tetrahedron.children[0].material) {{
+                    tetrahedron.children[0].material.color.setHSL(hue / 360, 0.6, 0.5);
+                }}
+                scene.add(tetrahedron);
+            }});
+            
+            const box = new THREE.Box3().setFromObject(scene);
+            sceneCenter = box.getCenter(new THREE.Vector3());
+            const size = box.getSize(new THREE.Vector3());
+            const maxDim = Math.max(size.x, size.y, size.z);
+            const fov = camera.fov * (Math.PI / 180);
+            let cameraZ = Math.abs(maxDim / 2 / Math.tan(fov / 2));
+            cameraZ *= 1.5;
+            camera.position.set(sceneCenter.x + cameraZ, sceneCenter.y + cameraZ, sceneCenter.z + cameraZ);
+            camera.lookAt(sceneCenter);
+            
+            // Controls
+            let mouseDown = false, mouseX = 0, mouseY = 0, isRightClick = false;
+            
+            container.addEventListener('mousedown', (e) => {{
+                mouseDown = true; mouseX = e.clientX; mouseY = e.clientY; isRightClick = e.button === 2;
+            }});
+            container.addEventListener('contextmenu', (e) => e.preventDefault());
+            container.addEventListener('mousemove', (e) => {{
+                if (!mouseDown) return;
+                const deltaX = e.clientX - mouseX, deltaY = e.clientY - mouseY;
+                if (isRightClick) {{
+                    camera.position.x -= deltaX * 0.01;
+                    camera.position.y += deltaY * 0.01;
+                }} else {{
+                    const spherical = new THREE.Spherical();
+                    spherical.setFromVector3(camera.position.clone().sub(sceneCenter));
+                    spherical.theta -= deltaX * 0.005;
+                    spherical.phi += deltaY * 0.005;
+                    spherical.phi = Math.max(0.1, Math.min(Math.PI - 0.1, spherical.phi));
+                    camera.position.copy(sceneCenter).add(new THREE.Vector3().setFromSpherical(spherical));
+                    camera.lookAt(sceneCenter);
+                }}
+                mouseX = e.clientX; mouseY = e.clientY;
+            }});
+            container.addEventListener('mouseup', () => {{ mouseDown = false; }});
+            container.addEventListener('wheel', (e) => {{
+                e.preventDefault();
+                const scale = e.deltaY > 0 ? 1.1 : 0.9;
+                camera.position.multiplyScalar(scale);
+            }});
+            
+            function animate() {{
+                if (!isActive) return;
+                animationId = requestAnimationFrame(animate);
+                renderer.render(scene, camera);
+            }}
+            animate();
         }}
         
-        window.addEventListener('resize', handleResize);
-        
-        // Animation loop
-        function animate() {{
-            requestAnimationFrame(animate);
-            renderer.render(scene, camera);
+        function dispose() {{
+            if (!isActive) return;
+            isActive = false;
+            
+            if (animationId) {{
+                cancelAnimationFrame(animationId);
+                animationId = null;
+            }}
+            
+            const container = document.getElementById(vizId);
+            
+            if (renderer) {{
+                renderer.dispose();
+                if (renderer.domElement && renderer.domElement.parentNode) {{
+                    renderer.domElement.parentNode.removeChild(renderer.domElement);
+                }}
+                renderer = null;
+            }}
+            
+            if (scene) {{
+                scene.traverse(function(object) {{
+                    if (object.geometry) object.geometry.dispose();
+                    if (object.material) {{
+                        if (Array.isArray(object.material)) {{
+                            object.material.forEach(m => m.dispose());
+                        }} else {{
+                            object.material.dispose();
+                        }}
+                    }}
+                }});
+                scene = null;
+            }}
+            
+            camera = null;
+            sceneCenter = null;
+            
+            if (container) {{
+                const placeholder = container.querySelector('.viz-placeholder');
+                if (placeholder) placeholder.style.display = '';
+            }}
         }}
         
-        animate();
-        
-        // Cleanup on page unload
-        window.addEventListener('beforeunload', () => {{
-            renderer.dispose();
-        }});
+        // Register with VizManager
+        if (window.VizManager) {{
+            window.VizManager.register({{
+                id: vizId,
+                containerId: vizId,
+                activate: activate,
+                dispose: dispose
+            }});
+        }} else {{
+            activate();
+        }}
     }})();
     </script>
     """
@@ -736,7 +928,9 @@ def generate_threejs_graph_visualization(nodes: List[Tuple[float, float]],
                 📊 3D Graph Visualization: {graph_name} ({len(nodes)} nodes, {len(edges)} edges)
             </summary>
             <div style="margin-top: 10px;">
-                <div id="{viz_id}" style="width: 100%; height: 400px; border: 1px solid #ccc; background: #fafafa; border-radius: 4px;"></div>
+                <div id="{viz_id}" style="width: 100%; height: 400px; border: 1px solid #ccc; background: #fafafa; border-radius: 4px; display: flex; align-items: center; justify-content: center; color: #999;">
+                    <span class="viz-placeholder">Scroll here to activate 3D view</span>
+                </div>
                 <div style="margin-top: 8px; font-size: 12px; color: #666;">
                     🖱️ Left click + drag to rotate | Right click + drag to pan | Scroll to zoom
                 </div>
@@ -747,93 +941,162 @@ def generate_threejs_graph_visualization(nodes: List[Tuple[float, float]],
     <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
     <script>
     (function() {{
-        if (typeof THREE === 'undefined' || !document.getElementById('{viz_id}')) return;
+        const vizId = '{viz_id}';
+        const nodesData = {nodes_data};
+        const edgesData = {edges_data};
         
-        const nodes = {nodes_data};
-        const edges = {edges_data};
+        let scene, camera, renderer, animationId, sceneCenter;
+        let isActive = false;
         
-        // Scene setup
-        const scene = new THREE.Scene();
-        scene.background = new THREE.Color(0xf8f8f8);
-        
-        const container = document.getElementById('{viz_id}');
-        const camera = new THREE.PerspectiveCamera(75, container.clientWidth / 400, 0.1, 1000);
-        const renderer = new THREE.WebGLRenderer({{ antialias: true }});
-        renderer.setSize(container.clientWidth, 400);
-        container.appendChild(renderer.domElement);
-        
-        // Lighting
-        const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
-        scene.add(ambientLight);
-        
-        // Create nodes
-        const nodeGeometry = new THREE.SphereGeometry(0.1, 16, 16);
-        nodes.forEach((node, index) => {{
-            const nodeMaterial = new THREE.MeshPhongMaterial({{ color: 0x4488ff }});
-            const nodeMesh = new THREE.Mesh(nodeGeometry, nodeMaterial);
-            nodeMesh.position.set(node[0], node[1], 0);
-            scene.add(nodeMesh);
-        }});
-        
-        // Create edges
-        const edgeGeometry = new THREE.BufferGeometry();
-        const edgePositions = [];
-        edges.forEach(edge => {{
-            const node1 = nodes[edge[0]];
-            const node2 = nodes[edge[1]];
-            edgePositions.push(node1[0], node1[1], 0, node2[0], node2[1], 0);
-        }});
-        
-        edgeGeometry.setAttribute('position', new THREE.Float32BufferAttribute(edgePositions, 3));
-        const edgeMaterial = new THREE.LineBasicMaterial({{ color: 0x333333, linewidth: 2 }});
-        const edgeMesh = new THREE.LineSegments(edgeGeometry, edgeMaterial);
-        scene.add(edgeMesh);
-        
-        // Camera positioning
-        const box = new THREE.Box3().setFromObject(scene);
-        const center = box.getCenter(new THREE.Vector3());
-        const size = box.getSize(new THREE.Vector3());
-        const maxDim = Math.max(size.x, size.y, size.z);
-        const fov = camera.fov * (Math.PI / 180);
-        let cameraZ = Math.abs(maxDim / 2 / Math.tan(fov / 2));
-        cameraZ *= 1.5;
-        camera.position.set(center.x, center.y, center.z + cameraZ);
-        camera.lookAt(center);
-        
-        // Simple controls (same as tetrahedron visualization)
-        let mouseDown = false, mouseX = 0, mouseY = 0, isRightClick = false;
-        
-        container.addEventListener('mousedown', (e) => {{
-            mouseDown = true; mouseX = e.clientX; mouseY = e.clientY; isRightClick = e.button === 2;
-        }});
-        container.addEventListener('contextmenu', (e) => e.preventDefault());
-        container.addEventListener('mousemove', (e) => {{
-            if (!mouseDown) return;
-            const deltaX = e.clientX - mouseX, deltaY = e.clientY - mouseY;
-            if (isRightClick) {{
-                camera.position.x -= deltaX * 0.01; camera.position.y += deltaY * 0.01;
-            }} else {{
-                const spherical = new THREE.Spherical();
-                spherical.setFromVector3(camera.position.clone().sub(center));
-                spherical.theta -= deltaX * 0.005; spherical.phi += deltaY * 0.005;
-                spherical.phi = Math.max(0.1, Math.min(Math.PI - 0.1, spherical.phi));
-                camera.position.copy(center).add(new THREE.Vector3().setFromSpherical(spherical));
-                camera.lookAt(center);
+        function activate() {{
+            if (isActive) return;
+            isActive = true;
+            
+            if (typeof THREE === 'undefined') return;
+            const container = document.getElementById(vizId);
+            if (!container) return;
+            
+            // Clear placeholder
+            const placeholder = container.querySelector('.viz-placeholder');
+            if (placeholder) placeholder.style.display = 'none';
+            
+            // Scene setup
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0xf8f8f8);
+            
+            camera = new THREE.PerspectiveCamera(75, container.clientWidth / 400, 0.1, 1000);
+            renderer = new THREE.WebGLRenderer({{ antialias: true }});
+            renderer.setSize(container.clientWidth, 400);
+            container.appendChild(renderer.domElement);
+            
+            // Lighting
+            const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+            scene.add(ambientLight);
+            
+            // Create nodes
+            const nodeGeometry = new THREE.SphereGeometry(0.1, 16, 16);
+            nodesData.forEach((node, index) => {{
+                const nodeMaterial = new THREE.MeshPhongMaterial({{ color: 0x4488ff }});
+                const nodeMesh = new THREE.Mesh(nodeGeometry, nodeMaterial);
+                nodeMesh.position.set(node[0], node[1], 0);
+                scene.add(nodeMesh);
+            }});
+            
+            // Create edges
+            const edgeGeometry = new THREE.BufferGeometry();
+            const edgePositions = [];
+            edgesData.forEach(edge => {{
+                const node1 = nodesData[edge[0]];
+                const node2 = nodesData[edge[1]];
+                edgePositions.push(node1[0], node1[1], 0, node2[0], node2[1], 0);
+            }});
+            
+            edgeGeometry.setAttribute('position', new THREE.Float32BufferAttribute(edgePositions, 3));
+            const edgeMaterial = new THREE.LineBasicMaterial({{ color: 0x333333, linewidth: 2 }});
+            const edgeMesh = new THREE.LineSegments(edgeGeometry, edgeMaterial);
+            scene.add(edgeMesh);
+            
+            // Camera positioning
+            const box = new THREE.Box3().setFromObject(scene);
+            sceneCenter = box.getCenter(new THREE.Vector3());
+            const size = box.getSize(new THREE.Vector3());
+            const maxDim = Math.max(size.x, size.y, size.z);
+            const fov = camera.fov * (Math.PI / 180);
+            let cameraZ = Math.abs(maxDim / 2 / Math.tan(fov / 2));
+            cameraZ *= 1.5;
+            camera.position.set(sceneCenter.x, sceneCenter.y, sceneCenter.z + cameraZ);
+            camera.lookAt(sceneCenter);
+            
+            // Simple controls
+            let mouseDown = false, mouseX = 0, mouseY = 0, isRightClick = false;
+            
+            container.addEventListener('mousedown', (e) => {{
+                mouseDown = true; mouseX = e.clientX; mouseY = e.clientY; isRightClick = e.button === 2;
+            }});
+            container.addEventListener('contextmenu', (e) => e.preventDefault());
+            container.addEventListener('mousemove', (e) => {{
+                if (!mouseDown) return;
+                const deltaX = e.clientX - mouseX, deltaY = e.clientY - mouseY;
+                if (isRightClick) {{
+                    camera.position.x -= deltaX * 0.01; camera.position.y += deltaY * 0.01;
+                }} else {{
+                    const spherical = new THREE.Spherical();
+                    spherical.setFromVector3(camera.position.clone().sub(sceneCenter));
+                    spherical.theta -= deltaX * 0.005; spherical.phi += deltaY * 0.005;
+                    spherical.phi = Math.max(0.1, Math.min(Math.PI - 0.1, spherical.phi));
+                    camera.position.copy(sceneCenter).add(new THREE.Vector3().setFromSpherical(spherical));
+                    camera.lookAt(sceneCenter);
+                }}
+                mouseX = e.clientX; mouseY = e.clientY;
+            }});
+            container.addEventListener('mouseup', () => {{ mouseDown = false; }});
+            container.addEventListener('wheel', (e) => {{
+                e.preventDefault();
+                const scale = e.deltaY > 0 ? 1.1 : 0.9;
+                camera.position.multiplyScalar(scale);
+            }});
+            
+            function animate() {{
+                if (!isActive) return;
+                animationId = requestAnimationFrame(animate);
+                renderer.render(scene, camera);
             }}
-            mouseX = e.clientX; mouseY = e.clientY;
-        }});
-        container.addEventListener('mouseup', () => {{ mouseDown = false; }});
-        container.addEventListener('wheel', (e) => {{
-            e.preventDefault();
-            const scale = e.deltaY > 0 ? 1.1 : 0.9;
-            camera.position.multiplyScalar(scale);
-        }});
-        
-        function animate() {{
-            requestAnimationFrame(animate);
-            renderer.render(scene, camera);
+            animate();
         }}
-        animate();
+        
+        function dispose() {{
+            if (!isActive) return;
+            isActive = false;
+            
+            if (animationId) {{
+                cancelAnimationFrame(animationId);
+                animationId = null;
+            }}
+            
+            const container = document.getElementById(vizId);
+            
+            if (renderer) {{
+                renderer.dispose();
+                if (renderer.domElement && renderer.domElement.parentNode) {{
+                    renderer.domElement.parentNode.removeChild(renderer.domElement);
+                }}
+                renderer = null;
+            }}
+            
+            if (scene) {{
+                scene.traverse(function(object) {{
+                    if (object.geometry) object.geometry.dispose();
+                    if (object.material) {{
+                        if (Array.isArray(object.material)) {{
+                            object.material.forEach(m => m.dispose());
+                        }} else {{
+                            object.material.dispose();
+                        }}
+                    }}
+                }});
+                scene = null;
+            }}
+            
+            camera = null;
+            sceneCenter = null;
+            
+            if (container) {{
+                const placeholder = container.querySelector('.viz-placeholder');
+                if (placeholder) placeholder.style.display = '';
+            }}
+        }}
+        
+        // Register with VizManager
+        if (window.VizManager) {{
+            window.VizManager.register({{
+                id: vizId,
+                containerId: vizId,
+                activate: activate,
+                dispose: dispose
+            }});
+        }} else {{
+            activate();
+        }}
     }})();
     </script>
     """

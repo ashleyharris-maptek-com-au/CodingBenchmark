@@ -625,7 +625,9 @@ def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
                     3D Visualization: {len(viz_placements)}/{len(placements)} placements
                 </summary>
                 <div style="margin-top: 10px;">
-                    <div id="binpack3d-renderer-{viz_id}" style="width: 100%; height: 500px; border: 1px solid #ccc; background: #fafafa; border-radius: 4px;"></div>
+                    <div id="binpack3d-renderer-{viz_id}" style="width: 100%; height: 500px; border: 1px solid #ccc; background: #fafafa; border-radius: 4px; display: flex; align-items: center; justify-content: center; color: #999;">
+                        <span class="viz-placeholder">Scroll here to activate 3D view</span>
+                    </div>
                     <div style="margin-top: 8px; font-size: 12px; color: #666; background: #f8f8f8; padding: 5px; border-radius: 3px;">
                         Left-drag rotate, Right-drag pan, Scroll zoom
                     </div>
@@ -637,103 +639,160 @@ def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
         <script src="https://cdn.jsdelivr.net/npm/three@0.132.2/examples/js/controls/OrbitControls.js"></script>
         <script>
         (function() {{
-            if (typeof THREE === 'undefined') return;
-            const containerEl = document.getElementById('binpack3d-renderer-{viz_id}');
-            if (!containerEl) return;
+            const vizId = 'binpack3d-renderer-{viz_id}';
+            const containerSizeData = {container_data};
+            const polyVerticesData = {poly_vertices};
+            const polyFacesData = {poly_faces};
+            const placementsData = {placements_data};
+            
+            let scene, camera, renderer, controls, animationId;
+            let isActive = false;
+            
+            function activate() {{
+                if (isActive) return;
+                isActive = true;
+                
+                if (typeof THREE === 'undefined') return;
+                const containerEl = document.getElementById(vizId);
+                if (!containerEl) return;
+                
+                const placeholder = containerEl.querySelector('.viz-placeholder');
+                if (placeholder) placeholder.style.display = 'none';
 
-            const containerSize = {container_data};
-            const polyVertices = {poly_vertices};
-            const polyFaces = {poly_faces};
-            const placements = {placements_data};
+                scene = new THREE.Scene();
+                scene.background = new THREE.Color(0xf0f0f0);
 
-            const scene = new THREE.Scene();
-            scene.background = new THREE.Color(0xf0f0f0);
+                renderer = new THREE.WebGLRenderer({{ antialias: true }});
+                renderer.setSize(containerEl.clientWidth, containerEl.clientHeight);
+                containerEl.appendChild(renderer.domElement);
 
-            const renderer = new THREE.WebGLRenderer({{ antialias: true }});
-            renderer.setSize(containerEl.clientWidth, containerEl.clientHeight);
-            containerEl.appendChild(renderer.domElement);
+                camera = new THREE.PerspectiveCamera(60, containerEl.clientWidth / containerEl.clientHeight, 0.1, 100000);
+                camera.position.set(1, 1, 1);
 
-            const camera = new THREE.PerspectiveCamera(60, containerEl.clientWidth / containerEl.clientHeight, 0.1, 100000);
-            camera.position.set(1, 1, 1);
+                controls = new THREE.OrbitControls(camera, renderer.domElement);
+                controls.enableDamping = true;
+                controls.dampingFactor = 0.05;
 
-            const controls = new THREE.OrbitControls(camera, renderer.domElement);
-            controls.enableDamping = true;
-            controls.dampingFactor = 0.05;
+                const ambient = new THREE.AmbientLight(0xffffff, 0.6);
+                scene.add(ambient);
+                const dir = new THREE.DirectionalLight(0xffffff, 0.8);
+                dir.position.set(1, 2, 3);
+                scene.add(dir);
 
-            const ambient = new THREE.AmbientLight(0xffffff, 0.6);
-            scene.add(ambient);
-            const dir = new THREE.DirectionalLight(0xffffff, 0.8);
-            dir.position.set(1, 2, 3);
-            scene.add(dir);
+                const root = new THREE.Group();
+                scene.add(root);
+                root.position.set(-containerSizeData[0] / 2, -containerSizeData[1] / 2, -containerSizeData[2] / 2);
 
-            const root = new THREE.Group();
-            scene.add(root);
-            root.position.set(-containerSize[0] / 2, -containerSize[1] / 2, -containerSize[2] / 2);
+                const boxGeom = new THREE.BoxGeometry(containerSizeData[0], containerSizeData[1], containerSizeData[2]);
+                const boxEdges = new THREE.EdgesGeometry(boxGeom);
+                const boxMat = new THREE.LineBasicMaterial({{ color: 0x333333 }});
+                const boxLines = new THREE.LineSegments(boxEdges, boxMat);
+                boxLines.position.set(containerSizeData[0] / 2, containerSizeData[1] / 2, containerSizeData[2] / 2);
+                root.add(boxLines);
 
-            const boxGeom = new THREE.BoxGeometry(containerSize[0], containerSize[1], containerSize[2]);
-            const boxEdges = new THREE.EdgesGeometry(boxGeom);
-            const boxMat = new THREE.LineBasicMaterial({{ color: 0x333333 }});
-            const boxLines = new THREE.LineSegments(boxEdges, boxMat);
-            boxLines.position.set(containerSize[0] / 2, containerSize[1] / 2, containerSize[2] / 2);
-            root.add(boxLines);
+                const positions = [];
+                for (let i = 0; i < polyVerticesData.length; i++) {{
+                    const v = polyVerticesData[i];
+                    positions.push(v[0], v[1], v[2]);
+                }}
+                const indices = [];
+                for (let i = 0; i < polyFacesData.length; i++) {{
+                    const f = polyFacesData[i];
+                    if (f.length >= 3) {{
+                        indices.push(f[0], f[1], f[2]);
+                    }}
+                }}
 
-            const positions = [];
-            for (let i = 0; i < polyVertices.length; i++) {{
-                const v = polyVertices[i];
-                positions.push(v[0], v[1], v[2]);
+                const geom = new THREE.BufferGeometry();
+                geom.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+                geom.setIndex(indices);
+                geom.computeVertexNormals();
+
+                for (let i = 0; i < placementsData.length; i++) {{
+                    const p = placementsData[i] || {{}};
+                    const t = p.translation || [0, 0, 0];
+                    const q = p.quaternion || [1, 0, 0, 0];
+                    const color = new THREE.Color().setHSL((i * 37 % 360) / 360, 0.6, 0.55);
+                    const mat = new THREE.MeshPhongMaterial({{ color: color, transparent: true, opacity: 0.75, side: THREE.DoubleSide }});
+                    const m = new THREE.Mesh(geom, mat);
+                    m.position.set(t[0], t[1], t[2]);
+                    m.quaternion.set(q[1], q[2], q[3], q[0]);
+                    root.add(m);
+                }}
+
+                const box = new THREE.Box3().setFromObject(root);
+                const center = box.getCenter(new THREE.Vector3());
+                const size = box.getSize(new THREE.Vector3());
+                const maxDim = Math.max(size.x, size.y, size.z);
+                const fov = camera.fov * Math.PI / 180;
+                let cameraZ = Math.abs(maxDim / 2 / Math.tan(fov / 2));
+                cameraZ *= 1.6;
+                camera.position.set(center.x + cameraZ, center.y + cameraZ, center.z + cameraZ);
+                camera.lookAt(center);
+                controls.target.copy(center);
+                controls.update();
+
+                function animate() {{
+                    if (!isActive) return;
+                    animationId = requestAnimationFrame(animate);
+                    controls.update();
+                    renderer.render(scene, camera);
+                }}
+                animate();
             }}
-            const indices = [];
-            for (let i = 0; i < polyFaces.length; i++) {{
-                const f = polyFaces[i];
-                if (f.length >= 3) {{
-                    indices.push(f[0], f[1], f[2]);
+            
+            function dispose() {{
+                if (!isActive) return;
+                isActive = false;
+                
+                if (animationId) {{
+                    cancelAnimationFrame(animationId);
+                    animationId = null;
+                }}
+                
+                const containerEl = document.getElementById(vizId);
+                
+                if (renderer) {{
+                    renderer.dispose();
+                    if (renderer.domElement && renderer.domElement.parentNode) {{
+                        renderer.domElement.parentNode.removeChild(renderer.domElement);
+                    }}
+                    renderer = null;
+                }}
+                
+                if (scene) {{
+                    scene.traverse(function(object) {{
+                        if (object.geometry) object.geometry.dispose();
+                        if (object.material) {{
+                            if (Array.isArray(object.material)) {{
+                                object.material.forEach(m => m.dispose());
+                            }} else {{
+                                object.material.dispose();
+                            }}
+                        }}
+                    }});
+                    scene = null;
+                }}
+                
+                camera = null;
+                controls = null;
+                
+                if (containerEl) {{
+                    const placeholder = containerEl.querySelector('.viz-placeholder');
+                    if (placeholder) placeholder.style.display = '';
                 }}
             }}
-
-            const geom = new THREE.BufferGeometry();
-            geom.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
-            geom.setIndex(indices);
-            geom.computeVertexNormals();
-
-            for (let i = 0; i < placements.length; i++) {{
-                const p = placements[i] || {{}};
-                const t = p.translation || [0, 0, 0];
-                const q = p.quaternion || [1, 0, 0, 0];
-                const color = new THREE.Color().setHSL((i * 37 % 360) / 360, 0.6, 0.55);
-                const mat = new THREE.MeshPhongMaterial({{ color: color, transparent: true, opacity: 0.75, side: THREE.DoubleSide }});
-                const m = new THREE.Mesh(geom, mat);
-                m.position.set(t[0], t[1], t[2]);
-                m.quaternion.set(q[1], q[2], q[3], q[0]);
-                root.add(m);
+            
+            if (window.VizManager) {{
+                window.VizManager.register({{
+                    id: vizId,
+                    containerId: vizId,
+                    activate: activate,
+                    dispose: dispose
+                }});
+            }} else {{
+                activate();
             }}
-
-            const box = new THREE.Box3().setFromObject(root);
-            const center = box.getCenter(new THREE.Vector3());
-            const size = box.getSize(new THREE.Vector3());
-            const maxDim = Math.max(size.x, size.y, size.z);
-            const fov = camera.fov * Math.PI / 180;
-            let cameraZ = Math.abs(maxDim / 2 / Math.tan(fov / 2));
-            cameraZ *= 1.6;
-            camera.position.set(center.x + cameraZ, center.y + cameraZ, center.z + cameraZ);
-            camera.lookAt(center);
-            controls.target.copy(center);
-            controls.update();
-
-            function handleResize() {{
-                const w = containerEl.clientWidth;
-                const h = containerEl.clientHeight;
-                camera.aspect = w / h;
-                camera.updateProjectionMatrix();
-                renderer.setSize(w, h);
-            }}
-            window.addEventListener('resize', handleResize);
-
-            function animate() {{
-                requestAnimationFrame(animate);
-                controls.update();
-                renderer.render(scene, camera);
-            }}
-            animate();
         }})();
         </script>
         """

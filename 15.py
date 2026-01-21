@@ -583,7 +583,9 @@ def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
                     3D Visualization: {len(viz_placements)}/{len(placements)} tetrahedrons
                 </summary>
                 <div style="margin-top: 10px;">
-                    <div id="shadow3d-renderer-{viz_id}" style="width: 100%; height: 500px; border: 1px solid #ccc; background: #fafafa; border-radius: 4px;"></div>
+                    <div id="shadow3d-renderer-{viz_id}" style="width: 100%; height: 500px; border: 1px solid #ccc; background: #fafafa; border-radius: 4px; display: flex; align-items: center; justify-content: center; color: #999;">
+                        <span class="viz-placeholder">Scroll here to activate 3D view</span>
+                    </div>
                     <div style="margin-top: 8px; font-size: 12px; color: #666; background: #f8f8f8; padding: 5px; border-radius: 3px;">
                         Left-drag rotate, Right-drag pan, Scroll zoom
                     </div>
@@ -595,118 +597,175 @@ def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
         <script src="https://cdn.jsdelivr.net/npm/three@0.132.2/examples/js/controls/OrbitControls.js"></script>
         <script>
         (function() {{
-            if (typeof THREE === 'undefined') return;
-            const containerEl = document.getElementById('shadow3d-renderer-{viz_id}');
-            if (!containerEl) return;
+            const vizId = 'shadow3d-renderer-{viz_id}';
+            const targetPolyData = {poly_data};
+            const placementsData = {placements_data};
+            const sunVectorData = {sun_data};
+            const tetraVertsData = {tetra_data};
+            const centerXYData = [{cx}, {cy}];
+            const boundsData = {{ minx: {min_x}, miny: {min_y}, maxx: {max_x}, maxy: {max_y} }};
+            
+            let scene, camera, renderer, controls, animationId;
+            let isActive = false;
+            
+            function activate() {{
+                if (isActive) return;
+                isActive = true;
+                
+                if (typeof THREE === 'undefined') return;
+                const containerEl = document.getElementById(vizId);
+                if (!containerEl) return;
+                
+                const placeholder = containerEl.querySelector('.viz-placeholder');
+                if (placeholder) placeholder.style.display = 'none';
 
-            const targetPoly = {poly_data};
-            const placements = {placements_data};
-            const sunVector = {sun_data};
-            const tetraVerts = {tetra_data};
-            const centerXY = [{cx}, {cy}];
+                scene = new THREE.Scene();
+                scene.background = new THREE.Color(0xf0f0f0);
 
-            const scene = new THREE.Scene();
-            scene.background = new THREE.Color(0xf0f0f0);
+                renderer = new THREE.WebGLRenderer({{ antialias: true }});
+                renderer.setSize(containerEl.clientWidth, containerEl.clientHeight);
+                containerEl.appendChild(renderer.domElement);
 
-            const renderer = new THREE.WebGLRenderer({{ antialias: true }});
-            renderer.setSize(containerEl.clientWidth, containerEl.clientHeight);
-            containerEl.appendChild(renderer.domElement);
+                camera = new THREE.PerspectiveCamera(60, containerEl.clientWidth / containerEl.clientHeight, 0.1, 1e12);
 
-            const camera = new THREE.PerspectiveCamera(60, containerEl.clientWidth / containerEl.clientHeight, 0.1, 1e12);
+                controls = new THREE.OrbitControls(camera, renderer.domElement);
+                controls.enableDamping = true;
+                controls.dampingFactor = 0.05;
 
-            const controls = new THREE.OrbitControls(camera, renderer.domElement);
-            controls.enableDamping = true;
-            controls.dampingFactor = 0.05;
+                const ambient = new THREE.AmbientLight(0xffffff, 0.6);
+                scene.add(ambient);
+                const dir = new THREE.DirectionalLight(0xffffff, 0.8);
+                dir.position.set(1, 2, 3);
+                scene.add(dir);
 
-            const ambient = new THREE.AmbientLight(0xffffff, 0.6);
-            scene.add(ambient);
-            const dir = new THREE.DirectionalLight(0xffffff, 0.8);
-            dir.position.set(1, 2, 3);
-            scene.add(dir);
+                const root = new THREE.Group();
+                scene.add(root);
+                root.position.set(-centerXYData[0], -centerXYData[1], 0);
 
-            const root = new THREE.Group();
-            scene.add(root);
-            root.position.set(-centerXY[0], -centerXY[1], 0);
+                if (targetPolyData && targetPolyData.length >= 3) {{
+                    const pts = [];
+                    for (let i = 0; i < targetPolyData.length; i++) {{
+                        const p = targetPolyData[i];
+                        pts.push(new THREE.Vector3(p[0], p[1], 0));
+                    }}
+                    const geomLine = new THREE.BufferGeometry().setFromPoints(pts);
+                    const matLine = new THREE.LineBasicMaterial({{ color: 0x111111 }});
+                    const line = new THREE.LineLoop(geomLine, matLine);
+                    root.add(line);
 
-            if (targetPoly && targetPoly.length >= 3) {{
-                const pts = [];
-                for (let i = 0; i < targetPoly.length; i++) {{
-                    const p = targetPoly[i];
-                    pts.push(new THREE.Vector3(p[0], p[1], 0));
+                    const planeW = Math.max(1, (boundsData.maxx - boundsData.minx) * 1.1);
+                    const planeH = Math.max(1, (boundsData.maxy - boundsData.miny) * 1.1);
+                    const grid = new THREE.GridHelper(Math.max(planeW, planeH), 20, 0x999999, 0xcccccc);
+                    grid.rotation.x = Math.PI / 2;
+                    grid.position.set(centerXYData[0], centerXYData[1], 0);
+                    root.add(grid);
                 }}
-                const geomLine = new THREE.BufferGeometry().setFromPoints(pts);
-                const matLine = new THREE.LineBasicMaterial({{ color: 0x111111 }});
-                const line = new THREE.LineLoop(geomLine, matLine);
-                root.add(line);
 
-                const minx = {min_x}, miny = {min_y}, maxx = {max_x}, maxy = {max_y};
-                const planeW = Math.max(1, (maxx - minx) * 1.1);
-                const planeH = Math.max(1, (maxy - miny) * 1.1);
-                const grid = new THREE.GridHelper(Math.max(planeW, planeH), 20, 0x999999, 0xcccccc);
-                grid.rotation.x = Math.PI / 2;
-                grid.position.set(centerXY[0], centerXY[1], 0);
-                root.add(grid);
-            }}
+                const positions = [];
+                for (let i = 0; i < tetraVertsData.length; i++) {{
+                    const v = tetraVertsData[i];
+                    positions.push(v[0], v[1], v[2]);
+                }}
+                const indices = [0, 1, 2, 0, 2, 3, 0, 3, 1, 1, 3, 2];
+                const tetraGeom = new THREE.BufferGeometry();
+                tetraGeom.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+                tetraGeom.setIndex(indices);
+                tetraGeom.computeVertexNormals();
 
-            const positions = [];
-            for (let i = 0; i < tetraVerts.length; i++) {{
-                const v = tetraVerts[i];
-                positions.push(v[0], v[1], v[2]);
-            }}
-            const indices = [0, 1, 2, 0, 2, 3, 0, 3, 1, 1, 3, 2];
-            const tetraGeom = new THREE.BufferGeometry();
-            tetraGeom.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
-            tetraGeom.setIndex(indices);
-            tetraGeom.computeVertexNormals();
+                for (let i = 0; i < placementsData.length; i++) {{
+                    const p = placementsData[i] || {{}};
+                    const pos = p.position || [0, 0, 1];
+                    const q = p.quaternion || [1, 0, 0, 0];
+                    const s = (p.scale === undefined) ? 1.0 : p.scale;
+                    const color = new THREE.Color().setHSL((i * 37 % 360) / 360, 0.6, 0.55);
+                    const mat = new THREE.MeshPhongMaterial({{ color: color, transparent: true, opacity: 0.75, side: THREE.DoubleSide }});
+                    const m = new THREE.Mesh(tetraGeom, mat);
+                    m.position.set(pos[0], pos[1], pos[2]);
+                    m.quaternion.set(q[1], q[2], q[3], q[0]);
+                    m.scale.set(s, s, s);
+                    root.add(m);
+                }}
 
-            for (let i = 0; i < placements.length; i++) {{
-                const p = placements[i] || {{}};
-                const pos = p.position || [0, 0, 1];
-                const q = p.quaternion || [1, 0, 0, 0];
-                const s = (p.scale === undefined) ? 1.0 : p.scale;
-                const color = new THREE.Color().setHSL((i * 37 % 360) / 360, 0.6, 0.55);
-                const mat = new THREE.MeshPhongMaterial({{ color: color, transparent: true, opacity: 0.75, side: THREE.DoubleSide }});
-                const m = new THREE.Mesh(tetraGeom, mat);
-                m.position.set(pos[0], pos[1], pos[2]);
-                m.quaternion.set(q[1], q[2], q[3], q[0]);
-                m.scale.set(s, s, s);
-                root.add(m);
-            }}
+                const sunDir = new THREE.Vector3(sunVectorData[0], sunVectorData[1], sunVectorData[2]);
+                if (sunDir.length() > 0) {{
+                    sunDir.normalize();
+                    const arrow = new THREE.ArrowHelper(sunDir.clone().multiplyScalar(-1), new THREE.Vector3(centerXYData[0], centerXYData[1], 0), Math.max(1, Math.max(boundsData.maxx - boundsData.minx, boundsData.maxy - boundsData.miny) * 0.25), 0xff8800);
+                    root.add(arrow);
+                }}
 
-            const sunDir = new THREE.Vector3(sunVector[0], sunVector[1], sunVector[2]);
-            if (sunDir.length() > 0) {{
-                sunDir.normalize();
-                const arrow = new THREE.ArrowHelper(sunDir.clone().multiplyScalar(-1), new THREE.Vector3(centerXY[0], centerXY[1], 0), Math.max(1, Math.max({max_x} - {min_x}, {max_y} - {min_y}) * 0.25), 0xff8800);
-                root.add(arrow);
-            }}
-
-            const box = new THREE.Box3().setFromObject(root);
-            const center = box.getCenter(new THREE.Vector3());
-            const size = box.getSize(new THREE.Vector3());
-            const maxDim = Math.max(size.x, size.y, size.z);
-            const fov = camera.fov * Math.PI / 180;
-            let cameraZ = Math.abs(maxDim / 2 / Math.tan(fov / 2));
-            cameraZ *= 1.6;
-            camera.position.set(center.x + cameraZ, center.y + cameraZ, center.z + cameraZ);
-            camera.lookAt(center);
-            controls.target.copy(center);
-            controls.update();
-
-            function handleResize() {{
-                const w = containerEl.clientWidth;
-                const h = containerEl.clientHeight;
-                camera.aspect = w / h;
-                camera.updateProjectionMatrix();
-                renderer.setSize(w, h);
-            }}
-            window.addEventListener('resize', handleResize);
-
-            function animate() {{
-                requestAnimationFrame(animate);
+                const box = new THREE.Box3().setFromObject(root);
+                const center = box.getCenter(new THREE.Vector3());
+                const size = box.getSize(new THREE.Vector3());
+                const maxDim = Math.max(size.x, size.y, size.z);
+                const fov = camera.fov * Math.PI / 180;
+                let cameraZ = Math.abs(maxDim / 2 / Math.tan(fov / 2));
+                cameraZ *= 1.6;
+                camera.position.set(center.x + cameraZ, center.y + cameraZ, center.z + cameraZ);
+                camera.lookAt(center);
+                controls.target.copy(center);
                 controls.update();
-                renderer.render(scene, camera);
+
+                function animate() {{
+                    if (!isActive) return;
+                    animationId = requestAnimationFrame(animate);
+                    controls.update();
+                    renderer.render(scene, camera);
+                }}
+                animate();
             }}
-            animate();
+            
+            function dispose() {{
+                if (!isActive) return;
+                isActive = false;
+                
+                if (animationId) {{
+                    cancelAnimationFrame(animationId);
+                    animationId = null;
+                }}
+                
+                const containerEl = document.getElementById(vizId);
+                
+                if (renderer) {{
+                    renderer.dispose();
+                    if (renderer.domElement && renderer.domElement.parentNode) {{
+                        renderer.domElement.parentNode.removeChild(renderer.domElement);
+                    }}
+                    renderer = null;
+                }}
+                
+                if (scene) {{
+                    scene.traverse(function(object) {{
+                        if (object.geometry) object.geometry.dispose();
+                        if (object.material) {{
+                            if (Array.isArray(object.material)) {{
+                                object.material.forEach(m => m.dispose());
+                            }} else {{
+                                object.material.dispose();
+                            }}
+                        }}
+                    }});
+                    scene = null;
+                }}
+                
+                camera = null;
+                controls = null;
+                
+                if (containerEl) {{
+                    const placeholder = containerEl.querySelector('.viz-placeholder');
+                    if (placeholder) placeholder.style.display = '';
+                }}
+            }}
+            
+            if (window.VizManager) {{
+                window.VizManager.register({{
+                    id: vizId,
+                    containerId: vizId,
+                    activate: activate,
+                    dispose: dispose
+                }});
+            }} else {{
+                activate();
+            }}
         }})();
         </script>
         """
