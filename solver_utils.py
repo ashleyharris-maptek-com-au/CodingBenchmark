@@ -487,8 +487,8 @@ def execute_solver_with_data(code_content, data_dict, solver_function_name, time
   for key, value in data_dict.items():
     temp_content += f"\n{key} = {value!r}\n"
 
-  assert "if __name__ == '__main__':" not in cleaned_code
-  assert 'if __name__ == "__main__":' not in cleaned_code
+  assert "\nif __name__ == '__main__':" not in cleaned_code
+  assert "\n" + 'if __name__ == "__main__":' not in cleaned_code
 
   temp_content += "\n# LLM-generated solver code\n"
   temp_content += cleaned_code

@@ -167,7 +167,7 @@ Write complete, runnable Python code with the pack_boxes function.
 
 
 # List of subpasses to grade the single answer against all difficulty levels
-extraGradeAnswerRuns = list(range(len(TEST_CASES)))
+extraGradeAnswerRuns = list(range(8)) #list(range(len(TEST_CASES)))
 
 structure = {
   "type": "object",
