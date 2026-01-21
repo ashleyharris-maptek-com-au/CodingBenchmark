@@ -2,9 +2,12 @@
 
 A programming benchmark that tests LLM capabilities in algorithm design and optimization using the classic Travelling Salesman Problem.
 
+Still a work in progress. See a test run at <https://ashleyharris-maptek-com-au.github.io/CodingBenchmark/results/gpt-5-mini.html>
+
 ## Overview
 
 This benchmark evaluates whether LLMs can:
+
 - Write efficient algorithms that scale
 - Discover and implement heuristics for NP-hard problems
 - Optimize code to meet time constraints
@@ -16,6 +19,7 @@ The LLM must write a Python solver for TSP that handles varying city counts with
 ### Test 1: Travelling Salesman Problem
 
 **Subpasses by city count:**
+
 | Subpass | Cities | Difficulty |
 |---------|--------|------------|
 | 0 | 10 | Easy - brute force possible |
@@ -26,6 +30,7 @@ The LLM must write a Python solver for TSP that handles varying city counts with
 | 5 | 1000 | Extreme - needs efficient implementation |
 
 **Scoring:**
+
 - **1.0**: Route within 10% of baseline (excellent)
 - **0.85**: Route within 50% of baseline (good)
 - **0.7**: Route within 2x baseline (acceptable)
@@ -65,6 +70,7 @@ python TSPBenchmark.py --force
 ## Baseline (Placebo)
 
 The "Human with tools" baseline uses a naive **nearest-neighbor heuristic**:
+
 - O(n²) time complexity
 - No optimizations (2-opt, etc.)
 - Provides a reasonable approximation
@@ -81,6 +87,7 @@ LLMs are expected to match or beat this baseline.
 ## Expected Approaches
 
 Successful solvers typically implement:
+
 - **Nearest Neighbor**: O(n²), simple greedy
 - **2-opt**: Local search improvement
 - **Christofides**: Near-optimal for metric TSP
