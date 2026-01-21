@@ -803,7 +803,7 @@ class RustCompiler(NativeCompiler):
     exe_path = self._get_cached_exe_path(source_hash)
 
     # Create temp source file
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.rs', delete=False) as f:
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.rs', delete=False, encoding='utf-8') as f:
       f.write(source_code)
       src_path = f.name
 
@@ -1020,7 +1020,7 @@ class CSharpCompiler(NativeCompiler):
     try:
       # Write source file
       src_path = project_dir / "Program.cs"
-      with open(src_path, 'w') as f:
+      with open(src_path, 'w', encoding='utf-8') as f:
         f.write(source_code)
 
       # Write minimal csproj
@@ -1033,7 +1033,7 @@ class CSharpCompiler(NativeCompiler):
   </PropertyGroup>
 </Project>"""
       csproj_path = project_dir / "Program.csproj"
-      with open(csproj_path, 'w') as f:
+      with open(csproj_path, 'w', encoding='utf-8') as f:
         f.write(csproj_content)
 
       # Build

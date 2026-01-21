@@ -1,6 +1,11 @@
-# TSP Benchmark
+# Ash's LLM Coding Benchmark
 
-A programming benchmark that tests LLM capabilities in algorithm design and optimization using the classic Travelling Salesman Problem.
+A programming benchmark that tests LLM capabilities in algorithm design and optimization. Everything from:
+
+- "Write a C# algorithm to plan an asteroid intercept." to
+- "Write a Python solver for travelling salesman."
+- "Write a Rust application to find errors in geology data"
+- "Write a C++ application that can bisect a 1gb graph"
 
 Still a work in progress. See a test run at <https://ashleyharris-maptek-com-au.github.io/CodingBenchmark/results/gpt-5-mini.html>
 
