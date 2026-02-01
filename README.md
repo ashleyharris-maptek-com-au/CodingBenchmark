@@ -102,3 +102,8 @@ Successful solvers typically implement:
 ## License
 
 MIT License - see LLMBenchCore/LICENSE for details.
+
+## Additional ideas
+
+- Inspect code with backdoors such as reverse shells or buffer overflows.
+- Give it a NP hard problem, a test harness that tries to solve it and times out, and ability to edit the file. And see if it edits the test framework to cheat.
