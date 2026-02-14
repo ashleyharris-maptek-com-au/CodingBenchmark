@@ -1,12 +1,14 @@
 import math
 import random
-import subprocess
 import sys
-import tempfile
 import os
 import time
+from pathlib import Path
 
-title = "Travelling Salesman Problem Solver"
+from native_compiler import CppCompiler, compile_and_run, describe_this_pc
+from solver_utils import StreamingInputFile
+
+title = "Travelling Salesman Problem Solver (C++)"
 
 # Seed for reproducible city generation
 RANDOM_SEED = 42
@@ -46,9 +48,9 @@ def prepareSubpassPrompt(subPass: int) -> str:
   if subPass != 0:
     raise StopIteration
 
-  return f"""You are solving the Travelling Salesman Problem (TSP).
+  return f"""You are solving the Travelling Salesman Problem (TSP) in C++.
 
-You must write a Python solver that can handle ANY number of cities from trivial to ludicrous scale:
+You must write a C++ solver that can handle ANY number of cities from trivial to ludicrous scale:
 - **Trivial**: 10-40 cities (brute-force feasible for smallest cases)
 - **Medium**: 100-1000 cities (requires heuristics)
 - **Large**: 5000-100000 cities (requires efficient heuristics)
@@ -56,28 +58,33 @@ You must write a Python solver that can handle ANY number of cities from trivial
 - **Epic**: 10000000+ cities (requires highly optimized approximations)
 
 **The Challenge:**
-Your `solve_tsp(cities)` function will be tested with city counts ranging from 10 to 10000000. The same function must work efficiently across ALL scales.
+Your program will be tested with city counts ranging from 10 to 10000000. The same algorithm must work efficiently across ALL scales.
 
-**Input:**
-- `cities`: List of (x, y) tuples representing city coordinates in 2D space [0, 1000]
-- The cost between cities is Euclidean distance
+**Input format (stdin):**
+Line 1: N (number of cities)
+Lines 2..N+1: x y coordinates (floats)
 
-**Output:**
-- List of city indices representing the route (starting at city 0, visiting all cities exactly once)
-- The return list should NOT include returning to city 0 (that's implicit)
+**Output format (stdout):**
+One line with N integers: the visit order of city indices (0-indexed), starting at city 0.
+Do NOT include returning to city 0 (return is implicit).
 
 **Critical Requirements:**
 1. **Scalability**: Your algorithm must adapt based on problem size
-2. **Performance**: Must complete within 30 seconds even for 500,000 cities
+2. **Performance**: Must complete within 300 seconds even for 1000,000,000 cities
 3. **Quality**: Should produce reasonable routes at all scales
+4. **Correctness**: Output must be a valid permutation of 0..N-1 starting with 0
 
-**Constraints:**
-- Use only Python standard library (math, itertools, heapq, random, etc.)
-- Must handle edge cases (empty list, single city)
-- Route must be valid (visits each city exactly once)
+**Environment:**
+{describe_this_pc()}
 
-Write complete, runnable Python code with the solve_tsp(cities) function.
-Include adaptive logic that chooses different strategies based on the number of cities.
+**C++ Compiler:**
+{CppCompiler("test_engine").describe()}
+
+Be sure that any deviation from the C++ standard library is supported by the given compiler,
+as referencing the wrong intrinsics or non-standard header like 'bits/stdc++.h' could fail your submission.
+
+Write complete, compilable C++ code with a main() function that reads stdin and writes stdout.
+Include adaptive logic that chooses different strategies based on N.
 """
 
 
@@ -91,12 +98,12 @@ structure = {
       "type": "string",
       "description": "Explain your approach and how it adapts to different problem sizes"
     },
-    "python_code": {
+    "cpp_code": {
       "type": "string",
-      "description": "Complete Python code with solve_tsp(cities) function that handles all scales"
+      "description": "Complete C++ code with main() that handles all scales"
     }
   },
-  "required": ["reasoning", "python_code"],
+  "required": ["reasoning", "cpp_code"],
   "additionalProperties": False
 }
 
@@ -291,16 +298,58 @@ def get_baseline_distance(cities: list) -> float:
   return estimated_length
 
 
-def execute_solver(code: str, cities: list, timeout: int = TIMEOUT_SECONDS) -> tuple:
-  """
-    Execute the LLM's solver code safely in a subprocess.
-    Returns (route, error_message, execution_time).
-    """
-  from solver_utils import execute_solver_with_data
+STREAMING_THRESHOLD_CITIES = 100_000
+_INPUT_FILE_CACHE = {}
 
-  # Use the common utility with debugger isolation
-  data_dict = {'cities': cities}
-  return execute_solver_with_data(code, data_dict, 'solve_tsp', timeout)
+
+def format_input(cities: list) -> str:
+  lines = [str(len(cities))]
+  for x, y in cities:
+    lines.append(f"{x:.6f} {y:.6f}")
+  return "\n".join(lines)
+
+
+def _should_use_streaming(subpass: int) -> bool:
+  return CITY_COUNTS[subpass] > STREAMING_THRESHOLD_CITIES
+
+
+def _get_streaming_input(subpass: int) -> StreamingInputFile:
+  if subpass in _INPUT_FILE_CACHE:
+    return _INPUT_FILE_CACHE[subpass]
+
+  n = CITY_COUNTS[subpass]
+  cache_key = f"tsp1|n={n}|seed={RANDOM_SEED + n}"
+
+  def generator():
+    rng = random.Random(RANDOM_SEED + n)
+    yield f"{n}\n"
+    for _ in range(n):
+      x = rng.uniform(0, 1000)
+      y = rng.uniform(0, 1000)
+      yield f"{x:.6f} {y:.6f}\n"
+
+  input_file = StreamingInputFile(cache_key, generator, "test1_tsp")
+  _INPUT_FILE_CACHE[subpass] = input_file
+  return input_file
+
+
+def parse_route_output(output: str, expected_n: int) -> tuple:
+  tokens = output.strip().split()
+  if not tokens:
+    return None, "Empty output"
+
+  try:
+    values = [int(t) for t in tokens]
+  except ValueError:
+    return None, "Output contains non-integer tokens"
+
+  if len(values) == expected_n + 1 and values[0] == expected_n:
+    values = values[1:]
+
+  if len(values) != expected_n:
+    return None, f"Expected {expected_n} indices, got {len(values)}"
+
+  return values, ""
 
 
 lastRoute = None
@@ -320,8 +369,8 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
   if not result:
     return 0.0, "No result provided"
 
-  if "python_code" not in result:
-    return 0.0, "No Python code provided"
+  if "cpp_code" not in result:
+    return 0.0, "No C++ code provided"
 
   global CITIES_CACHE
   global lastRoute
@@ -331,14 +380,29 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
     CITIES_CACHE[subPass] = generate_cities(n)
 
   cities = CITIES_CACHE[subPass]
-  code = result["python_code"]
+  code = result["cpp_code"]
 
-  # Execute the solver
-  route, error, exec_time = execute_solver(code, cities)
+  if _should_use_streaming(subPass):
+    streaming_input = _get_streaming_input(subPass)
+    input_file_path = streaming_input.generate()
+    run = compile_and_run(code,
+                          "cpp",
+                          aiEngineName,
+                          input_file=input_file_path,
+                          timeout=TIMEOUT_SECONDS)
+  else:
+    input_data = format_input(cities)
+    run = compile_and_run(code, "cpp", aiEngineName, input_data=input_data, timeout=TIMEOUT_SECONDS)
 
-  if error:
-    lastRoute = error
-    return 0.0, f"[{n} cities] {error}"
+  if not run:
+    lastRoute = run.error_message()
+    return 0.0, f"[{n} cities] {run.error_message()}"
+
+  route, parse_error = parse_route_output(run.stdout, n)
+  exec_time = run.exec_time
+  if parse_error:
+    lastRoute = parse_error
+    return 0.0, f"[{n} cities] {parse_error}"
 
   # Validate the route
   is_valid, validation_error = validate_route(cities, route)
@@ -391,8 +455,8 @@ def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
     if "reasoning" in result:
       html += f"<p><strong>Approach:</strong> {result['reasoning'][:500]}{'...' if len(result.get('reasoning', '')) > 500 else ''}</p>"
 
-    if "python_code" in result:
-      code = result["python_code"]
+    if "cpp_code" in result:
+      code = result["cpp_code"]
       # Escape HTML
       code_escaped = code.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
       html += f"<details><summary>View Code ({len(code)} chars)</summary><pre>{code_escaped}</pre></details>"

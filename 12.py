@@ -13,14 +13,12 @@ Solver times out after 5 minutes.
 import json
 import math
 import random
-import subprocess
-import sys
-import tempfile
-import os
 import time
 from typing import List, Tuple, Dict, Optional
 
-title = "3D Bin Packing - Polyhedra in Box"
+from native_compiler import CSharpCompiler, compile_and_run, describe_this_pc
+
+title = "3D Bin Packing - Polyhedra in Box (C#)"
 
 # Timeout in seconds (5 minutes)
 TIMEOUT_SECONDS = 30
@@ -215,49 +213,44 @@ def prepareSubpassPrompt(subPass: int) -> str:
   if subPass != 0:
     raise StopIteration
 
-  return f"""You are solving a 3D Bin Packing problem.
+  return f"""You are solving a 3D Bin Packing problem in C#.
 
-You must write a Python solver that can handle ANY problem size from trivial to ludicrous scale:
-- **Trivial**: Small containers (5x5x5), simple polyhedra (tetrahedra, cubes)
-- **Medium**: Medium containers (10x10x10-20x20x20), moderate complexity polyhedra
-- **Large**: Large containers (50x50x50-100x100x100), complex polyhedra
-- **Extreme**: Massive containers (200x200x200-500x500x500), very complex geometries
+You must write a C# solver that can handle ANY problem size from trivial to ludicrous scale:
+- **Trivial**: Small containers (5x5x5), simple polyhedra
+- **Medium**: Medium containers (10x10x10-20x20x20)
+- **Large**: Large containers (50x50x50-100x100x100)
+- **Extreme**: Massive containers (200x200x200-500x500x500)
 
-**The Challenge:**
-Your `pack_polyhedra(polyhedron, container_size)` function will be tested with containers 
-ranging from 5x5x5 to 500x500x500 and various polyhedron complexities. The same function must 
-adapt its strategy based on the problem scale and work efficiently across ALL scales.
+**Input format (stdin):**
+Line 1: V F (vertex/face count of the polyhedron)
+Next V lines: x y z (polyhedron vertices)
+Next F lines: a b c (polyhedron face indices)
+Last line: W H D (container width, height, depth)
+Container origin at (0,0,0), extends to (W,H,D).
 
-**Input:**
-- `polyhedron`: Dict with "vertices" (list of [x, y, z]) and "faces" (list of triangles)
-- `container_size`: Tuple (width, height, depth) of axis-aligned bounding box
-- Container origin at (0, 0, 0), extends to (width, height, depth)
+**Output format (stdout):**
+Line 1: count (number of polyhedra packed)
+Next count lines: tx ty tz qw qx qy qz
+  tx,ty,tz: translation
+  qw,qx,qy,qz: rotation quaternion (w is scalar part)
 
-**Output:**
-- Dict with:
-  - `"count"`: Number of polyhedra packed
-  - `"placements"`: List of placement dicts:
-    - `"translation"`: [x, y, z] - position offset
-    - `"quaternion"`: [w, x, y, z] - rotation quaternion (w is scalar part)
+**Quaternion Rotation Reference:**
+- Identity (no rotation): 1 0 0 0
+- 90° around Z: 0.707 0 0 0.707
+- To rotate a point: p' = q * p * q^(-1)
 
 **Critical Requirements:**
 1. **Scalability**: Your algorithm must adapt based on container size and polyhedron complexity
 2. **Performance**: Must complete within 5 minutes even for massive containers
 3. **Quality**: Maximize packing count while ensuring valid placements
 
-**Quaternion Rotation Reference:**
-- Identity (no rotation): [1, 0, 0, 0]
-- 90° around Z: [0.707, 0, 0, 0.707]
-- 180° around Z: [0, 0, 0, 1]
-- To rotate a point: p' = q * p * q^(-1)
+**Environment:**
+{describe_this_pc()}
 
-**Constraints:**
-- Libraries allowed: any python standard library + numpy, scipy
-- All polyhedra must be entirely within the container bounds
-- No two polyhedra may intersect/overlap
-- Must handle varying container sizes and polyhedron complexities
+**C# Compiler:**
+{CSharpCompiler("test_engine").describe()}
 
-Write complete, runnable Python code with the pack_polyhedra function.
+Write complete, compilable C# code with a static void Main method.
 Include adaptive logic that chooses different strategies based on problem scale.
 """
 
@@ -274,14 +267,12 @@ structure = {
       "description":
       "Explain your 3D packing algorithm and how it adapts to different container sizes and polyhedron complexities"
     },
-    "python_code": {
-      "type":
-      "string",
-      "description":
-      "Complete Python code with pack_polyhedra(polyhedron, container_size) function that handles all scales"
+    "csharp_code": {
+      "type": "string",
+      "description": "Complete C# code with Main method that handles all scales"
     }
   },
-  "required": ["reasoning", "python_code"],
+  "required": ["reasoning", "csharp_code"],
   "additionalProperties": False
 }
 
@@ -448,57 +439,91 @@ def get_baseline_count(poly: Dict, container: Tuple) -> int:
   return max(1, count)
 
 
+def get_smart_baseline_count(poly: Dict, container: Tuple) -> int:
+  """Grid placement trying all 6 axis-aligned orientation permutations of the AABB.
+  Returns the best count achievable by simple grid with rotation."""
+  dims = mesh_dimensions(poly)
+  dx, dy, dz = dims
+  gap = 0.1
+  best = 0
+  for sx, sy, sz in [(dx, dy, dz), (dx, dz, dy), (dy, dx, dz), (dy, dz, dx), (dz, dx, dy),
+                     (dz, dy, dx)]:
+    if sx < 0.001 or sy < 0.001 or sz < 0.001:
+      continue
+    nx = int(container[0] / (sx + gap))
+    ny = int(container[1] / (sy + gap))
+    nz = int(container[2] / (sz + gap))
+    best = max(best, nx * ny * nz)
+  return max(1, best)
+
+
+def format_input(poly: Dict, container: Tuple) -> str:
+  verts = poly["vertices"]
+  faces = poly["faces"]
+  lines = [f"{len(verts)} {len(faces)}"]
+  for v in verts:
+    lines.append(f"{v[0]:.6f} {v[1]:.6f} {v[2]:.6f}")
+  for f in faces:
+    lines.append(f"{f[0]} {f[1]} {f[2]}")
+  lines.append(f"{container[0]} {container[1]} {container[2]}")
+  return "\n".join(lines)
+
+
+def parse_packing_output(output: str) -> tuple:
+  text = output.strip()
+  if not text:
+    return None, "Empty output"
+
+  lines = [l for l in text.splitlines() if l.strip()]
+  if not lines:
+    return None, "No output lines"
+
+  try:
+    count = int(lines[0])
+  except ValueError:
+    return None, "First line must be count integer"
+
+  if count == 0:
+    return {'count': 0, 'placements': []}, None
+
+  if len(lines) < 1 + count:
+    return None, f"Expected {count} placement lines, got {len(lines) - 1}"
+
+  placements = []
+  for i in range(1, 1 + count):
+    parts = lines[i].split()
+    if len(parts) < 7:
+      return None, f"Placement line {i} needs 7 values (tx ty tz qw qx qy qz)"
+    try:
+      tx, ty, tz = float(parts[0]), float(parts[1]), float(parts[2])
+      qw, qx, qy, qz = float(parts[3]), float(parts[4]), float(parts[5]), float(parts[6])
+    except ValueError:
+      return None, f"Invalid values in placement line {i}"
+    placements.append({
+      'translation': [tx, ty, tz],
+      'quaternion': [qw, qx, qy, qz],
+    })
+
+  return {'count': count, 'placements': placements}, None
+
+
 def execute_solver(code: str,
                    poly: Dict,
                    container: Tuple,
+                   ai_engine_name: str,
                    timeout: int = TIMEOUT_SECONDS) -> tuple:
   """Execute the LLM's solver."""
-  from solver_utils import execute_solver_with_data
+  input_data = format_input(poly, container)
+  run = compile_and_run(code, "csharp", ai_engine_name, input_data=input_data, timeout=timeout)
 
-  data_dict = {
-    'polyhedron': poly,
-    'container_size': container,
-  }
+  if not run:
+    return None, run.error_message(), run.exec_time
 
-  result, error, exec_time = execute_solver_with_data(code, data_dict, 'pack_polyhedra', timeout)
+  solution, parse_error = parse_packing_output(run.stdout)
+  if parse_error:
+    return None, parse_error, run.exec_time
 
-  if error:
-    return None, error, exec_time
-
-  if not isinstance(result, dict):
-    return None, f"Invalid result type: expected dict, got {type(result).__name__}", exec_time
-
-  # Normalize output to match expected schema
-  try:
-    placements = result.get('placements')
-    if not isinstance(placements, list):
-      return None, "Invalid result: missing or non-list 'placements'", exec_time
-
-    normalized_placements = []
-    for p in placements:
-      if not isinstance(p, dict):
-        continue
-      translation = p.get('translation', [0, 0, 0])
-      quaternion = p.get('quaternion', [1, 0, 0, 0])
-      normalized_placements.append({
-        'translation': [float(translation[0]),
-                        float(translation[1]),
-                        float(translation[2])],
-        'quaternion':
-        [float(quaternion[0]),
-         float(quaternion[1]),
-         float(quaternion[2]),
-         float(quaternion[3])],
-      })
-
-    out = {
-      'count': int(result.get('count', len(normalized_placements))),
-      'placements': normalized_placements,
-    }
-  except Exception as e:
-    return None, f"Invalid result format: {e}", exec_time
-
-  return out, None, exec_time
+  return solution, None, run.exec_time
 
 
 def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
@@ -506,17 +531,17 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
   if not result:
     return 0.0, "No result provided"
 
-  if "python_code" not in result:
-    return 0.0, "No Python code provided"
+  if "csharp_code" not in result:
+    return 0.0, "No C# code provided"
 
   case = TEST_CASES[subPass]
   poly = case["polyhedron"]
   container = case["container"]
   description = case["description"]
-  code = result["python_code"]
+  code = result["csharp_code"]
 
   # Execute solver
-  solution, error, exec_time = execute_solver(code, poly, container)
+  solution, error, exec_time = execute_solver(code, poly, container, aiEngineName)
 
   global lastSolution
   global lastCase
@@ -566,9 +591,26 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
     score = 0.0
     quality = "no valid placements"
 
+  # ── Repack penalty ──
+  # For 3D single-container maximization, the analog of "repack worst 5 boards"
+  # is checking if a rotation-aware grid trivially beats the solution.
+  # If the smart baseline (trying all 6 AABB orientations) packs ≥2x more,
+  # the solution missed obvious improvements.
+  penalty_note = ""
+  smart_baseline = get_smart_baseline_count(poly, container)
+  if smart_baseline > baseline_count and valid_count > 0:
+    if valid_count * 2 <= smart_baseline:
+      score = 0.0
+      penalty_note = f" REPACK PENALTY: smart grid={smart_baseline} vs packed={valid_count} (≥2x gap) → 0"
+    elif valid_count * 1.5 <= smart_baseline:
+      score = min(score, 0.5)
+      penalty_note = f" REPACK PENALTY: smart grid={smart_baseline} vs packed={valid_count} (≥1.5x gap) → capped 0.5"
+    else:
+      penalty_note = f" (smart grid={smart_baseline}, no penalty)"
+
   msg = validation_error if validation_error else ""
   explanation = (f"[{description}] Packed: {valid_count}, Baseline: {baseline_count}, "
-                 f"Time: {exec_time:.1f}s - {quality} {msg}")
+                 f"Time: {exec_time:.1f}s - {quality} {msg}.{penalty_note}")
 
   return score, explanation
 
@@ -592,8 +634,8 @@ def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
                                                if len(result.get('reasoning', '')) > 500 else '')
       html += f"<p><strong>Algorithm:</strong> {reasoning}</p>"
 
-    if "python_code" in result:
-      code = result["python_code"]
+    if "csharp_code" in result:
+      code = result["csharp_code"]
       code_escaped = code.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
       html += f"<details><summary>View Code ({len(code)} chars)</summary><pre>{code_escaped}</pre></details>"
 

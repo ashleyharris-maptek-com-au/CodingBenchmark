@@ -16,14 +16,13 @@ Solver times out after 5 minutes.
 """
 
 import random
-import subprocess
-import sys
-import tempfile
-import os
 import time
 from typing import List, Tuple, Set
 
-title = "Minesweeper Solver"
+from native_compiler import CSharpCompiler, compile_and_run, describe_this_pc
+from solver_utils import StreamingInputFile
+
+title = "Minesweeper Solver (C#)"
 
 # Timeout in seconds (5 minutes)
 TIMEOUT_SECONDS = 30
@@ -179,45 +178,42 @@ def prepareSubpassPrompt(subPass: int) -> str:
   if subPass != 0:
     raise StopIteration
 
-  return f"""You are writing a Minesweeper solver that must handle ANY board complexity from trivial 
-  to ludicrous scale:
+  return f"""You are writing a Minesweeper solver in C# that must handle ANY board complexity from trivial to ludicrous scale.
 
 - **Trivial**: Small boards (5x5-8x8), simple patterns, few mines
-- **Extreme**: Massive boards (50x50-100x100), very complex constraint satisfaction problems
+- **Extreme**: Massive boards (10000x10000), very complex constraint satisfaction problems
 
-**The Challenge:**
-Your `solve_minesweeper(board)` function will be tested with boards ranging from 5x5 to 100x100 with varying mine densities. The same function must work efficiently across ALL scales.
-
-**Input:**
-- `board`: 2D list of characters representing the board state
+**Input format (stdin):**
+Line 1: H W (height and width)
+Next H lines: the board row strings (each W characters)
 
 **Cell meanings:**
-- `' '` (space): Unknown/unrevealed cell - could be mine or safe
-- `'0'`-`'8'`: Revealed safe cell showing count of adjacent mines (8 neighbors)
-- `'*'`: Flagged mine (known mine location)
+- ' ' (space): Unknown/unrevealed cell - could be mine or safe
+- '0'-'8': Revealed safe cell showing count of adjacent mines (8 neighbors)
+- '*': Flagged mine (known mine location)
 
-**Output:**
-- List of (x, y) coordinates of cells **guaranteed** to be safe
-- x is column (0 = leftmost), y is row (0 = topmost)
-- Only return cells that are currently unknown (' ') and provably safe
-- Do NOT guess - only return cells you can prove are safe
+**Output format (stdout):**
+Line 1: N (number of safe cells found)
+Next N lines: x y (column row, 0-indexed)
+Only output cells that are currently unknown (' ') and provably safe.
+Do NOT guess - only return cells you can prove are safe.
 
 **Example:**
-```
-  012
-0 1*
-1 11
-2   
-```
-Cell (0,0) shows '1' and has one adjacent mine at (1,0). So (0,1) and (0,2) are guaranteed safe.
+For a board where cell (0,0) shows '1' and has one adjacent mine at (1,0):
+Neighbors (0,1) and (0,2) are guaranteed safe.
 
 **Constraints:**
-- Use only Python standard library or numpy
 - Return as many provably safe cells as possible
 - Never return a cell that could be a mine
 - Must handle varying board sizes and mine densities efficiently
 
-Write complete, runnable Python code with the solve_minesweeper function.
+**Environment:**
+{describe_this_pc()}
+
+**C# Compiler:**
+{CSharpCompiler("test_engine").describe()}
+
+Write complete, compilable C# code with a static void Main method.
 Include adaptive logic that chooses different strategies based on board complexity.
 """
 
@@ -234,14 +230,12 @@ structure = {
       "description":
       "Explain your Minesweeper solving algorithm and how it adapts to different board complexities"
     },
-    "python_code": {
-      "type":
-      "string",
-      "description":
-      "Complete Python code with solve_minesweeper(board) function that handles all scales"
+    "csharp_code": {
+      "type": "string",
+      "description": "Complete C# code with Main method that handles all scales"
     }
   },
-  "required": ["reasoning", "python_code"],
+  "required": ["reasoning", "csharp_code"],
   "additionalProperties": False
 }
 
@@ -341,35 +335,195 @@ def get_baseline_safe_cells(board: List[List[str]]) -> Set[Tuple[int, int]]:
   return safe
 
 
-def execute_solver(code: str, board: List[List[str]], timeout: int = TIMEOUT_SECONDS) -> tuple:
-  """Execute the LLM's solver."""
-  from solver_utils import execute_solver_with_data
+STREAMING_THRESHOLD_CELLS = 500_000
+_INPUT_FILE_CACHE = {}
 
-  data_dict = {
-    'board': board,
-  }
 
-  result, error, exec_time = execute_solver_with_data(code, data_dict, 'solve_minesweeper', timeout)
+def format_input(board: List[List[str]]) -> str:
+  height = len(board)
+  width = len(board[0]) if board else 0
+  lines = [f"{height} {width}"]
+  for row in board:
+    lines.append("".join(row))
+  return "\n".join(lines)
 
-  if error:
-    return None, error, exec_time
 
-  moves = None
-  if isinstance(result, dict):
-    moves = result.get('moves', [])
-  else:
-    moves = result
+def _get_streaming_input(subpass: int, board: List[List[str]]) -> StreamingInputFile:
+  if subpass in _INPUT_FILE_CACHE:
+    return _INPUT_FILE_CACHE[subpass]
 
-  if not isinstance(moves, list):
-    return None, f"Invalid output: expected list, got {type(moves).__name__}", exec_time
+  height = len(board)
+  width = len(board[0]) if board else 0
+  cache_key = f"mine14|h={height}|w={width}|seed={RANDOM_SEED + subpass}"
+
+  def generator():
+    yield f"{height} {width}\n"
+    for row in board:
+      yield "".join(row) + "\n"
+
+  input_file = StreamingInputFile(cache_key, generator, "test14_mine")
+  _INPUT_FILE_CACHE[subpass] = input_file
+  return input_file
+
+
+def parse_moves_output(output: str) -> tuple:
+  text = output.strip()
+  if not text:
+    return [], None
+
+  lines = [l for l in text.splitlines() if l.strip()]
+  if not lines:
+    return [], None
 
   try:
-    return [(int(m[0]), int(m[1])) for m in moves], None, exec_time
-  except Exception as e:
-    return None, f"Invalid move format: {e}", exec_time
+    n = int(lines[0])
+  except ValueError:
+    return None, "First line must be count of safe cells"
+
+  if n == 0:
+    return [], None
+
+  if len(lines) < 1 + n:
+    return None, f"Expected {n} coordinate lines, got {len(lines) - 1}"
+
+  moves = []
+  for i in range(1, 1 + n):
+    parts = lines[i].split()
+    if len(parts) < 2:
+      return None, f"Invalid coordinate line {i}"
+    try:
+      x, y = int(parts[0]), int(parts[1])
+      moves.append((x, y))
+    except ValueError:
+      return None, f"Non-integer coordinate at line {i}"
+
+  return moves, None
+
+
+def execute_solver(code: str,
+                   board: List[List[str]],
+                   subpass: int,
+                   ai_engine_name: str,
+                   timeout: int = TIMEOUT_SECONDS) -> tuple:
+  """Execute the LLM's solver."""
+  height = len(board)
+  width = len(board[0]) if board else 0
+  total_cells = height * width
+
+  if total_cells > STREAMING_THRESHOLD_CELLS:
+    streaming_input = _get_streaming_input(subpass, board)
+    input_file_path = streaming_input.generate()
+    run = compile_and_run(code,
+                          "csharp",
+                          ai_engine_name,
+                          input_file=input_file_path,
+                          timeout=timeout)
+  else:
+    input_data = format_input(board)
+    run = compile_and_run(code, "csharp", ai_engine_name, input_data=input_data, timeout=timeout)
+
+  if not run:
+    return None, run.error_message(), run.exec_time
+
+  moves, parse_error = parse_moves_output(run.stdout)
+  if parse_error:
+    return None, parse_error, run.exec_time
+
+  return moves, None, run.exec_time
 
 
 lastGame = None
+
+
+def _render_minesweeper_grid_html(board: List[List[str]], moves: List[Tuple[int, int]]) -> str:
+  height = len(board)
+  width = len(board[0]) if height else 0
+  total = height * width
+
+  if total == 0:
+    return "<p>(empty board)</p>"
+
+  max_cells_full = 10_000
+  if total <= max_cells_full:
+    view_x0, view_y0, view_w, view_h = 0, 0, width, height
+  else:
+    win = 60
+    if moves:
+      mx, my = moves[0]
+      cx = max(0, min(width - 1, int(mx)))
+      cy = max(0, min(height - 1, int(my)))
+    else:
+      cx, cy = width // 2, height // 2
+    view_x0 = max(0, min(width - win, cx - win // 2))
+    view_y0 = max(0, min(height - win, cy - win // 2))
+    view_w = min(win, width)
+    view_h = min(win, height)
+
+  move_set = set()
+  for x, y in moves:
+    if 0 <= x < width and 0 <= y < height:
+      move_set.add((int(x), int(y)))
+
+  cell_px = 14
+  grid_style = (f"display:grid;grid-template-columns:repeat({view_w},{cell_px}px);"
+                f"grid-auto-rows:{cell_px}px;gap:1px;background:#cfcfcf;"
+                "border:1px solid #cfcfcf;overflow:auto;max-height:700px;max-width:100%;")
+  cell_base = (
+    f"width:{cell_px}px;height:{cell_px}px;display:flex;align-items:center;justify-content:center;"
+    "font:700 11px/1 monospace;user-select:none;")
+
+  num_colors = {
+    '0': '#777',
+    '1': '#1976d2',
+    '2': '#2e7d32',
+    '3': '#d32f2f',
+    '4': '#512da8',
+    '5': '#6d4c41',
+    '6': '#00838f',
+    '7': '#424242',
+    '8': '#000000',
+  }
+
+  cells = []
+  for y in range(view_y0, view_y0 + view_h):
+    row = board[y]
+    for x in range(view_x0, view_x0 + view_w):
+      c = row[x]
+      if c == ' ':
+        bg = '#e0e0e0'
+        fg = '#333'
+        text = ''
+      elif c == '*':
+        bg = '#f5f5f5'
+        fg = '#111'
+        text = '*'
+      else:
+        bg = '#ffffff'
+        fg = num_colors.get(c, '#111')
+        text = c
+
+      if (x, y) in move_set:
+        bg = '#c8e6c9'
+
+      title = f"({x},{y}) '{c if c != ' ' else ' '}'"
+      style = cell_base + f"background:{bg};color:{fg};"
+      cells.append(f"<div title=\"{title}\" style=\"{style}\">{text}</div>")
+
+  view_note = ""
+  if total > max_cells_full:
+    view_note = (f"<div style='margin:8px 0;color:#666;font-size:12px;'>"
+                 f"Showing {view_w}x{view_h} window at x=[{view_x0},{view_x0+view_w-1}], "
+                 f"y=[{view_y0},{view_y0+view_h-1}] (board is {width}x{height})."
+                 f"</div>")
+
+  legend = ("<div style='margin:8px 0;color:#666;font-size:12px;'>"
+            "Legend: unknown=grey, revealed=white, flagged='*', returned-safe=green."
+            "</div>")
+
+  return (
+    "<div style='margin: 12px 0; padding: 10px; border: 1px solid #ddd; border-radius: 4px; background: white;'>"
+    "<h5 style='margin:0 0 8px 0;color:#333;'>Board Visualization</h5>" + legend + view_note +
+    f"<div style=\"{grid_style}\">" + "".join(cells) + "</div>" + "</div>")
 
 
 def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
@@ -380,17 +534,17 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
   if not result:
     return 0.0, "No result provided"
 
-  if "python_code" not in result:
-    return 0.0, "No Python code provided"
+  if "csharp_code" not in result:
+    return 0.0, "No C# code provided"
 
   case = TEST_CASES[subPass]
   board = case["board"]()
   safe_cells = case["safe_cells"]()
   description = case["description"]
-  code = result["python_code"]
+  code = result["csharp_code"]
 
   # Execute solver
-  moves, error, exec_time = execute_solver(code, board)
+  moves, error, exec_time = execute_solver(code, board, subPass, aiEngineName)
 
   if error:
     return 0.0, f"[{description}] {error}"
@@ -456,17 +610,14 @@ def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
                                                if len(result.get('reasoning', '')) > 500 else '')
       html += f"<p><strong>Algorithm:</strong> {reasoning}</p>"
 
-    if "python_code" in result:
-      code = result["python_code"]
+    if "csharp_code" in result:
+      code = result["csharp_code"]
       code_escaped = code.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
       html += f"<details><summary>View Code ({len(code)} chars)</summary><pre>{code_escaped}</pre></details>"
 
   if lastGame:
     (board, moves, correct, incorrect) = lastGame
-    if len(board) < 1000:
-      html += "<p>Table map of the game board goes here.</p>"
-    else:
-      html += "<p>Board too large to display.</p>"
+    html += _render_minesweeper_grid_html(board, moves)
 
     html += f"<p>Moves: {len(moves)}, Correct: {correct}, Incorrect: {incorrect}</p>"
 

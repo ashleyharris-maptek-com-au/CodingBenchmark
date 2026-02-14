@@ -13,17 +13,16 @@ Solver times out after 5 minutes.
 
 import math
 import random
-import subprocess
-import sys
-import tempfile
-import os
 import time
 from typing import List, Tuple, Set, Optional, Dict
+
+from native_compiler import CppCompiler, compile_and_run, describe_this_pc
+from solver_utils import StreamingInputFile
 
 # Import visualization utilities
 from visualization_utils import generate_threejs_tetrahedron_visualization
 
-title = "Regular Tetrahedron Packing in Polyhedra"
+title = "Regular Tetrahedron Packing in Polyhedra (C++)"
 
 # Seed for reproducibility
 RANDOM_SEED = 99999
@@ -115,54 +114,38 @@ def prepareSubpassPrompt(subPass: int) -> str:
   if subPass != 0:
     raise StopIteration
 
-  return f"""You are solving a 3D Packing problem: Pack regular tetrahedrons into polyhedra.
+  return f"""You are solving a 3D Packing problem: Pack regular tetrahedrons into polyhedra (C++).
 
-You must write a Python solver that can handle ANY container size from trivial to ludicrous scale.
+You must write a C++ solver that can handle ANY container size from trivial to ludicrous scale.
 
-Your `pack_tetrahedrons(container_vertices, edge_length)` function will be tested with containers 
-ranging from small boxes to massive 500-unit cubes. The same function must work efficiently across ALL scales.
+**Input format (stdin):**
+Line 1: V edge_length
+Lines 2..V+1: x y z (container vertices)
 
-**Input:**
-- `container_vertices`: List of (x, y, z) tuples defining a convex polyhedron
-- `edge_length`: Fixed edge length for all regular tetrahedrons
-
-**Output:**
-- List of tetrahedron placements
-- Each placement is a dict with:
-  - `"center"`: (x, y, z) tuple - center of the tetrahedron
-  - `"rotation"`: (rx, ry, rz) tuple - Euler angles in radians
+**Output format (stdout):**
+Line 1: K (number of tetrahedrons placed)
+Lines 2..K+1: cx cy cz rx ry rz (center + Euler angles in radians)
 
 **Critical Requirements:**
 1. **Scalability**: Your algorithm must adapt based on container volume and complexity
 2. **Performance**: Must complete within 30 seconds even for massive containers
 3. **Quality**: Maximize number of tetrahedrons while ensuring no overlaps
 
-**Algorithm Strategy Recommendations:**
-- **Small containers**: Can use precise geometric algorithms, dense packing
-- **Medium containers**: Grid-based placement, local optimization
-- **Large containers**: Coarse grid placement, simple heuristics
-- **Very Large containers**: Very coarse placement, possibly stochastic methods
-
-**Key Geometry (regular tetrahedron, edge length e={TETRA_EDGE}):**
+**Key Geometry (edge length e={TETRA_EDGE}):**
 - Height: h = e * sqrt(2/3) ≈ {TETRA_EDGE * math.sqrt(2/3):.4f}
 - Circumradius: R = e * sqrt(3/8) ≈ {TETRA_EDGE * math.sqrt(3/8):.4f}
 - Inradius: r = e / sqrt(24) ≈ {TETRA_EDGE / math.sqrt(24):.4f}
 
-**Implementation Hints:**
-- Detect container volume and choose appropriate algorithm
-- Use efficient collision detection for large numbers of tetrahedrons
-- Consider using spatial partitioning (grid/octree) for large problems
-- Implement adaptive quality vs speed tradeoffs
-- For very large containers, consider simplified placement strategies
+**Environment:**
+{describe_this_pc()}
 
-**Constraints:**
-- Use only Python standard library
-- Each tetrahedron must be entirely inside the container
-- Tetrahedrons must not overlap each other
-- Maximize the number of tetrahedrons packed
+**C++ Compiler:**
+{CppCompiler("test_engine").describe()}
 
-Write complete, runnable Python code with the pack_tetrahedrons function.
-Include adaptive logic that chooses different strategies based on container size.
+Be sure that any deviation from the C++ standard library is supported by the given compiler,
+as referencing the wrong intrinsics or non-standard header like 'bits/stdc++.h' could fail your submission.
+
+Write complete, compilable C++ code with a main() function.
 """
 
 
@@ -176,14 +159,12 @@ structure = {
       "type": "string",
       "description": "Explain your packing strategy and how it adapts to different container sizes"
     },
-    "python_code": {
-      "type":
-      "string",
-      "description":
-      "Complete Python code with pack_tetrahedrons(container_vertices, edge_length) function that handles all scales"
+    "cpp_code": {
+      "type": "string",
+      "description": "Complete C++ code with main() that handles all scales"
     }
   },
-  "required": ["reasoning", "python_code"],
+  "required": ["reasoning", "cpp_code"],
   "additionalProperties": False
 }
 
@@ -339,31 +320,65 @@ def get_baseline_packing(container_vertices: List[Tuple], edge: float) -> int:
   return max(1, expected_count)
 
 
+def format_input(container_vertices: List[Tuple], edge: float) -> str:
+  lines = [f"{len(container_vertices)} {edge:.6f}"]
+  for x, y, z in container_vertices:
+    lines.append(f"{x:.6f} {y:.6f} {z:.6f}")
+  return "\n".join(lines)
+
+
+def parse_placements_output(output: str) -> tuple:
+  tokens = output.strip().split()
+  if not tokens:
+    return None, "Empty output"
+
+  values = []
+  try:
+    values = [float(t) for t in tokens]
+  except ValueError:
+    return None, "Output contains non-numeric tokens"
+
+  if len(values) < 1:
+    return None, "Missing placement count"
+
+  count = int(values[0])
+  remaining = values[1:]
+
+  if count < 0:
+    return None, "Invalid placement count"
+
+  if len(remaining) < count * 6:
+    if len(values) % 6 == 0:
+      count = len(values) // 6
+      remaining = values
+    else:
+      return None, f"Expected {count * 6} placement values, got {len(remaining)}"
+
+  placements = []
+  for i in range(count):
+    idx = i * 6
+    cx, cy, cz, rx, ry, rz = remaining[idx:idx + 6]
+    placements.append({'center': (cx, cy, cz), 'rotation': (rx, ry, rz)})
+
+  return placements, ""
+
+
 def execute_solver(code: str,
                    container_vertices: List[Tuple],
                    edge: float,
                    timeout: int = TIMEOUT_SECONDS) -> tuple:
   """Execute the LLM's solver. Returns (placements, error, exec_time)."""
-  from solver_utils import execute_solver_with_data
+  input_data = format_input(container_vertices, edge)
+  run = compile_and_run(code, "cpp", "test_engine", input_data=input_data, timeout=timeout)
 
-  # Use the common utility with debugger isolation
-  data_dict = {'container_vertices': container_vertices, 'edge_length': edge}
+  if not run:
+    return None, run.error_message(), run.exec_time
 
-  # Custom result processing for tetrahedron packing
-  result, error, exec_time = execute_solver_with_data(code, data_dict, 'pack_tetrahedrons', timeout)
+  placements, parse_error = parse_placements_output(run.stdout)
+  if parse_error:
+    return None, parse_error, run.exec_time
 
-  if error:
-    return None, error, exec_time
-
-  # Convert to proper format (list of dicts with center/rotation)
-  placements = []
-  for p in result:
-    placements.append({
-      'center': tuple(p['center']),
-      'rotation': tuple(p.get('rotation', (0, 0, 0)))
-    })
-
-  return placements, None, exec_time
+  return placements, None, run.exec_time
 
 
 def validate_packing(placements: List[dict], container_vertices: List[Tuple],
@@ -411,13 +426,13 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
   if not result:
     return 0.0, "No result provided"
 
-  if "python_code" not in result:
-    return 0.0, "No Python code provided"
+  if "cpp_code" not in result:
+    return 0.0, "No C++ code provided"
 
   global lastPlacements
   name, container_vertices = CONTAINERS_CACHE[subPass]
   _, _, expected_min = CONTAINER_CONFIGS[subPass]
-  code = result["python_code"]
+  code = result["cpp_code"]
 
   # Execute solver
   placements, error, exec_time = execute_solver(code, container_vertices, TETRA_EDGE)
@@ -482,8 +497,8 @@ def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
                                                if len(result.get('reasoning', '')) > 500 else '')
       html += f"<p><strong>Strategy:</strong> {reasoning}</p>"
 
-    if "python_code" in result:
-      code = result["python_code"]
+    if "cpp_code" in result:
+      code = result["cpp_code"]
       code_escaped = code.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
       html += f"<details><summary>View Code ({len(code)} chars)</summary><pre>{code_escaped}</pre></details>"
 

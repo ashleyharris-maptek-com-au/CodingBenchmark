@@ -25,26 +25,27 @@ from placebo_data import get_placebo_response
 
 
 class TSPBenchmarkRunner(BenchmarkRunner):
-    """
+  """
     Algorithm Design and Optimization Benchmark runner.
     
     Tests whether LLMs can design and optimize algorithms for complex software engineering tasks.
     """
 
-    def get_benchmark_title(self) -> str:
-        return "Algorithm Design and Optimization Benchmark"
+  def get_benchmark_title(self) -> str:
+    return "Algorithm Design and Optimization Benchmark"
 
-    def get_benchmark_subtitle(self) -> str:
-        return "Complex Software Engineering Problems - Algorithm Optimization"
+  def get_benchmark_subtitle(self) -> str:
+    return "Complex Software Engineering Problems - Algorithm Optimization"
 
-    def get_benchmark_description(self) -> str:
-        return """<p>Can LLMs design and optimize algorithms for complex software engineering tasks?</p>
+  def get_benchmark_description(self) -> str:
+    return """<p>Can LLMs design and optimize algorithms for complex software engineering tasks?</p>
         <p>The LLM must write efficient solutions that scale well and meet performance requirements.</p>"""
 
 
 if __name__ == "__main__":
-    # Register placebo data provider for "Human with tools" baseline
-    set_placebo_data_provider(get_placebo_response)
+  # Register placebo data provider for "Human with tools" baseline
+  set_placebo_data_provider(["naive", "naive-optimised", "best-published", "random", "human"],
+                            get_placebo_response)
 
-    runner = TSPBenchmarkRunner()
-    run_benchmark_main(runner, __file__)
+  runner = TSPBenchmarkRunner()
+  run_benchmark_main(runner, __file__)

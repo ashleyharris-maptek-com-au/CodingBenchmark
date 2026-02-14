@@ -1,13 +1,13 @@
 import math
 import random
-import subprocess
-import sys
-import tempfile
-import os
 import time
 from collections import defaultdict
+from pathlib import Path
 
-title = "Graph Layout - Edge Crossing Minimization"
+from native_compiler import RustCompiler, compile_and_run, describe_this_pc
+from solver_utils import StreamingInputFile
+
+title = "Graph Layout - Edge Crossing Minimization (Rust)"
 
 # Seed for reproducible graph generation
 RANDOM_SEED = 54321
@@ -21,6 +21,7 @@ GRAPH_CONFIGS = [
   (6, "tree", True),  # Simple tree - trivially planar
   (8, "cycle_with_chords", True),  # Cycle with some chords - planar
   (10, "grid", True),  # 2x5 grid - planar
+  (30, "grid", True),  # grid - planar
   (12, "dense_planar", True),  # Dense but still planar
   (15, "k5_subdivision", False),  # K5 subdivision - not planar, but 1-planar
   (20, "random_dense", False),  # Random dense graph - likely many crossings
@@ -79,10 +80,10 @@ def generate_dense_planar(n: int, rng: random.Random) -> list:
 
   # Add nodes one by one, connecting to 3 existing nodes
   for i in range(3, n):
-    # Pick 3 connected nodes to form a face
+    # Pick 2 connected nodes to form a face
     existing = list(range(i))
     rng.shuffle(existing)
-    connected = existing[:min(3, len(existing))]
+    connected = existing[:min(2, len(existing))]
     for j in connected:
       if (i, j) not in edge_set:
         edges.append((i, j, 1))
@@ -185,38 +186,38 @@ def prepareSubpassPrompt(subPass: int) -> str:
   if subPass != 0:
     raise StopIteration
 
-  return f"""You are solving a Graph Layout problem (Edge Crossing Minimization).
+  return f"""You are solving a Graph Layout problem (Edge Crossing Minimization) in Rust.
 
-You must write a Python solver that can handle ANY graph size from trivial to ludicrous scale:
+You must write a Rust solver that can handle ANY graph size from trivial to ludicrous scale:
 - **Trivial**: 6-15 nodes, small trees and cycles (planar, 0 crossings achievable)
 - **Medium**: 20-100 nodes, dense planar and non-planar graphs
 - **Large**: 500-1000 nodes, random dense graphs (many crossings unavoidable)
 - **Extreme**: 5000-10000 nodes, very large random graphs
 
 **The Challenge:**
-Your `layout_graph(num_nodes, edges)` function will be tested with graphs ranging from 6 nodes to 10,000 nodes. The same function must work efficiently across ALL scales.
+Your program will be tested with graphs ranging from 6 nodes to 200,000 nodes. The same solver must work efficiently across ALL scales.
 
-**Input:**
-- `num_nodes`: Number of nodes in the undirected graph (labeled 0 to num_nodes-1)
-- `edges`: List of (node1, node2) tuples (unweighted edges)
+**Input format (stdin):**
+Line 1: N M (number of nodes, number of edges)
+Lines 2..M+1: u v (undirected edge endpoints, 0-indexed)
 
-**Output:**
-- List of (x, y) coordinate tuples, one per node
-- Coordinates can be any floats
-- Goal: Minimize edge crossings when edges are drawn as straight lines
+**Output format (stdout):**
+Output N lines, one per node, with: x y coordinates (floats).
+You may optionally prefix with a single integer N on the first line.
 
 **Critical Requirements:**
 1. **Scalability**: Your algorithm must adapt based on graph size and density
-2. **Performance**: Must complete within 30 seconds even for 10,000 node graphs
+2. **Performance**: Must complete within 30 seconds even for large graphs
 3. **Quality**: Should produce reasonable layouts with minimal crossings
 4. **Robustness**: Handle disconnected components, self-loops, and parallel edges gracefully
 
-**Constraints:**
-- Use only Python standard library
-- Must handle edge cases (empty graphs, single nodes)
-- Layout should be valid (coordinates for all nodes)
+**Environment:**
+{describe_this_pc()}
 
-Write complete, runnable Python code with the layout_graph(num_nodes, edges) function.
+**Rust Compiler:**
+{RustCompiler("test_engine").describe()}
+
+Write complete, compilable Rust code with a main() function.
 """
 
 
@@ -230,14 +231,12 @@ structure = {
       "type": "string",
       "description": "Explain your layout approach and how it adapts to different graph sizes"
     },
-    "python_code": {
-      "type":
-      "string",
-      "description":
-      "Complete Python code with layout_graph(num_nodes, edges) function that handles all scales"
+    "rust_code": {
+      "type": "string",
+      "description": "Complete Rust code with main() that handles all scales"
     }
   },
-  "required": ["reasoning", "python_code"],
+  "required": ["reasoning", "rust_code"],
   "additionalProperties": False
 }
 
@@ -347,34 +346,95 @@ def validate_layout(num_nodes: int, positions: list) -> tuple:
   return True, ""
 
 
-def execute_solver(code: str, num_nodes: int, edges: list, timeout: int = TIMEOUT_SECONDS) -> tuple:
+STREAMING_THRESHOLD_EDGES = 200_000
+_INPUT_FILE_CACHE = {}
+
+
+def format_input(num_nodes: int, edges: list) -> str:
+  lines = [f"{num_nodes} {len(edges)}"]
+  for a, b, *_ in edges:
+    lines.append(f"{a} {b}")
+  return "\n".join(lines)
+
+
+def _should_use_streaming(edge_count: int) -> bool:
+  return edge_count > STREAMING_THRESHOLD_EDGES
+
+
+def _get_streaming_input(subpass: int, num_nodes: int, edges: list) -> StreamingInputFile:
+  if subpass in _INPUT_FILE_CACHE:
+    return _INPUT_FILE_CACHE[subpass]
+
+  cache_key = f"layout3|n={num_nodes}|m={len(edges)}|seed={RANDOM_SEED + subpass * 1000}"
+
+  def generator():
+    yield f"{num_nodes} {len(edges)}\n"
+    for a, b, *_ in edges:
+      yield f"{a} {b}\n"
+
+  input_file = StreamingInputFile(cache_key, generator, "test3_layout")
+  _INPUT_FILE_CACHE[subpass] = input_file
+  return input_file
+
+
+def parse_positions_output(output: str, expected_n: int) -> tuple:
+  tokens = output.strip().split()
+  if not tokens:
+    return None, "Empty output"
+
+  # Optional leading count
+  if len(tokens) == expected_n * 2 + 1:
+    try:
+      count = int(tokens[0])
+      if count == expected_n:
+        tokens = tokens[1:]
+    except ValueError:
+      pass
+
+  if len(tokens) != expected_n * 2:
+    return None, f"Expected {expected_n * 2} coordinate values, got {len(tokens)}"
+
+  positions = []
+  try:
+    for i in range(expected_n):
+      x = float(tokens[i * 2])
+      y = float(tokens[i * 2 + 1])
+      positions.append((x, y))
+  except ValueError:
+    return None, "Non-numeric coordinate in output"
+
+  return positions, ""
+
+
+def execute_solver(code: str,
+                   num_nodes: int,
+                   edges: list,
+                   subpass: int,
+                   ai_engine_name: str,
+                   timeout: int = TIMEOUT_SECONDS) -> tuple:
   """Execute the LLM's solver code. Returns (positions, error, exec_time)."""
-  from solver_utils import execute_solver_with_data
-
-  edges_simple = [(a, b) for a, b, *_ in edges]
-
   # Reduce timeout for larger graphs to prevent hanging
   if num_nodes > 1000:
-    timeout = min(timeout, 10)  # Max 10 seconds for large graphs
+    timeout = min(timeout, 10)
   elif num_nodes > 100:
-    timeout = min(timeout, 20)  # Max 20 seconds for medium graphs
+    timeout = min(timeout, 20)
 
-  data_dict = {
-    'num_nodes': num_nodes,
-    'edges': edges_simple,
-  }
+  if _should_use_streaming(len(edges)):
+    streaming_input = _get_streaming_input(subpass, num_nodes, edges)
+    input_file_path = streaming_input.generate()
+    run = compile_and_run(code, "rust", ai_engine_name, input_file=input_file_path, timeout=timeout)
+  else:
+    input_data = format_input(num_nodes, edges)
+    run = compile_and_run(code, "rust", ai_engine_name, input_data=input_data, timeout=timeout)
 
-  result, error, exec_time = execute_solver_with_data(code, data_dict, 'layout_graph', timeout)
+  if not run:
+    return None, run.error_message(), run.exec_time
 
-  if error:
-    return None, error, exec_time
+  positions, parse_error = parse_positions_output(run.stdout, num_nodes)
+  if parse_error:
+    return None, parse_error, run.exec_time
 
-  if not isinstance(result, list):
-    return None, f"Invalid output: expected list, got {type(result).__name__}", exec_time
-
-  # Convert back to tuples for consistency
-  positions = [tuple(p) for p in result]
-  return positions, None, exec_time
+  return positions, None, run.exec_time
 
 
 lastPositions = None
@@ -395,8 +455,8 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
   if not result:
     return 0.0, "No result provided"
 
-  if "python_code" not in result:
-    return 0.0, "No Python code provided"
+  if "rust_code" not in result:
+    return 0.0, "No Rust code provided"
 
   if subPass not in GRAPHS_CACHE:
 
@@ -405,10 +465,10 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
 
   num_nodes, edges = GRAPHS_CACHE[subPass]
   _, graph_type, is_planar = GRAPH_CONFIGS[subPass]
-  code = result["python_code"]
+  code = result["rust_code"]
 
   # Execute solver
-  positions, error, exec_time = execute_solver(code, num_nodes, edges)
+  positions, error, exec_time = execute_solver(code, num_nodes, edges, subPass, aiEngineName)
   if error:
     return 0.0, f"[{graph_type}, {num_nodes} nodes] {error}"
 
@@ -470,8 +530,8 @@ def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
                                                if len(result.get('reasoning', '')) > 500 else '')
       html += f"<p><strong>Approach:</strong> {reasoning}</p>"
 
-    if "python_code" in result:
-      code = result["python_code"]
+    if "rust_code" in result:
+      code = result["rust_code"]
       code_escaped = code.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
       html += f"<details><summary>View Code ({len(code)} chars)</summary><pre>{code_escaped}</pre></details>"
 

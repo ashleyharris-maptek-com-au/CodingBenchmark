@@ -11,15 +11,15 @@ Solver times out after 5 minutes.
 """
 
 import math
-import subprocess
-import sys
-import tempfile
-import os
 import time
 import json
+import random
 from typing import List, Tuple, Dict
 
-title = "CSG Union of Two Polyhedra"
+from native_compiler import CppCompiler, compile_and_run, describe_this_pc
+from solver_utils import StreamingInputFile
+
+title = "CSG Union of Two Polyhedra (C++)"
 
 # Timeout in seconds (30 seconds for testing)
 TIMEOUT_SECONDS = 30
@@ -258,35 +258,41 @@ def prepareSubpassPrompt(subPass: int) -> str:
   if subPass != 0:
     raise StopIteration
 
-  return f"""You are implementing a CSG (Constructive Solid Geometry) Union operation.
+  return f"""You are implementing a CSG (Constructive Solid Geometry) Union operation in C++.
 
-You must write a Python solver that can handle ANY mesh complexity from trivial (6 vertex unit cubes) to 
-ludicrous scale (millions of vertices):
-Your `csg_union(mesh_a, mesh_b)` function will be tested with meshes ranging from simple boxes to complex 
-polyhedra. The same function must work efficiently across ALL scales.
+You must write a C++ solver that can handle ANY mesh complexity from trivial (6 vertex unit cubes) to
+ludicrous scale (millions of vertices). The same program must work efficiently across ALL scales.
 
-**Input:**
-- `mesh_a`, `mesh_b`: Each a dict with:
-  - `"vertices"`: List of [x, y, z] coordinates
-  - `"faces"`: List of triangles (3 vertex indices each)
+**Input format (stdin):**
+Line 1: VA FA VB FB (vertex/face counts for mesh A and B)
+Next VA lines: x y z (mesh A vertices)
+Next FA lines: a b c (mesh A faces, 0-indexed)
+Next VB lines: x y z (mesh B vertices)
+Next FB lines: a b c (mesh B faces)
 
-**Output:**
-- Union mesh in the same format (vertices and faces)
-- Must be a valid closed mesh (watertight)
-- No duplicate vertices at same position
-- Face normals should be consistent (outward-facing)
+You can assume that the input geometry is clean, manifold, watertight, and free of self-intersections.
+
+**Output format (stdout):**
+Line 1: V F (vertex and face counts for union mesh)
+Next V lines: x y z
+Next F lines: a b c (0-indexed triangle indices)
 
 **Critical Requirements:**
 1. **Scalability**: Your algorithm must adapt based on mesh complexity
 2. **Performance**: Must complete within 5 minutes even for very complex meshes
-3. **Correctness**: Must handle overlapping/intersecting geometry properly
+3. **Correctness**: Must output correct union geometry. Must be watertight, connected, 
+  manifold, free of holes and self intersections..
 
-**Constraints:**
-- Use only Python standard library + numpy if needed for vector math.
-- Result must be a valid mesh dict with "vertices" and "faces"
+**Environment:**
+{describe_this_pc()}
 
-Write complete, runnable Python code with the csg_union function.
-Include adaptive logic that chooses different strategies based on mesh complexity.
+**C++ Compiler:**
+{CppCompiler("test_engine").describe()}
+
+Be sure that any deviation from the C++ standard library is supported by the given compiler,
+as referencing the wrong intrinsics or non-standard header like 'bits/stdc++.h' could fail your submission.
+
+Write complete, compilable C++ code with a main() function.
 """
 
 
@@ -302,14 +308,12 @@ structure = {
       "description":
       "Explain your CSG algorithm approach and how it adapts to different mesh complexities"
     },
-    "python_code": {
-      "type":
-      "string",
-      "description":
-      "Complete Python code with csg_union(mesh_a, mesh_b) function that handles all scales"
+    "cpp_code": {
+      "type": "string",
+      "description": "Complete C++ code with main() that handles all scales"
     }
   },
-  "required": ["reasoning", "python_code"],
+  "required": ["reasoning", "cpp_code"],
   "additionalProperties": False
 }
 
@@ -552,20 +556,126 @@ def estimate_tetra_tetra_intersection(tetra_a: Dict, tetra_b: Dict) -> float:
   return bb_overlap_vol * 0.67
 
 
-def execute_solver(code: str, mesh_a: Dict, mesh_b: Dict, timeout: int = TIMEOUT_SECONDS) -> tuple:
+STREAMING_THRESHOLD_FACES = 200_000
+_INPUT_FILE_CACHE = {}
+
+
+def format_input(mesh_a: Dict, mesh_b: Dict) -> str:
+  lines = [
+    f"{len(mesh_a['vertices'])} {len(mesh_a['faces'])} {len(mesh_b['vertices'])} {len(mesh_b['faces'])}"
+  ]
+  for x, y, z in mesh_a["vertices"]:
+    lines.append(f"{x:.6f} {y:.6f} {z:.6f}")
+  for a, b, c in mesh_a["faces"]:
+    lines.append(f"{a} {b} {c}")
+  for x, y, z in mesh_b["vertices"]:
+    lines.append(f"{x:.6f} {y:.6f} {z:.6f}")
+  for a, b, c in mesh_b["faces"]:
+    lines.append(f"{a} {b} {c}")
+  return "\n".join(lines)
+
+
+def _should_use_streaming(mesh_a: Dict, mesh_b: Dict) -> bool:
+  total_faces = len(mesh_a["faces"]) + len(mesh_b["faces"])
+  return total_faces > STREAMING_THRESHOLD_FACES
+
+
+def _get_streaming_input(subpass: int, mesh_a: Dict, mesh_b: Dict) -> StreamingInputFile:
+  if subpass in _INPUT_FILE_CACHE:
+    return _INPUT_FILE_CACHE[subpass]
+
+  cache_key = (f"csg7|a_v={len(mesh_a['vertices'])}|a_f={len(mesh_a['faces'])}|"
+               f"b_v={len(mesh_b['vertices'])}|b_f={len(mesh_b['faces'])}|seed={subpass}")
+
+  def generator():
+    yield f"{len(mesh_a['vertices'])} {len(mesh_a['faces'])} {len(mesh_b['vertices'])} {len(mesh_b['faces'])}\n"
+    for x, y, z in mesh_a["vertices"]:
+      yield f"{x:.6f} {y:.6f} {z:.6f}\n"
+    for a, b, c in mesh_a["faces"]:
+      yield f"{a} {b} {c}\n"
+    for x, y, z in mesh_b["vertices"]:
+      yield f"{x:.6f} {y:.6f} {z:.6f}\n"
+    for a, b, c in mesh_b["faces"]:
+      yield f"{a} {b} {c}\n"
+
+  input_file = StreamingInputFile(cache_key, generator, "test7_csg")
+  _INPUT_FILE_CACHE[subpass] = input_file
+  return input_file
+
+
+def parse_mesh_output(output: str) -> tuple:
+  text = output.strip()
+  if not text:
+    return None, "Empty output"
+
+  if text[0] in "[{":
+    try:
+      parsed = json.loads(text)
+      if isinstance(parsed, dict) and "vertices" in parsed and "faces" in parsed:
+        return parsed, ""
+    except Exception:
+      pass
+
+  lines = [line for line in text.splitlines() if line.strip()]
+  header = lines[0].split()
+  if len(header) < 2:
+    return None, "Missing vertex/face counts"
+
+  try:
+    v_count = int(header[0])
+    f_count = int(header[1])
+  except ValueError:
+    return None, "Invalid vertex/face counts"
+
+  if len(lines) < 1 + v_count + f_count:
+    return None, "Not enough lines for declared mesh size"
+
+  vertices = []
+  for i in range(1, 1 + v_count):
+    parts = lines[i].split()
+    if len(parts) < 3:
+      return None, f"Invalid vertex line {i}"
+    try:
+      vertices.append([float(parts[0]), float(parts[1]), float(parts[2])])
+    except ValueError:
+      return None, f"Non-numeric vertex at line {i}"
+
+  faces = []
+  for i in range(1 + v_count, 1 + v_count + f_count):
+    parts = lines[i].split()
+    if len(parts) < 3:
+      return None, f"Invalid face line {i}"
+    try:
+      faces.append([int(parts[0]), int(parts[1]), int(parts[2])])
+    except ValueError:
+      return None, f"Non-integer face at line {i}"
+
+  return {"vertices": vertices, "faces": faces}, ""
+
+
+def execute_solver(code: str,
+                   mesh_a: Dict,
+                   mesh_b: Dict,
+                   subpass: int,
+                   ai_engine_name: str,
+                   timeout: int = TIMEOUT_SECONDS) -> tuple:
   """Execute the LLM's solver. Returns (result_mesh, error, exec_time)."""
-  from solver_utils import execute_solver_with_data
+  if _should_use_streaming(mesh_a, mesh_b):
+    streaming_input = _get_streaming_input(subpass, mesh_a, mesh_b)
+    input_file_path = streaming_input.generate()
+    run = compile_and_run(code, "cpp", ai_engine_name, input_file=input_file_path, timeout=timeout)
+  else:
+    input_data = format_input(mesh_a, mesh_b)
+    run = compile_and_run(code, "cpp", ai_engine_name, input_data=input_data, timeout=timeout)
 
-  # Build data dictionary for solver
-  data_dict = {'mesh_a': mesh_a, 'mesh_b': mesh_b}
+  if not run:
+    return None, run.error_message(), run.exec_time
 
-  # Execute using common utility with __main__ block stripping
-  result, error, exec_time = execute_solver_with_data(code, data_dict, 'csg_union', timeout)
+  result_mesh, parse_error = parse_mesh_output(run.stdout)
+  if parse_error:
+    return None, parse_error, run.exec_time
 
-  if error:
-    return None, error, exec_time
-
-  return result, None, exec_time
+  return result_mesh, None, run.exec_time
 
 
 def validate_mesh(mesh: Dict) -> Tuple[bool, str]:
@@ -602,6 +712,150 @@ def validate_mesh(mesh: Dict) -> Tuple[bool, str]:
   return True, ""
 
 
+def check_mesh_topology(mesh: Dict) -> List[str]:
+  """Check mesh for watertight, manifold, and connected properties.
+  Returns list of issue strings (empty = perfect topology)."""
+  faces = mesh["faces"]
+  issues = []
+
+  # Build edge data structures
+  edge_face_count = {}  # undirected edge -> count
+  edge_to_faces = {}  # undirected edge -> list of face indices
+  directed_edge_count = {}  # directed edge -> count
+
+  for fi, face in enumerate(faces):
+    n = len(face)
+    for i in range(n):
+      a, b = face[i], face[(i + 1) % n]
+      # Directed edge
+      directed_edge_count[(a, b)] = directed_edge_count.get((a, b), 0) + 1
+      # Undirected edge
+      edge = (min(a, b), max(a, b))
+      edge_face_count[edge] = edge_face_count.get(edge, 0) + 1
+      if edge not in edge_to_faces:
+        edge_to_faces[edge] = []
+      edge_to_faces[edge].append(fi)
+
+  total_edges = len(edge_face_count)
+
+  # Boundary edges (shared by only 1 face) = holes in the mesh
+  boundary_edges = sum(1 for c in edge_face_count.values() if c == 1)
+  if boundary_edges > 0:
+    issues.append(f"{boundary_edges} boundary edges (mesh has holes, not watertight)")
+
+  # Non-manifold edges (shared by 3+ faces)
+  non_manifold_edges = sum(1 for c in edge_face_count.values() if c > 2)
+  if non_manifold_edges > 0:
+    issues.append(f"{non_manifold_edges} non-manifold edges")
+
+  # Connected components via face adjacency (BFS)
+  all_visited = set()
+  num_components = 0
+  for start_face in range(len(faces)):
+    if start_face in all_visited:
+      continue
+    num_components += 1
+    stack = [start_face]
+    while stack:
+      f = stack.pop()
+      if f in all_visited:
+        continue
+      all_visited.add(f)
+      face = faces[f]
+      n = len(face)
+      for i in range(n):
+        a, b = face[i], face[(i + 1) % n]
+        edge = (min(a, b), max(a, b))
+        for neighbor in edge_to_faces.get(edge, []):
+          if neighbor not in all_visited:
+            stack.append(neighbor)
+
+  if num_components > 1:
+    issues.append(f"{num_components} disconnected components (should be 1 solid)")
+
+  # Consistent orientation: each directed edge (a,b) should have matching (b,a)
+  # and each should appear exactly once for a properly oriented closed manifold
+  bad_orientation = 0
+  for (a, b), count in directed_edge_count.items():
+    if count > 1:
+      bad_orientation += count - 1
+    if (b, a) not in directed_edge_count:
+      bad_orientation += 1
+  if bad_orientation > 0:
+    pct = bad_orientation * 100.0 / max(len(directed_edge_count), 1)
+    if pct > 5:
+      issues.append(f"inconsistent face winding ({bad_orientation} edges, {pct:.0f}%)")
+
+  return issues
+
+
+def _ray_triangle_intersect(origin, face_verts):
+  """Test if ray from origin in +X direction intersects triangle.
+  Returns True if intersection exists at positive t."""
+  v0, v1, v2 = face_verts
+  # Edge vectors
+  e1 = [v1[i] - v0[i] for i in range(3)]
+  e2 = [v2[i] - v0[i] for i in range(3)]
+  # Ray direction = (1, 0, 0)
+  # h = d × e2 = (1,0,0) × e2 = (0, -e2[2], e2[1])
+  h = [0.0, -e2[2], e2[1]]
+  a = e1[0] * h[0] + e1[1] * h[1] + e1[2] * h[2]
+  if abs(a) < 1e-12:
+    return False
+  f = 1.0 / a
+  s = [origin[i] - v0[i] for i in range(3)]
+  u = f * (s[0] * h[0] + s[1] * h[1] + s[2] * h[2])
+  if u < 0.0 or u > 1.0:
+    return False
+  q = [s[1] * e1[2] - s[2] * e1[1], s[2] * e1[0] - s[0] * e1[2], s[0] * e1[1] - s[1] * e1[0]]
+  # v = f * (d · q) = f * q[0] since d=(1,0,0)
+  v = f * q[0]
+  if v < 0.0 or u + v > 1.0:
+    return False
+  # t = f * (e2 · q)
+  t = f * (e2[0] * q[0] + e2[1] * q[1] + e2[2] * q[2])
+  return t > 1e-8
+
+
+def point_in_mesh(point, vertices, faces):
+  """Ray casting: count +X ray intersections. Odd = inside."""
+  count = 0
+  for face in faces:
+    fv = [vertices[face[0]], vertices[face[1]], vertices[face[2]]]
+    if _ray_triangle_intersect(point, fv):
+      count += 1
+  return count % 2 == 1
+
+
+def monte_carlo_union_volume(mesh_a: Dict, mesh_b: Dict, n_samples: int = 5000) -> float:
+  """Estimate true union volume via Monte Carlo point sampling."""
+  # Combined bounding box
+  all_verts = mesh_a["vertices"] + mesh_b["vertices"]
+  min_c = [min(v[i] for v in all_verts) for i in range(3)]
+  max_c = [max(v[i] for v in all_verts) for i in range(3)]
+  # Small margin
+  for i in range(3):
+    margin = (max_c[i] - min_c[i]) * 0.01
+    min_c[i] -= margin
+    max_c[i] += margin
+
+  bb_vol = (max_c[0] - min_c[0]) * (max_c[1] - min_c[1]) * (max_c[2] - min_c[2])
+  if bb_vol <= 0:
+    return 0.0
+
+  rng = random.Random(42)
+  inside_count = 0
+  verts_a, faces_a = mesh_a["vertices"], mesh_a["faces"]
+  verts_b, faces_b = mesh_b["vertices"], mesh_b["faces"]
+
+  for _ in range(n_samples):
+    pt = [min_c[i] + rng.random() * (max_c[i] - min_c[i]) for i in range(3)]
+    if point_in_mesh(pt, verts_a, faces_a) or point_in_mesh(pt, verts_b, faces_b):
+      inside_count += 1
+
+  return bb_vol * inside_count / n_samples
+
+
 lastGeneratedMesh = None
 
 
@@ -610,15 +864,16 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
     Grade the CSG union solver.
     
     Scoring based on:
-    - Valid mesh structure
-    - Volume accuracy compared to expected
+    1. Valid mesh structure (pass/fail)
+    2. Mesh topology: watertight, manifold, single connected component (caps score)
+    3. Volume accuracy compared to ground truth (Monte Carlo for small meshes)
     """
   global lastGeneratedMesh
   if not result:
     return 0.0, "No result provided"
 
-  if "python_code" not in result:
-    return 0.0, "No Python code provided"
+  if "cpp_code" not in result:
+    return 0.0, "No C++ code provided"
 
   config = TEST_CONFIGS[subPass]
   MESHES_CACHE[subPass] = {
@@ -631,10 +886,10 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
   mesh_a = data["mesh_a"]
   mesh_b = data["mesh_b"]
   name = data["name"]
-  code = result["python_code"]
+  code = result["cpp_code"]
 
   # Execute solver
-  result_mesh, error, exec_time = execute_solver(code, mesh_a, mesh_b)
+  result_mesh, error, exec_time = execute_solver(code, mesh_a, mesh_b, subPass, aiEngineName)
 
   if error:
     return 0.0, f"[{name}] {error}"
@@ -647,43 +902,83 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
   # Store last generated mesh for visualization
   lastGeneratedMesh = result_mesh
 
-  # Compute volumes
+  # ── Topology checks ──
+  topology_issues = check_mesh_topology(result_mesh)
+  topology_ok = len(topology_issues) == 0
+  topology_str = "; ".join(topology_issues) if topology_issues else "clean"
+
+  # ── Volume computation ──
   vol_a = compute_volume(mesh_a)
   vol_b = compute_volume(mesh_b)
   result_vol = compute_volume(result_mesh)
-  expected_vol = get_expected_union_volume(mesh_a, mesh_b)
 
-  # Minimum valid volume: at least as big as the larger input
-  min_valid_vol = max(vol_a, vol_b) * 0.9
+  # Use Monte Carlo ground truth for small meshes (< 500 total input faces)
+  total_input_faces = len(mesh_a["faces"]) + len(mesh_b["faces"])
+  if total_input_faces < 500:
+    n_mc = 10000 if total_input_faces < 100 else 3000
+    expected_vol = monte_carlo_union_volume(mesh_a, mesh_b, n_samples=n_mc)
+    vol_source = "MC"
+  else:
+    expected_vol = get_expected_union_volume(mesh_a, mesh_b)
+    vol_source = "est"
 
-  # Maximum valid volume: sum of both (no intersection)
+  if expected_vol <= 0:
+    expected_vol = max(vol_a, vol_b)
+    vol_source = "fallback"
+
+  # ── Volume bounds ──
+  min_valid_vol = max(vol_a, vol_b) * 0.85
   max_valid_vol = (vol_a + vol_b) * 1.1
 
+  # ── Scoring ──
+  # If topology is bad, the divergence theorem volume is unreliable.
+  # Cap score at 0.3 for any topology issue (holes, disconnected, non-manifold).
+  if not topology_ok:
+    # Still check if volume is at least in the right ballpark
+    vol_error = abs(result_vol - expected_vol) / expected_vol if expected_vol > 0 else 1.0
+    explanation = (f"[{name}] TOPOLOGY ISSUES: {topology_str}. "
+                   f"Result vol: {result_vol:.2f}, Expected ({vol_source}): ~{expected_vol:.2f}, "
+                   f"Inputs: {vol_a:.2f} + {vol_b:.2f}, "
+                   f"Time: {exec_time:.1f}s")
+
+    if topology_str == "clean":
+      return 0.1, explanation
+
+    return 0.0, explanation
+
+  # Topology is clean - score based on volume accuracy
   if result_vol < min_valid_vol:
-    return 0.3, f"[{name}] Volume too small: {result_vol:.2f} < min {min_valid_vol:.2f}"
+    return 0.0, (f"[{name}] Volume too small: {result_vol:.2f} < min {min_valid_vol:.2f}. "
+                 f"Expected ({vol_source}): ~{expected_vol:.2f}, "
+                 f"Inputs: {vol_a:.2f} + {vol_b:.2f}, Time: {exec_time:.1f}s. "
+                 f"Topology: {topology_str}")
 
   if result_vol > max_valid_vol:
-    return 0.3, f"[{name}] Volume too large: {result_vol:.2f} > max {max_valid_vol:.2f}"
+    return 0.0, (f"[{name}] Volume too large: {result_vol:.2f} > max {max_valid_vol:.2f}. "
+                 f"Expected ({vol_source}): ~{expected_vol:.2f}, "
+                 f"Inputs: {vol_a:.2f} + {vol_b:.2f}, Time: {exec_time:.1f}s. "
+                 f"Topology: {topology_str}")
 
-  # Score based on volume accuracy
   vol_error = abs(result_vol - expected_vol) / expected_vol if expected_vol > 0 else 0
 
-  if vol_error < 0.1:
+  if vol_error < 0.01:
     score = 1.0
-    quality = "excellent (< 10% error)"
+    quality = "excellent (< 1% error)"
   elif vol_error < 0.25:
-    score = 0.3
-    quality = "good (< 25% error)"
-  elif vol_error < 0.5:
     score = 0.1
-    quality = "acceptable (< 50% error)"
+    quality = "passable (< 25% error)"
+  elif vol_error < 0.5:
+    score = 0.05
+    quality = "poor (< 50% error)"
   else:
     score = 0
-    quality = f"poor ({vol_error*100:.0f}% error)"
+    quality = f"bad ({vol_error*100:.0f}% error)"
 
-  explanation = (f"[{name}] Result volume: {result_vol:.2f}, Expected: ~{expected_vol:.2f}, "
-                 f"Inputs: {vol_a:.2f} + {vol_b:.2f}, "
-                 f"Time: {exec_time:.1f}s - {quality}")
+  explanation = (
+    f"[{name}] Result vol: {result_vol:.2f}, Expected ({vol_source}): ~{expected_vol:.2f}, "
+    f"Inputs: {vol_a:.2f} + {vol_b:.2f}, "
+    f"Time: {exec_time:.1f}s - {quality}. "
+    f"Topology: {topology_str}")
 
   return score, explanation
 
@@ -705,8 +1000,8 @@ def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
                                                if len(result.get('reasoning', '')) > 500 else '')
       html += f"<p><strong>Approach:</strong> {reasoning}</p>"
 
-    if "python_code" in result:
-      code = result["python_code"]
+    if "cpp_code" in result:
+      code = result["cpp_code"]
       code_escaped = code.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
       html += f"<details><summary>View Code ({len(code)} chars)</summary><pre>{code_escaped}</pre></details>"
 

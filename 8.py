@@ -1,12 +1,12 @@
-import subprocess
-import sys
-import tempfile
-import os
 import time
 import random
+import sys
 from typing import List, Tuple, Set
 
-title = "Maze Solver"
+from native_compiler import RustCompiler, compile_and_run, describe_this_pc
+from solver_utils import StreamingInputFile
+
+title = "Maze Solver (Rust)"
 
 # Timeout in seconds (30 seconds)
 TIMEOUT_SECONDS = 30
@@ -314,41 +314,42 @@ def prepareSubpassPrompt(subPass: int) -> str:
   if subPass != 0:
     raise StopIteration
 
-  return f"""You are writing a maze solver that must handle ANY maze complexity from trivial to ludicrous scale:
+  return f"""You are writing a maze solver in Rust that must handle ANY maze complexity from trivial to ludicrous scale.
 
-Your `solve_maze(maze_string)` function will be tested with mazes ranging from 5x5 to 50000x50000. 
-The same function must work efficiently across ALL scales.
+Your program will be tested with mazes ranging from 5x5 to 50000x50000.
+The same program must work efficiently across ALL scales.
 
 **Maze format:**
 - 'A' = Start position
-- 'B' = Goal/End position  
+- 'B' = Goal/End position
 - '#' = Wall (cannot pass through)
 - ' ' (space) = Open path (can walk through)
 
-**Input:**
-- `maze_string`: Multi-line string representing the maze
+**Input format (stdin):**
+Line 1: H W (height and width)
+Next H lines: the maze row strings (each W characters)
 
-**Output:**
-- List of (x, y) coordinates representing the path from A to B
-- Coordinates are 0-indexed: (0,0) is top-left
-- Path should include both start (A) and end (B) positions
-- Movement is only up/down/left/right (no diagonals)
-
-**Example output for a simple maze:**
-```python
-[(1, 1), (2, 1), (3, 1), (3, 2), (3, 3)]  # path from A to B
-```
+**Output format (stdout):**
+Line 1: N (number of steps in path)
+Next N lines: x y (0-indexed coordinates from top-left)
+Path should include both start (A) and end (B) positions.
+Movement is only up/down/left/right (no diagonals).
+Output nothing (or 0) if no path exists.
 
 **Constraints:**
-- Use only Python standard library and numpy
-- Return empty list [] if no path exists
 - Path must be continuous (each step adjacent to previous)
 - Path must not go through walls ('#')
 - Path must start at 'A' and end at 'B'
 - Path must not loop even if the maze allows it.
 - If multiple solutions exist, return any one.
 
-Write complete, runnable Python code with the solve_maze function.
+**Environment:**
+{describe_this_pc()}
+
+**Rust Compiler:**
+{RustCompiler("test_engine").describe()}
+
+Write complete, compilable Rust code with a main() function.
 """
 
 
@@ -362,14 +363,12 @@ structure = {
       "type": "string",
       "description": "Explain your maze-solving algorithm and how it adapts to different maze sizes"
     },
-    "python_code": {
-      "type":
-      "string",
-      "description":
-      "Complete Python code with solve_maze(maze_string) function that handles all scales"
+    "rust_code": {
+      "type": "string",
+      "description": "Complete Rust code with main() that handles all scales"
     }
   },
-  "required": ["reasoning", "python_code"],
+  "required": ["reasoning", "rust_code"],
   "additionalProperties": False
 }
 
@@ -438,25 +437,95 @@ def validate_path(maze_string: str, path: List[Tuple[int, int]]) -> Tuple[bool, 
   return True, ""
 
 
-def execute_solver(code: str, maze_string: str, timeout: int = TIMEOUT_SECONDS) -> tuple:
+STREAMING_THRESHOLD_CHARS = 500_000
+_INPUT_FILE_CACHE = {}
+
+
+def format_input(maze_string: str) -> str:
+  lines = maze_string.strip().split('\n')
+  height = len(lines)
+  width = max(len(line) for line in lines)
+  result_lines = [f"{height} {width}"]
+  for line in lines:
+    result_lines.append(line.ljust(width))
+  return "\n".join(result_lines)
+
+
+def _get_streaming_input(subpass: int, maze_string: str) -> StreamingInputFile:
+  if subpass in _INPUT_FILE_CACHE:
+    return _INPUT_FILE_CACHE[subpass]
+
+  lines = maze_string.strip().split('\n')
+  height = len(lines)
+  width = max(len(line) for line in lines)
+  cache_key = f"maze8|h={height}|w={width}|seed={RANDOM_SEED + subpass}"
+
+  def generator():
+    yield f"{height} {width}\n"
+    for line in lines:
+      yield line.ljust(width) + "\n"
+
+  input_file = StreamingInputFile(cache_key, generator, "test8_maze")
+  _INPUT_FILE_CACHE[subpass] = input_file
+  return input_file
+
+
+def parse_path_output(output: str) -> tuple:
+  text = output.strip()
+  if not text:
+    return [], None
+
+  lines = [l for l in text.splitlines() if l.strip()]
+  if not lines:
+    return [], None
+
+  try:
+    n = int(lines[0])
+  except ValueError:
+    return None, "First line must be path length"
+
+  if n == 0:
+    return [], None
+
+  if len(lines) < 1 + n:
+    return None, f"Expected {n} coordinate lines, got {len(lines) - 1}"
+
+  path = []
+  for i in range(1, 1 + n):
+    parts = lines[i].split()
+    if len(parts) < 2:
+      return None, f"Invalid coordinate line {i}"
+    try:
+      x, y = int(parts[0]), int(parts[1])
+      path.append((x, y))
+    except ValueError:
+      return None, f"Non-integer coordinate at line {i}"
+
+  return path, None
+
+
+def execute_solver(code: str,
+                   maze_string: str,
+                   subpass: int,
+                   ai_engine_name: str,
+                   timeout: int = TIMEOUT_SECONDS) -> tuple:
   """Execute the LLM's solver. Returns (path, error, exec_time)."""
-  from solver_utils import execute_solver_with_data
+  if len(maze_string) > STREAMING_THRESHOLD_CHARS:
+    streaming_input = _get_streaming_input(subpass, maze_string)
+    input_file_path = streaming_input.generate()
+    run = compile_and_run(code, "rust", ai_engine_name, input_file=input_file_path, timeout=timeout)
+  else:
+    input_data = format_input(maze_string)
+    run = compile_and_run(code, "rust", ai_engine_name, input_data=input_data, timeout=timeout)
 
-  data_dict = {
-    'maze_string': maze_string,
-  }
+  if not run:
+    return None, run.error_message(), run.exec_time
 
-  result, error, exec_time = execute_solver_with_data(code, data_dict, 'solve_maze', timeout)
+  path, parse_error = parse_path_output(run.stdout)
+  if parse_error:
+    return None, parse_error, run.exec_time
 
-  if error:
-    return None, error, exec_time
-
-  if not isinstance(result, list):
-    return None, f"Invalid output: expected list, got {type(result).__name__}", exec_time
-
-  # Convert to tuples for consistency
-  path = [tuple(p) for p in result]
-  return path, None, exec_time
+  return path, None, run.exec_time
 
 
 lastPath = None
@@ -477,15 +546,15 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
   if not result:
     return 0.0, "No result provided"
 
-  if "python_code" not in result:
-    return 0.0, "No Python code provided"
+  if "rust_code" not in result:
+    return 0.0, "No Rust code provided"
 
   maze = get_maze(subPass)
   info = get_maze_info(maze)
-  code = result["python_code"]
+  code = result["rust_code"]
 
   # Execute solver
-  path, error, exec_time = execute_solver(code, maze)
+  path, error, exec_time = execute_solver(code, maze, subPass, aiEngineName)
 
   global lastPath
   lastPath = path
@@ -522,8 +591,8 @@ def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
                                                if len(result.get('reasoning', '')) > 500 else '')
       html += f"<p><strong>Algorithm:</strong> {reasoning}</p>"
 
-    if "python_code" in result:
-      code = result["python_code"]
+    if "rust_code" in result:
+      code = result["rust_code"]
       code_escaped = code.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
       html += f"<details><summary>View Code ({len(code)} chars)</summary><pre>{code_escaped}</pre></details>"
 

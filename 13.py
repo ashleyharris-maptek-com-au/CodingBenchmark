@@ -12,17 +12,16 @@ Solver times out after 5 minutes.
 
 import random
 import string
-import subprocess
-import sys
-import tempfile
-import os
 import time
 from typing import List, Tuple, Optional
 
-title = "Longest Common Substring"
+from native_compiler import CppCompiler, compile_and_run, describe_this_pc
+from solver_utils import StreamingInputFile
+
+title = "Longest Common Substring (C++)"
 
 # Timeout in seconds (0.5 minutes)
-TIMEOUT_SECONDS = 30
+TIMEOUT_SECONDS = 300
 
 # Seed for reproducibility
 RANDOM_SEED = 44444
@@ -159,44 +158,47 @@ def prepareSubpassPrompt(subPass: int) -> str:
   if subPass != 0:
     raise StopIteration
 
-  return f"""You are solving the Longest Common Substring problem.
+  return f"""You are solving the Longest Common Substring problem in C++.
 
-You must write a Python solver that can handle ANY problem size from trivial to ludicrous scale:
-- **Trivial**: 2-3 short strings (10-50 chars each), simple cases
-- **Medium**: 3-5 medium strings (100-500 chars each), moderate complexity
-- **Large**: 5-10 long strings (1000-5000 chars each), complex patterns
-- **Extreme**: 100 very long strings (10mb+ each), massive search space
+You must write a C++ solver that can handle ANY problem size from trivial to ludicrous scale:
+- **Trivial**: 2-3 short strings (10-50 chars each)
+- **Medium**: 3-5 medium strings (100-500 chars each)
+- **Large**: 5-10 long strings (1000-5000 chars each)
+- **Extreme**: 100 very long strings (10MB+ each), massive search space
 
-**The Challenge:**
-Your `longest_common_substring(strings)` function will be tested with problems ranging 
-from a few short strings to many very long strings. The same function must work efficiently 
-across ALL scales - from trivial to ludicrously large inputs, maintaining correctness and performance.
+**Input format (stdin):**
+Line 1: N (number of strings)
+Next N lines: one string per line
 
-**Input:**
-- `strings`: List of strings to find common substring in
+**Output format (stdout):**
+One line: the longest common substring
+If no common substring exists, output an empty line.
 
-**Output:**
-- Longest common substring (as a string)
-- If multiple substrings have same max length, return any one
-- If no common substring exists (other than empty), return ""
+**Example:**
+Input:
+3
+abcdef
+xbcdey
+zbcdew
+
+Output:
+bcde
 
 **Critical Requirements:**
 1. **Scalability**: Your algorithm must adapt based on number and length of strings
-2. **Performance**: Must complete within 5 minutes even for very long strings
+2. **Performance**: Must complete within 300 seconds even for very long strings
 3. **Correctness**: Must find the actual longest common substring
 
-**Example:**
-```python
-strings = ["abcdef", "xbcdey", "zbcdew"]
-# Returns: "bcde" (length 4)
-```
+**Environment:**
+{describe_this_pc()}
 
-**Constraints:**
-- Use only Python standard library
-- Return the actual substring string, not just its length
-- Must handle varying numbers and lengths of strings efficiently
+**C++ Compiler:**
+{CppCompiler("test_engine").describe()}
 
-Write complete, runnable Python code with the longest_common_substring function.
+Be sure that any deviation from the C++ standard library is supported by the given compiler,
+as referencing the wrong intrinsics or non-standard header like 'bits/stdc++.h' could fail your submission.
+
+Write complete, compilable C++ code with a main() function.
 Include adaptive logic that chooses different strategies based on problem scale.
 """
 
@@ -211,14 +213,12 @@ structure = {
       "type": "string",
       "description": "Explain your substring algorithm and how it adapts to different problem sizes"
     },
-    "python_code": {
-      "type":
-      "string",
-      "description":
-      "Complete Python code with longest_common_substring(strings) function that handles all scales"
+    "cpp_code": {
+      "type": "string",
+      "description": "Complete C++ code with main() that handles all scales"
     }
   },
-  "required": ["reasoning", "python_code"],
+  "required": ["reasoning", "cpp_code"],
   "additionalProperties": False
 }
 
@@ -257,24 +257,54 @@ def validate_solution(result: str, strings: List[str], expected: str) -> Tuple[b
   return True, "", len(result)
 
 
-def execute_solver(code: str, strings: List[str], timeout: int = TIMEOUT_SECONDS) -> tuple:
+STREAMING_THRESHOLD_CHARS = 1_000_000
+_INPUT_FILE_CACHE = {}
+
+
+def format_input(strings: List[str]) -> str:
+  lines = [str(len(strings))]
+  for s in strings:
+    lines.append(s)
+  return "\n".join(lines)
+
+
+def _get_streaming_input(subpass: int, strings: List[str]) -> StreamingInputFile:
+  if subpass in _INPUT_FILE_CACHE:
+    return _INPUT_FILE_CACHE[subpass]
+
+  total_len = sum(len(s) for s in strings)
+  cache_key = f"lcs13|n={len(strings)}|total={total_len}|seed={RANDOM_SEED + subpass}"
+
+  def generator():
+    yield f"{len(strings)}\n"
+    for s in strings:
+      yield s + "\n"
+
+  input_file = StreamingInputFile(cache_key, generator, "test13_lcs")
+  _INPUT_FILE_CACHE[subpass] = input_file
+  return input_file
+
+
+def execute_solver(code: str,
+                   strings: List[str],
+                   subpass: int,
+                   ai_engine_name: str,
+                   timeout: int = TIMEOUT_SECONDS) -> tuple:
   """Execute the LLM's solver."""
-  from solver_utils import execute_solver_with_data
+  total_chars = sum(len(s) for s in strings)
+  if total_chars > STREAMING_THRESHOLD_CHARS:
+    streaming_input = _get_streaming_input(subpass, strings)
+    input_file_path = streaming_input.generate()
+    run = compile_and_run(code, "cpp", ai_engine_name, input_file=input_file_path, timeout=timeout)
+  else:
+    input_data = format_input(strings)
+    run = compile_and_run(code, "cpp", ai_engine_name, input_data=input_data, timeout=timeout)
 
-  data_dict = {
-    'strings': strings,
-  }
+  if not run:
+    return None, run.error_message(), run.exec_time
 
-  result, error, exec_time = execute_solver_with_data(code, data_dict, 'longest_common_substring',
-                                                      timeout)
-
-  if error:
-    return None, error, exec_time
-
-  if not isinstance(result, str):
-    return None, f"Invalid result type: expected str, got {type(result).__name__}", exec_time
-
-  return result, None, exec_time
+  result = run.stdout.strip()
+  return result, None, run.exec_time
 
 
 def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
@@ -282,17 +312,17 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
   if not result:
     return 0.0, "No result provided"
 
-  if "python_code" not in result:
-    return 0.0, "No Python code provided"
+  if "cpp_code" not in result:
+    return 0.0, "No C++ code provided"
 
   case = TEST_CASES[subPass]
   strings = case["strings"]()
   expected = case["expected"]()
   description = case["description"]
-  code = result["python_code"]
+  code = result["cpp_code"]
 
   # Execute solver
-  solution, error, exec_time = execute_solver(code, strings)
+  solution, error, exec_time = execute_solver(code, strings, subPass, aiEngineName)
 
   if error:
     return 0.0, f"[{description}] {error}"
@@ -343,8 +373,8 @@ def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
                                                if len(result.get('reasoning', '')) > 500 else '')
       html += f"<p><strong>Algorithm:</strong> {reasoning}</p>"
 
-    if "python_code" in result:
-      code = result["python_code"]
+    if "cpp_code" in result:
+      code = result["cpp_code"]
       code_escaped = code.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
       html += f"<details><summary>View Code ({len(code)} chars)</summary><pre>{code_escaped}</pre></details>"
 

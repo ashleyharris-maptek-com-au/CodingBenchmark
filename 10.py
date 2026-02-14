@@ -12,14 +12,12 @@ Solver times out after 5 minutes.
 """
 
 import random
-import subprocess
-import sys
-import tempfile
-import os
 import time
 from typing import List, Tuple, Dict
 
-title = "2D Cutting Stock - Rectangle Packing"
+from native_compiler import CppCompiler, compile_and_run, describe_this_pc
+
+title = "2D Cutting Stock - Rectangle Packing (C++)"
 
 # Timeout in seconds (30 seconds)
 TIMEOUT_SECONDS = 30
@@ -133,42 +131,43 @@ def prepareSubpassPrompt(subPass: int) -> str:
   if subPass != 0:
     raise StopIteration
 
-  return f"""You are solving the 2D Cutting Stock Problem (Rectangle Bin Packing).
+  return f"""You are solving the 2D Cutting Stock Problem (Rectangle Bin Packing) in C++.
 
-You must write a Python solver that can handle ANY problem size from trivial to ludicrous scale:
-- **Trivial**: 4-8 rectangles, 100x100-200x150 boards (small problems, exact methods feasible)
-- **Ludicrous**: 500-5000 rectangles, 2000x2000-10000x10000 boards (requires very fast heuristics)
+Given the option to purchase fixed size large 2D boards, and a list of rectangles needed,
+minimize the number of boards purchased by cleverly planning your cuts and minimising waste.
 
-**The Challenge:**
-Your `solve_2d_cutting(rectangles, board_width, board_height)` function will be tested with problems 
-ranging from 4 rectangles to 5000 rectangles on boards up to 10000x10000. The same function must work 
-efficiently across all scales.
+You must write a C++ solver that can handle ANY problem size from trivial to ludicrous scale:
+- **Trivial**: 4-8 rectangles, 100x100-200x150 boards
+- **Ludicrous**: 500-50000 rectangles, 2000x2000-10000x10000 boards
 
-**Input:**
-- `rectangles`: List of (width, height) tuples for pieces to cut
-- `board_width`, `board_height`: Dimensions of wholesale boards
+**Input format (stdin):**
+Line 1: N board_width board_height
+Next N lines: w h (rectangle dimensions)
 
-**Output:**
-- Dictionary with:
-  - `"num_boards"`: Number of boards used (int)
-  - `"placements"`: List of placements, one per rectangle
-    - Each placement: (board_index, x, y, rotated)
-    - board_index: which board (0-indexed)
-    - x, y: position of rectangle's bottom-left corner on that board
-    - rotated: True if rectangle was rotated 90°
+**Output format (stdout):**
+Line 1: num_boards
+Next N lines: board_index x y rotated (one per rectangle, rotated is 0 or 1)
 
 **Critical Requirements:**
 1. **Scalability**: Your algorithm must adapt based on problem size and board dimensions
-2. **Performance**: Must complete within 30 seconds even for 5000 rectangles
+2. **Performance**: Must complete within 30 seconds even for 50000 rectangles
 3. **Quality**: Minimize number of boards used while producing valid placements
 
 **Constraints:**
-- Use only Python standard library or numpy
 - Rectangles may be rotated 90° if it helps
 - No overlapping allowed
 - Rectangles must not exceed board boundaries
 
-Write complete, runnable Python code with the solve_2d_cutting function.
+**Environment:**
+{describe_this_pc()}
+
+**C++ Compiler:**
+{CppCompiler("test_engine").describe()}
+
+Be sure that any deviation from the C++ standard library is supported by the given compiler,
+as referencing the wrong intrinsics or non-standard header like 'bits/stdc++.h' could fail your submission.
+
+Write complete, compilable C++ code with a main() function.
 """
 
 
@@ -183,14 +182,12 @@ structure = {
       "description":
       "Explain your 2D packing algorithm and how it adapts to different problem sizes"
     },
-    "python_code": {
-      "type":
-      "string",
-      "description":
-      "Complete Python code with solve_2d_cutting(rectangles, board_width, board_height) function that handles all scales"
+    "cpp_code": {
+      "type": "string",
+      "description": "Complete C++ code with main() that handles all scales"
     }
   },
-  "required": ["reasoning", "python_code"],
+  "required": ["reasoning", "cpp_code"],
   "additionalProperties": False
 }
 
@@ -265,6 +262,94 @@ def compute_waste(placements: List, rects: List[Tuple[int, int]], board_w: int,
   return total_board_area - total_rect_area
 
 
+def _repack_rects_shelf_bfd(pieces: List[Tuple[int, int]], board_w: int, board_h: int,
+                            max_bins: int) -> int:
+  """Shelf Best Fit Decreasing packer. Returns bins used (or max_bins+1 if overflow)."""
+  if not pieces:
+    return 0
+  sorted_p = sorted(pieces, key=lambda p: -max(p))
+  bins = []  # Each bin: list of [y_start, shelf_height, x_used]
+
+  for orig_w, orig_h in sorted_p:
+    placed = False
+    orientations = [(orig_w, orig_h)]
+    if orig_w != orig_h:
+      orientations.append((orig_h, orig_w))
+
+    for rw, rh in orientations:
+      if rw > board_w or rh > board_h:
+        continue
+      # Best fit existing shelf (least remaining width)
+      best_bi, best_si, best_rem = -1, -1, board_w + 1
+      for bi, shelves in enumerate(bins):
+        for si, shelf in enumerate(shelves):
+          rem = board_w - shelf[2] - rw
+          if rh <= shelf[1] and rem >= 0 and rem < best_rem:
+            best_bi, best_si, best_rem = bi, si, rem
+      if best_bi >= 0:
+        bins[best_bi][best_si][2] += rw
+        placed = True
+        break
+      # New shelf on existing bin
+      for bi, shelves in enumerate(bins):
+        used_h = sum(s[1] for s in shelves)
+        if used_h + rh <= board_h:
+          shelves.append([used_h, rh, rw])
+          placed = True
+          break
+      if placed:
+        break
+
+    if not placed:
+      if len(bins) >= max_bins:
+        return max_bins + 1
+      for rw, rh in orientations:
+        if rw <= board_w and rh <= board_h:
+          bins.append([[0, rh, rw]])
+          placed = True
+          break
+      if not placed:
+        return max_bins + 1
+  return len(bins)
+
+
+def check_top_waste_repack_2d(placements, rects, board_w, board_h) -> Tuple[int, int]:
+  """Pick the 5 boards with highest waste, strip their rectangles, and repack
+  using shelf BFD. Returns (original_count, optimal_count)."""
+  N_FOCUS = 5
+  board_area = board_w * board_h
+
+  # Group rect indices by board
+  boards = {}
+  for i, p in enumerate(placements):
+    bi = int(p[0])
+    if bi not in boards:
+      boards[bi] = []
+    boards[bi].append(i)
+
+  if len(boards) < N_FOCUS:
+    return len(boards), len(boards)
+
+  # Waste per board
+  waste_per = []
+  for bi, indices in boards.items():
+    used = sum(rects[i][0] * rects[i][1] for i in indices)
+    waste_per.append((board_area - used, bi))
+  waste_per.sort(reverse=True)
+
+  focus = waste_per[:N_FOCUS]
+  focus_rects = []
+  for _, bi in focus:
+    for idx in boards[bi]:
+      focus_rects.append(rects[idx])
+
+  if not focus_rects:
+    return N_FOCUS, N_FOCUS
+
+  optimal = _repack_rects_shelf_bfd(focus_rects, board_w, board_h, N_FOCUS)
+  return N_FOCUS, optimal
+
+
 def get_baseline_solution(rects: List[Tuple[int, int]], board_w: int, board_h: int) -> int:
   """
     Compute baseline using Shelf Next Fit Decreasing Height (SNFDH).
@@ -322,61 +407,65 @@ def get_baseline_solution(rects: List[Tuple[int, int]], board_w: int, board_h: i
   return len(boards)
 
 
+def format_input(rects: List[Tuple[int, int]], board_w: int, board_h: int) -> str:
+  lines = [f"{len(rects)} {board_w} {board_h}"]
+  for w, h in rects:
+    lines.append(f"{w} {h}")
+  return "\n".join(lines)
+
+
+def parse_placements_output(output: str, num_rects: int) -> tuple:
+  text = output.strip()
+  if not text:
+    return None, "Empty output"
+
+  lines = [l for l in text.splitlines() if l.strip()]
+  if not lines:
+    return None, "No output lines"
+
+  try:
+    num_boards = int(lines[0])
+  except ValueError:
+    return None, "First line must be num_boards integer"
+
+  if len(lines) < 1 + num_rects:
+    return None, f"Expected {num_rects} placement lines, got {len(lines) - 1}"
+
+  placements = []
+  for i in range(1, 1 + num_rects):
+    parts = lines[i].split()
+    if len(parts) < 4:
+      return None, f"Placement line {i} needs 4 values (board_idx x y rotated)"
+    try:
+      board_idx = int(parts[0])
+      x = float(parts[1])
+      y = float(parts[2])
+      rotated = bool(int(parts[3]))
+    except ValueError:
+      return None, f"Invalid values in placement line {i}"
+    placements.append([board_idx, x, y, rotated])
+
+  return {'num_boards': num_boards, 'placements': placements}, None
+
+
 def execute_solver(code: str,
                    rects: List[Tuple[int, int]],
                    board_w: int,
                    board_h: int,
+                   ai_engine_name: str,
                    timeout: int = TIMEOUT_SECONDS) -> tuple:
   """Execute the LLM's solver. Returns (solution, error, exec_time)."""
-  from solver_utils import execute_solver_with_data
+  input_data = format_input(rects, board_w, board_h)
+  run = compile_and_run(code, "cpp", ai_engine_name, input_data=input_data, timeout=timeout)
 
-  data_dict = {
-    'rectangles': rects,
-    'board_width': board_w,
-    'board_height': board_h,
-  }
+  if not run:
+    return None, run.error_message(), run.exec_time
 
-  result, error, exec_time = execute_solver_with_data(code, data_dict, 'solve_2d_cutting', timeout)
+  solution, parse_error = parse_placements_output(run.stdout, len(rects))
+  if parse_error:
+    return None, parse_error, run.exec_time
 
-  if error:
-    return None, error, exec_time
-
-  if not isinstance(result, dict):
-    return None, f"Invalid result type: expected dict, got {type(result).__name__}", exec_time
-
-  # Normalize to ensure JSON-serializable primitives (e.g., numpy int -> int)
-  try:
-    placements = result.get('placements')
-    if not isinstance(placements, list):
-      return None, "Invalid result: missing or non-list 'placements'", exec_time
-
-    normalized_placements = []
-    for p in placements:
-      if isinstance(p, (list, tuple)) and len(p) == 4:
-        board_idx, x, y, rotated = p
-      elif isinstance(p, dict):
-        board_idx = p.get('board_idx', p.get('board_index', p.get('board', 0)))
-        x = p.get('x', 0)
-        y = p.get('y', 0)
-        rotated = p.get('rotated', p.get('rotation', False))
-      else:
-        return None, "Invalid placement: expected (board_idx, x, y, rotated)", exec_time
-
-      normalized_placements.append([
-        int(board_idx),
-        float(x),
-        float(y),
-        bool(rotated),
-      ])
-
-    out = {
-      'num_boards': int(result.get('num_boards')),
-      'placements': normalized_placements,
-    }
-  except Exception as e:
-    return None, f"Invalid result format: {e}", exec_time
-
-  return out, None, exec_time
+  return solution, None, run.exec_time
 
 
 lastSolution = None
@@ -395,17 +484,17 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
   if not result:
     return 0.0, "No result provided"
 
-  if "python_code" not in result:
-    return 0.0, "No Python code provided"
+  if "cpp_code" not in result:
+    return 0.0, "No C++ code provided"
 
   case = TEST_CASES[subPass]
   rects = case["rectangles"]
   board_w, board_h = case["board_size"]
   description = case["description"]
-  code = result["python_code"]
+  code = result["cpp_code"]
 
   # Execute solver
-  solution, error, exec_time = execute_solver(code, rects, board_w, board_h)
+  solution, error, exec_time = execute_solver(code, rects, board_w, board_h, aiEngineName)
 
   global lastSolution
   lastSolution = solution
@@ -438,8 +527,28 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
     score = 0.0
     quality = f"inefficient ({ratio:.2f}x baseline)"
 
+  # ── Repack penalty ──
+  # If total waste < 1 board area, packing is tight — no penalty.
+  # Otherwise, take the 5 boards with the most waste, strip their rects,
+  # and repack with shelf BFD.  If fewer boards needed, penalise.
+  board_area = board_w * board_h
+  penalty_note = ""
+  if waste < board_area:
+    penalty_note = " (waste < 1 board, no repack check)"
+  else:
+    orig, optimal = check_top_waste_repack_2d(solution["placements"], rects, board_w, board_h)
+    saved = orig - optimal
+    if saved >= 2:
+      score = 0.0
+      penalty_note = f" REPACK PENALTY: top-5 waste boards repacked {orig}→{optimal} (saved {saved}) → 0"
+    elif saved == 1:
+      score = min(score, 0.5)
+      penalty_note = f" REPACK PENALTY: top-5 waste boards repacked {orig}→{optimal} (saved 1) → capped 0.5"
+    else:
+      penalty_note = f" (repack check: top-5 waste boards already optimal at {optimal})"
+
   explanation = (f"[{description}] Boards: {num_boards}, Baseline: {baseline_boards}, "
-                 f"Waste: {waste}, Time: {exec_time:.1f}s - {quality}")
+                 f"Waste: {waste}, Time: {exec_time:.1f}s - {quality}.{penalty_note}")
 
   return score, explanation
 
@@ -460,8 +569,8 @@ def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
                                                if len(result.get('reasoning', '')) > 500 else '')
       html += f"<p><strong>Algorithm:</strong> {reasoning}</p>"
 
-    if "python_code" in result:
-      code = result["python_code"]
+    if "cpp_code" in result:
+      code = result["cpp_code"]
       code_escaped = code.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
       html += f"<details><summary>View Code ({len(code)} chars)</summary><pre>{code_escaped}</pre></details>"
 

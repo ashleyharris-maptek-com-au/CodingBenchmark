@@ -18,14 +18,12 @@ Solver times out after 5 minutes.
 import json
 import math
 import random
-import subprocess
-import sys
-import tempfile
-import os
 import time
 from typing import List, Tuple, Dict, Set
 
-title = "Tetrahedron Shadow Covering"
+from native_compiler import RustCompiler, compile_and_run, describe_this_pc
+
+title = "Tetrahedron Shadow Covering (Rust)"
 
 # Timeout in seconds (5 minutes)
 TIMEOUT_SECONDS = 30
@@ -163,42 +161,46 @@ def prepareSubpassPrompt(subPass: int) -> str:
   if subPass != 0:
     raise StopIteration
 
-  return f"""You are solving a Shadow Covering problem with tetrahedrons.
+  return f"""You are solving a Shadow Covering problem with tetrahedrons in Rust.
 
 **The Challenge:**
-Your `solve_shadow_cover(target_polygon, sun_vector)` function will be tested with polygons 
-ranging from simple shapes to very complex geometries. The same function must work efficiently 
-across ALL scales.
+Your program will be tested with polygons ranging from simple shapes to very complex geometries.
+The same program must work efficiently across ALL scales.
 
-**Input:**
-- `target_polygon`: List of (x, y) vertices defining 2D polygon on z=0 plane
-- `sun_vector`: 3D direction vector (points from sun toward ground)
+**Input format (stdin):**
+Line 1: NV (number of polygon vertices)
+Next NV lines: x y (polygon vertices on z=0 plane)
+Last line: sx sy sz (sun direction vector, points from sun toward ground)
 
-**Output:**
-- Dict with:
-  - `"count"`: Number of tetrahedrons used
-  - `"placements"`: List of placement dicts:
-    - `"position"`: [x, y, z] - center position of tetrahedron
-    - `"quaternion"`: [w, x, y, z] - rotation (w is scalar)
+**Output format (stdout):**
+Line 1: count (number of tetrahedrons)
+Next count lines: px py pz qw qx qy qz scale
+  px,py,pz: center position
+  qw,qx,qy,qz: rotation quaternion (w is scalar)
+  scale: uniform scale factor
 
 **Standard Tetrahedron Reference:**
-```python
-tetra_vertices = [
-    [1.0, 0.0, -0.707],
-    [-1.0, 0.0, -0.707],
-    [0.0, 1.0, 0.707],
-    [0.0, -1.0, 0.707]
-]
-```
+Vertices (before transform):
+  [1.0, 0.0, -0.707]
+  [-1.0, 0.0, -0.707]
+  [0.0, 1.0, 0.707]
+  [0.0, -1.0, 0.707]
 
 **Constraints:**
-- Libraries allowed: numpy, scipy, python standard library
 - Combined shadows must completely cover target polygon
 - Tetrahedrons must not intersect each other in 3D
 - Minimize number of tetrahedrons
-- Must handle varying polygon complexities and sun angles
 
-Write complete, runnable Python code with the solve_shadow_cover function.
+**Environment:**
+{describe_this_pc()}
+
+**Rust Compiler:**
+{RustCompiler("test_engine").describe()}
+
+Be aware that default warnings are enabled and will cause a compilation failure,
+so ensure that you write warning-free code.
+
+Write complete, compilable Rust code with a main() function.
 Include adaptive logic that chooses different strategies based on problem scale.
 """
 
@@ -215,14 +217,12 @@ structure = {
       "description":
       "Explain your shadow covering algorithm and how it adapts to different polygon complexities"
     },
-    "python_code": {
-      "type":
-      "string",
-      "description":
-      "Complete Python code with solve_shadow_cover(target_polygon, sun_vector) function that handles all scales"
+    "rust_code": {
+      "type": "string",
+      "description": "Complete Rust code with main() that handles all scales"
     }
   },
-  "required": ["reasoning", "python_code"],
+  "required": ["reasoning", "rust_code"],
   "additionalProperties": False
 }
 
@@ -425,54 +425,71 @@ def get_baseline_count(target_polygon, sun_vector):
   return max(1, int(area / shadow_per_tetra) + 1)
 
 
-def execute_solver(code: str, target_polygon, sun_vector, timeout: int = TIMEOUT_SECONDS):
-  """Execute the LLM's solver."""
-  from solver_utils import execute_solver_with_data
+def format_input(target_polygon, sun_vector) -> str:
+  lines = [str(len(target_polygon))]
+  for x, y in target_polygon:
+    lines.append(f"{x:.6f} {y:.6f}")
+  lines.append(f"{sun_vector[0]:.6f} {sun_vector[1]:.6f} {sun_vector[2]:.6f}")
+  return "\n".join(lines)
 
-  data_dict = {
-    'target_polygon': target_polygon,
-    'sun_vector': sun_vector,
-  }
 
-  result, error, exec_time = execute_solver_with_data(code, data_dict, 'solve_shadow_cover',
-                                                      timeout)
+def parse_placements_output(output: str) -> tuple:
+  text = output.strip()
+  if not text:
+    return None, "Empty output"
 
-  if error:
-    return None, error, exec_time
-
-  if not isinstance(result, dict):
-    return None, f"Invalid result type: expected dict, got {type(result).__name__}", exec_time
+  lines = [l for l in text.splitlines() if l.strip()]
+  if not lines:
+    return None, "No output lines"
 
   try:
-    placements = result.get('placements')
-    if not isinstance(placements, list):
-      return None, "Invalid result: missing or non-list 'placements'", exec_time
+    count = int(lines[0])
+  except ValueError:
+    return None, "First line must be count integer"
 
-    normalized_placements = []
-    for p in placements:
-      if not isinstance(p, dict):
-        continue
-      pos = p.get('position', [0, 0, 1])
-      quat = p.get('quaternion', [1, 0, 0, 0])
-      scale = p.get('scale', 1.0)
-      normalized_placements.append({
-        'position': [float(pos[0]), float(pos[1]), float(pos[2])],
-        'quaternion': [float(quat[0]),
-                       float(quat[1]),
-                       float(quat[2]),
-                       float(quat[3])],
-        'scale':
-        float(scale),
-      })
+  if count == 0:
+    return {'count': 0, 'placements': []}, None
 
-    out = {
-      'count': int(result.get('count', len(normalized_placements))),
-      'placements': normalized_placements,
-    }
-  except Exception as e:
-    return None, f"Invalid result format: {e}", exec_time
+  if len(lines) < 1 + count:
+    return None, f"Expected {count} placement lines, got {len(lines) - 1}"
 
-  return out, None, exec_time
+  placements = []
+  for i in range(1, 1 + count):
+    parts = lines[i].split()
+    if len(parts) < 8:
+      return None, f"Placement line {i} needs 8 values (px py pz qw qx qy qz scale)"
+    try:
+      px, py, pz = float(parts[0]), float(parts[1]), float(parts[2])
+      qw, qx, qy, qz = float(parts[3]), float(parts[4]), float(parts[5]), float(parts[6])
+      scale = float(parts[7])
+    except ValueError:
+      return None, f"Invalid values in placement line {i}"
+    placements.append({
+      'position': [px, py, pz],
+      'quaternion': [qw, qx, qy, qz],
+      'scale': scale,
+    })
+
+  return {'count': count, 'placements': placements}, None
+
+
+def execute_solver(code: str,
+                   target_polygon,
+                   sun_vector,
+                   ai_engine_name: str,
+                   timeout: int = TIMEOUT_SECONDS):
+  """Execute the LLM's solver."""
+  input_data = format_input(target_polygon, sun_vector)
+  run = compile_and_run(code, "rust", ai_engine_name, input_data=input_data, timeout=timeout)
+
+  if not run:
+    return None, run.error_message(), run.exec_time
+
+  solution, parse_error = parse_placements_output(run.stdout)
+  if parse_error:
+    return None, parse_error, run.exec_time
+
+  return solution, None, run.exec_time
 
 
 def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
@@ -480,17 +497,17 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
   if not result:
     return 0.0, "No result provided"
 
-  if "python_code" not in result:
-    return 0.0, "No Python code provided"
+  if "rust_code" not in result:
+    return 0.0, "No Rust code provided"
 
   case = TEST_CASES[subPass]
   target = case["polygon"]
   sun = case["sun_vector"]
   description = case["description"]
-  code = result["python_code"]
+  code = result["rust_code"]
 
   # Execute solver
-  solution, error, exec_time = execute_solver(code, target, sun)
+  solution, error, exec_time = execute_solver(code, target, sun, aiEngineName)
 
   global lastSolution
   global lastCase
@@ -545,8 +562,8 @@ def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
                                                if len(result.get('reasoning', '')) > 500 else '')
       html += f"<p><strong>Algorithm:</strong> {reasoning}</p>"
 
-    if "python_code" in result:
-      code = result["python_code"]
+    if "rust_code" in result:
+      code = result["rust_code"]
       code_escaped = code.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
       html += f"<details><summary>View Code ({len(code)} chars)</summary><pre>{code_escaped}</pre></details>"
 

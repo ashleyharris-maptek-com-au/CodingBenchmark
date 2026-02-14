@@ -91,11 +91,8 @@ def generate_threejs_csg_visualization(mesh_a: Dict,
 
   # Convert mesh data to JSON for lazy initialization
   def mesh_to_json(mesh):
-    return {
-      'vertices': mesh['vertices'],
-      'faces': mesh['faces']
-    }
-  
+    return {'vertices': mesh['vertices'], 'faces': mesh['faces']}
+
   mesh_a_json = json.dumps(mesh_to_json(mesh_a))
   mesh_b_json = json.dumps(mesh_to_json(mesh_b))
   result_mesh_json = json.dumps(mesh_to_json(result_mesh))
@@ -401,7 +398,7 @@ def generate_threejs_maze_visualization(path,
                 <div id=\"maze-renderer-{viz_id}\" style=\"width: 100%; height: 420px; border: 1px solid #ccc; background: #fafafa; border-radius: 4px; position: relative; display: flex; align-items: center; justify-content: center; color: #999;\">
                     <span class="viz-placeholder">Scroll here to activate 3D view</span>
                 </div>
-                <div style=\"margin-top: 8px; font-size: 12px; color: #666; background: #f8f8f8; padding: 5px; border-radius: 3px;\">A=start, B=end, black=wall, white=open, purple=path</div>
+                <div style=\"margin-top: 8px; font-size: 12px; color: #666; background: #f8f8f8; padding: 5px; border-radius: 3px;\">A=start, B=end, black=wall, white=open, purple=path, hot-pink=path-through-wall (invalid)</div>
             </div>
         </details>
     </div>
@@ -459,13 +456,40 @@ def generate_threejs_maze_visualization(path,
             }}
 
             if (pathData && pathData.length) {{
-                ctx.fillStyle = '#7c3aed';
+                const violations = new Array(pathData.length);
                 for (let i = 0; i < pathData.length; i++) {{
                     const p = pathData[i];
                     const x = p[0];
                     const y = p[1];
-                    ctx.fillRect(x * cellSize, y * cellSize, cellSize, cellSize);
+                    const row = (maze[y] || '');
+                    const ch = row[x] || '#';
+                    const isWall = (ch === '#');
+                    violations[i] = isWall;
+
+                    if (!isWall) {{
+                        ctx.fillStyle = '#7c3aed';
+                        ctx.fillRect(x * cellSize, y * cellSize, cellSize, cellSize);
+                    }} else {{
+                        // Path walks through a wall: render as an obvious error tile.
+                        ctx.fillStyle = '#ff00cc';
+                        ctx.fillRect(x * cellSize, y * cellSize, cellSize, cellSize);
+                        ctx.strokeStyle = '#000000';
+                        ctx.lineWidth = Math.max(1, Math.floor(cellSize / 10));
+                        ctx.beginPath();
+                        ctx.moveTo(x * cellSize + 1, y * cellSize + 1);
+                        ctx.lineTo((x + 1) * cellSize - 1, (y + 1) * cellSize - 1);
+                        ctx.moveTo((x + 1) * cellSize - 1, y * cellSize + 1);
+                        ctx.lineTo(x * cellSize + 1, (y + 1) * cellSize - 1);
+                        ctx.stroke();
+                        ctx.strokeStyle = '#ffffff';
+                        ctx.lineWidth = Math.max(1, Math.floor(cellSize / 16));
+                        ctx.strokeRect(x * cellSize + 0.5, y * cellSize + 0.5, cellSize - 1, cellSize - 1);
+                    }}
                 }}
+
+                // Export violations to 3D overlay drawing.
+                window.__mazeVizViolations = window.__mazeVizViolations || {{}};
+                window.__mazeVizViolations['{viz_id}'] = violations;
             }}
 
             if (startData) {{
@@ -514,20 +538,60 @@ def generate_threejs_maze_visualization(path,
             scene.add(plane);
 
             if (pathData && pathData.length) {{
-                const positions = new Float32Array(pathData.length * 3);
-                for (let i = 0; i < pathData.length; i++) {{
-                    const p = pathData[i];
+                const violations = (window.__mazeVizViolations && window.__mazeVizViolations['{viz_id}']) || [];
+
+                // Split into valid/invalid segments so violations are visually unmistakable.
+                const good = [];
+                const bad = [];
+                const badPts = [];
+
+                function toWorld(p) {{
                     const px = p[0] - mazeWidth / 2 + 0.5;
                     const py = mazeHeight / 2 - p[1] - 0.5;
-                    positions[i * 3 + 0] = px;
-                    positions[i * 3 + 1] = py;
-                    positions[i * 3 + 2] = 0.2;
+                    return [px, py, 0.25];
                 }}
-                const pathGeom = new THREE.BufferGeometry();
-                pathGeom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-                const pathMat = new THREE.LineBasicMaterial({{ color: 0x7c3aed }});
-                const pathLine = new THREE.Line(pathGeom, pathMat);
-                scene.add(pathLine);
+
+                for (let i = 0; i < pathData.length; i++) {{
+                    if (violations[i]) {{
+                        const w = toWorld(pathData[i]);
+                        badPts.push(w[0], w[1], w[2]);
+                    }}
+                    if (i + 1 >= pathData.length) break;
+                    const aBad = !!violations[i];
+                    const bBad = !!violations[i + 1];
+                    const segBad = aBad || bBad;
+                    const a = toWorld(pathData[i]);
+                    const b = toWorld(pathData[i + 1]);
+                    if (segBad) {{
+                        bad.push(a[0], a[1], a[2], b[0], b[1], b[2]);
+                    }} else {{
+                        good.push(a[0], a[1], a[2], b[0], b[1], b[2]);
+                    }}
+                }}
+
+                if (good.length) {{
+                    const geom = new THREE.BufferGeometry();
+                    geom.setAttribute('position', new THREE.BufferAttribute(new Float32Array(good), 3));
+                    const mat = new THREE.LineBasicMaterial({{ color: 0x7c3aed, linewidth: 1 }});
+                    const line = new THREE.LineSegments(geom, mat);
+                    scene.add(line);
+                }}
+
+                if (bad.length) {{
+                    const geom = new THREE.BufferGeometry();
+                    geom.setAttribute('position', new THREE.BufferAttribute(new Float32Array(bad), 3));
+                    const mat = new THREE.LineBasicMaterial({{ color: 0xff00cc, linewidth: 2 }});
+                    const line = new THREE.LineSegments(geom, mat);
+                    scene.add(line);
+                }}
+
+                if (badPts.length) {{
+                    const geom = new THREE.BufferGeometry();
+                    geom.setAttribute('position', new THREE.BufferAttribute(new Float32Array(badPts), 3));
+                    const mat = new THREE.PointsMaterial({{ color: 0xffea00, size: 0.35, sizeAttenuation: false }});
+                    const pts = new THREE.Points(geom, mat);
+                    scene.add(pts);
+                }}
             }}
 
             function animate() {{

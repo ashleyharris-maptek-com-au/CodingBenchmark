@@ -8,16 +8,13 @@ Subpasses grow in grid size and number of obstacles.
 Solver times out after 5 minutes.
 """
 
-from pickle import FALSE
 import random
-import subprocess
-import sys
-import tempfile
-import os
 import time
 from typing import List, Tuple, Set, Optional
 
-title = "Hamiltonian Path on Grid with Obstacles"
+from native_compiler import RustCompiler, compile_and_run, describe_this_pc
+
+title = "Hamiltonian Path on Grid with Obstacles (Rust)"
 
 # Seed for reproducibility
 RANDOM_SEED = 77777
@@ -781,24 +778,20 @@ def prepareSubpassPrompt(subPass: int) -> str:
   if subPass != 0:
     raise StopIteration
 
-  return f"""You are solving a Hamiltonian Path problem on 2D grids with obstacles.
+  return f"""You are solving a Hamiltonian Path problem on 2D grids with obstacles in Rust.
 
-You must write a Python solver that can handle ANY grid size from trivial to ludicrous scale:
+You must write a Rust solver that can handle ANY grid size from trivial to ludicrous scale.
 
-Your `find_hamiltonian_path(width, height, obstacles, require_cycle)` function will be tested with grids ranging from 4x4 to 50x50. 
-The same function must work efficiently across ALL scales.
+**Input format (stdin):**
+Line 1: width height obstacle_count require_cycle(0/1)
+Next obstacle_count lines: x y (blocked cells)
 
-**Input:**
-- `width`, `height`: Grid dimensions
-- `obstacles`: Set of (x, y) tuples for blocked cells
-- `require_cycle`: Boolean - if True, must form cycle back to start
-
-**Output:**
-- List of (x, y) coordinates representing the path
-- Path must start at (0, 0)
-- Path must visit every non-obstacle cell exactly once
-- Movement is only to adjacent cells (up/down/left/right)
-- If require_cycle is True, last cell must be adjacent to (0, 0)
+**Output format (stdout):**
+Either:
+- Line 1: 0 (no path exists)
+OR
+- Line 1: L (path length)
+- Next L lines: x y coordinates of the path in order
 
 **Critical Requirements:**
 1. **Scalability**: Your algorithm must adapt based on grid size and obstacle density
@@ -806,12 +799,18 @@ The same function must work efficiently across ALL scales.
 3. **Correctness**: Must find valid paths or correctly report impossibility
 
 **Constraints:**
-- Use only Python standard library
-- Return empty list [] if no path exists
-- Must handle both path-only and cycle requirements
+- Path must start at (0, 0)
+- Path must visit every non-obstacle cell exactly once
+- Movement is only to adjacent cells (up/down/left/right)
+- If require_cycle is True, last cell must be adjacent to (0, 0)
 
-Write complete, runnable Python code with the find_hamiltonian_path function.
-Include adaptive logic that chooses different strategies based on grid size.
+**Environment:**
+{describe_this_pc()}
+
+**Rust Compiler:**
+{RustCompiler("test_engine").describe()}
+
+Write complete, compilable Rust code with a main() function.
 """
 
 
@@ -827,14 +826,12 @@ structure = {
       "description":
       "Explain your approach to finding Hamiltonian paths and how it adapts to different grid sizes"
     },
-    "python_code": {
-      "type":
-      "string",
-      "description":
-      "Complete Python code with find_hamiltonian_path(width, height, obstacles, require_cycle) function that handles all scales"
+    "rust_code": {
+      "type": "string",
+      "description": "Complete Rust code with main() that handles all scales"
     }
   },
-  "required": ["reasoning", "python_code"],
+  "required": ["reasoning", "rust_code"],
   "additionalProperties": False
 }
 
@@ -892,6 +889,39 @@ def validate_path(path: List[Tuple[int, int]], width: int, height: int,
   return True, ""
 
 
+def format_input(width: int, height: int, obstacles: Set[Tuple[int, int]],
+                 require_cycle: bool) -> str:
+  lines = [f"{width} {height} {len(obstacles)} {1 if require_cycle else 0}"]
+  for x, y in sorted(obstacles):
+    lines.append(f"{x} {y}")
+  return "\n".join(lines)
+
+
+def parse_path_output(output: str) -> tuple:
+  tokens = output.strip().split()
+  if not tokens:
+    return None, "Empty output"
+
+  try:
+    values = [int(t) for t in tokens]
+  except ValueError:
+    return None, "Output contains non-integer tokens"
+
+  if values[0] == 0:
+    return [], ""
+
+  length = values[0]
+  coords = values[1:]
+  if len(coords) != length * 2:
+    return None, f"Expected {length * 2} coordinate values, got {len(coords)}"
+
+  path = []
+  for i in range(length):
+    path.append((coords[i * 2], coords[i * 2 + 1]))
+
+  return path, ""
+
+
 def execute_solver(code: str,
                    width: int,
                    height: int,
@@ -899,28 +929,17 @@ def execute_solver(code: str,
                    require_cycle: bool,
                    timeout: int = TIMEOUT_SECONDS) -> tuple:
   """Execute the LLM's solver. Returns (path, error, exec_time)."""
-  from solver_utils import execute_solver_with_data
+  input_data = format_input(width, height, obstacles, require_cycle)
+  run = compile_and_run(code, "rust", "test_engine", input_data=input_data, timeout=timeout)
 
-  # Use the common utility with debugger isolation
-  data_dict = {
-    'width': width,
-    'height': height,
-    'obstacles': obstacles,
-    'require_cycle': require_cycle
-  }
+  if not run:
+    return None, run.error_message(), run.exec_time
 
-  result, error, exec_time = execute_solver_with_data(code, data_dict, 'find_hamiltonian_path',
-                                                      timeout)
+  path, parse_error = parse_path_output(run.stdout)
+  if parse_error:
+    return None, parse_error, run.exec_time
 
-  if error:
-    return None, error, exec_time
-
-  if result is None:
-    return None, "Solver returned no result", exec_time
-
-  # Convert to tuples for consistency
-  path = [tuple(p) for p in result]
-  return path, None, exec_time
+  return path, None, run.exec_time
 
 
 lastPath = None
@@ -938,11 +957,11 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
   if not result:
     return 0.0, "No result provided"
 
-  if "python_code" not in result:
-    return 0.0, "No Python code provided"
+  if "rust_code" not in result:
+    return 0.0, "No Rust code provided"
 
   width, height, obstacles, require_cycle = GRIDS_CACHE[subPass]
-  code = result["python_code"]
+  code = result["rust_code"]
 
   # Execute solver
   path, error, exec_time = execute_solver(code, width, height, obstacles, require_cycle)
@@ -1122,8 +1141,8 @@ def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
                                                if len(result.get('reasoning', '')) > 500 else '')
       html += f"<p><strong>Approach:</strong> {reasoning}</p>"
 
-    if "python_code" in result:
-      code = result["python_code"]
+    if "rust_code" in result:
+      code = result["rust_code"]
       code_escaped = code.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
       html += f"<details><summary>View Code ({len(code)} chars)</summary><pre>{code_escaped}</pre></details>"
 

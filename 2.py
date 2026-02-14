@@ -1,13 +1,14 @@
 import math
 import random
-import subprocess
-import sys
-import tempfile
 import os
 import time
+from pathlib import Path
+
+from native_compiler import CSharpCompiler, compile_and_run, describe_this_pc
+from solver_utils import StreamingInputFile
 from collections import defaultdict
 
-title = "Chinese Postman Problem Solver"
+title = "Chinese Postman Problem Solver (C#)"
 
 # Seed for reproducible graph generation
 RANDOM_SEED = 12345
@@ -111,9 +112,9 @@ def prepareSubpassPrompt(subPass: int) -> str:
   if subPass != 0:
     raise StopIteration
 
-  return f"""You are solving the Chinese Postman Problem (Route Inspection Problem).
+  return f"""You are solving the Chinese Postman Problem (Route Inspection Problem) in C#.
 
-You must write a Python solver that can handle ANY graph size from trivial to ludicrous scale:
+You must write a C# solver that can handle ANY graph size from trivial to ludicrous scale:
 - **Trivial**: 6-20 nodes, 8-45 edges (small graphs, exact algorithms feasible)
 - **Medium**: 35-200 nodes, 80-600 edges (requires efficient algorithms)
 - **Large**: 500-1000 nodes, 2000-5000 edges (requires optimized implementations)
@@ -121,28 +122,29 @@ You must write a Python solver that can handle ANY graph size from trivial to lu
 - **Epic**: 50000-100000 nodes, 500000-1000000 edges (requires highly optimized algorithms)
 
 **The Challenge:**
-Your `solve_cpp(num_nodes, edges)` function will be tested with graphs ranging from 6 nodes to 10,000 nodes. The same function must work efficiently across ALL scales.
+Your program will be tested with graphs ranging from 6 nodes to 100000 nodes. The same function must work efficiently across ALL scales.
 
-**Input:**
-- `num_nodes`: Number of nodes in the undirected graph (labeled 0 to num_nodes-1)
-- `edges`: List of (node1, node2, weight) tuples representing weighted edges
+**Input format (stdin):**
+Line 1: N M (number of nodes, number of edges)
+Lines 2..M+1: u v w (edge endpoints, 0-indexed, weight integer)
 
-**Output:**
-- List of node indices representing the route
-- Route must start at node 0, traverse EVERY edge at least once, and return to node 0
+**Output format (stdout):**
+A sequence of node indices (whitespace-separated) representing a route that starts at node 0,
+traverses EVERY edge at least once, and returns to node 0.
+You may optionally prefix with a single integer L (route length). If present, it must match the number of nodes listed.
 
 **Critical Requirements:**
 1. **Scalability**: Your algorithm must adapt based on graph size and complexity
-2. **Performance**: Must complete within 30 seconds even for 10,000 node graphs
+2. **Performance**: Must complete within 30 seconds even for large graphs
 3. **Correctness**: Must traverse every edge at least once
 
-**Constraints:**
-- Use only Python standard library
-- Must handle edge cases (disconnected graphs, single nodes)
-- Route must be valid and complete
+**Environment:**
+{describe_this_pc()}
 
-Write complete, runnable Python code with the solve_cpp(num_nodes, edges) function.
-Include adaptive logic that chooses different strategies based on graph size.
+**C# Compiler:**
+{CSharpCompiler("test_engine").describe()}
+
+Write complete, compilable C# code with a static void Main method.
 """
 
 
@@ -158,14 +160,12 @@ structure = {
       "description":
       "Explain your approach to solving the Chinese Postman Problem and how it adapts to different graph sizes"
     },
-    "python_code": {
-      "type":
-      "string",
-      "description":
-      "Complete Python code with solve_cpp(num_nodes, edges) function that handles all scales"
+    "csharp_code": {
+      "type": "string",
+      "description": "Complete C# code with Main method that handles all scales"
     }
   },
-  "required": ["reasoning", "python_code"],
+  "required": ["reasoning", "csharp_code"],
   "additionalProperties": False
 }
 
@@ -262,16 +262,52 @@ def get_baseline_distance(num_nodes: int, edges: list) -> float:
   return total_weight * 1.5
 
 
-def execute_solver(code: str, num_nodes: int, edges: list, timeout: int = TIMEOUT_SECONDS) -> tuple:
-  """
-    Execute the LLM's solver code safely in a subprocess.
-    Returns (route, error_message, execution_time).
-    """
-  from solver_utils import execute_solver_with_data
+STREAMING_THRESHOLD_EDGES = 200_000
+_INPUT_FILE_CACHE = {}
 
-  # Use the common utility with debugger isolation
-  data_dict = {'num_nodes': num_nodes, 'edges': edges}
-  return execute_solver_with_data(code, data_dict, 'solve_cpp', timeout)
+
+def format_input(num_nodes: int, edges: list) -> str:
+  lines = [f"{num_nodes} {len(edges)}"]
+  for a, b, w in edges:
+    lines.append(f"{a} {b} {w}")
+  return "\n".join(lines)
+
+
+def _should_use_streaming(subpass: int) -> bool:
+  _, edge_count = GRAPH_CONFIGS[subpass]
+  return edge_count > STREAMING_THRESHOLD_EDGES
+
+
+def _get_streaming_input(subpass: int, edges: list, num_nodes: int) -> StreamingInputFile:
+  if subpass in _INPUT_FILE_CACHE:
+    return _INPUT_FILE_CACHE[subpass]
+
+  cache_key = f"cpp2|n={num_nodes}|m={len(edges)}|seed={RANDOM_SEED + subpass * 100}"
+
+  def generator():
+    yield f"{num_nodes} {len(edges)}\n"
+    for a, b, w in edges:
+      yield f"{a} {b} {w}\n"
+
+  input_file = StreamingInputFile(cache_key, generator, "test2_cpp")
+  _INPUT_FILE_CACHE[subpass] = input_file
+  return input_file
+
+
+def parse_route_output(output: str) -> tuple:
+  tokens = output.strip().split()
+  if not tokens:
+    return None, "Empty output"
+
+  try:
+    values = [int(t) for t in tokens]
+  except ValueError:
+    return None, "Output contains non-integer tokens"
+
+  if len(values) >= 2 and values[0] == len(values) - 1:
+    values = values[1:]
+
+  return values, ""
 
 
 lastRoute = None
@@ -281,8 +317,8 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
   if not result:
     return 0.0, "No result provided"
 
-  if "python_code" not in result:
-    return 0.0, "No Python code provided"
+  if "csharp_code" not in result:
+    return 0.0, "No C# code provided"
 
   global GRAPHS_CACHE
   if subPass not in GRAPHS_CACHE:
@@ -293,13 +329,31 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
 
   num_nodes, _ = GRAPH_CONFIGS[subPass]
   edges = GRAPHS_CACHE[subPass]
-  code = result["python_code"]
+  code = result["csharp_code"]
 
-  # Execute the solver
-  route, error, exec_time = execute_solver(code, num_nodes, edges)
+  if _should_use_streaming(subPass):
+    streaming_input = _get_streaming_input(subPass, edges, num_nodes)
+    input_file_path = streaming_input.generate()
+    run = compile_and_run(code,
+                          "csharp",
+                          aiEngineName,
+                          input_file=input_file_path,
+                          timeout=TIMEOUT_SECONDS)
+  else:
+    input_data = format_input(num_nodes, edges)
+    run = compile_and_run(code,
+                          "csharp",
+                          aiEngineName,
+                          input_data=input_data,
+                          timeout=TIMEOUT_SECONDS)
 
-  if error:
-    return 0.0, f"[{num_nodes} nodes, {len(edges)} edges] {error}"
+  if not run:
+    return 0.0, f"[{num_nodes} nodes, {len(edges)} edges] {run.error_message()}"
+
+  route, parse_error = parse_route_output(run.stdout)
+  exec_time = run.exec_time
+  if parse_error:
+    return 0.0, f"[{num_nodes} nodes, {len(edges)} edges] {parse_error}"
 
   global lastRoute
   lastRoute = route
@@ -355,8 +409,8 @@ def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
                                                if len(result.get('reasoning', '')) > 500 else '')
       html += f"<p><strong>Approach:</strong> {reasoning}</p>"
 
-    if "python_code" in result:
-      code = result["python_code"]
+    if "csharp_code" in result:
+      code = result["csharp_code"]
       code_escaped = code.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
       html += f"<details><summary>View Code ({len(code)} chars)</summary><pre>{code_escaped}</pre></details>"
 

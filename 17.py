@@ -12,14 +12,12 @@ Solver times out after 5 minutes.
 """
 
 import random
-import subprocess
-import sys
-import tempfile
-import os
 import time
 from typing import List, Tuple, Dict
 
-title = "3D AABB Bin Packing"
+from native_compiler import CSharpCompiler, compile_and_run, describe_this_pc
+
+title = "3D AABB Bin Packing (C#)"
 
 # Timeout in seconds (5 minutes)
 TIMEOUT_SECONDS = 30
@@ -120,54 +118,42 @@ def prepareSubpassPrompt(subPass: int) -> str:
   if subPass != 0:
     raise StopIteration
 
-  return f"""You are solving a 3D Bin Packing problem with axis-aligned boxes.
+  return f"""You are solving a 3D Bin Packing problem with axis-aligned boxes in C#.
 
-Need a function that works on all scales, from: 10,000 boxes in 1,000,000 cubic units,
-down to 4 boxes in a 10x10x10
+Your program must work on all scales, from 10,000 boxes in 1,000,000 cubic units
+down to 4 boxes in a 10x10x10 container.
 
-**The Challenge:**
-Your `pack_boxes(boxes, container)` function will be tested with containers ranging 
-from 5x5x5 to 500x500x500 and varying numbers of boxes. The same function must work efficiently 
-across ALL scales, from small to very large problems.
+**Input format (stdin):**
+Line 1: N W H D (number of boxes, container width, height, depth)
+Next N lines: w h d (box dimensions)
 
-**Input:**
-- `boxes`: List of (width, height, depth) tuples
-- `container`: (W, H, D) tuple for container dimensions
-- Container origin at (0, 0, 0), extends to (W, H, D)
-
-**Output:**
-- Dict with:
-  - `"packed_count"`: Number of boxes successfully packed
-  - `"placements"`: List of placements for packed boxes:
-    - `"box_index"`: Index of the box in input list
-    - `"position"`: (x, y, z) - corner position of box
-    - `"rotated"`: (rot_x, rot_y, rot_z) - which axes to swap (optional)
+**Output format (stdout):**
+Line 1: packed_count
+Next packed_count lines: box_index x y z (0-indexed box index and corner position)
 
 **Critical Requirements:**
 1. **Scalability**: Your algorithm must adapt based on container size and number of boxes
-2. **Performance**: Must complete within 5 minutes even for very large containers
+2. **Performance**: Must complete within 30 seconds even for very large containers
 3. **Quality**: Maximize number of boxes packed while ensuring valid placements
 
-**Rotation Options:**
-- (0, 0, 0): No rotation - (w, h, d) as given
-- (1, 0, 0): Swap height and depth - (w, d, h)
-- (0, 1, 0): Swap width and depth - (d, h, w)
-- etc. (6 possible orientations for a box)
-
 **Constraints:**
-- Use only Python standard library and numpy
 - Boxes must be entirely within container bounds
 - No two boxes may overlap
-- Boxes are axis-aligned (no arbitrary rotation)
+- Boxes are axis-aligned (no arbitrary rotation, but you may reorder w/h/d)
 - Maximize number of boxes packed
-- Must handle varying container sizes and box counts efficiently
 
-Write complete, runnable Python code with the pack_boxes function.
+**Environment:**
+{describe_this_pc()}
+
+**C# Compiler:**
+{CSharpCompiler("test_engine").describe()}
+
+Write complete, compilable C# code with a static void Main method.
 """
 
 
 # List of subpasses to grade the single answer against all difficulty levels
-extraGradeAnswerRuns = list(range(8)) #list(range(len(TEST_CASES)))
+extraGradeAnswerRuns = list(range(8))  #list(range(len(TEST_CASES)))
 
 structure = {
   "type": "object",
@@ -178,14 +164,12 @@ structure = {
       "description":
       "Explain your 3D packing algorithm and how it adapts to different container sizes and box counts"
     },
-    "python_code": {
-      "type":
-      "string",
-      "description":
-      "Complete Python code with pack_boxes(boxes, container) function that handles all scales"
+    "csharp_code": {
+      "type": "string",
+      "description": "Complete C# code with Main method that handles all scales"
     }
   },
-  "required": ["reasoning", "python_code"],
+  "required": ["reasoning", "csharp_code"],
   "additionalProperties": False
 }
 
@@ -335,52 +319,69 @@ def greedy_pack(boxes: List[Tuple], container: Tuple) -> int:
   return len(placed)
 
 
+def format_input(boxes: List[Tuple], container: Tuple) -> str:
+  lines = [f"{len(boxes)} {container[0]} {container[1]} {container[2]}"]
+  for w, h, d in boxes:
+    lines.append(f"{w} {h} {d}")
+  return "\n".join(lines)
+
+
+def parse_packing_output(output: str, boxes: List[Tuple]) -> tuple:
+  text = output.strip()
+  if not text:
+    return None, "Empty output"
+
+  lines = [l for l in text.splitlines() if l.strip()]
+  if not lines:
+    return None, "No output lines"
+
+  try:
+    packed_count = int(lines[0])
+  except ValueError:
+    return None, "First line must be packed_count integer"
+
+  if packed_count == 0:
+    return {'packed_count': 0, 'placements': []}, None
+
+  if len(lines) < 1 + packed_count:
+    return None, f"Expected {packed_count} placement lines, got {len(lines) - 1}"
+
+  placements = []
+  for i in range(1, 1 + packed_count):
+    parts = lines[i].split()
+    if len(parts) < 4:
+      return None, f"Placement line {i} needs 4 values (box_index x y z)"
+    try:
+      box_idx = int(parts[0])
+      x, y, z = int(parts[1]), int(parts[2]), int(parts[3])
+    except ValueError:
+      return None, f"Invalid values in placement line {i}"
+    placements.append({
+      'box_index': box_idx,
+      'position': [x, y, z],
+      'rotated': [0, 0, 0],
+    })
+
+  return {'packed_count': packed_count, 'placements': placements}, None
+
+
 def execute_solver(code: str,
                    boxes: List[Tuple],
                    container: Tuple,
+                   ai_engine_name: str,
                    timeout: int = TIMEOUT_SECONDS) -> tuple:
   """Execute the LLM's solver."""
-  from solver_utils import execute_solver_with_data
+  input_data = format_input(boxes, container)
+  run = compile_and_run(code, "csharp", ai_engine_name, input_data=input_data, timeout=timeout)
 
-  data_dict = {
-    'boxes': boxes,
-    'container': container,
-  }
+  if not run:
+    return None, run.error_message(), run.exec_time
 
-  result, error, exec_time = execute_solver_with_data(code, data_dict, 'pack_boxes', timeout)
+  solution, parse_error = parse_packing_output(run.stdout, boxes)
+  if parse_error:
+    return None, parse_error, run.exec_time
 
-  if error:
-    return None, error, exec_time
-
-  if not isinstance(result, dict):
-    return None, f"Invalid result type: expected dict, got {type(result).__name__}", exec_time
-
-  try:
-    placements = result.get('placements')
-    if not isinstance(placements, list):
-      return None, "Invalid result: missing or non-list 'placements'", exec_time
-
-    normalized_placements = []
-    for p in placements:
-      if not isinstance(p, dict):
-        continue
-      idx = int(p.get('box_index', 0))
-      pos = p.get('position', [0, 0, 0])
-      rot = p.get('rotated', [0, 0, 0])
-      normalized_placements.append({
-        'box_index': idx,
-        'position': [int(pos[0]), int(pos[1]), int(pos[2])],
-        'rotated': [int(rot[0]), int(rot[1]), int(rot[2])],
-      })
-
-    out = {
-      'packed_count': int(result.get('packed_count', len(normalized_placements))),
-      'placements': normalized_placements,
-    }
-  except Exception as e:
-    return None, f"Invalid result format: {e}", exec_time
-
-  return out, None, exec_time
+  return solution, None, run.exec_time
 
 
 def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
@@ -388,17 +389,17 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
   if not result:
     return 0.0, "No result provided"
 
-  if "python_code" not in result:
-    return 0.0, "No Python code provided"
+  if "csharp_code" not in result:
+    return 0.0, "No C# code provided"
 
   case = TEST_CASES[subPass]
   boxes = case["boxes"]
   container = case["container"]
   description = case["description"]
-  code = result["python_code"]
+  code = result["csharp_code"]
 
   # Execute solver
-  solution, error, exec_time = execute_solver(code, boxes, container)
+  solution, error, exec_time = execute_solver(code, boxes, container, aiEngineName)
 
   if error:
     return 0.0, f"[{description}] {error}"
@@ -456,8 +457,8 @@ def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
                                                if len(result.get('reasoning', '')) > 500 else '')
       html += f"<p><strong>Algorithm:</strong> {reasoning}</p>"
 
-    if "python_code" in result:
-      code = result["python_code"]
+    if "csharp_code" in result:
+      code = result["csharp_code"]
       code_escaped = code.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
       html += f"<details><summary>View Code ({len(code)} chars)</summary><pre>{code_escaped}</pre></details>"
 

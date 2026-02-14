@@ -13,14 +13,12 @@ Solver times out after 5 minutes.
 
 import math
 import random
-import subprocess
-import sys
-import tempfile
-import os
 import time
 from typing import List, Tuple, Dict
 
-title = "2D Polygon Cutting Stock"
+from native_compiler import RustCompiler, compile_and_run, describe_this_pc
+
+title = "2D Polygon Cutting Stock (Rust)"
 
 # Timeout in seconds (30 seconds for testing)
 TIMEOUT_SECONDS = 30
@@ -255,39 +253,43 @@ def prepareSubpassPrompt(subPass: int) -> str:
   if subPass != 0:
     raise StopIteration
 
-  return f"""You are solving a 2D Polygon Cutting Stock Problem.
+  return f"""You are solving a 2D Polygon Cutting Stock Problem in Rust.
 
 **The Challenge:**
-Your `solve_polygon_cutting(stock_polygon, pieces)` function will be tested with problems 
-ranging from 2 simple pieces to 100+ complex polygons. The same function must work efficiently 
-across ALL scales, from small test cases to large industrial problems with thousands of pieces 
-and varying polygon complexities.
+Your program will be tested with problems ranging from 2 simple pieces to 5000+ complex polygons.
+The same program must work efficiently across ALL scales.
 
-**Input:**
-- `stock_polygon`: List of (x, y) vertices defining the stock shape
-- `pieces`: List of polygons, each a list of (x, y) vertices
+**Input format (stdin):**
+Line 1: SV NP (number of stock polygon vertices, number of pieces)
+Next SV lines: x y (stock polygon vertices)
+For each piece:
+  Line: PV (number of vertices in this piece)
+  Next PV lines: x y (piece polygon vertices)
 
-**Output:**
-- Dict with:
-  - `"num_stocks"`: Number of stock polygons used
-  - `"placements"`: List of placement dicts, one per piece:
-    - `"stock_index"`: Which stock (0-indexed)
-    - `"position"`: (x, y) translation to apply to piece
-    - `"rotation"`: Rotation angle in radians
+**Output format (stdout):**
+Line 1: num_stocks
+Next NP lines: stock_index x y rotation (one per piece)
+  stock_index: 0-indexed stock polygon
+  x y: translation to apply
+  rotation: angle in radians
 
 **Critical Requirements:**
 1. **Scalability**: Your algorithm must adapt based on number and complexity of pieces
-2. **Performance**: Must complete within 5 minutes even for 10000+ complex pieces
+2. **Performance**: Must complete within 5 minutes even for 5000+ complex pieces
 3. **Quality**: Minimize stock usage while ensuring valid placements
 
 **Constraints:**
-- Use only Python standard library + numpy
 - Each placed piece must fit entirely within the stock polygon
 - Pieces on same stock must not overlap
 - Pieces may be rotated to any angle
-- Must handle varying numbers and complexities of pieces
 
-Write complete, runnable Python code with the solve_polygon_cutting function.
+**Environment:**
+{describe_this_pc()}
+
+**Rust Compiler:**
+{RustCompiler("test_engine").describe()}
+
+Write complete, compilable Rust code with a main() function.
 """
 
 
@@ -303,14 +305,12 @@ structure = {
       "description":
       "Explain your polygon packing algorithm and how it adapts to different problem complexities"
     },
-    "python_code": {
-      "type":
-      "string",
-      "description":
-      "Complete Python code with solve_polygon_cutting(stock_polygon, pieces) function that handles all scales"
+    "rust_code": {
+      "type": "string",
+      "description": "Complete Rust code with main() that handles all scales"
     }
   },
-  "required": ["reasoning", "python_code"],
+  "required": ["reasoning", "rust_code"],
   "additionalProperties": False
 }
 
@@ -431,6 +431,58 @@ def validate_solution(solution: Dict, stock: List[Tuple[float, float]],
   return True, ""
 
 
+def check_top_waste_repack_poly(solution: Dict, stock: List[Tuple[float, float]],
+                                pieces: List[List[Tuple[float, float]]]) -> Tuple[int, int]:
+  """Pick the 5 stocks with highest waste, strip their pieces, and repack
+  using the greedy baseline.  Returns (original_count, optimal_count)."""
+  N_FOCUS = 5
+  num_stocks = solution["num_stocks"]
+  placements = solution["placements"]
+  stock_area = polygon_area(stock)
+
+  if num_stocks < N_FOCUS:
+    return num_stocks, num_stocks
+
+  # Group piece indices by stock
+  stocks = {}
+  for i, p in enumerate(placements):
+    si = p["stock_index"]
+    if si not in stocks:
+      stocks[si] = []
+    stocks[si].append(i)
+
+  # Waste per stock
+  waste_per = []
+  for si, indices in stocks.items():
+    used = sum(polygon_area(pieces[i]) for i in indices)
+    waste_per.append((stock_area - used, si))
+  waste_per.sort(reverse=True)
+
+  focus = waste_per[:N_FOCUS]
+  focus_pieces = []
+  for _, si in focus:
+    for idx in stocks[si]:
+      focus_pieces.append(pieces[idx])
+
+  if not focus_pieces:
+    return N_FOCUS, N_FOCUS
+
+  # Area-based lower bound — if pieces can't even fit in fewer by area, skip
+  total_piece_area = sum(polygon_area(p) for p in focus_pieces)
+  area_lb = max(1, math.ceil(total_piece_area / stock_area))
+  if area_lb >= N_FOCUS:
+    return N_FOCUS, N_FOCUS
+
+  # For small piece counts, run greedy baseline on the subset
+  if len(focus_pieces) <= 80:
+    optimal = get_baseline_solution(stock, focus_pieces)
+    return N_FOCUS, min(optimal, N_FOCUS)
+
+  # For larger counts, use area bound with 65% packing efficiency assumption
+  est = max(area_lb, math.ceil(total_piece_area / (stock_area * 0.65)))
+  return N_FOCUS, min(est, N_FOCUS)
+
+
 def get_baseline_solution(stock: List[Tuple[float, float]],
                           pieces: List[List[Tuple[float, float]]]) -> int:
   """
@@ -498,61 +550,72 @@ def get_baseline_solution(stock: List[Tuple[float, float]],
   return len(stocks_pieces)
 
 
+def format_input(stock: List[Tuple[float, float]], pieces: List[List[Tuple[float, float]]]) -> str:
+  lines = [f"{len(stock)} {len(pieces)}"]
+  for x, y in stock:
+    lines.append(f"{x:.6f} {y:.6f}")
+  for piece in pieces:
+    lines.append(str(len(piece)))
+    for x, y in piece:
+      lines.append(f"{x:.6f} {y:.6f}")
+  return "\n".join(lines)
+
+
+def parse_placements_output(output: str, num_pieces: int) -> tuple:
+  text = output.strip()
+  if not text:
+    return None, "Empty output"
+
+  lines = [l for l in text.splitlines() if l.strip()]
+  if not lines:
+    return None, "No output lines"
+
+  try:
+    num_stocks = int(lines[0])
+  except ValueError:
+    return None, "First line must be num_stocks integer"
+
+  if len(lines) < 1 + num_pieces:
+    return None, f"Expected {num_pieces} placement lines, got {len(lines) - 1}"
+
+  placements = []
+  for i in range(1, 1 + num_pieces):
+    parts = lines[i].split()
+    if len(parts) < 4:
+      return None, f"Placement line {i} needs 4 values (stock_index x y rotation)"
+    try:
+      stock_index = int(parts[0])
+      x = float(parts[1])
+      y = float(parts[2])
+      rotation = float(parts[3])
+    except ValueError:
+      return None, f"Invalid values in placement line {i}"
+    placements.append({
+      'stock_index': stock_index,
+      'position': [x, y],
+      'rotation': rotation,
+    })
+
+  return {'num_stocks': num_stocks, 'placements': placements}, None
+
+
 def execute_solver(code: str,
                    stock: List[Tuple[float, float]],
                    pieces: List[List[Tuple[float, float]]],
+                   ai_engine_name: str,
                    timeout: int = TIMEOUT_SECONDS) -> tuple:
   """Execute the LLM's solver."""
-  from solver_utils import execute_solver_with_data
+  input_data = format_input(stock, pieces)
+  run = compile_and_run(code, "rust", ai_engine_name, input_data=input_data, timeout=timeout)
 
-  data_dict = {
-    'stock_polygon': stock,
-    'pieces': pieces,
-  }
+  if not run:
+    return None, run.error_message(), run.exec_time
 
-  result, error, exec_time = execute_solver_with_data(code, data_dict, 'solve_polygon_cutting',
-                                                      timeout)
+  solution, parse_error = parse_placements_output(run.stdout, len(pieces))
+  if parse_error:
+    return None, parse_error, run.exec_time
 
-  if error:
-    return None, error, exec_time
-
-  if not isinstance(result, dict):
-    return None, f"Invalid result type: expected dict, got {type(result).__name__}", exec_time
-
-  try:
-    placements = result.get('placements')
-    if not isinstance(placements, list):
-      return None, "Invalid result: missing or non-list 'placements'", exec_time
-
-    normalized_placements = []
-    for p in placements:
-      if isinstance(p, dict):
-        stock_index = int(p.get('stock_index', 0))
-        position = p.get('position', (0, 0))
-        rotation = p.get('rotation', 0)
-      elif isinstance(p, (list, tuple)) and len(p) >= 3:
-        stock_index = int(p[0])
-        position = p[1]
-        rotation = p[2]
-      else:
-        stock_index = 0
-        position = (0, 0)
-        rotation = 0
-
-      normalized_placements.append({
-        'stock_index': stock_index,
-        'position': [float(position[0]), float(position[1])],
-        'rotation': float(rotation),
-      })
-
-    out = {
-      'num_stocks': int(result.get('num_stocks')),
-      'placements': normalized_placements,
-    }
-  except Exception as e:
-    return None, f"Invalid result format: {e}", exec_time
-
-  return out, None, exec_time
+  return solution, None, run.exec_time
 
 
 lastSolution = None
@@ -563,17 +626,17 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
   if not result:
     return 0.0, "No result provided"
 
-  if "python_code" not in result:
-    return 0.0, "No Python code provided"
+  if "rust_code" not in result:
+    return 0.0, "No Rust code provided"
 
   case = TEST_CASES[subPass]
   stock = case["stock_polygon"]
   pieces = case["pieces"]
   description = case["description"]
-  code = result["python_code"]
+  code = result["rust_code"]
 
   # Execute solver
-  solution, error, exec_time = execute_solver(code, stock, pieces)
+  solution, error, exec_time = execute_solver(code, stock, pieces, aiEngineName)
 
   global lastSolution
   lastSolution = solution
@@ -611,8 +674,30 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
     score = 0.5
     quality = f"valid but inefficient ({ratio:.2f}x baseline)"
 
+  # ── Repack penalty ──
+  # If total waste < 1 stock area, packing is tight — no penalty.
+  # Otherwise, take the 5 stocks with the most waste, strip their pieces,
+  # and repack.  If fewer stocks needed, penalise.
+  stock_area = polygon_area(stock)
+  total_piece_area = sum(polygon_area(p) for p in pieces)
+  waste_area = num_stocks * stock_area - total_piece_area
+  penalty_note = ""
+  if waste_area < stock_area:
+    penalty_note = " (waste < 1 stock area, no repack check)"
+  elif num_stocks >= 5 and num_stocks <= 200 and len(pieces) <= 5000:
+    orig, optimal = check_top_waste_repack_poly(solution, stock, pieces)
+    saved = orig - optimal
+    if saved >= 2:
+      score = 0.0
+      penalty_note = f" REPACK PENALTY: top-5 waste stocks repacked {orig}→{optimal} (saved {saved}) → 0"
+    elif saved == 1:
+      score = min(score, 0.5)
+      penalty_note = f" REPACK PENALTY: top-5 waste stocks repacked {orig}→{optimal} (saved 1) → capped 0.5"
+    else:
+      penalty_note = f" (repack check: top-5 waste stocks already optimal at {optimal})"
+
   explanation = (f"[{description}] Stocks: {num_stocks}, Baseline: {baseline_stocks}, "
-                 f"Time: {exec_time:.1f}s - {quality}")
+                 f"Time: {exec_time:.1f}s - {quality}.{penalty_note}")
 
   return score, explanation
 
@@ -631,8 +716,8 @@ def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
                                              if len(result.get('reasoning', '')) > 500 else '')
     html += f"<p><strong>Algorithm:</strong> {reasoning}</p>"
 
-  if "python_code" in result:
-    code = result["python_code"]
+  if "rust_code" in result:
+    code = result["rust_code"]
     code_escaped = code.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     html += f"<details><summary>View Code ({len(code)} chars)</summary><pre>{code_escaped}</pre></details>"
 

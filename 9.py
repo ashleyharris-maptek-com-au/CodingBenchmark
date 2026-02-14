@@ -12,14 +12,12 @@ Solver times out after 5 minutes.
 """
 
 import random
-import subprocess
-import sys
-import tempfile
-import os
 import time
 from typing import List, Tuple, Dict
 
-title = "1D Cutting Stock - Minimum Waste"
+from native_compiler import CSharpCompiler, compile_and_run, describe_this_pc
+
+title = "1D Cutting Stock - Minimum Waste (C#)"
 
 # Timeout in seconds (30 seconds)
 TIMEOUT_SECONDS = 30
@@ -103,6 +101,26 @@ TEST_CASES = [
     "cuts": generate_cuts(10000, 100000, RANDOM_SEED + 7),
     "description": "10000 cuts, stock=100000"
   },
+  {
+    "stock_length": 1000,
+    "cuts": generate_cuts(100000, 1000, RANDOM_SEED + 8),
+    "description": "100000 cuts, stock=1000"
+  },
+  {
+    "stock_length": 1000,
+    "cuts": generate_cuts(500000, 1000, RANDOM_SEED + 9),
+    "description": "500000 cuts, stock=1000"
+  },
+  {
+    "stock_length": 1000,
+    "cuts": generate_cuts(1000000, 1000, RANDOM_SEED + 9),
+    "description": "1000000 cuts, stock=1000"
+  },
+  {
+    "stock_length": 1000,
+    "cuts": generate_cuts(10000000, 1000, RANDOM_SEED + 10),
+    "description": "10000000 cuts, stock=1000"
+  },
 ]
 
 
@@ -119,48 +137,47 @@ def prepareSubpassPrompt(subPass: int) -> str:
   if subPass != 0:
     raise StopIteration
 
-  return f"""You are solving the 1D Cutting Stock Problem.
+  return f"""You are solving the 1D Cutting Stock Problem in C#.
 
-You must write a Python solver that can handle ANY problem size from trivial to ludicrous scale:
-- **Trivial**: 3-8 cuts, short stock lengths (simple problems, optimal solutions feasible)
-- **Medium**: 10-25 cuts, moderate stock lengths (requires heuristics)
-- **Large**: 50-100 cuts, long stock lengths (needs efficient algorithms)
-- **Extreme**: 200-500 cuts, very long stock lengths (requires advanced heuristics)
-- **Ludicrous**: 10000+ cuts, very long stock lengths (requires highly optimized heuristics)
+You must write a C# solver that can handle ANY problem size from trivial to ludicrous scale:
+- **Trivial**: 3-8 cuts, short stock lengths
+- **Medium**: 10-25 cuts, moderate stock lengths
+- **Large**: 50-100 cuts, long stock lengths
+- **Extreme**: 200-500 cuts, very long stock lengths
+- **Ludicrous**: 10000+ cuts, very long stock lengths
 
-**The Challenge:**
-Your `solve_cutting_stock(cuts_needed, stock_length)` function will be tested with problems ranging 
-from 3 cuts to 10000 cuts. The same function must work efficiently across ALL scales.
+**Input format (stdin):**
+Line 1: N stock_length
+Line 2: N cut lengths separated by spaces
 
-**Input:**
-- `cuts_needed`: List of cut lengths required
-- `stock_length`: Length of wholesale stock pieces
-
-**Output:**
-- Dict with:
-  - `"num_stocks"`: Number of stock pieces used (int)
-  - `"assignments"`: List of lists, where each inner list contains cut indices assigned to that stock
-  - `"waste"`: Total waste (unused length) across all stocks
-
+**Output format (stdout):**
+Line 1: num_stocks
+Next num_stocks lines: space-separated cut indices assigned to that stock (0-indexed)
 
 **Example:**
 For cuts=[30, 40, 50] and stock_length=100:
-```python
-{{
-    "num_stocks": 2,
-    "assignments": [[0, 1], [2]],  # Stock 1: cuts 0,1 (30+40=70), Stock 2: cut 2 (50)
-    "waste": 80  # (100-70) + (100-50) = 30 + 50 = 80
-}}
-```
+Input:
+3 100
+30 40 50
+
+Output:
+2
+0 1
+2
 
 **Constraints:**
-- Use only Python standard library or numpy
 - Each cut must come from a single stock piece (no gluing)
 - Multiple cuts can come from the same stock piece if they fit
 - No cut can exceed stock_length
 - Must handle varying numbers of cuts efficiently
 
-Write complete, runnable Python code with the solve_cutting_stock function.
+**Environment:**
+{describe_this_pc()}
+
+**C# Compiler:**
+{CSharpCompiler("test_engine").describe()}
+
+Write complete, compilable C# code with a static void Main method.
 """
 
 
@@ -176,14 +193,12 @@ structure = {
       "description":
       "Explain your cutting stock algorithm and how it adapts to different problem sizes"
     },
-    "python_code": {
-      "type":
-      "string",
-      "description":
-      "Complete Python code with solve_cutting_stock(cuts_needed, stock_length) function that handles all scales"
+    "csharp_code": {
+      "type": "string",
+      "description": "Complete C# code with Main method that handles all scales"
     }
   },
-  "required": ["reasoning", "python_code"],
+  "required": ["reasoning", "csharp_code"],
   "additionalProperties": False
 }
 
@@ -253,6 +268,97 @@ def compute_waste(assignments: List[List[int]], cuts: List[int], stock_length: i
   return total_waste
 
 
+def _min_bins_exact(pieces: List[int], capacity: int, max_bins: int) -> int:
+  """Find minimum number of bins needed for pieces via backtracking.
+  Returns min bins needed, or max_bins+1 if impossible within max_bins.
+  pieces must be sorted descending for best pruning."""
+
+  n = len(pieces)
+  if n == 0:
+    return 0
+
+  # Quick lower bound: ceiling of total / capacity
+  total = sum(pieces)
+  lb = (total + capacity - 1) // capacity
+  if lb > max_bins:
+    return max_bins + 1
+
+  best = [max_bins + 1]
+  bins = [0] * max_bins  # used space per bin
+
+  def solve(idx):
+    if idx == n:
+      # Count non-empty bins
+      used = sum(1 for b in bins if b > 0)
+      if used < best[0]:
+        best[0] = used
+      return
+
+    p = pieces[idx]
+    # Pruning: remaining items need at least ceil(remaining_total / capacity) more bins
+    remaining = sum(pieces[idx:])
+    free = sum(capacity - b for b in bins[:best[0] - 1]
+               if b > 0) + capacity * (best[0] - 1 - sum(1 for b in bins if b > 0))
+
+    tried_empty = False
+    for j in range(min(best[0], max_bins)):
+      if bins[j] + p > capacity:
+        continue
+      if bins[j] == 0:
+        if tried_empty:
+          continue  # all empty bins are equivalent
+        tried_empty = True
+      bins[j] += p
+      solve(idx + 1)
+      bins[j] -= p
+      if best[0] <= lb:
+        return  # can't do better than lower bound
+
+  solve(0)
+  return best[0]
+
+
+def check_top_waste_repack(assignments: List[List[int]], cuts: List[int],
+                           stock_length: int) -> Tuple[int, int]:
+  """Pick the 5 stocks with highest waste, strip their cuts, and exhaustively
+  repack.  Returns (original_count, optimal_count) for those stocks.
+  
+  Grading rule applied by caller:
+    optimal <= 3  (saved 2+)  -> score 0
+    optimal == 4  (saved 1)   -> score capped at 0.5
+    optimal == 5  (no saving)  -> no penalty
+  """
+  N_FOCUS = 5
+  # Compute waste per stock
+  waste_per_stock = []
+  for i, stock_cuts in enumerate(assignments):
+    used = sum(cuts[idx] for idx in stock_cuts)
+    waste_per_stock.append((stock_length - used, i))
+
+  # Sort by waste descending, pick top 5
+  waste_per_stock.sort(reverse=True)
+  focus = waste_per_stock[:N_FOCUS]
+  focus_indices = [idx for _, idx in focus]
+
+  # Gather all cut lengths from those stocks
+  focus_pieces = []
+  for si in focus_indices:
+    for cut_idx in assignments[si]:
+      focus_pieces.append(cuts[cut_idx])
+
+  if not focus_pieces:
+    return N_FOCUS, N_FOCUS
+
+  original_count = len(focus_indices)
+
+  # Sort descending for best backtracking pruning
+  focus_pieces.sort(reverse=True)
+
+  optimal = _min_bins_exact(focus_pieces, stock_length, original_count)
+
+  return original_count, optimal
+
+
 def get_baseline_solution(cuts: List[int], stock_length: int) -> int:
   """
     Compute baseline using First Fit Decreasing (FFD).
@@ -275,44 +381,65 @@ def get_baseline_solution(cuts: List[int], stock_length: int) -> int:
   return len(stocks)
 
 
+def format_input(cuts: List[int], stock_length: int) -> str:
+  lines = [f"{len(cuts)} {stock_length}"]
+  lines.append(" ".join(str(c) for c in cuts))
+  return "\n".join(lines)
+
+
+def parse_assignments_output(output: str, num_cuts: int) -> tuple:
+  text = output.strip()
+  if not text:
+    return None, "Empty output"
+
+  lines = [l for l in text.splitlines() if l.strip()]
+  if not lines:
+    return None, "No output lines"
+
+  try:
+    num_stocks = int(lines[0])
+  except ValueError:
+    return None, "First line must be num_stocks integer"
+
+  if len(lines) < 1 + num_stocks:
+    return None, f"Expected {num_stocks} assignment lines, got {len(lines) - 1}"
+
+  assignments = []
+  for i in range(1, 1 + num_stocks):
+    parts = lines[i].split()
+    try:
+      indices = [int(p) for p in parts]
+    except ValueError:
+      return None, f"Non-integer index in assignment line {i}"
+    assignments.append(indices)
+
+  # Compute waste for the solution dict
+  all_assigned = [idx for stock in assignments for idx in stock]
+  out = {
+    'num_stocks': num_stocks,
+    'assignments': assignments,
+    'waste': 0,  # will be computed by caller
+  }
+  return out, None
+
+
 def execute_solver(code: str,
                    cuts: List[int],
                    stock_length: int,
+                   ai_engine_name: str,
                    timeout: int = TIMEOUT_SECONDS) -> tuple:
   """Execute the LLM's solver. Returns (solution, error, exec_time)."""
-  from solver_utils import execute_solver_with_data
+  input_data = format_input(cuts, stock_length)
+  run = compile_and_run(code, "csharp", ai_engine_name, input_data=input_data, timeout=timeout)
 
-  data_dict = {
-    'cuts_needed': cuts,
-    'stock_length': stock_length,
-  }
+  if not run:
+    return None, run.error_message(), run.exec_time
 
-  result, error, exec_time = execute_solver_with_data(code, data_dict, 'solve_cutting_stock',
-                                                      timeout)
+  solution, parse_error = parse_assignments_output(run.stdout, len(cuts))
+  if parse_error:
+    return None, parse_error, run.exec_time
 
-  if error:
-    return None, error, exec_time
-
-  if not isinstance(result, dict):
-    return None, f"Invalid result type: expected dict, got {type(result).__name__}", exec_time
-
-  # Normalize to ensure JSON-serializable primitives (e.g., numpy int -> int)
-  try:
-    assignments = result.get('assignments')
-    if not isinstance(assignments, list):
-      return None, "Invalid result: missing or non-list 'assignments'", exec_time
-
-    normalized_assignments = [list(map(int, a)) for a in assignments]
-
-    out = {
-      'num_stocks': int(result.get('num_stocks')),
-      'assignments': normalized_assignments,
-      'waste': int(result.get('waste', 0)),
-    }
-  except Exception as e:
-    return None, f"Invalid result format: {e}", exec_time
-
-  return out, None, exec_time
+  return solution, None, run.exec_time
 
 
 lastSolution = None
@@ -322,26 +449,26 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
   """
     Grade the cutting stock solver.
     
-    Scoring based on stocks used vs baseline:
-    - 1.0: <= baseline stocks
-    - 0.85: <= 1.1x baseline
-    - 0.5: <= 1.25x baseline
-    - 0.0: inefficient Invalid or error
+    Scoring based on stocks used vs baseline, with a trivial-improvement penalty:
+    - 1.0: <= baseline stocks AND no trivially saveable stocks
+    - 0.5: could trivially save exactly 1 stock (passable but not optimal)
+    - 0.0: could trivially save 2+ stocks (lazy packing)
+    - Ratio-based penalties still apply on top.
     """
   if not result:
     return 0.0, "No result provided"
 
-  if "python_code" not in result:
-    return 0.0, "No Python code provided"
+  if "csharp_code" not in result:
+    return 0.0, "No C# code provided"
 
   case = TEST_CASES[subPass]
   cuts = case["cuts"]
   stock_length = case["stock_length"]
   description = case["description"]
-  code = result["python_code"]
+  code = result["csharp_code"]
 
   # Execute solver
-  solution, error, exec_time = execute_solver(code, cuts, stock_length)
+  solution, error, exec_time = execute_solver(code, cuts, stock_length, aiEngineName)
 
   global lastSolution
   lastSolution = solution
@@ -374,8 +501,27 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
     score = 0.0
     quality = f"valid but crazily inefficient ({ratio:.2f}x baseline)"
 
+  # ── Repack penalty ──
+  # If total waste < 1 stock length, packing is tight enough — no penalty.
+  # Otherwise, take the 5 stocks with the most waste, strip their cuts,
+  # and exhaustively repack.  If we can fit them in fewer stocks, penalise.
+  penalty_note = ""
+  if waste < stock_length:
+    penalty_note = " (waste < 1 stock, no repack check)"
+  elif num_stocks >= 5 and num_stocks <= 500 and len(cuts) <= 10000:
+    orig, optimal = check_top_waste_repack(solution["assignments"], cuts, stock_length)
+    saved = orig - optimal
+    if saved >= 2:
+      score = 0.0
+      penalty_note = f" REPACK PENALTY: top-5 waste stocks repacked {orig}→{optimal} (saved {saved}) → 0"
+    elif saved == 1:
+      score = min(score, 0.5)
+      penalty_note = f" REPACK PENALTY: top-5 waste stocks repacked {orig}→{optimal} (saved 1) → capped 0.5"
+    else:
+      penalty_note = f" (repack check: top-5 waste stocks already optimal at {optimal})"
+
   explanation = (f"[{description}] Stocks used: {num_stocks}, Baseline: {baseline_stocks}, "
-                 f"Waste: {waste}, Time: {exec_time:.1f}s - {quality}")
+                 f"Waste: {waste}, Time: {exec_time:.1f}s - {quality}.{penalty_note}")
 
   return score, explanation
 
@@ -395,8 +541,8 @@ def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
                                                if len(result.get('reasoning', '')) > 500 else '')
       html += f"<p><strong>Algorithm:</strong> {reasoning}</p>"
 
-    if "python_code" in result:
-      code = result["python_code"]
+    if "csharp_code" in result:
+      code = result["csharp_code"]
       code_escaped = code.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
       html += f"<details><summary>View Code ({len(code)} chars)</summary><pre>{code_escaped}</pre></details>"
 

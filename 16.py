@@ -13,14 +13,12 @@ Solver times out after 5 minutes.
 """
 
 import random
-import subprocess
-import sys
-import tempfile
-import os
 import time
 from typing import List, Tuple, Dict
 
-title = "Job-Shop Scheduling"
+from native_compiler import CppCompiler, compile_and_run, describe_this_pc
+
+title = "Job-Shop Scheduling (C++)"
 
 # Timeout in seconds (5 minutes)
 TIMEOUT_SECONDS = 30
@@ -157,29 +155,38 @@ def prepareSubpassPrompt(subPass: int) -> str:
   if subPass != 0:
     raise StopIteration
 
-  return f"""You are solving a Job-Shop Scheduling problem.
+  return f"""You are solving a Job-Shop Scheduling problem in C++.
 
-You must write a Python solver that can handle ANY problem size from trivial to extremely large scale:
-- **Trivial**: 2-3 jobs, 2-3 machines, 5-10 tasks total (simple cases)
-- **Extreme**: 1000+ jobs, 50+ machines, 50k+ tasks total (massive optimization)
+You must write a C++ solver that can handle ANY problem size from trivial to extremely large scale:
+- **Trivial**: 2-3 jobs, 2-3 machines, 5-10 tasks total
+- **Extreme**: 1000+ jobs, 50+ machines, 50k+ tasks total
 
-**The Challenge:**
-Your `schedule_jobs(jobs, num_machines)` function will be tested with problems ranging in scope.
-The same function must work efficiently across ALL scales.
+**Input format (stdin):**
+Line 1: J M (number of jobs, number of machines)
+For each job:
+  Line: T (number of tasks in this job)
+  Next T lines: machine duration
 
-**Input:**
-- `jobs`: List of jobs, each job is a list of tasks with machine and duration
-- `num_machines`: Number of available machines (numbered 0 to num_machines-1)
+**Output format (stdout):**
+For each job (J lines total):
+  T pairs per line: start_time machine start_time machine ... (all tasks for that job)
 
-**Output:**
-- Dict with:
-  - `"makespan"`: Total completion time (when last task finishes)
-  - `"schedule"`: List of lists - for each job, for each task: (start_time, machine)
+**Example:**
+Input:
+2 2
+2
+0 3
+1 2
+2
+1 2
+0 4
 
-**Critical Requirements:**
-1. **Scalability**: Your algorithm must adapt based on number of jobs, machines, and tasks
-2. **Performance**: Must complete within 5 minutes even for very large scheduling problems
-3. **Quality**: Minimize makespan while respecting all constraints
+Output:
+0 0 3 1
+0 1 5 0
+
+(Job 0: task 0 starts at t=0 on M0, task 1 at t=3 on M1)
+(Job 1: task 0 starts at t=0 on M1, task 1 at t=5 on M0)
 
 **Key Constraints:**
 1. Each task in a job must run on its specified machine
@@ -187,24 +194,13 @@ The same function must work efficiently across ALL scales.
 3. A machine can only run one task at a time
 4. Tasks cannot be interrupted once started
 
-**Example output:**
-```python
-{{
-    "makespan": 12,
-    "schedule": [
-        [(0, 0), (3, 1)],     # Job 0: task 0 starts at t=0 on M0, task 1 at t=3 on M1
-        [(0, 1), (5, 0)],     # Job 1: task 0 starts at t=0 on M1, task 1 at t=5 on M0
-    ]
-}}
-```
+**Environment:**
+{describe_this_pc()}
 
-**Constraints:**
-- Use only Python standard library or numpy
-- Must handle varying numbers of jobs, machines, and tasks efficiently
-- Must respect all scheduling constraints
-- Minimize makespan (total completion time)
+**C++ Compiler:**
+{CppCompiler("test_engine").describe()}
 
-Write complete, runnable Python code with the schedule_jobs function.
+Write complete, compilable C++ code with a main() function.
 Include adaptive logic that chooses different strategies based on problem scale.
 """
 
@@ -221,14 +217,12 @@ structure = {
       "description":
       "Explain your scheduling algorithm and how it adapts to different problem complexities"
     },
-    "python_code": {
-      "type":
-      "string",
-      "description":
-      "Complete Python code with schedule_jobs(jobs, num_machines) function that handles all scales"
+    "cpp_code": {
+      "type": "string",
+      "description": "Complete C++ code with main() that handles all scales"
     }
   },
-  "required": ["reasoning", "python_code"],
+  "required": ["reasoning", "cpp_code"],
   "additionalProperties": False
 }
 
@@ -336,61 +330,66 @@ def greedy_schedule(jobs: List[List[Dict]], num_machines: int) -> int:
   return max(machine_free)
 
 
+def format_input(jobs: List[List[Dict]], num_machines: int) -> str:
+  lines = [f"{len(jobs)} {num_machines}"]
+  for job in jobs:
+    lines.append(str(len(job)))
+    for task in job:
+      lines.append(f"{task['machine']} {task['duration']}")
+  return "\n".join(lines)
+
+
+def parse_schedule_output(output: str, jobs: List[List[Dict]]) -> tuple:
+  text = output.strip()
+  if not text:
+    return None, "Empty output"
+
+  lines = [l for l in text.splitlines() if l.strip()]
+  if len(lines) < len(jobs):
+    return None, f"Expected {len(jobs)} schedule lines, got {len(lines)}"
+
+  schedule = []
+  makespan = 0
+
+  for job_idx in range(len(jobs)):
+    parts = lines[job_idx].split()
+    num_tasks = len(jobs[job_idx])
+    if len(parts) < num_tasks * 2:
+      return None, f"Job {job_idx}: expected {num_tasks * 2} values, got {len(parts)}"
+
+    job_sched = []
+    for t in range(num_tasks):
+      try:
+        start_time = int(parts[t * 2])
+        machine = int(parts[t * 2 + 1])
+      except ValueError:
+        return None, f"Job {job_idx} task {t}: non-integer values"
+      job_sched.append((start_time, machine))
+      duration = jobs[job_idx][t]['duration']
+      makespan = max(makespan, start_time + duration)
+
+    schedule.append(job_sched)
+
+  return {'makespan': makespan, 'schedule': schedule}, None
+
+
 def execute_solver(code: str,
                    jobs: List[List[Dict]],
                    num_machines: int,
+                   ai_engine_name: str,
                    timeout: int = TIMEOUT_SECONDS) -> tuple:
   """Execute the LLM's solver."""
-  from solver_utils import execute_solver_with_data
+  input_data = format_input(jobs, num_machines)
+  run = compile_and_run(code, "cpp", ai_engine_name, input_data=input_data, timeout=timeout)
 
-  data_dict = {
-    'jobs': jobs,
-    'num_machines': num_machines,
-  }
+  if not run:
+    return None, run.error_message(), run.exec_time
 
-  result, error, exec_time = execute_solver_with_data(code, data_dict, 'schedule_jobs', timeout)
+  solution, parse_error = parse_schedule_output(run.stdout, jobs)
+  if parse_error:
+    return None, parse_error, run.exec_time
 
-  if error:
-    return None, error, exec_time
-
-  if not isinstance(result, dict):
-    return None, f"Invalid result type: expected dict, got {type(result).__name__}", exec_time
-
-  try:
-    schedule = result.get('schedule')
-    if not isinstance(schedule, list):
-      return None, "Invalid result: missing or non-list 'schedule'", exec_time
-
-    normalized_schedule = []
-    makespan = 0
-
-    for job_idx, job_sched in enumerate(schedule):
-      if not isinstance(job_sched, list):
-        normalized_schedule.append([])
-        continue
-
-      normalized_job = []
-      for task_idx, t in enumerate(job_sched):
-        if not isinstance(t, (list, tuple)) or len(t) != 2:
-          normalized_job.append((0, int(jobs[job_idx][task_idx]['machine'])))
-          continue
-        start_time = int(t[0])
-        machine = int(t[1])
-        normalized_job.append((start_time, machine))
-
-        duration = int(jobs[job_idx][task_idx].get('duration', 0))
-        makespan = max(makespan, start_time + duration)
-
-      normalized_schedule.append(normalized_job)
-
-    out = {
-      'makespan': int(result.get('makespan', makespan)),
-      'schedule': normalized_schedule,
-    }
-  except Exception as e:
-    return None, f"Invalid result format: {e}", exec_time
-
-  return out, None, exec_time
+  return solution, None, run.exec_time
 
 
 def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
@@ -398,17 +397,17 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
   if not result:
     return 0.0, "No result provided"
 
-  if "python_code" not in result:
-    return 0.0, "No Python code provided"
+  if "cpp_code" not in result:
+    return 0.0, "No C++ code provided"
 
   case = TEST_CASES[subPass]
   jobs = case["jobs"]
   num_machines = case["num_machines"]
   description = case["description"]
-  code = result["python_code"]
+  code = result["cpp_code"]
 
   # Execute solver
-  solution, error, exec_time = execute_solver(code, jobs, num_machines)
+  solution, error, exec_time = execute_solver(code, jobs, num_machines, aiEngineName)
 
   if error:
     return 0.0, f"[{description}] {error}"
@@ -460,8 +459,8 @@ def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
                                                if len(result.get('reasoning', '')) > 500 else '')
       html += f"<p><strong>Algorithm:</strong> {reasoning}</p>"
 
-    if "python_code" in result:
-      code = result["python_code"]
+    if "cpp_code" in result:
+      code = result["cpp_code"]
       code_escaped = code.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
       html += f"<details><summary>View Code ({len(code)} chars)</summary><pre>{code_escaped}</pre></details>"
 

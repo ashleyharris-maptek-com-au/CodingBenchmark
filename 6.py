@@ -14,14 +14,15 @@ Solver times out after 5 minutes.
 """
 
 import math
-import subprocess
-import sys
-import tempfile
-import os
 import time
-from typing import List, Tuple, Dict
+import random
+import json
+import uuid
+from typing import List, Tuple, Dict, Optional
 
-title = "Orbital TSP - Space Station Route Planning"
+from native_compiler import CSharpCompiler, compile_and_run, describe_this_pc
+
+title = "Orbital TSP - Space Station Route Planning (C#)"
 
 # Timeout in seconds (5 minutes)
 TIMEOUT_SECONDS = 30
@@ -30,25 +31,144 @@ TIMEOUT_SECONDS = 30
 MU = 398600.4418
 EARTH_RADIUS = 6371  # km
 
-# Orbit data: [Pos X, Y, Z, Vel X, Y, Z] at epoch T=0 (km, km/s)
-ORBITS = [
-  [4579.848378, 5233.075386, 578.192725, -5.209886, 4.167153, 3.551514],
-  [5315.246203, -4099.931110, -1906.074155, 1.612607, 4.727540, -5.671965],
-  [7078.137000, 0.000000, 0.000000, 0.000000, -1.122156, 7.419911],
-  [-3589.068500, 6216.448994, 0.000000, -6.453475, -3.725916, 0.000000],
-  [-5021.137307, -2809.845016, 4456.930482, 1.463799, -6.765963, -2.616458],
-  [-3789.068500, 0.000000, -6562.859155, -0.000000, -7.252499, -0.000000],
-  [-6607.161632, -1921.218246, 3836.584185, 3.874056, -2.671117, 5.334098],
-  [-53.281442, -4752.411653, -6655.348928, 4.056966, -4.639096, 3.280179],
-  [-7661.829065, -1642.577396, 2820.670269, -2.051378, -1.486347, -6.437742],
-  [-1362.468620, 5363.320462, -4332.803085, -6.670648, -3.059719, -1.689831],
-]
 
-# Starting orbit (spacecraft initial position)
-START_ORBIT = [-1845.998197, -6653.941516, -3451.314228, 4.305530, 1.936911, -5.512077]
+# Orbit data: [Pos X, Y, Z, Vel X, Y, Z] at epoch T=0 (km, km/s)
+def _kepler_to_state(mu: float, a_km: float, e: float, i_rad: float, raan_rad: float,
+                     argp_rad: float, nu_rad: float) -> List[float]:
+  """Convert Keplerian elements to ECI state vector.
+
+  Elements:
+  - a_km: semi-major axis (km)
+  - e: eccentricity
+  - i_rad: inclination (rad)
+  - raan_rad: RAAN (rad)
+  - argp_rad: argument of periapsis (rad)
+  - nu_rad: true anomaly (rad)
+  """
+  p = a_km * (1.0 - e * e)
+  r_pf = p / (1.0 + e * math.cos(nu_rad))
+
+  # Perifocal position/velocity
+  x_pf = r_pf * math.cos(nu_rad)
+  y_pf = r_pf * math.sin(nu_rad)
+  z_pf = 0.0
+
+  v_pf_scale = math.sqrt(mu / p)
+  vx_pf = -v_pf_scale * math.sin(nu_rad)
+  vy_pf = v_pf_scale * (e + math.cos(nu_rad))
+  vz_pf = 0.0
+
+  # Rotation matrix from perifocal to ECI: R3(raan) * R1(i) * R3(argp)
+  cO, sO = math.cos(raan_rad), math.sin(raan_rad)
+  ci, si = math.cos(i_rad), math.sin(i_rad)
+  co, so = math.cos(argp_rad), math.sin(argp_rad)
+
+  r11 = cO * co - sO * so * ci
+  r12 = -cO * so - sO * co * ci
+  r13 = sO * si
+  r21 = sO * co + cO * so * ci
+  r22 = -sO * so + cO * co * ci
+  r23 = -cO * si
+  r31 = so * si
+  r32 = co * si
+  r33 = ci
+
+  x = r11 * x_pf + r12 * y_pf + r13 * z_pf
+  y = r21 * x_pf + r22 * y_pf + r23 * z_pf
+  z = r31 * x_pf + r32 * y_pf + r33 * z_pf
+
+  vx = r11 * vx_pf + r12 * vy_pf + r13 * vz_pf
+  vy = r21 * vx_pf + r22 * vy_pf + r23 * vz_pf
+  vz = r31 * vx_pf + r32 * vy_pf + r33 * vz_pf
+
+  return [x, y, z, vx, vy, vz]
+
+
+def generate_random_orbit(rng: random.Random,
+                          *,
+                          min_perigee_alt_km: float = 600.0,
+                          max_apogee_alt_km: float = 80000.0) -> List[float]:
+  """Generate a random long-lived Earth orbit as a state vector.
+
+  Constraints:
+  - Perigee altitude >= min_perigee_alt_km (avoids atmospheric drag for geologic times)
+  - Apogee altitude <= max_apogee_alt_km (well below the Moon, avoids lunar dynamics)
+  """
+  # Choose inclination including retrograde
+  i_deg = rng.uniform(0.0, 180.0)
+  i = math.radians(i_deg)
+
+  raan = rng.uniform(0.0, 2.0 * math.pi)
+  argp = rng.uniform(0.0, 2.0 * math.pi)
+  nu = rng.uniform(0.0, 2.0 * math.pi)
+
+  # Semi-major axis baseline from altitude
+  # Spread: LEO -> MEO-ish, avoid GEO-synchronous special-casing but allow it.
+  base_alt_km = rng.uniform(700.0, 40000.0)
+
+  # Eccentricity spread: near-circular to moderately elliptical
+  e = rng.uniform(0.0, 0.6)
+
+  rp_min = EARTH_RADIUS + float(min_perigee_alt_km)
+  ra_max = EARTH_RADIUS + float(max_apogee_alt_km)
+
+  # Solve for a such that constraints hold: rp = a(1-e) and ra = a(1+e)
+  # Start with base altitude and adjust if needed.
+  a = EARTH_RADIUS + base_alt_km
+  a = max(a, rp_min / max(1e-6, (1.0 - e)))
+  a = min(a, ra_max / max(1e-6, (1.0 + e)))
+
+  # If constraints still infeasible (high e with low max apogee), reduce e.
+  # (rare but possible if we clipped a hard)
+  if a * (1.0 - e) < rp_min or a * (1.0 + e) > ra_max:
+    e = min(e, 0.3)
+    a = max(a, rp_min / (1.0 - e))
+    a = min(a, ra_max / (1.0 + e))
+
+  # Final sanity clamps
+  rp = a * (1.0 - e)
+  ra = a * (1.0 + e)
+  if rp < rp_min:
+    a = rp_min / (1.0 - e)
+  if ra > ra_max:
+    a = ra_max / (1.0 + e)
+
+  return _kepler_to_state(MU, a, e, i, raan, argp, nu)
+
+
+def generate_random_orbits(seed: int, n: int) -> Tuple[List[float], List[List[float]]]:
+  """Generate a start orbit and N station orbits deterministically from seed."""
+  rng = random.Random(int(seed))
+  start_orbit = generate_random_orbit(
+    rng,
+    min_perigee_alt_km=700.0,
+    max_apogee_alt_km=20000.0,
+  )
+  orbits = [generate_random_orbit(rng) for _ in range(n)]
+  return start_orbit, orbits
+
+
+# Default dataset (seeded for repeatability). Hardest test requires 100 stations.
+START_ORBIT, ORBITS = generate_random_orbits(seed=6, n=100)
 
 # Number of stations for each subpass
 STATION_COUNTS = [2, 3, 4, 5, 6, 8, 10, 15, 20, 50, 100]
+
+_DATASET_CACHE: Dict[int, Tuple[List[float], List[List[float]]]] = {}
+
+
+def _get_dataset_for_subpass(subpass: int) -> Tuple[List[float], List[List[float]]]:
+  """Return (start_orbit, orbits) for a given subpass.
+
+  This makes each difficulty level start from a different (but deterministic) orbit
+  and uses a different station set.
+  """
+  seed = 6000 + int(subpass)
+  if seed in _DATASET_CACHE:
+    return _DATASET_CACHE[seed]
+  ds = generate_random_orbits(seed=seed, n=100)
+  _DATASET_CACHE[seed] = ds
+  return ds
 
 
 def get_orbit_info(orbit: List[float]) -> Dict:
@@ -101,59 +221,47 @@ def prepareSubpassPrompt(subPass: int) -> str:
 
   start_info = get_orbit_info(START_ORBIT)
 
-  return f"""You are solving an Orbital Travelling Salesman Problem.
+  return f"""You are solving an Orbital Travelling Salesman Problem in C#.
 
-You must write a Python solver that can handle ANY number of stations from trivial to ludicrous scale:
+You must write a C# solver that can handle ANY number of stations from trivial to ludicrous scale:
 - **Trivial**: 2-5 stations (simple brute-force permutations feasible)
 - **Medium**: 6-10 stations (requires heuristics, some optimization)
 - **Large**: 15-20 stations (complex orbital mechanics, needs efficient algorithms)
 - **Extreme**: 50-100 stations (very complex, requires advanced heuristics)
 
 **The Challenge:**
-Your `solve_orbital_tsp(start_orbit, station_orbits, mu)` function will be tested with 2 to 100 stations. The same function must work efficiently across ALL scales.
+Your program will be tested with 2 to 100 stations. The same algorithm must work efficiently across ALL scales.
+
+**Input format (stdin):**
+Line 1: N mu
+Line 2: start orbit: x y z vx vy vz
+Lines 3..N+2: station orbits: x y z vx vy vz
+
+**Output format (stdout):**
+One line containing N integers: the visitation order of station indices (0..N-1).
+
 
 **Starting position (epoch T=0):**
 Position: ({START_ORBIT[0]:.1f}, {START_ORBIT[1]:.1f}, {START_ORBIT[2]:.1f}) km
 Velocity: ({START_ORBIT[3]:.3f}, {START_ORBIT[4]:.3f}, {START_ORBIT[5]:.3f}) km/s
 Altitude: ~{start_info['altitude_km']:.0f} km
 
-**Station orbits:**
-- {len(ORBITS)} available station orbits with varying altitudes and inclinations
-- Your function will receive subsets of these stations to visit
-- All orbits follow Kepler's laws with Earth's gravity
-
 **Physics constants:**
 - Earth gravitational parameter μ = {MU} km³/s²
 - Earth radius = {EARTH_RADIUS} km
-- Earth-Centered Inertial (ECI) coordinates
-- Two-body dynamics (ignore Moon, Sun, atmosphere)
-- Instantaneous impulsive burns (delta-V applied instantly)
-
-**Input:**
-- `start_orbit`: [x, y, z, vx, vy, vz] - spacecraft initial state vector (6 floats: position + velocity)
-- `station_orbits`: List of [x, y, z, vx, vy, vz] for each station (each is 6 floats)
-- `mu`: Gravitational parameter (single float)
-
-**Note:** All orbit data are 6-element lists containing position (x,y,z) and velocity (vx,vy,vz) components.
-
-**Output:**
-- Dict with:
-  - `"visit_order"`: list of station indices in visitation order
-  - `"total_delta_v"`: estimated total delta-V in km/s
-  - `"reasoning"`: brief explanation of approach
 
 **Critical Requirements:**
 1. **Scalability**: Your algorithm must adapt based on number of stations
 2. **Performance**: Must complete within 5 minutes even for 100 stations
 3. **Accuracy**: Should provide reasonable delta-V estimates
 
-**Constraints:**
-- Use only Python standard library
-- Handle varying numbers of stations efficiently
-- Provide reasonable orbital transfer estimates
+**Environment:**
+{describe_this_pc()}
 
-Write complete, runnable Python code with the solve_orbital_tsp function.
-Include adaptive logic that chooses different strategies based on station count.
+**C# Compiler:**
+{CSharpCompiler("test_engine").describe()}
+
+Write complete, compilable C# code with a static void Main method.
 """
 
 
@@ -169,12 +277,12 @@ structure = {
       "description":
       "Explain your orbital mechanics approach and how it adapts to different station counts"
     },
-    "python_code": {
+    "csharp_code": {
       "type": "string",
-      "description": "Complete Python code with solve_orbital_tsp function that handles all scales"
+      "description": "Complete C# code with Main method that handles all scales"
     }
   },
-  "required": ["reasoning", "python_code"],
+  "required": ["reasoning", "csharp_code"],
   "additionalProperties": False
 }
 
@@ -379,22 +487,23 @@ def cluster_orbits(station_orbits: List[List[float]]) -> List[List[int]]:
   return clusters
 
 
-def get_baseline_solution(num_stations: int) -> Tuple[List[int], float]:
+def get_baseline_solution(num_stations: int, start_orbit: List[float],
+                          orbits: List[List[float]]) -> Tuple[List[int], float]:
   """
   Get baseline solution using intelligent orbital clustering.
   Groups similar orbits together, then finds optimal sequence between clusters.
   """
-  station_orbits = ORBITS[:num_stations]
+  station_orbits = orbits[:num_stations]
 
   if num_stations <= 2:
     # For small numbers, just try all permutations
     if num_stations == 1:
-      return [0], estimate_transfer_delta_v(START_ORBIT, station_orbits[0])
+      return [0], estimate_transfer_delta_v(start_orbit, station_orbits[0])
     elif num_stations == 2:
       # Try both orders
-      dv1 = estimate_transfer_delta_v(START_ORBIT, station_orbits[0]) + \
+      dv1 = estimate_transfer_delta_v(start_orbit, station_orbits[0]) + \
             estimate_transfer_delta_v(station_orbits[0], station_orbits[1])
-      dv2 = estimate_transfer_delta_v(START_ORBIT, station_orbits[1]) + \
+      dv2 = estimate_transfer_delta_v(start_orbit, station_orbits[1]) + \
             estimate_transfer_delta_v(station_orbits[1], station_orbits[0])
       if dv1 <= dv2:
         return [0, 1], dv1
@@ -408,7 +517,7 @@ def get_baseline_solution(num_stations: int) -> Tuple[List[int], float]:
   # Use simple heuristic: start with cluster closest to start, then move to next closest
   remaining_clusters = clusters.copy()
   cluster_order = []
-  current_orbit = START_ORBIT
+  current_orbit = start_orbit
 
   while remaining_clusters:
     best_cluster = None
@@ -432,7 +541,7 @@ def get_baseline_solution(num_stations: int) -> Tuple[List[int], float]:
   # Now optimize within each cluster (visit stations in optimal order)
   final_order = []
   total_dv = 0
-  current_orbit = START_ORBIT
+  current_orbit = start_orbit
 
   for cluster in cluster_order:
     if len(cluster) == 1:
@@ -464,27 +573,56 @@ def get_baseline_solution(num_stations: int) -> Tuple[List[int], float]:
   return final_order, total_dv
 
 
-def execute_solver(code: str, num_stations: int, timeout: int = TIMEOUT_SECONDS) -> tuple:
-  """Execute the LLM's solver. Returns (result_dict, error, exec_time)."""
-  from solver_utils import execute_solver_with_data
-
-  station_orbits = ORBITS[:num_stations]
-
-  # Use the common utility with debugger isolation
-  data_dict = {'MU': MU, 'start_orbit': START_ORBIT, 'station_orbits': station_orbits}
-
-  return execute_solver_with_data(code, data_dict, 'solve_orbital_tsp', timeout)
+def format_input(num_stations: int, start_orbit: List[float], orbits: List[List[float]]) -> str:
+  lines = [f"{num_stations} {MU}"]
+  lines.append(" ".join(f"{v:.6f}" for v in start_orbit))
+  for orbit in orbits[:num_stations]:
+    lines.append(" ".join(f"{v:.6f}" for v in orbit))
+  return "\n".join(lines)
 
 
-def validate_solution(result: Dict, num_stations: int) -> Tuple[bool, str]:
-  """Validate the solution format."""
-  if not isinstance(result, dict):
-    return False, "Result must be a dict"
+def parse_order_output(output: str, expected_n: int) -> tuple:
+  tokens = output.strip().split()
+  if not tokens:
+    return None, "Empty output"
 
-  if "visit_order" not in result:
-    return False, "Missing 'visit_order' in result"
+  try:
+    values = [int(t) for t in tokens]
+  except ValueError:
+    return None, "Output contains non-integer tokens"
 
-  order = result["visit_order"]
+  if len(values) == expected_n + 1 and values[0] == expected_n:
+    values = values[1:]
+
+  if len(values) != expected_n:
+    return None, f"Expected {expected_n} indices, got {len(values)}"
+
+  return values, ""
+
+
+def execute_solver(code: str,
+                   num_stations: int,
+                   start_orbit: List[float],
+                   orbits: List[List[float]],
+                   timeout: int = TIMEOUT_SECONDS) -> tuple:
+  """Execute the LLM's solver. Returns (order, error, exec_time)."""
+  input_data = format_input(num_stations, start_orbit, orbits)
+  run = compile_and_run(code, "csharp", "test_engine", input_data=input_data, timeout=timeout)
+
+  if not run:
+    return None, run.error_message(), run.exec_time
+
+  order, parse_error = parse_order_output(run.stdout, num_stations)
+  if parse_error:
+    return None, parse_error, run.exec_time
+
+  return order, None, run.exec_time
+
+
+def validate_solution(order: List[int], num_stations: int) -> Tuple[bool, str]:
+  """Validate the visitation order format."""
+  if not isinstance(order, list):
+    return False, "Order must be a list"
   if not isinstance(order, list):
     return False, "visit_order must be a list"
 
@@ -497,15 +635,15 @@ def validate_solution(result: Dict, num_stations: int) -> Tuple[bool, str]:
   return True, ""
 
 
-def evaluate_order(order: List[int]) -> float:
+def evaluate_order(order: List[int], start_orbit: List[float], orbits: List[List[float]]) -> float:
   """Evaluate the delta-V for a given visitation order."""
-  current_orbit = START_ORBIT
+  current_orbit = start_orbit
   total_dv = 0
 
   for station in order:
-    dv = estimate_transfer_delta_v(current_orbit, ORBITS[station])
+    dv = estimate_transfer_delta_v(current_orbit, orbits[station])
     total_dv += dv
-    current_orbit = ORBITS[station]
+    current_orbit = orbits[station]
 
   return total_dv
 
@@ -524,44 +662,45 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
   if not result:
     return 0.0, "No result provided"
 
-  if "python_code" not in result:
-    return 0.0, "No Python code provided"
+  if "csharp_code" not in result:
+    return 0.0, "No C# code provided"
 
   num_stations = STATION_COUNTS[subPass]
-  code = result["python_code"]
+  code = result["csharp_code"]
+
+  start_orbit, orbits = _get_dataset_for_subpass(subPass)
 
   # Execute solver
-  solution, error, exec_time = execute_solver(code, num_stations)
+  order, error, exec_time = execute_solver(code, num_stations, start_orbit, orbits)
 
   if error:
     return 0.0, f"[{num_stations} stations] {error}"
 
   # Validate solution
-  is_valid, validation_error = validate_solution(solution, num_stations)
+  is_valid, validation_error = validate_solution(order, num_stations)
   if not is_valid:
     return 0.0, f"[{num_stations} stations] Invalid: {validation_error}"
 
   # Evaluate the order
-  order = solution["visit_order"]
-  solution_dv = evaluate_order(order)
+  solution_dv = evaluate_order(order, start_orbit, orbits)
 
   # Get baseline
-  baseline_order, baseline_dv = get_baseline_solution(num_stations)
+  baseline_order, baseline_dv = get_baseline_solution(num_stations, start_orbit, orbits)
 
   # Score
   ratio = solution_dv / baseline_dv if baseline_dv > 0 else float('inf')
 
-  if ratio <= 1.0:
+  if ratio <= 1.01:
     score = 1.0
     quality = "excellent (≤ baseline)"
   elif ratio <= 1.2:
-    score = 0.85
+    score = 0.2
     quality = "good (≤ 1.2x baseline)"
   elif ratio <= 1.5:
-    score = 0.7
+    score = 0.1
     quality = "acceptable (≤ 1.5x baseline)"
   else:
-    score = 0.5
+    score = 0.0
     quality = f"poor ({ratio:.1f}x baseline)"
 
   explanation = (f"[{num_stations} stations] Order: {order}, "
@@ -571,8 +710,442 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
   return score, explanation
 
 
+def _state_to_elements(sv):
+  """Convert state vector [x,y,z,vx,vy,vz] (km, km/s) to orbital elements (a, e, i, raan, argp)."""
+  rx, ry, rz = sv[0], sv[1], sv[2]
+  vx, vy, vz = sv[3], sv[4], sv[5]
+
+  r = math.sqrt(rx**2 + ry**2 + rz**2)
+  v = math.sqrt(vx**2 + vy**2 + vz**2)
+
+  # Angular momentum h = r x v
+  hx = ry * vz - rz * vy
+  hy = rz * vx - rx * vz
+  hz = rx * vy - ry * vx
+  h = math.sqrt(hx**2 + hy**2 + hz**2)
+
+  # Node vector n = k x h = [-hy, hx, 0]
+  nx, ny = -hy, hx
+  n = math.sqrt(nx**2 + ny**2)
+
+  # Eccentricity vector: e = (v x h)/mu - r_hat
+  vhx = vy * hz - vz * hy
+  vhy = vz * hx - vx * hz
+  vhz = vx * hy - vy * hx
+  ex = vhx / MU - rx / r
+  ey = vhy / MU - ry / r
+  ez = vhz / MU - rz / r
+  e = math.sqrt(ex**2 + ey**2 + ez**2)
+
+  # Semi-major axis
+  energy = v**2 / 2 - MU / r
+  if abs(energy) > 1e-10:
+    a = -MU / (2 * energy)
+  else:
+    a = r
+
+  # Inclination
+  inc = math.acos(max(-1, min(1, hz / h)))
+
+  # RAAN
+  if n > 1e-10:
+    raan = math.acos(max(-1, min(1, nx / n)))
+    if ny < 0:
+      raan = 2 * math.pi - raan
+  else:
+    raan = 0.0
+
+  # Argument of periapsis
+  if n > 1e-10 and e > 1e-10:
+    dot_ne = nx * ex + ny * ey
+    cos_argp = dot_ne / (n * e)
+    argp = math.acos(max(-1, min(1, cos_argp)))
+    if ez < 0:
+      argp = 2 * math.pi - argp
+  else:
+    argp = 0.0
+
+  return a, e, inc, raan, argp
+
+
+def _orbit_ring_points(a, e, inc, raan, argp, n_pts=64, scale=1.0):
+  """Sample n_pts points around an orbit ellipse, scaled by scale factor."""
+  if e >= 1.0:
+    e = 0.99
+  p = a * (1.0 - e * e)
+  if p <= 0:
+    return []
+
+  cO, sO = math.cos(raan), math.sin(raan)
+  ci, si = math.cos(inc), math.sin(inc)
+  co, so = math.cos(argp), math.sin(argp)
+
+  r11 = cO * co - sO * so * ci
+  r12 = -cO * so - sO * co * ci
+  r21 = sO * co + cO * so * ci
+  r22 = -sO * so + cO * co * ci
+  r31 = so * si
+  r32 = co * si
+
+  points = []
+  for k in range(n_pts + 1):
+    nu = 2.0 * math.pi * k / n_pts
+    denom = 1.0 + e * math.cos(nu)
+    if denom <= 0:
+      continue
+    r_pf = p / denom
+    x_pf = r_pf * math.cos(nu)
+    y_pf = r_pf * math.sin(nu)
+
+    x = (r11 * x_pf + r12 * y_pf) * scale
+    y = (r21 * x_pf + r22 * y_pf) * scale
+    z = (r31 * x_pf + r32 * y_pf) * scale
+    points.append([round(x, 4), round(y, 4), round(z, 4)])
+  return points
+
+
+def _ring_point_nearest_dir(ring, direction):
+  """Find index of ring point most aligned with direction. Returns (index, point)."""
+  best_dot = -float('inf')
+  best_idx = 0
+  for i, p in enumerate(ring):
+    r = math.sqrt(p[0] * p[0] + p[1] * p[1] + p[2] * p[2])
+    if r > 0:
+      dot = (p[0] * direction[0] + p[1] * direction[1] + p[2] * direction[2]) / r
+      if dot > best_dot:
+        best_dot = dot
+        best_idx = i
+  return best_idx, ring[best_idx]
+
+
+def _compute_transfer_arc(dep_ring, arr_ring, sv_dep, sv_arr, n_pts=100):
+  """Compute a Hohmann transfer arc between two orbit rings.
+  
+  Departure/arrival are chosen at the line of nodes (h_dep × h_arr) so that
+  orbit tangent directions are naturally compatible for 180° sweep.
+  Uses Hermite spline for direction + cosine radius interpolation.
+  
+  Returns:
+    list of [x,y,z] arc points (already in scaled coordinates)
+  """
+  if not dep_ring or not arr_ring or len(dep_ring) < 3 or len(arr_ring) < 3:
+    return []
+
+  # Angular momenta h = r × v (in km, unscaled)
+  h_dep = [
+    sv_dep[1] * sv_dep[5] - sv_dep[2] * sv_dep[4], sv_dep[2] * sv_dep[3] - sv_dep[0] * sv_dep[5],
+    sv_dep[0] * sv_dep[4] - sv_dep[1] * sv_dep[3]
+  ]
+  h_arr = [
+    sv_arr[1] * sv_arr[5] - sv_arr[2] * sv_arr[4], sv_arr[2] * sv_arr[3] - sv_arr[0] * sv_arr[5],
+    sv_arr[0] * sv_arr[4] - sv_arr[1] * sv_arr[3]
+  ]
+
+  # Line of nodes = h_dep × h_arr
+  node = [
+    h_dep[1] * h_arr[2] - h_dep[2] * h_arr[1], h_dep[2] * h_arr[0] - h_dep[0] * h_arr[2],
+    h_dep[0] * h_arr[1] - h_dep[1] * h_arr[0]
+  ]
+  node_mag = math.sqrt(sum(x * x for x in node))
+
+  if node_mag < 1e-10:
+    # Coplanar orbits: use satellite position as departure direction
+    node = [sv_dep[0], sv_dep[1], sv_dep[2]]
+    node_mag = math.sqrt(sum(x * x for x in node))
+    if node_mag < 1e-10:
+      return []
+
+  node_hat = [node[i] / node_mag for i in range(3)]
+
+  # Departure: ring point nearest +node, Arrival: ring point nearest -node
+  dep_idx, dep_pt = _ring_point_nearest_dir(dep_ring, node_hat)
+  arr_idx, arr_pt = _ring_point_nearest_dir(arr_ring, [-node_hat[i] for i in range(3)])
+
+  dep_r = math.sqrt(sum(x * x for x in dep_pt))
+  arr_r = math.sqrt(sum(x * x for x in arr_pt))
+  if dep_r < 1e-10 or arr_r < 1e-10:
+    return []
+
+  dep_hat = [dep_pt[i] / dep_r for i in range(3)]
+  arr_hat = [arr_pt[i] / arr_r for i in range(3)]
+
+  # Orbit tangent at departure from adjacent ring points
+  nd = len(dep_ring)
+  td = [dep_ring[(dep_idx + 1) % nd][i] - dep_ring[(dep_idx - 1) % nd][i] for i in range(3)]
+  td_dot_r = sum(td[i] * dep_hat[i] for i in range(3))
+  td = [td[i] - td_dot_r * dep_hat[i] for i in range(3)]
+  td_mag = math.sqrt(sum(x * x for x in td))
+  if td_mag < 1e-12:
+    return []
+  td = [td[i] / td_mag for i in range(3)]
+
+  # Orbit tangent at arrival from adjacent ring points
+  na = len(arr_ring)
+  ta = [arr_ring[(arr_idx + 1) % na][i] - arr_ring[(arr_idx - 1) % na][i] for i in range(3)]
+  ta_dot_r = sum(ta[i] * arr_hat[i] for i in range(3))
+  ta = [ta[i] - ta_dot_r * arr_hat[i] for i in range(3)]
+  ta_mag = math.sqrt(sum(x * x for x in ta))
+  if ta_mag < 1e-12:
+    return []
+  ta = [ta[i] / ta_mag for i in range(3)]
+
+  # Hermite scale factor = angle between dep_hat and arr_hat
+  dot_da = max(-1.0, min(1.0, sum(dep_hat[i] * arr_hat[i] for i in range(3))))
+  angle = math.acos(dot_da)
+  if angle < 0.01:
+    angle = math.pi
+  S = angle
+
+  # Hermite spline direction + cosine radius
+  points = []
+  for k in range(n_pts + 1):
+    t = k / n_pts
+    t2 = t * t
+    t3 = t2 * t
+    h00 = 2.0 * t3 - 3.0 * t2 + 1.0
+    h10 = t3 - 2.0 * t2 + t
+    h01 = -2.0 * t3 + 3.0 * t2
+    h11 = t3 - t2
+
+    dx = h00 * dep_hat[0] + h10 * S * td[0] + h01 * arr_hat[0] + h11 * S * ta[0]
+    dy = h00 * dep_hat[1] + h10 * S * td[1] + h01 * arr_hat[1] + h11 * S * ta[1]
+    dz = h00 * dep_hat[2] + h10 * S * td[2] + h01 * arr_hat[2] + h11 * S * ta[2]
+
+    d_mag = math.sqrt(dx * dx + dy * dy + dz * dz)
+    if d_mag < 1e-12:
+      d_mag = 1e-12
+    dx /= d_mag
+    dy /= d_mag
+    dz /= d_mag
+
+    r = (dep_r + arr_r) / 2.0 + (dep_r - arr_r) / 2.0 * math.cos(math.pi * t)
+    points.append([round(r * dx, 4), round(r * dy, 4), round(r * dz, 4)])
+
+  return points
+
+
+def _build_viz_data(start_orbit, orbits, num_stations, order=None):
+  """Build visualization data: orbit rings, positions, path."""
+  scale = 1.0 / EARTH_RADIUS  # normalize so Earth radius = 1.0
+
+  # Start orbit ring
+  try:
+    a, e, inc, raan, argp = _state_to_elements(start_orbit)
+    start_ring = _orbit_ring_points(a, e, inc, raan, argp, n_pts=64, scale=scale)
+  except Exception:
+    start_ring = []
+
+  start_pos = [round(start_orbit[i] * scale, 4) for i in range(3)]
+
+  # Station orbit rings and positions
+  orbit_rings = []
+  station_positions = []
+  for i in range(num_stations):
+    sv = orbits[i]
+    station_positions.append([round(sv[j] * scale, 4) for j in range(3)])
+    try:
+      a, e, inc, raan, argp = _state_to_elements(sv)
+      orbit_rings.append(_orbit_ring_points(a, e, inc, raan, argp, n_pts=64, scale=scale))
+    except Exception:
+      orbit_rings.append([])
+
+  # Transfer arcs (if we have a valid order)
+  transfer_arcs = None
+  if order is not None:
+    transfer_arcs = []
+    prev_ring = start_ring
+    prev_sv = start_orbit
+    for idx in order:
+      if 0 <= idx < num_stations:
+        next_ring = orbit_rings[idx]
+        next_sv = orbits[idx]
+        arc_points = _compute_transfer_arc(prev_ring, next_ring, prev_sv, next_sv, n_pts=40)
+        if arc_points:
+          transfer_arcs.append(arc_points)
+        prev_ring = next_ring
+        prev_sv = next_sv
+
+  return {
+    'earthRadius': 1.0,
+    'orbitRings': orbit_rings,
+    'stationPositions': station_positions,
+    'startPosition': start_pos,
+    'startRing': start_ring,
+    'transferArcs': transfer_arcs,
+  }
+
+
+def _generate_orbital_viz_html(viz_data, name="Orbital TSP"):
+  """Generate three.js HTML for orbital TSP visualization."""
+  viz_id = str(uuid.uuid4())[:8]
+  n_stations = len(viz_data['stationPositions'])
+  arcs = viz_data['transferArcs']
+  path_label = f", {len(arcs)} transfers" if arcs else ""
+
+  data_json = json.dumps(viz_data)
+
+  # The JS template uses {{ }} for literal braces inside the f-string
+  return f"""
+    <div class="orbital-tsp-visualization" style="margin: 15px 0;">
+        <details>
+            <summary style="cursor: pointer; padding: 8px; background: #e8e8e8; border-radius: 4px; font-weight: bold; color: #333; border: 1px solid #ccc;">
+                &#128752; 3D Orbital View: {name} ({n_stations} stations{path_label})
+            </summary>
+            <div style="margin-top: 10px;">
+                <div id="orb-{viz_id}" style="width: 100%; height: 500px; border: 1px solid #333; background: #080818; border-radius: 4px; position: relative; display: flex; align-items: center; justify-content: center; color: #999;">
+                    <span class="viz-placeholder">Scroll here to activate 3D view</span>
+                </div>
+                <div style="margin-top: 8px; font-size: 12px; color: #666; background: #f8f8f8; padding: 5px; border-radius: 3px;">
+                    Blue sphere = Earth | colored rings = station orbits | white ring = start orbit | green sphere = start | gradient line = solution path (green&#8594;red) | Drag to rotate, scroll to zoom, right-drag to pan
+                </div>
+            </div>
+        </details>
+    </div>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.132.2/build/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.132.2/examples/js/controls/OrbitControls.js"></script>
+    <script>
+    (function() {{
+        var vizId = 'orb_{viz_id}';
+        var D = {data_json};
+        var scene, camera, renderer, controls, animId;
+        var active = false;
+
+        function go() {{
+            if (active) return;
+            active = true;
+            var el = document.getElementById('orb-{viz_id}');
+            if (!el || typeof THREE === 'undefined') return;
+            var ph = el.querySelector('.viz-placeholder');
+            if (ph) ph.style.display = 'none';
+
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0x080818);
+            camera = new THREE.PerspectiveCamera(50, el.clientWidth / el.clientHeight, 0.01, 500);
+            renderer = new THREE.WebGLRenderer({{ antialias: true }});
+            renderer.setSize(el.clientWidth, el.clientHeight);
+            el.appendChild(renderer.domElement);
+            controls = new THREE.OrbitControls(camera, renderer.domElement);
+            controls.enableDamping = true;
+            controls.dampingFactor = 0.05;
+
+            var maxR = D.earthRadius, i, j, r, ring, geom, mat, pos, positions, colors, t, n;
+            for (i = 0; i < D.orbitRings.length; i++) {{
+                ring = D.orbitRings[i];
+                for (j = 0; j < ring.length; j++) {{
+                    r = Math.sqrt(ring[j][0]*ring[j][0]+ring[j][1]*ring[j][1]+ring[j][2]*ring[j][2]);
+                    if (r > maxR) maxR = r;
+                }}
+            }}
+            if (maxR < 2) maxR = 2;
+            camera.position.set(maxR*1.2, maxR*0.8, maxR*1.2);
+            camera.lookAt(0,0,0);
+
+            scene.add(new THREE.AmbientLight(0x404060));
+            var dl = new THREE.DirectionalLight(0xffffff, 0.8);
+            dl.position.set(5,3,5);
+            scene.add(dl);
+
+            // Earth
+            scene.add(new THREE.Mesh(
+                new THREE.SphereGeometry(D.earthRadius, 32, 32),
+                new THREE.MeshPhongMaterial({{ color: 0x2244aa, emissive: 0x112244, transparent: true, opacity: 0.85 }})
+            ));
+
+            // Equatorial ring
+            var eq = [];
+            for (i = 0; i <= 64; i++) {{
+                var a = 2*Math.PI*i/64;
+                eq.push(Math.cos(a)*D.earthRadius*1.02, 0, Math.sin(a)*D.earthRadius*1.02);
+            }}
+            geom = new THREE.BufferGeometry();
+            geom.setAttribute('position', new THREE.Float32BufferAttribute(eq, 3));
+            scene.add(new THREE.Line(geom, new THREE.LineBasicMaterial({{ color: 0x336699, transparent: true, opacity: 0.5 }})));
+
+            var nS = D.stationPositions.length;
+            // Station orbit rings
+            for (i = 0; i < D.orbitRings.length; i++) {{
+                ring = D.orbitRings[i];
+                if (!ring || ring.length < 2) continue;
+                positions = new Float32Array(ring.length*3);
+                for (j = 0; j < ring.length; j++) {{ positions[j*3]=ring[j][0]; positions[j*3+1]=ring[j][1]; positions[j*3+2]=ring[j][2]; }}
+                geom = new THREE.BufferGeometry();
+                geom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+                var hue = i / nS;
+                mat = new THREE.LineBasicMaterial({{ color: new THREE.Color().setHSL(hue, 0.7, 0.5), transparent: true, opacity: 0.3 }});
+                scene.add(new THREE.Line(geom, mat));
+            }}
+
+            // Start orbit ring (white)
+            if (D.startRing && D.startRing.length > 1) {{
+                positions = new Float32Array(D.startRing.length*3);
+                for (j = 0; j < D.startRing.length; j++) {{ positions[j*3]=D.startRing[j][0]; positions[j*3+1]=D.startRing[j][1]; positions[j*3+2]=D.startRing[j][2]; }}
+                geom = new THREE.BufferGeometry();
+                geom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+                scene.add(new THREE.Line(geom, new THREE.LineBasicMaterial({{ color: 0xffffff, transparent: true, opacity: 0.6 }})));
+            }}
+
+            // Station markers
+            var ms = Math.max(0.03, maxR*0.012);
+            for (i = 0; i < nS; i++) {{
+                pos = D.stationPositions[i];
+                var sc = new THREE.Color().setHSL(i/nS, 0.8, 0.6);
+                var sp = new THREE.Mesh(new THREE.SphereGeometry(ms, 8, 8), new THREE.MeshBasicMaterial({{ color: sc }}));
+                sp.position.set(pos[0], pos[1], pos[2]);
+                scene.add(sp);
+            }}
+
+            // Start marker (green)
+            pos = D.startPosition;
+            var ss = new THREE.Mesh(new THREE.SphereGeometry(ms*2.5, 12, 12), new THREE.MeshBasicMaterial({{ color: 0x00ff00 }}));
+            ss.position.set(pos[0], pos[1], pos[2]);
+            scene.add(ss);
+
+            // Transfer arcs (gradient green -> yellow -> red)
+            if (D.transferArcs && D.transferArcs.length > 0) {{
+                var nArcs = D.transferArcs.length;
+                for (var ai = 0; ai < nArcs; ai++) {{
+                    var arc = D.transferArcs[ai];
+                    var arcLen = arc.length;
+                    positions = new Float32Array(arcLen*3);
+                    colors = new Float32Array(arcLen*3);
+                    for (i = 0; i < arcLen; i++) {{
+                        positions[i*3]=arc[i][0]; positions[i*3+1]=arc[i][1]; positions[i*3+2]=arc[i][2];
+                        // Color based on position in overall journey
+                        t = (ai + i/arcLen) / nArcs;
+                        colors[i*3] = Math.min(1.0, t*2);
+                        colors[i*3+1] = Math.min(1.0, (1-t)*2);
+                        colors[i*3+2] = 0.1;
+                    }}
+                    geom = new THREE.BufferGeometry();
+                    geom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+                    geom.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+                    scene.add(new THREE.Line(geom, new THREE.LineBasicMaterial({{ vertexColors: true }})));
+                }}
+            }}
+
+            function anim() {{ if (!active) return; animId = requestAnimationFrame(anim); controls.update(); renderer.render(scene, camera); }}
+            anim();
+        }}
+
+        function stop() {{
+            if (!active) return;
+            active = false;
+            if (animId) {{ cancelAnimationFrame(animId); animId = null; }}
+            var el = document.getElementById('orb-{viz_id}');
+            if (renderer) {{ renderer.dispose(); if (renderer.domElement && renderer.domElement.parentNode) renderer.domElement.parentNode.removeChild(renderer.domElement); renderer = null; }}
+            if (scene) {{ scene.traverse(function(o) {{ if (o.geometry) o.geometry.dispose(); if (o.material) {{ if (Array.isArray(o.material)) o.material.forEach(function(m){{m.dispose();}}); else o.material.dispose(); }} }}); scene = null; }}
+            camera = null; controls = null;
+            if (el) {{ var ph = el.querySelector('.viz-placeholder'); if (ph) ph.style.display = ''; }}
+        }}
+
+        if (window.VizManager) {{ window.VizManager.register({{ id: vizId, containerId: 'orb-{viz_id}', activate: go, dispose: stop }}); }}
+        else {{ go(); }}
+    }})();
+    </script>"""
+
+
 def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
-  """Generate HTML report."""
+  """Generate HTML report with 3D orbital visualization."""
   if not result:
     return "<p style='color:red'>No result provided</p>"
 
@@ -586,12 +1159,24 @@ def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
                                                if len(result.get('reasoning', '')) > 500 else '')
       html += f"<p><strong>Approach:</strong> {reasoning}</p>"
 
-    if "python_code" in result:
-      code = result["python_code"]
+    if "csharp_code" in result:
+      code = result["csharp_code"]
       code_escaped = code.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
       html += f"<details><summary>View Code ({len(code)} chars)</summary><pre>{code_escaped}</pre></details>"
 
-  # TODO Add a visualisation, once an LLM gets more than 0.
+  # Run solver to get visitation order for visualization
+  start_orbit, orbits = _get_dataset_for_subpass(subPass)
+  order = None
+  if "csharp_code" in result:
+    try:
+      order, error, _ = execute_solver(result["csharp_code"], num_stations, start_orbit, orbits)
+      if error:
+        order = None
+    except Exception:
+      order = None
+
+  viz_data = _build_viz_data(start_orbit, orbits, num_stations, order)
+  html += _generate_orbital_viz_html(viz_data, name=f"{num_stations} stations (subpass {subPass})")
 
   return html
 
