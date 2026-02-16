@@ -1,0 +1,336 @@
+"""
+Test 47: Hash Mining / Proof of Work (HLSL Compute Shader)
+
+The LLM must write an HLSL compute shader that searches for a uint32 nonce
+such that a custom hash of (base_data XOR nonce) has D trailing zero bits.
+This is a classic GPU-parallel brute-force search problem.
+
+This tests:
+1. HLSL compute shader proficiency
+2. Bitwise operations and hash function implementation on GPU
+3. Parallel search with atomic result reporting
+4. Performance at scale (embarrassingly parallel)
+
+Buffer layout:
+  Binding 0 (read):     Base data - 16 uint32 values to hash against
+  Binding 1 (readwrite): Result buffer - uint32[4]: [found_flag, nonce, hash_lo, hash_hi]
+  Binding 2 (uniform):  Params - uint32[4]: [difficulty, range_start, range_size, 0]
+"""
+
+import struct
+import time
+from typing import Tuple, Optional
+
+import numpy as np
+
+from shader_test_utils import compile_hlsl, validate_spirv
+from compute_test_utils import ComputeShaderRunner, grade_compute
+
+title = "Hash Mining / Proof of Work (HLSL Compute)"
+
+RANDOM_SEED = 47474747
+TIMEOUT_SECONDS = 60
+
+# Subpass configurations: (difficulty_bits, search_range_size)
+# difficulty_bits = number of trailing zero bits required in hash output
+SUBPASSES = [
+  (4, 1 << 16),  # 16 trailing zero nibble - easy
+  (8, 1 << 20),  # 8 trailing zero bits
+  (12, 1 << 24),  # 12 trailing zero bits
+  (16, 1 << 28),  # 16 trailing zero bits
+  (20, 1 << 30),  # 20 trailing zero bits - hard
+]
+
+
+def generate_base_data(seed=RANDOM_SEED):
+  """Generate 16 uint32 values as base hash input."""
+  import random
+  rng = random.Random(seed)
+  return [rng.getrandbits(32) for _ in range(16)]
+
+
+def custom_hash(data_words, nonce):
+  """
+  Simple but non-trivial hash function (must match GPU implementation).
+  Based on a reduced-round ChaCha-like mixing function.
+  Input: 16 uint32 words XORed with nonce, output: 2 uint32 words.
+  """
+  M = 0xFFFFFFFF
+  state = list(data_words)
+
+  # XOR nonce into all words
+  for i in range(16):
+    state[i] = (state[i] ^ (nonce + i)) & M
+
+  # 8 rounds of mixing
+  for _ in range(8):
+    for i in range(0, 16, 4):
+      a, b, c, d = state[i], state[i + 1], state[i + 2], state[i + 3]
+      a = (a + b) & M
+      d ^= a
+      d = ((d << 16) | (d >> 16)) & M
+      c = (c + d) & M
+      b ^= c
+      b = ((b << 12) | (b >> 20)) & M
+      a = (a + b) & M
+      d ^= a
+      d = ((d << 8) | (d >> 24)) & M
+      c = (c + d) & M
+      b ^= c
+      b = ((b << 7) | (b >> 25)) & M
+      state[i], state[i + 1], state[i + 2], state[i + 3] = a, b, c, d
+
+  # Fold to 2 words
+  h0 = 0
+  h1 = 0
+  for i in range(0, 16, 2):
+    h0 ^= state[i]
+    h1 ^= state[i + 1]
+
+  return h0 & M, h1 & M
+
+
+def count_trailing_zeros(h0, h1):
+  """Count trailing zero bits in the 64-bit hash [h0, h1] (h0 is low)."""
+  if h0 == 0:
+    tz = 32
+    val = h1
+  else:
+    tz = 0
+    val = h0
+
+  if val == 0:
+    return 64
+
+  while (val & 1) == 0:
+    tz += 1
+    val >>= 1
+  return tz
+
+
+def find_nonce_cpu(base_data, difficulty, max_range):
+  """CPU reference: find a nonce with required trailing zeros."""
+  for nonce in range(max_range):
+    h0, h1 = custom_hash(base_data, nonce)
+    if count_trailing_zeros(h0, h1) >= difficulty:
+      return nonce, h0, h1
+  return None, 0, 0
+
+
+def base_data_to_buffer(base_data):
+  """Pack base data into buffer."""
+  return struct.pack('16I', *base_data)
+
+
+def make_result_buffer():
+  """Create zeroed result buffer: [found, nonce, hash_lo, hash_hi]."""
+  return struct.pack('4I', 0, 0, 0, 0)
+
+
+def make_params_buffer(difficulty, range_start, range_size):
+  """Create params uniform buffer."""
+  return struct.pack('4I', difficulty, range_start, range_size, 0)
+
+
+# ---------------------------------------------------------------------------
+# Prompt
+# ---------------------------------------------------------------------------
+
+HLSL_INTERFACE = """**HLSL Compute Shader Interface:**
+
+```hlsl
+// Binding 0: Base data to hash (16 uint values)
+[[vk::binding(0, 0)]] StructuredBuffer<uint> baseData;  // length 16
+
+// Binding 1: Result buffer [found_flag, nonce, hash_lo, hash_hi]
+[[vk::binding(1, 0)]] RWStructuredBuffer<uint> result;   // length 4
+
+// Binding 2: Parameters [difficulty, range_start, range_size, 0]
+[[vk::binding(2, 0)]] cbuffer Params {
+    uint4 params;  // .x=difficulty, .y=range_start, .z=range_size
+};
+
+[numthreads(256, 1, 1)]
+void main(uint3 dtid : SV_DispatchThreadID) { ... }
+```
+
+**Task:** Write a compute shader that searches for a uint32 nonce such that
+the custom hash of (baseData XOR nonce) has at least `difficulty` trailing
+zero bits in the 64-bit output.
+
+**Hash function (MUST match exactly):**
+```
+function custom_hash(data[16], nonce) -> (h0, h1):
+    state[0..15] = data[0..15]
+    for i in 0..15: state[i] ^= (nonce + i)
+
+    // 8 rounds of quarter-round mixing (ChaCha-like)
+    repeat 8 times:
+        for each group of 4 consecutive elements (i, i+1, i+2, i+3):
+            a += b;  d ^= a;  d = rotl(d, 16)
+            c += d;  b ^= c;  b = rotl(b, 12)
+            a += b;  d ^= a;  d = rotl(d, 8)
+            c += d;  b ^= c;  b = rotl(b, 7)
+
+    // Fold 16 words to 2:
+    h0 = state[0] ^ state[2] ^ state[4] ^ state[6] ^ state[8] ^ state[10] ^ state[12] ^ state[14]
+    h1 = state[1] ^ state[3] ^ state[5] ^ state[7] ^ state[9] ^ state[11] ^ state[13] ^ state[15]
+    return (h0, h1)  // h0 is low 32 bits
+```
+
+**Trailing zero count:** Count trailing zero bits of the 64-bit value [h0 | (h1 << 32)].
+That is, count from h0's LSB first; if h0 == 0, add 32 and continue counting from h1.
+
+**Algorithm:**
+1. Each thread computes: my_nonce = params.y + dtid.x  (range_start + thread ID)
+2. Guard: if my_nonce >= params.y + params.z, return (out of range)
+3. Compute hash, count trailing zeros
+4. If trailing_zeros >= difficulty:
+   Write result[0]=1, result[1]=nonce, result[2]=h0, result[3]=h1
+   (Race writes are acceptable - any valid nonce will be verified on CPU)
+
+**Important implementation notes:**
+- The inner quarter-round loop MUST be unrolled (write out all 4 groups
+  of s[0..3], s[4..7], s[8..11], s[12..15] explicitly). Do NOT use
+  a `for (g = 0; g < 16; g += 4)` loop with dynamic array indexing.
+- For counting trailing zeros, use a binary search approach (check
+  lower 16 bits, then 8, then 4, etc.) rather than `firstbitlow()`.
+- Do NOT use InterlockedCompareExchange or any atomic operations.
+
+The shader will be dispatched with ceil(range_size / 256) workgroups.
+Only ONE dispatch is performed - find the nonce in a single pass.
+"""
+
+
+def prepareSubpassPrompt(subPass):
+  if subPass != 0:
+    raise StopIteration
+
+  configs = []
+  for i, (diff, rng) in enumerate(SUBPASSES):
+    configs.append(f"  Subpass {i}: difficulty={diff} bits, search_range={rng:,}")
+
+  return f"""Write an HLSL compute shader for hash mining (proof-of-work).
+
+{HLSL_INTERFACE}
+
+**Test Configurations:**
+{chr(10).join(configs)}
+
+Write the complete HLSL compute shader source code.
+The shader must implement the exact hash function described above.
+Use InterlockedCompareExchange to safely report the first valid nonce found.
+"""
+
+
+extraGradeAnswerRuns = list(range(1, len(SUBPASSES)))
+
+structure = {
+  "type": "object",
+  "properties": {
+    "reasoning": {
+      "type": "string",
+      "description": "Explain your approach to the hash mining compute shader"
+    },
+    "shader_code": {
+      "type": "string",
+      "description": "Complete HLSL compute shader source code"
+    }
+  },
+  "required": ["reasoning", "shader_code"],
+  "additionalProperties": False
+}
+
+_runner_cache = None
+_base_data = None
+_ref_cache = {}
+
+
+def gradeAnswer(result, subPass, aiEngineName):
+  global _runner_cache, _base_data, _ref_cache
+
+  if not result or "shader_code" not in result:
+    return 0.0, "No shader code provided"
+
+  code = result["shader_code"]
+
+  # Compile HLSL to SPIR-V
+  try:
+    spirv = compile_hlsl(code, stage="comp")
+  except RuntimeError as e:
+    return 0.0, f"HLSL compilation failed: {e}"
+
+  valid, err = validate_spirv(spirv)
+  if not valid:
+    return 0.0, f"SPIR-V validation failed: {err}"
+
+  difficulty, range_size = SUBPASSES[subPass]
+
+  # Generate base data (same for all subpasses)
+  if _base_data is None:
+    _base_data = generate_base_data()
+
+  # First verify a CPU solution exists
+  cache_key = (difficulty, range_size)
+  if cache_key not in _ref_cache:
+    print(f"  Finding CPU reference nonce for difficulty={difficulty}...")
+    nonce, h0, h1 = find_nonce_cpu(_base_data, difficulty, min(range_size, 1 << 24))
+    if nonce is not None:
+      _ref_cache[cache_key] = (nonce, h0, h1)
+      print(f"    CPU found nonce={nonce}, hash=({h0:#010x}, {h1:#010x}), "
+            f"tz={count_trailing_zeros(h0, h1)}")
+    else:
+      _ref_cache[cache_key] = None
+      print(f"    WARNING: CPU couldn't find nonce in range")
+
+  # Prepare buffers
+  base_buf = base_data_to_buffer(_base_data)
+  result_buf = make_result_buffer()
+  params_buf = make_params_buffer(difficulty, 0, range_size)
+  workgroups = ((range_size + 255) // 256, 1, 1)
+  # Cap workgroups to reasonable maximum
+  workgroups = (min(workgroups[0], 65535), 1, 1)
+
+  # Run on GPU
+  try:
+    if _runner_cache is None:
+      _runner_cache = ComputeShaderRunner()
+
+    def verify_fn(results):
+      out = results[1]
+      found, nonce, h0, h1 = struct.unpack_from('4I', out, 0)
+
+      if found == 0:
+        return 0.0, f"No nonce found (difficulty={difficulty} bits)"
+
+      # Verify the hash on CPU
+      cpu_h0, cpu_h1 = custom_hash(_base_data, nonce)
+      tz = count_trailing_zeros(cpu_h0, cpu_h1)
+
+      if tz < difficulty:
+        return 0.0, (f"Nonce {nonce} invalid: hash=({cpu_h0:#010x}, {cpu_h1:#010x}), "
+                     f"trailing zeros={tz}, need {difficulty}")
+
+      return 1.0, (f"Found valid nonce {nonce}: "
+                   f"hash=({cpu_h0:#010x}, {cpu_h1:#010x}), "
+                   f"trailing zeros={tz} >= {difficulty}")
+
+    return grade_compute(spirv,
+                         buffers={
+                           0: base_buf,
+                           1: result_buf,
+                           2: params_buf
+                         },
+                         buffer_types={
+                           0: 'read',
+                           1: 'readwrite',
+                           2: 'uniform'
+                         },
+                         workgroups=workgroups,
+                         read_back=[1],
+                         verify_fn=verify_fn,
+                         runner=_runner_cache,
+                         timeout=TIMEOUT_SECONDS)
+
+  except Exception as e:
+    return 0.0, f"GPU execution failed: {e}"

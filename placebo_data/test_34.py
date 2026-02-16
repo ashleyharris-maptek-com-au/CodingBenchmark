@@ -1,0 +1,49 @@
+"""Test 34: Vehicle Routing - Placebo responses for all control types."""
+
+
+def get_response(model_name, subpass):
+  """Return (result_dict, reasoning_string) for the given control type."""
+  if model_name == 'naive':
+    return _naive(subpass)
+  elif model_name == 'naive-optimised':
+    return _naive_optimised(subpass)
+  elif model_name == 'best-published':
+    return _best_published(subpass)
+  elif model_name == 'random':
+    return _random(subpass)
+  elif model_name == 'human':
+    return _human(subpass)
+  return None, ''
+
+
+def _naive(subpass):
+  reasoning = 'Using nearest neighbor heuristic for VRP: 1) Start route from depot. 2) Add nearest unvisited customer that fits capacity. 3) Return to depot when capacity exceeded. 4) Repeat until all customers visited.'
+  code = 'import math\ndef solve():\n    header = input().split()\n    n, v, cap = int(header[0]), int(header[1]), int(header[2])\n    depot = list(map(float, input().split()))\n    customers = []\n    demands = []\n    for _ in range(n):\n        parts = input().split()\n        customers.append((float(parts[0]), float(parts[1])))\n        demands.append(int(parts[2]))\n    def dist(p1, p2): return math.sqrt((p1[0]-p2[0])**2 + (p1[1]-p2[1])**2)\n    unvisited = set(range(n))\n    routes = []\n    total_dist = 0\n    while unvisited:\n        route = []\n        load = 0\n        pos = tuple(depot)\n        while unvisited:\n            best_c, best_d = None, float(\'inf\')\n            for c in unvisited:\n                if load + demands[c] <= cap:\n                    d = dist(pos, customers[c])\n                    if d < best_d: best_d, best_c = d, c\n            if best_c is None: break\n            route.append(best_c)\n            total_dist += best_d\n            pos = customers[best_c]\n            load += demands[best_c]\n            unvisited.remove(best_c)\n        total_dist += dist(pos, tuple(depot))\n        routes.append(route)\n    print(f"{total_dist:.2f}")\n    print(len(routes))\n    for i, r in enumerate(routes): print(f"route{i}: " + " ".join(map(str, r)))\nif __name__ == "__main__": solve()'
+  return {"reasoning": reasoning, 'python_code': code}, reasoning
+
+
+def _naive_optimised(subpass):
+  # TODO: Same algorithm as naive but hyper-optimised for Python
+  # (parallel, SIMD, small data types, register packing, etc.)
+  return _naive(subpass)
+
+
+def _best_published(subpass):
+  reasoning = (
+    "Best published: Clarke-Wright savings (Clarke & Wright 1964, Operations Research 12(4):568-581). "
+    "TODO: Full implementation pending."
+  )
+  code = '# TODO: Implement Clarke-Wright savings'
+  return {"reasoning": reasoning, 'python_code': code}, reasoning
+
+
+def _random(subpass):
+  reasoning = 'Random: pseudorandom output with fixed seed 42.'
+  code = 'import random\nrandom.seed(42)\ndef solve():\n    header = input().split()\n    print("0")\nif __name__ == "__main__":\n    solve()'
+  return {"reasoning": reasoning, 'python_code': code}, reasoning
+
+
+def _human(subpass):
+  reasoning = 'Human starting point for Vehicle Routing. Fill in the TODOs.'
+  code = '# TODO: Human attempt at Vehicle Routing\ndef solve():\n    header = input().split()\n    # TODO: Parse input\n    # TODO: Implement solution\n    # TODO: Output result\n    print("0")\nif __name__ == "__main__":\n    solve()'
+  return {"reasoning": reasoning, 'python_code': code}, reasoning

@@ -1,0 +1,8 @@
+"""Test 41: SPIR-V ASM Fragment Shaders - Placebo responses (correctness test)."""
+
+
+def get_response(model_name, subpass):
+  """All control types return the same for correctness tests."""
+  # Shader/correctness tests: answer is right or wrong, no optimization axis.
+  # All control types produce the same code.
+  return None, 'No pre-built placebo for SPIR-V ASM Fragment Shaders subpass ' + str(subpass)
