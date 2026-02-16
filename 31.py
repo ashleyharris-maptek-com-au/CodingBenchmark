@@ -4,9 +4,6 @@ Test 31: Subset Sum (Rust Implementation)
 The LLM must write Rust code to find a subset of integers that sums to
 exactly a target value. This is NP-Complete.
 
-Subpasses increase set size and target magnitude, requiring meet-in-the-middle,
-dynamic programming with optimizations, or pseudo-polynomial algorithms.
-
 Solver times out after 5 minutes.
 """
 
@@ -14,7 +11,7 @@ import random
 import subprocess
 import time
 from typing import List, Tuple, Optional, Dict, Any
-from native_compiler import RustCompiler, CompilationError, ExecutionError
+from native_compiler import RustCompiler, CompilationError, ExecutionError,describe_this_pc
 from solver_utils import StreamingInputFile
 
 title = "Subset Sum (Rust)"
@@ -22,7 +19,8 @@ TIMEOUT_SECONDS = 30
 RANDOM_SEED = 31313131
 
 
-def generate_subset_sum(n: int, max_val: int, seed: int) -> Tuple[List[int], int]:
+def generate_subset_sum(n: int, max_val: int,
+                        seed: int) -> Tuple[List[int], int, List[int]]:
   """Generate subset sum instance with a known solution."""
   rng = random.Random(seed)
   nums = [rng.randint(1, max_val) for _ in range(n)]
@@ -32,7 +30,7 @@ def generate_subset_sum(n: int, max_val: int, seed: int) -> Tuple[List[int], int
   solution_indices = rng.sample(range(n), solution_size)
   target = sum(nums[i] for i in solution_indices)
 
-  return nums, target
+  return nums, target, solution_indices
 
 
 TEST_CASES = [
@@ -126,14 +124,17 @@ TEST_CASES = [
 
 INSTANCE_CACHE: Dict[int, Any] = {}
 _INPUT_FILE_CACHE: Dict[int, StreamingInputFile] = {}
+LAST_SUBSET_VIZ: Dict[Tuple[int, str], dict] = {}
 STREAMING_THRESHOLD_N = 100_000
 
 
-def get_instance(subpass: int) -> Tuple[List[int], int]:
+def get_instance(subpass: int) -> Tuple[List[int], int, List[int]]:
   if subpass not in INSTANCE_CACHE:
     case = TEST_CASES[subpass]
-    nums, target = generate_subset_sum(case["n"], case["max_val"], RANDOM_SEED + subpass)
-    INSTANCE_CACHE[subpass] = (nums, target)
+    nums, target, solution_indices = generate_subset_sum(
+      case["n"], case["max_val"], RANDOM_SEED + subpass
+    )
+    INSTANCE_CACHE[subpass] = (nums, target, solution_indices)
   return INSTANCE_CACHE[subpass]
 
 
@@ -149,7 +150,7 @@ def _get_streaming_input(subpass: int) -> StreamingInputFile:
   cache_key = f"subset31|n={case['n']}|max={case['max_val']}|seed={RANDOM_SEED + subpass}"
 
   def generator():
-    nums, target = get_instance(subpass)
+    nums, target, _ = get_instance(subpass)
     yield f"{len(nums)} {target}\n"
     yield " ".join(map(str, nums)) + "\n"
 
@@ -171,19 +172,17 @@ def prepareSubpassPrompt(subPass: int) -> str:
 
   return f"""You are writing Rust code to solve the Subset Sum problem.
 
-You must write a Rust solver that can handle ANY subset sum complexity from trivial to ludicrous scale:
-- **Trivial**: Small sets (20 numbers), exact backtracking, brute force
-- **Medium**: Moderate sets (100 numbers), meet-in-the-middle, optimized DP
-- **Large**: Complex sets (1000 numbers), pseudo-polynomial DP, bitset optimization
-- **Extreme**: Massive sets (10000+ numbers), approximation algorithms, randomized methods
+Your Rust subset sum solver will be tested with instances ranging from simple to very 
+complex sets. The same algorithm must work efficiently across ALL problem complexities.
 
-**The Challenge:**
-Your Rust subset sum solver will be tested with instances ranging from simple to very complex sets. The same algorithm must work efficiently across ALL problem complexities.
+Given a set of integers and a target value, determine if there exists a subset 
+that sums to exactly the target value. Simple sets (<100 numbers) you can probably
+brute force, however this code will also need to run on sets with millions of
+numbers. This is NP-Complete and requires sophisticated algorithms for larger instances:
+additionally; threading, memory optimization, vectorization and parallelization are all 
+strongly suggested.
 
-**Problem:**
-Given a set of integers and a target value, determine if there exists a subset that sums to exactly the target value. This is NP-Complete and requires sophisticated algorithms for larger instances.
-
-**Input format (stdin):**
+**Input format (stdin, space seperated decimal integers):**
 ```
 num_numbers target
 num1 num2 ... numN
@@ -195,31 +194,13 @@ YES or NO
 [index1 index2 ... indexK]  (only if YES, 0-indexed indices of subset elements)
 ```
 
-**Critical Requirements:**
-1. **Scalability**: Your algorithm must adapt based on set size and target magnitude
-2. **Performance**: Must complete within 5 minutes even for massive sets
-3. **Quality**: Find exact solutions or correctly report impossibility
-
-**Algorithm Strategy Recommendations:**
-- **Small sets (≤50 numbers)**: Can use exact backtracking with pruning
-- **Medium sets (50-500 numbers)**: Meet-in-the-middle algorithm, optimized DP
-- **Large sets (500-5000 numbers)**: Pseudo-polynomial DP with bitset optimization
-- **Very Large sets (>5000 numbers)**: Approximation algorithms, randomized methods
-
-**Key Techniques:**
-- **Backtracking**: Systematic search with pruning based on partial sums
-- **Meet-in-the-middle**: Split set in half, compute all subset sums of each half
-- **Dynamic Programming**: DP table for reachable sums, optimized with bitsets
-- **Approximation**: PTAS (Polynomial Time Approximation Scheme) for large instances
-- **Randomization**: Randomized algorithms for very large instances
-
 **Implementation Hints:**
 - Detect set complexity and choose appropriate algorithm
 - Use efficient data structures: bitsets, hash sets for DP
 - Implement adaptive quality vs speed tradeoffs
 - For very large sets, focus on approximation algorithms
-- Handle edge cases: empty set, zero target, negative numbers
-- Use fast I/O for large inputs
+- Handle edge cases: empty set, zero target, all numbers add to target.
+- Use fast I/O as the input size can approach 1gb.
 
 **Success Criteria:**
 - Correctly determine if subset sum exists
@@ -232,14 +213,22 @@ YES or NO
 - Timeout without conclusion
 
 **Requirements:**
-1. Program must compile with rustc (edition 2021)
+1. Program must compile with rustc
 2. Read from stdin, write to stdout
 3. Handle variable set sizes and target values
 4. Complete within 5 minutes
 5. Must handle varying subset sum complexities efficiently
 
-Write complete, compilable Rust code with a main function.
-Include adaptive logic that chooses different strategies based on subset sum complexity.
+**Environment:**
+{describe_this_pc()}
+
+**Rust Compiler:**
+{RustCompiler("test_engine").describe()}
+
+Be aware that default warnings are enabled and will cause a compilation failure,
+so ensure that you write warning-free code.
+
+Write complete, compilable Rust code with a main() function.
 """
   # List of subpasses to grade the single answer against all difficulty levels
 
@@ -330,7 +319,7 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
 
       proc_stdout = stdout
     else:
-      nums, target = get_instance(subPass)
+      nums, target, solution_indices = get_instance(subPass)
       input_data = format_input(nums, target)
 
       start = time.time()
@@ -357,18 +346,23 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
         return 0.2, f"[{case['desc']}] YES but no indices"
 
       indices = list(map(int, lines[1].split()))
-      nums, target = get_instance(subPass)
+      nums, target, solution_indices = get_instance(subPass)
       valid, msg = verify_subset(nums, target, indices)
+
+      if case["n"] <= 200 and not use_streaming:
+        LAST_SUBSET_VIZ[(subPass, aiEngineName)] = _build_subset_viz(
+          nums, target, solution_indices, indices, valid, msg
+        )
 
       if valid:
         return 1.0, f"[{case['desc']}] Valid subset of {len(indices)} elements, {exec_time:.2f}s"
       else:
-        return 0.2, f"[{case['desc']}] {msg}"
+        return 0.0, f"[{case['desc']}] {msg}"
 
-    return 0.1, f"[{case['desc']}] Unknown output format"
+    return 0.0, f"[{case['desc']}] Unknown output format"
 
   except subprocess.TimeoutExpired:
-    return 0.1, f"[{case['desc']}] Timeout"
+    return 0.0, f"[{case['desc']}] Timeout"
   except Exception as e:
     return 0.0, f"[{case['desc']}] Error: {str(e)[:100]}"
 
@@ -378,13 +372,114 @@ def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
     return "<p style='color:red'>No result provided</p>"
   case = TEST_CASES[subPass]
   html = f"<h4>Subset Sum - {case['desc']}</h4>"
-  if "reasoning" in result:
+  if "reasoning" in result and subPass ==0:
     r = result['reasoning'][:400] + ('...' if len(result.get('reasoning', '')) > 400 else '')
     html += f"<p><strong>Approach:</strong> {r.replace('<', '&lt;').replace('>', '&gt;')}</p>"
-  if "rust_code" in result:
+  if "rust_code" in result and subPass ==0:
     code = result["rust_code"].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     html += f"<details><summary>View Rust Code ({len(result['rust_code'])} chars)</summary><pre>{code}</pre></details>"
+  viz = LAST_SUBSET_VIZ.get((subPass, aiEngineName))
+  if viz:
+    html += _generate_subset_viz_html(viz)
   return html
+
+
+def _build_subset_viz(nums: List[int], target: int, solution_indices: List[int],
+                      chosen_indices: List[int], valid: bool, msg: str) -> dict:
+  solution_set = set(solution_indices)
+  chosen_set = set(chosen_indices)
+  items = []
+  for i, val in enumerate(nums):
+    in_solution = i in solution_set
+    in_chosen = i in chosen_set
+    if in_solution and in_chosen:
+      status = "tp"
+    elif in_solution and not in_chosen:
+      status = "fn"
+    elif not in_solution and in_chosen:
+      status = "fp"
+    else:
+      status = "tn"
+    items.append({"index": i, "value": val, "status": status})
+
+  return {
+    "n": len(nums),
+    "target": target,
+    "valid": valid,
+    "message": msg,
+    "items": items,
+    "chosen_sum": sum(nums[i] for i in chosen_set if i < len(nums)),
+    "solution_sum": sum(nums[i] for i in solution_set if i < len(nums)),
+  }
+
+
+def _generate_subset_viz_html(viz: dict) -> str:
+  color_map = {
+    "tp": ("#22c55e", "Chosen & in true solution"),
+    "tn": ("#9ca3af", "Not chosen & not in solution"),
+    "fp": ("#f59e0b", "Chosen but NOT in solution"),
+    "fn": ("#facc15", "In solution but NOT chosen"),
+  }
+  max_items = 200
+  items = viz["items"][:max_items]
+  total = viz["n"]
+
+  chips = []
+  for item in items:
+    fill = color_map[item["status"]][0]
+    chips.append(
+      "<div style='display:flex;flex-direction:column;align-items:center;gap:2px;"
+      "padding:6px 4px;border-radius:6px;background:#0f172a;border:1px solid #1f2937;'>"
+      f"<div style='font-size:11px;color:#e2e8f0'>{item['value']}</div>"
+      f"<div style='font-size:9px;color:#94a3b8'>#{item['index']}</div>"
+      f"<div style='width:14px;height:14px;border-radius:50%;background:{fill};'></div>"
+      "</div>"
+    )
+
+  legend_items = []
+  for key in ("tp", "fp", "fn", "tn"):
+    color, label = color_map[key]
+    legend_items.append(
+      "<div style='display:flex;align-items:center;gap:6px;'>"
+      f"<span style='width:12px;height:12px;border-radius:3px;background:{color};display:inline-block;'></span>"
+      f"<span style='color:#cbd5f5;font-size:11px;'>{label}</span>"
+      "</div>"
+    )
+
+  status = "VALID" if viz["valid"] else "INVALID"
+  status_color = "#22c55e" if viz["valid"] else "#f97316"
+  header = (
+    f"<div style='color:#e2e8f0;font-size:13px;margin-bottom:6px;'>"
+    f"<strong>Subset Visualization</strong> &mdash; "
+    f"<span style='color:{status_color};'>{status}</span> "
+    f"(target={viz['target']}, chosen_sum={viz['chosen_sum']})</div>"
+  )
+  if viz.get("message"):
+    header += (
+      f"<div style='color:#94a3b8;font-size:11px;margin-bottom:6px;'>"
+      f"{viz['message']}</div>"
+    )
+
+  more_note = ""
+  if total > max_items:
+    more_note = (
+      f"<div style='color:#94a3b8;font-size:11px;margin-top:6px;'>"
+      f"Showing first {max_items} of {total} numbers.</div>"
+    )
+
+  return (
+    "<div style='margin:12px 0;padding:10px;border:1px solid #1f2937;"
+    "border-radius:8px;background:#0b1120;'>"
+    f"{header}"
+    "<div style='display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px;'>"
+    + "".join(legend_items) +
+    "</div>"
+    "<div style='display:grid;grid-template-columns:repeat(auto-fill, minmax(70px, 1fr));gap:6px;'>"
+    + "".join(chips) +
+    "</div>"
+    f"{more_note}"
+    "</div>"
+  )
 
 
 highLevelSummary = """

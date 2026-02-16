@@ -13,6 +13,7 @@ Solver times out after 5 minutes.
 import random
 import subprocess
 import time
+import math
 from typing import List, Tuple, Dict, Any
 from native_compiler import CSharpCompiler, CompilationError, ExecutionError
 from solver_utils import StreamingInputFile
@@ -124,7 +125,8 @@ TEST_CASES = [
 
 INSTANCE_CACHE: Dict[int, Any] = {}
 _INPUT_FILE_CACHE: Dict[int, StreamingInputFile] = {}
-STREAMING_THRESHOLD_N = 200
+STREAMING_THRESHOLD_N = 500
+LAST_QAP_VIZ: Dict[Tuple[int, str], dict] = {}
 
 
 def get_instance(subpass: int):
@@ -175,55 +177,42 @@ def prepareSubpassPrompt(subPass: int) -> str:
   if subPass != 0:
     raise StopIteration
 
-  return f"""You are writing RUST code to solve the Maximum Flow problem.
-
-You must write a RUST solver that can handle ANY problem complexity from trivial to ludicrous scale:
-- **Trivial**: Simple instances, basic algorithms
-- **Medium**: Moderate instances, efficient algorithms  
-- **Large**: Complex instances, advanced algorithms
-- **Extreme**: Massive instances, very fast heuristics
-
-**The Challenge:**
-Your RUST solver will be tested with instances ranging from simple to very complex cases. The same algorithm must work efficiently across ALL problem complexities.
+  return f"""You are writing C# code to solve the Quadratic Assignment Problem (QAP), which is NP-hard.
 
 **Problem:**
-Find the maximum possible flow from a source to a sink in a flow network.
+You have N facilities and N locations. You must assign each facility to exactly one
+location (a permutation). The cost of assigning facility i to location p[i] is:
+
+  sum over all pairs (i, j): flow[i][j] * distance[p[i]][p[j]]
+
+Your goal is to minimize this total cost.
 
 **Input format (stdin):**
 ```
-[Input format varies by problem]
+N
+flow[0][0] flow[0][1] ... flow[0][N-1]
+...
+flow[N-1][0] ...       flow[N-1][N-1]
+dist[0][0] dist[0][1] ... dist[0][N-1]
+...
+dist[N-1][0] ...       dist[N-1][N-1]
 ```
+All values are integers. Matrices are N×N. Indices are 0-based in the output.
 
 **Output format (stdout):**
 ```
-[Output format varies by problem]
+total_cost
+p0 p1 p2 ... p(N-1)
 ```
-
-**Critical Requirements:**
-1. **Scalability**: Your algorithm must adapt based on problem size and complexity
-2. **Performance**: Must complete within 5 minutes even for the largest instances
-3. **Quality**: Find optimal or near-optimal solutions
-
-**Algorithm Strategy Recommendations:**
-Small networks (50 nodes): Ford-Fulkerson, Medium (500 nodes): Dinic's algorithm, Large (5000 nodes): Push-relabel, Extreme (50000+ nodes): very fast heuristics
-
-**Implementation Hints:**
-- Detect problem complexity and choose appropriate algorithm
-- Use efficient data structures and algorithms
-- Implement adaptive quality vs speed tradeoffs
-- For very large instances, focus on fast heuristics
-- Handle edge cases appropriately
-- Use fast I/O for large inputs
+Where p is a permutation of 0..N-1 and p[i] is the location assigned to facility i.
 
 **Requirements:**
-1. Program must compile with appropriate compiler
-2. Read from stdin, write to stdout
-3. Handle variable problem sizes
-4. Complete within 5 minutes
-5. Must handle varying problem complexities efficiently
+1. Read from stdin, write to stdout.
+2. Output a valid permutation.
+3. Handle N from very small up to ~2000 within 5 minutes.
+4. Heuristics are acceptable for large N; lower cost scores higher.
 
-Write complete, compilable RUST code.
-Include adaptive logic that chooses different strategies based on problem complexity.
+Write complete, compilable C# code with a Main method. Assume only the standard library.
 """# List of subpasses to grade the single answer against all difficulty levels
 
 
@@ -243,7 +232,7 @@ structure = {
   },
   "required": ["reasoning", "csharp_code"],
   "additionalProperties": False
-},
+}
 
 
 def greedy_assignment(flow: List[List[int]], dist: List[List[int]]) -> Tuple[List[int], int]:
@@ -305,7 +294,7 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
         if lines:
           reported_cost = int(lines[0])
           return 0.8, f"[{case['desc']}] Cost {reported_cost} in {exec_time:.2f}s (verification skipped)"
-        return 0.2, f"[{case['desc']}] No output"
+        return 0.0, f"[{case['desc']}] No output"
     else:
       flow, dist = get_instance(subPass)
       input_data = format_input(flow, dist)
@@ -322,18 +311,20 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
     n = len(flow)
 
     if len(perm) != n or set(perm) != set(range(n)):
-      return 0.2, f"[{case['desc']}] Invalid permutation"
+      return 0.0, f"[{case['desc']}] Invalid permutation"
 
     actual_cost = evaluate_assignment(flow, dist, perm)
     if actual_cost != reported_cost:
-      return 0.3, f"[{case['desc']}] Cost mismatch: {actual_cost} vs {reported_cost}"
+      return 0.0, f"[{case['desc']}] Cost mismatch: {actual_cost} vs {reported_cost}"
 
     _, greedy_cost = greedy_assignment(flow, dist)
     ratio = actual_cost / greedy_cost if greedy_cost > 0 else 1.0
     score = min(1.0, 1.5 - ratio * 0.5)
 
-    return max(
-      0.5, score), f"[{case['desc']}] Cost {actual_cost} (greedy: {greedy_cost}), {exec_time:.2f}s"
+    if n <= 20 and not use_streaming:
+      LAST_QAP_VIZ[(subPass, aiEngineName)] = _build_qap_viz(flow, dist, perm, actual_cost)
+
+    return score, f"[{case['desc']}] Cost {actual_cost} (greedy: {greedy_cost}), {exec_time:.2f}s"
 
   except Exception as e:
     return 0.0, f"[{case['desc']}] Error: {str(e)[:100]}"
@@ -344,13 +335,102 @@ def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
     return "<p style='color:red'>No result provided</p>"
   case = TEST_CASES[subPass]
   html = f"<h4>Quadratic Assignment - {case['desc']}</h4>"
-  if "reasoning" in result:
+  if "reasoning" in result and subPass == 0:
     r = result['reasoning'][:400] + ('...' if len(result.get('reasoning', '')) > 400 else '')
     html += f"<p><strong>Approach:</strong> {r.replace('<', '&lt;').replace('>', '&gt;')}</p>"
-  if "csharp_code" in result:
+  if "csharp_code" in result and subPass == 0:
     code = result["csharp_code"].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     html += f"<details><summary>View C# Code ({len(result['csharp_code'])} chars)</summary><pre>{code}</pre></details>"
+  viz = LAST_QAP_VIZ.get((subPass, aiEngineName))
+  if viz:
+    html += _generate_qap_svg(viz)
   return html
+
+
+def _build_qap_viz(flow: List[List[int]], dist: List[List[int]],
+                   perm: List[int], actual_cost: int) -> dict:
+  n = len(flow)
+  flow_pairs = []
+  max_flow = 1
+  for i in range(n):
+    for j in range(i + 1, n):
+      f = flow[i][j] + flow[j][i]
+      if f > 0:
+        max_flow = max(max_flow, f)
+        flow_pairs.append((i, j, f))
+
+  return {
+    "n": n,
+    "perm": perm,
+    "flow_pairs": flow_pairs,
+    "max_flow": max_flow,
+    "actual_cost": actual_cost,
+    "dist": dist,
+  }
+
+
+def _generate_qap_svg(viz: dict) -> str:
+  n = viz["n"]
+  perm = viz["perm"]
+  flow_pairs = viz["flow_pairs"]
+  max_flow = viz["max_flow"]
+
+  width = 760
+  height = 520
+  cx = width / 2
+  cy = height / 2
+  radius = min(width, height) * 0.34
+
+  loc_pos = {}
+  for loc in range(n):
+    angle = (2 * math.pi * loc) / max(1, n)
+    loc_pos[loc] = (cx + radius * math.cos(angle), cy + radius * math.sin(angle))
+
+  edges = []
+  for i, j, f in flow_pairs:
+    li = perm[i]
+    lj = perm[j]
+    x1, y1 = loc_pos[li]
+    x2, y2 = loc_pos[lj]
+    w = 1.2 + 4.5 * (f / max_flow)
+    edges.append(
+      f"<path d='M {x1:.2f} {y1:.2f} Q {cx:.2f} {cy:.2f} {x2:.2f} {y2:.2f}' "
+      f"stroke='#38bdf8' stroke-width='{w:.2f}' stroke-linecap='round' "
+      "fill='none' opacity='0.65'/>"
+    )
+
+  nodes = []
+  for fac, loc in enumerate(perm):
+    x, y = loc_pos[loc]
+    nodes.append(
+      f"<circle cx='{x:.2f}' cy='{y:.2f}' r='9' fill='#0ea5e9' stroke='#0f172a' stroke-width='1'/>"
+    )
+    nodes.append(
+      f"<text x='{x:.2f}' y='{y + 4:.2f}' text-anchor='middle' font-size='9' "
+      f"font-family='sans-serif' fill='#0f172a'>F{fac}</text>"
+    )
+
+  legend = (
+    "<g font-family='sans-serif' font-size='11' fill='#cbd5f5'>"
+    "<text x='14' y='20'>Flow thickness = flow between facilities</text>"
+    "<rect x='14' y='28' width='14' height='14' fill='#0ea5e9' stroke='#0f172a'/>"
+    "<text x='34' y='40'>Location with assigned facility</text>"
+    "</g>"
+  )
+
+  return (
+    "<div style='margin:12px 0;padding:10px;border:1px solid #1f2937;"
+    "border-radius:8px;background:#0b1120;'>"
+    f"<div style='color:#e2e8f0;font-size:13px;margin-bottom:6px;'>"
+    f"<strong>QAP Flow Visualization</strong> &mdash; cost {viz['actual_cost']}</div>"
+    f"<svg width='100%' viewBox='0 0 {width} {height}' "
+    "style='background:#0b1120;border:1px solid #334155;border-radius:6px;'>"
+    + "".join(edges) 
+    + "".join(nodes) +
+    legend +
+    "</svg>"
+    "</div>"
+  )
 
 
 highLevelSummary = """

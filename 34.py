@@ -152,6 +152,7 @@ TEST_CASES = [
 
 INSTANCE_CACHE: Dict[int, Any] = {}
 _INPUT_FILE_CACHE: Dict[int, StreamingInputFile] = {}
+LAST_VRP_VIZ: Dict[Tuple[int, str], dict] = {}
 STREAMING_THRESHOLD_CUSTOMERS = 10_000
 
 
@@ -201,55 +202,40 @@ def prepareSubpassPrompt(subPass: int) -> str:
   if subPass != 0:
     raise StopIteration
 
-  return f"""You are writing CSHARP code to solve the Minimum Spanning Tree problem.
-
-You must write a CSHARP solver that can handle ANY problem complexity from trivial to ludicrous scale:
-- **Trivial**: Simple instances, basic algorithms
-- **Medium**: Moderate instances, efficient algorithms  
-- **Large**: Complex instances, advanced algorithms
-- **Extreme**: Massive instances, very fast heuristics
-
-**The Challenge:**
-Your CSHARP solver will be tested with instances ranging from simple to very complex cases. The same algorithm must work efficiently across ALL problem complexities.
+  return f"""You are writing Python code to solve the Capacitated Vehicle Routing Problem (CVRP).
 
 **Problem:**
-Find a subset of edges that connects all vertices together, without any cycles, and with the minimum possible total edge weight.
+You have a depot and N customers with coordinates and demands. You must create up to K vehicle
+routes starting and ending at the depot. Each customer must be visited exactly once and the sum
+of demands on any route must not exceed the vehicle capacity. Minimize total travel distance.
 
 **Input format (stdin):**
 ```
-[Input format varies by problem]
+N K CAPACITY
+depot_x depot_y
+x1 y1 demand1
+x2 y2 demand2
+...
+xN yN demandN
 ```
 
 **Output format (stdout):**
 ```
-[Output format varies by problem]
+total_distance
+num_routes
+route_1
+route_2
+...
 ```
-
-**Critical Requirements:**
-1. **Scalability**: Your algorithm must adapt based on problem size and complexity
-2. **Performance**: Must complete within 5 minutes even for the largest instances
-3. **Quality**: Find optimal or near-optimal solutions
-
-**Algorithm Strategy Recommendations:**
-Small graphs (100 nodes): Kruskal's, Medium (1000 nodes): optimized union-find, Large (10000 nodes): very fast implementations, Extreme (100000+ nodes): streaming algorithms
-
-**Implementation Hints:**
-- Detect problem complexity and choose appropriate algorithm
-- Use efficient data structures and algorithms
-- Implement adaptive quality vs speed tradeoffs
-- For very large instances, focus on fast heuristics
-- Handle edge cases appropriately
-- Use fast I/O for large inputs
+Each route line should list customer indices (0-based) in visit order.
 
 **Requirements:**
-1. Program must compile with appropriate compiler
-2. Read from stdin, write to stdout
-3. Handle variable problem sizes
-4. Complete within 5 minutes
-5. Must handle varying problem complexities efficiently
+1. Read from stdin, write to stdout.
+2. Output valid routes that cover all customers exactly once.
+3. Respect vehicle capacity on every route.
+4. Heuristics are acceptable for large instances; shorter distance scores higher.
 
-Write complete, compilable CSHARP code.
-Include adaptive logic that chooses different strategies based on problem complexity.
+Write complete, runnable Python code.
 """# List of subpasses to grade the single answer against all difficulty levels
 
 
@@ -269,7 +255,7 @@ structure = {
   },
   "required": ["reasoning", "python_code"],
   "additionalProperties": False
-},
+}
 
 
 def verify_routes(customers: List[Tuple[float, float]], demands: List[int],
@@ -415,8 +401,13 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
     valid, actual_dist, msg = verify_routes(customers, demands, depot, capacity, num_vehicles,
                                             routes)
 
+    if customers and len(customers) <= 200 and not use_streaming:
+      LAST_VRP_VIZ[(subPass, aiEngineName)] = _build_vrp_viz(
+        customers, demands, depot, capacity, routes, actual_dist, msg, valid
+      )
+
     if not valid:
-      return 0.2, f"[{case['desc']}] {msg}"
+      return 0.0, f"[{case['desc']}] {msg}"
 
     nn_dist = nearest_neighbor_distance(customers, demands, depot, capacity)
     ratio = actual_dist / nn_dist if nn_dist > 0 else 1.0
@@ -427,7 +418,7 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
       score), f"[{case['desc']}] Distance {actual_dist:.1f} (NN: {nn_dist:.1f}), {exec_time:.2f}s"
 
   except subprocess.TimeoutExpired:
-    return 0.1, f"[{case['desc']}] Timeout"
+    return 0.0, f"[{case['desc']}] Timeout"
   except Exception as e:
     return 0.0, f"[{case['desc']}] Error: {str(e)[:100]}"
 
@@ -443,7 +434,119 @@ def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
   if "python_code" in result:
     code = result["python_code"].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     html += f"<details><summary>View Python Code ({len(result['python_code'])} chars)</summary><pre>{code}</pre></details>"
+  viz = LAST_VRP_VIZ.get((subPass, aiEngineName))
+  if viz:
+    html += _generate_vrp_svg(viz)
   return html
+
+
+def _build_vrp_viz(customers: List[Tuple[float, float]], demands: List[int],
+                   depot: Tuple[float, float], capacity: int,
+                   routes: List[List[int]], total_dist: float,
+                   msg: str, valid: bool) -> dict:
+  return {
+    "customers": customers,
+    "demands": demands,
+    "depot": depot,
+    "capacity": capacity,
+    "routes": routes,
+    "total_dist": total_dist,
+    "message": msg,
+    "valid": valid,
+  }
+
+
+def _generate_vrp_svg(viz: dict) -> str:
+  customers = viz["customers"]
+  depot = viz["depot"]
+  routes = viz["routes"]
+  width = 720
+  height = 520
+  pad = 30
+
+  xs = [p[0] for p in customers] + [depot[0]]
+  ys = [p[1] for p in customers] + [depot[1]]
+  min_x, max_x = min(xs), max(xs)
+  min_y, max_y = min(ys), max(ys)
+
+  def scale_x(x):
+    if max_x == min_x:
+      return width / 2
+    return pad + (x - min_x) * (width - 2 * pad) / (max_x - min_x)
+
+  def scale_y(y):
+    if max_y == min_y:
+      return height / 2
+    return pad + (y - min_y) * (height - 2 * pad) / (max_y - min_y)
+
+  palette = [
+    "#22c55e", "#38bdf8", "#f59e0b", "#e879f9", "#f97316",
+    "#a3e635", "#60a5fa", "#facc15", "#fb7185", "#34d399",
+  ]
+
+  route_lines = []
+  for r_idx, route in enumerate(routes):
+    if not route:
+      continue
+    color = palette[r_idx % len(palette)]
+    pts = [depot] + [customers[i] for i in route] + [depot]
+    for a, b in zip(pts[:-1], pts[1:]):
+      x1, y1 = scale_x(a[0]), scale_y(a[1])
+      x2, y2 = scale_x(b[0]), scale_y(b[1])
+      route_lines.append(
+        f"<line x1='{x1:.2f}' y1='{y1:.2f}' x2='{x2:.2f}' y2='{y2:.2f}' "
+        f"stroke='{color}' stroke-width='2' opacity='0.85' />"
+      )
+
+  customer_nodes = []
+  for i, (x, y) in enumerate(customers):
+    cx, cy = scale_x(x), scale_y(y)
+    customer_nodes.append(
+      f"<circle cx='{cx:.2f}' cy='{cy:.2f}' r='4' fill='#94a3b8' stroke='#0f172a' stroke-width='1'/>"
+    )
+    customer_nodes.append(
+      f"<text x='{cx + 6:.2f}' y='{cy + 4:.2f}' font-size='9' font-family='sans-serif' "
+      f"fill='#cbd5f5'>C{i}</text>"
+    )
+
+  depot_x, depot_y = scale_x(depot[0]), scale_y(depot[1])
+  depot_node = (
+    f"<rect x='{depot_x - 6:.2f}' y='{depot_y - 6:.2f}' width='12' height='12' "
+    "fill='#facc15' stroke='#0f172a' stroke-width='1' />"
+    f"<text x='{depot_x + 8:.2f}' y='{depot_y + 4:.2f}' font-size='10' font-family='sans-serif' "
+    "fill='#fef08a'>Depot</text>"
+  )
+
+  status = "VALID" if viz["valid"] else "INVALID"
+  status_color = "#22c55e" if viz["valid"] else "#f97316"
+
+  legend = (
+    "<g font-family='sans-serif' font-size='11' fill='#cbd5f5'>"
+    "<rect x='14' y='14' width='12' height='12' fill='#facc15' stroke='#0f172a'/>"
+    "<text x='32' y='24'>Depot</text>"
+    "<circle cx='20' cy='40' r='4' fill='#94a3b8' stroke='#0f172a'/>"
+    "<text x='32' y='44'>Customer</text>"
+    "<text x='14' y='62'>Colored lines = routes</text>"
+    "</g>"
+  )
+
+  return (
+    "<div style='margin:12px 0;padding:10px;border:1px solid #1f2937;"
+    "border-radius:8px;background:#0b1120;'>"
+    f"<div style='color:#e2e8f0;font-size:13px;margin-bottom:6px;'>"
+    f"<strong>VRP Visualization</strong> &mdash; "
+    f"<span style='color:{status_color};'>{status}</span> "
+    f"(distance {viz['total_dist']:.1f})</div>"
+    f"<div style='color:#94a3b8;font-size:11px;margin-bottom:6px;'>{viz['message']}</div>"
+    f"<svg width='100%' viewBox='0 0 {width} {height}' "
+    "style='background:#0b1120;border:1px solid #334155;border-radius:6px;'>"
+    + "".join(route_lines) +
+     "".join(customer_nodes) +
+    depot_node +
+    legend +
+    "</svg>"
+    "</div>"
+  )
 
 
 highLevelSummary = """
