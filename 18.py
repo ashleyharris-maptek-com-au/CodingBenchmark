@@ -453,6 +453,15 @@ Output (one possible answer):
 3 0
 ```
 
+**Environment:**
+{describe_this_pc()}
+
+**C++ Compiler:**
+{CppCompiler("test_engine").describe()}
+
+Be sure that any deviation from the C++ standard library is supported by the given compiler,
+as referencing the wrong intrinsics or non-standard header like 'bits/stdc++.h' could fail your submission.
+
 Write complete, compilable C++ code with a main() function.
 Include adaptive logic that chooses different algorithms based on graph scale.
 """

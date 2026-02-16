@@ -812,6 +812,7 @@ class RustCompiler(NativeCompiler):
       cmd = [
         compiler,
         '-O',
+        '-Awarnings',
         f'--edition={edition}',
         '-o',
         str(exe_path),
@@ -1068,7 +1069,7 @@ class CSharpCompiler(NativeCompiler):
 
   def _compile_with_csc(self, source_code: str, exe_path: Path, extra_flags: List[str]) -> Path:
     """Compile using csc.exe."""
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.cs', delete=False) as f:
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.cs', delete=False,encoding='utf-8') as f:
       f.write(source_code)
       src_path = f.name
 
@@ -1100,7 +1101,7 @@ class CSharpCompiler(NativeCompiler):
 
   def _compile_with_mono(self, source_code: str, exe_path: Path, extra_flags: List[str]) -> Path:
     """Compile using Mono mcs."""
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.cs', delete=False) as f:
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.cs', delete=False,encoding='utf-8') as f:
       f.write(source_code)
       src_path = f.name
 

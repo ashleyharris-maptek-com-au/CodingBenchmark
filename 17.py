@@ -16,6 +16,7 @@ import time
 from typing import List, Tuple, Dict
 
 from native_compiler import CSharpCompiler, compile_and_run, describe_this_pc
+from visualization_utils import generate_threejs_aabb_visualization
 
 title = "3D AABB Bin Packing (C#)"
 
@@ -38,6 +39,9 @@ def generate_boxes(num_boxes: int, container: Tuple[int, int, int], min_size: in
     boxes.append((w, h, d))
   return boxes
 
+
+# Global variable to store last solution for visualization
+lastSolution = None
 
 # Test configurations
 TEST_CASES = [
@@ -392,6 +396,7 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
   if "csharp_code" not in result:
     return 0.0, "No C# code provided"
 
+  global lastSolution
   case = TEST_CASES[subPass]
   boxes = case["boxes"]
   container = case["container"]
@@ -403,6 +408,14 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
 
   if error:
     return 0.0, f"[{description}] {error}"
+
+  # Store solution for visualization
+  lastSolution = {
+    'solution': solution,
+    'boxes': boxes,
+    'container': container,
+    'description': description
+  }
 
   # Validate solution
   is_valid, validation_error, packed_count = validate_solution(solution, boxes, container)
@@ -423,14 +436,8 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
     score = 1.0
     quality = "excellent (≥ baseline)"
   elif ratio >= 0.8:
-    score = 0.85
+    score = 0.1
     quality = "good (≥ 80% of baseline)"
-  elif ratio >= 0.6:
-    score = 0.7
-    quality = "acceptable (≥ 60% of baseline)"
-  elif ratio > 0:
-    score = 0.5
-    quality = f"partial ({packed_count}/{baseline_count})"
   else:
     score = 0.0
     quality = "failed"
@@ -462,7 +469,28 @@ def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
       code_escaped = code.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
       html += f"<details><summary>View Code ({len(code)} chars)</summary><pre>{code_escaped}</pre></details>"
 
-  # TODO: Add three.js rendering here, for at least the trivial cases.
+  # Add 3D visualization if we have a solution
+  global lastSolution
+  if lastSolution and lastSolution['solution']:
+    try:
+      solution = lastSolution['solution']
+      boxes = lastSolution['boxes']
+      container = lastSolution['container']
+      description = lastSolution['description']
+      placements = solution.get('placements', [])
+
+      # Limit visualization to first 100 boxes for performance
+      if len(placements) > 100:
+        viz_placements = placements[:100]
+        html += f"<p style='color:#666;'>Showing first 100 of {len(placements)} boxes</p>"
+      else:
+        viz_placements = placements
+
+      viz_html = generate_threejs_aabb_visualization(container, boxes, viz_placements,
+                                                     f"{description} ({len(placements)} boxes)")
+      html += viz_html
+    except Exception as e:
+      html += f"<p style='color:orange;'>3D visualization error: {str(e)}</p>"
 
   return html
 

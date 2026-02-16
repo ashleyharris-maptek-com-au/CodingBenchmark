@@ -966,6 +966,240 @@ def generate_threejs_tetrahedron_visualization(container_vertices: List[Tuple[fl
   return html
 
 
+def generate_threejs_aabb_visualization(container: Tuple[int, int, int],
+                                        boxes: List[Tuple[int, int, int]],
+                                        placements: List[Dict],
+                                        container_name: str = "Container") -> str:
+  """
+    Generate HTML/JavaScript for 3D AABB bin packing visualization using three.js.
+    
+    Args:
+        container: (width, height, depth) of container
+        boxes: List of (w, h, d) box dimensions
+        placements: List of placed boxes with 'box_index' and 'position'
+        container_name: Name for the visualization
+        
+    Returns:
+        HTML string with three.js visualization
+    """
+  viz_id = f"aabb_viz_{hash(container_name) % 10000}"
+
+  # Convert data to JSON for JavaScript
+  container_data = json.dumps(container)
+  boxes_data = json.dumps(boxes)
+  placements_data = json.dumps(placements)
+
+  html = f"""
+    <div class="aabb-visualization" style="margin: 15px 0;">
+        <details>
+            <summary style="cursor: pointer; padding: 8px; background: #f0f0f0; border-radius: 4px; font-weight: bold;">
+                📦 3D Bin Packing Visualization: {container_name} ({len(placements)} boxes)
+            </summary>
+            <div style="margin-top: 10px;">
+                <div id="{viz_id}" style="width: 100%; height: 500px; border: 1px solid #ccc; background: #fafafa; border-radius: 4px; display: flex; align-items: center; justify-content: center; color: #999;">
+                    <span class="viz-placeholder">Scroll here to activate 3D view</span>
+                </div>
+                <div style="margin-top: 8px; font-size: 12px; color: #666;">
+                    🖱️ Left click + drag to rotate | Right click + drag to pan | Scroll to zoom
+                </div>
+            </div>
+        </details>
+    </div>
+    
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script>
+    (function() {{
+        const vizId = '{viz_id}';
+        const containerData = {container_data};
+        const boxesData = {boxes_data};
+        const placementsData = {placements_data};
+        
+        let scene, camera, renderer, animationId, sceneCenter;
+        let isActive = false;
+        
+        function activate() {{
+            if (isActive) return;
+            isActive = true;
+            
+            if (typeof THREE === 'undefined') return;
+            const container = document.getElementById(vizId);
+            if (!container) return;
+            
+            // Clear placeholder
+            const placeholder = container.querySelector('.viz-placeholder');
+            if (placeholder) placeholder.style.display = 'none';
+            
+            // Scene setup
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0xf8f8f8);
+            
+            // Camera setup
+            camera = new THREE.PerspectiveCamera(75, container.clientWidth / 500, 0.1, 10000);
+            
+            // Renderer setup
+            renderer = new THREE.WebGLRenderer({{ antialias: true }});
+            renderer.setSize(container.clientWidth, 500);
+            container.appendChild(renderer.domElement);
+            
+            // Lighting
+            const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+            scene.add(ambientLight);
+            const directionalLight = new THREE.DirectionalLight(0xffffff, 0.4);
+            directionalLight.position.set(10, 10, 5);
+            scene.add(directionalLight);
+            
+            // Draw container wireframe
+            const [cw, ch, cd] = containerData;
+            const containerEdges = new THREE.EdgesGeometry(new THREE.BoxGeometry(cw, ch, cd));
+            const containerMaterial = new THREE.LineBasicMaterial({{ color: 0x000000, linewidth: 2 }});
+            const containerWireframe = new THREE.LineSegments(containerEdges, containerMaterial);
+            containerWireframe.position.set(cw / 2, ch / 2, cd / 2);
+            scene.add(containerWireframe);
+            
+            // Draw placed boxes
+            placementsData.forEach((placement, index) => {{
+                const boxIdx = placement.box_index;
+                if (boxIdx < 0 || boxIdx >= boxesData.length) return;
+                
+                const [bw, bh, bd] = boxesData[boxIdx];
+                const [px, py, pz] = placement.position;
+                
+                // Create box geometry
+                const boxGeometry = new THREE.BoxGeometry(bw, bh, bd);
+                
+                // Vary color by index for visual distinction
+                const hue = (index * 37) % 360;
+                const boxMaterial = new THREE.MeshPhongMaterial({{ 
+                    color: new THREE.Color().setHSL(hue / 360, 0.7, 0.6),
+                    transparent: true,
+                    opacity: 0.7,
+                    side: THREE.DoubleSide
+                }});
+                
+                const boxMesh = new THREE.Mesh(boxGeometry, boxMaterial);
+                boxMesh.position.set(px + bw / 2, py + bh / 2, pz + bd / 2);
+                scene.add(boxMesh);
+                
+                // Add wireframe for clarity
+                const boxEdges = new THREE.EdgesGeometry(boxGeometry);
+                const edgeMaterial = new THREE.LineBasicMaterial({{ color: 0x222222, linewidth: 1 }});
+                const boxWireframe = new THREE.LineSegments(boxEdges, edgeMaterial);
+                boxWireframe.position.set(px + bw / 2, py + bh / 2, pz + bd / 2);
+                scene.add(boxWireframe);
+            }});
+            
+            // Position camera
+            const box = new THREE.Box3().setFromObject(scene);
+            sceneCenter = box.getCenter(new THREE.Vector3());
+            const size = box.getSize(new THREE.Vector3());
+            const maxDim = Math.max(size.x, size.y, size.z);
+            const fov = camera.fov * (Math.PI / 180);
+            let cameraZ = Math.abs(maxDim / 2 / Math.tan(fov / 2));
+            cameraZ *= 1.8;
+            camera.position.set(sceneCenter.x + cameraZ * 0.7, sceneCenter.y + cameraZ * 0.7, sceneCenter.z + cameraZ * 0.7);
+            camera.lookAt(sceneCenter);
+            
+            // Mouse controls
+            let mouseDown = false, mouseX = 0, mouseY = 0, isRightClick = false;
+            
+            container.addEventListener('mousedown', (e) => {{
+                mouseDown = true; mouseX = e.clientX; mouseY = e.clientY; isRightClick = e.button === 2;
+            }});
+            container.addEventListener('contextmenu', (e) => e.preventDefault());
+            container.addEventListener('mousemove', (e) => {{
+                if (!mouseDown) return;
+                const deltaX = e.clientX - mouseX, deltaY = e.clientY - mouseY;
+                if (isRightClick) {{
+                    camera.position.x -= deltaX * (maxDim / 500);
+                    camera.position.y += deltaY * (maxDim / 500);
+                }} else {{
+                    const spherical = new THREE.Spherical();
+                    spherical.setFromVector3(camera.position.clone().sub(sceneCenter));
+                    spherical.theta -= deltaX * 0.005;
+                    spherical.phi += deltaY * 0.005;
+                    spherical.phi = Math.max(0.1, Math.min(Math.PI - 0.1, spherical.phi));
+                    camera.position.copy(sceneCenter).add(new THREE.Vector3().setFromSpherical(spherical));
+                    camera.lookAt(sceneCenter);
+                }}
+                mouseX = e.clientX; mouseY = e.clientY;
+            }});
+            container.addEventListener('mouseup', () => {{ mouseDown = false; }});
+            container.addEventListener('wheel', (e) => {{
+                e.preventDefault();
+                const scale = e.deltaY > 0 ? 1.1 : 0.9;
+                const direction = camera.position.clone().sub(sceneCenter).normalize();
+                const distance = camera.position.distanceTo(sceneCenter);
+                camera.position.copy(sceneCenter).add(direction.multiplyScalar(distance * scale));
+            }});
+            
+            function animate() {{
+                if (!isActive) return;
+                animationId = requestAnimationFrame(animate);
+                renderer.render(scene, camera);
+            }}
+            animate();
+        }}
+        
+        function dispose() {{
+            if (!isActive) return;
+            isActive = false;
+            
+            if (animationId) {{
+                cancelAnimationFrame(animationId);
+                animationId = null;
+            }}
+            
+            const container = document.getElementById(vizId);
+            
+            if (renderer) {{
+                renderer.dispose();
+                if (renderer.domElement && renderer.domElement.parentNode) {{
+                    renderer.domElement.parentNode.removeChild(renderer.domElement);
+                }}
+                renderer = null;
+            }}
+            
+            if (scene) {{
+                scene.traverse(function(object) {{
+                    if (object.geometry) object.geometry.dispose();
+                    if (object.material) {{
+                        if (Array.isArray(object.material)) {{
+                            object.material.forEach(m => m.dispose());
+                        }} else {{
+                            object.material.dispose();
+                        }}
+                    }}
+                }});
+                scene = null;
+            }}
+            
+            camera = null;
+            sceneCenter = null;
+            
+            if (container) {{
+                const placeholder = container.querySelector('.viz-placeholder');
+                if (placeholder) placeholder.style.display = '';
+            }}
+        }}
+        
+        // Register with VizManager
+        if (window.VizManager) {{
+            window.VizManager.register({{
+                id: vizId,
+                containerId: vizId,
+                activate: activate,
+                dispose: dispose
+            }});
+        }} else {{
+            activate();
+        }}
+    }})();
+    </script>
+    """
+
+  return html
+
+
 def generate_threejs_graph_visualization(nodes: List[Tuple[float, float]],
                                          edges: List[Tuple[int, int]],
                                          graph_name: str = "Graph") -> str:

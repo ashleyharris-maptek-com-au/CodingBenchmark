@@ -35,8 +35,6 @@ Subpasses test increasingly complex scenarios.
 Solver times out after 5 minutes.
 """
 
-skip = True
-
 import random
 import subprocess
 import sys
@@ -48,7 +46,7 @@ from pathlib import Path
 from collections import deque
 
 # Import our native compiler helper
-from native_compiler import CppCompiler, CompilationError, ExecutionError
+from native_compiler import CppCompiler, CompilationError, ExecutionError, compile_and_run, describe_this_pc
 
 title = "N-Dimensional Snake Game (C++)"
 
@@ -333,10 +331,10 @@ def prepareSubpassPrompt(subPass: int) -> str:
   return f"""You are writing C++ code to play an N-Dimensional Snake Game.
 
 You must write a C++ solver that can handle ANY dimensional complexity from trivial to ludicrous scale:
-- **Trivial**: 2D games (8x8), few obstacles, basic pathfinding
-- **Medium**: 3D-4D games (6x6x6 to 8x8x8x8), moderate obstacles, intermediate planning
-- **Large**: 6D-8D games (4x4x4x4x4x4 to 6x6x6x6x6x6x6x6), many obstacles, complex pathfinding
-- **Extreme**: 10D-20D games (3x3x3... to 4x4x4...), massive state spaces, very complex optimization
+- **Trivial**: 2D games (eg 8x8), few obstacles, basic pathfinding
+- **Medium**: 3D-4D games (eg 6x6x6 to 8x8x8x8), moderate obstacles, intermediate planning
+- **Large**: 6D-8D games (eg 4x4x4x4x4x4 to 6x6x6x6x6x6x6x6), many obstacles, complex pathfinding
+- **Extreme**: 10D-20D games (eg 3x3x3... to 4x4x4...)
 
 **The Challenge:**
 Your C++ snake player will be tested with games ranging from simple 2D boards to massive 20D hypercubes. 
@@ -347,7 +345,7 @@ Like classic Nokia snake, but generalized to arbitrary dimensions. The snake occ
 connected integer grid points in N-D space, moves one step per turn along one axis (+1 or -1), 
 grows when eating food, and dies if it hits an obstacle or itself.
 
-**Input format (stdin):**
+**Input format (stdin, whitespace / newline seperated):**
 ```
 D max_turns (D = number of dimensions, max_turns = turn limit)
 bounds (D integers: size of space in each dimension)
@@ -363,46 +361,21 @@ Each turn, output: axis direction
   - axis: 0 to D-1 (which dimension to move along)
   - direction: -1 or +1 (which way to move)
 
-**Critical Requirements:**
-1. **Scalability**: Your algorithm must adapt based on number of dimensions and board size
-2. **Performance**: Must complete within 5 minutes even for 20D games
-3. **Quality**: Collect maximum food while avoiding collisions
-
-**Algorithm Strategy Recommendations:**
-- **Low dimensions (2D-3D)**: Can use A* pathfinding, exhaustive search
-- **Medium dimensions (4D-6D)**: Heuristic pathfinding, limited look-ahead
-- **High dimensions (7D-10D)**: Fast heuristics, greedy approaches
-- **Very High dimensions (>10D)**: Very fast heuristics, possibly random walk with bias
-
-**Key Techniques:**
-- **State representation**: Efficient N-dimensional position storage
-- **Pathfinding**: A* or Dijkstra adapted for N-D space
-- **Collision detection**: Fast checking for self-collision and obstacles
-- **Food targeting**: Prioritize nearest/safest food items
-- **Survival strategy**: Balance food collection with safety
-
-**Implementation Hints:**
-- Detect dimension count and choose appropriate algorithm complexity
-- Use efficient data structures for N-D positions (vectors, hash sets)
-- Implement adaptive look-ahead based on dimensionality
-- For very high dimensions, consider simplified heuristics
-- Handle edge cases: no valid moves, trapped situations
-- Use fast I/O for large inputs
-
 **Game ends when:**
 - Snake eats all food (win)
 - Snake hits obstacle or itself (lose)
 - Max turns reached
 
-**Requirements:**
-1. Program must compile with g++ or MSVC (C++17)
-2. Read from stdin, write to stdout
-3. Handle up to 20 dimensions with large board sizes
-4. Complete within 5 minutes
-5. Must handle varying dimensionalities efficiently
+**Environment:**
+{describe_this_pc()}
+
+**C++ Compiler:**
+{CppCompiler("test_engine").describe()}
+
+Be sure that any deviation from the C++ standard library is supported by the given compiler,
+as referencing the wrong intrinsics or non-standard header like 'bits/stdc++.h' could fail your submission.
 
 Write complete, compilable C++ code with a main() function.
-Include adaptive logic that chooses different strategies based on dimensional complexity.
 """
 
   # List of subpasses to grade the single answer against all difficulty levels

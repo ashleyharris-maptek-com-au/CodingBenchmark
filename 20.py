@@ -33,6 +33,7 @@ import sys
 import os
 import time
 import math
+import json
 from typing import List, Tuple, Dict, Set, Optional, Any
 from pathlib import Path
 
@@ -105,7 +106,7 @@ def generate_drillhole_data(
   # Using simple gradient + noise model
   def base_value(prop_idx: int, x: float, y: float, z: float) -> float:
     # Each property has different spatial correlation
-    freq = 0.01 * (prop_idx + 1)
+    freq = 0.001 * (prop_idx + 1)
     base = 50 + 30 * math.sin(freq * x) * math.cos(freq * y) + 20 * math.sin(freq * z * 0.5)
     return max(0, base + rng.gauss(0, 5))
 
@@ -148,6 +149,7 @@ def generate_drillhole_data(
         # Inject errors randomly
         if rng.random() < error_rate:
           # Typo: off by order of magnitude or wrong sign
+          original_value = value
           error_type = rng.choice(["magnitude", "digit", "sign"])
           if error_type == "magnitude":
             value *= rng.choice([0.1, 10, 100])
@@ -156,7 +158,8 @@ def generate_drillhole_data(
           else:
             value = -abs(value)
 
-          injected_errors.append((i, j, prop_name))
+          if abs(original_value - value) > abs(original_value * 0.1):
+            injected_errors.append((i, j, prop_name))
 
         props[prop_name] = round(value, 2)
 
@@ -201,7 +204,7 @@ TEST_CASES = [
     "num_holes": 10,
     "num_properties": 4,
     "samples_per_hole": 15,
-    "error_rate": 0.04,
+    "error_rate": 0.004,
     "description": "10 holes, 4 properties, 150 samples"
   },
   # Subpass 2: Medium dataset
@@ -209,7 +212,7 @@ TEST_CASES = [
     "num_holes": 20,
     "num_properties": 5,
     "samples_per_hole": 20,
-    "error_rate": 0.03,
+    "error_rate": 0.003,
     "description": "20 holes, 5 properties, 400 samples"
   },
   # Subpass 3: Larger dataset
@@ -217,7 +220,7 @@ TEST_CASES = [
     "num_holes": 35,
     "num_properties": 6,
     "samples_per_hole": 25,
-    "error_rate": 0.03,
+    "error_rate": 0.003,
     "description": "35 holes, 6 properties, 875 samples"
   },
   # Subpass 4: Complex
@@ -225,7 +228,7 @@ TEST_CASES = [
     "num_holes": 50,
     "num_properties": 8,
     "samples_per_hole": 30,
-    "error_rate": 0.02,
+    "error_rate": 0.002,
     "description": "50 holes, 8 properties, 1500 samples"
   },
   # Subpass 5: Large
@@ -233,7 +236,7 @@ TEST_CASES = [
     "num_holes": 75,
     "num_properties": 10,
     "samples_per_hole": 40,
-    "error_rate": 0.02,
+    "error_rate": 0.002,
     "description": "75 holes, 10 properties, 3000 samples"
   },
   # Extreme cases
@@ -241,35 +244,35 @@ TEST_CASES = [
     "num_holes": 100,
     "num_properties": 12,
     "samples_per_hole": 50,
-    "error_rate": 0.015,
+    "error_rate": 0.0015,
     "description": "100 holes, 12 properties, 5000 samples"
   },
   {
     "num_holes": 200,
     "num_properties": 12,
     "samples_per_hole": 60,
-    "error_rate": 0.01,
+    "error_rate": 0.001,
     "description": "200 holes, 12 properties, 12000 samples"
   },
   {
     "num_holes": 500,
     "num_properties": 12,
     "samples_per_hole": 80,
-    "error_rate": 0.008,
+    "error_rate": 0.0008,
     "description": "500 holes, 12 properties, 40000 samples"
   },
   {
     "num_holes": 1000,
     "num_properties": 12,
     "samples_per_hole": 100,
-    "error_rate": 0.005,
+    "error_rate": 0.0005,
     "description": "1000 holes, 12 properties, 100000 samples"
   },
   {
     "num_holes": 2000,
     "num_properties": 12,
     "samples_per_hole": 150,
-    "error_rate": 0.003,
+    "error_rate": 0.0003,
     "description": "2000 holes, 12 properties, 300000 samples"
   },
   # Ludicrous cases for streaming
@@ -277,21 +280,21 @@ TEST_CASES = [
     "num_holes": 5000,
     "num_properties": 12,
     "samples_per_hole": 200,
-    "error_rate": 0.002,
+    "error_rate": 0.0002,
     "description": "5K holes, 12 props, 1M samples"
   },
   {
     "num_holes": 10000,
     "num_properties": 12,
     "samples_per_hole": 300,
-    "error_rate": 0.001,
+    "error_rate": 0.0001,
     "description": "10K holes, 12 props, 3M samples"
   },
   {
     "num_holes": 20000,
     "num_properties": 12,
     "samples_per_hole": 400,
-    "error_rate": 0.0008,
+    "error_rate": 0.00008,
     "description": "20K holes, 12 props, 8M samples (~1GB)"
   },
 ]
@@ -557,12 +560,13 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
   stdout = run_result.stdout
   exec_time = run_result.exec_time
 
-  # Skip full verification for very large datasets WTF? TODO: LOOK INTO THIS HORRIBLE HACK.
-  if use_streaming and _estimate_samples(subPass) > 2_000_000:
-    return 0.8, f"[{description}] Completed in {exec_time:.2f}s (verification skipped)", "Large dataset"
-
   # Parse output
+  t = time.time()
   suspects, parse_error = parse_output(stdout)
+  parseTime = time.time() - t
+  if parseTime > 1:
+    print(f"  Parse time: {parseTime:.2f}s")
+    
   if parse_error and not suspects:
     return 0.0, f"[{description}] {parse_error}", parse_error
 
@@ -604,9 +608,365 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
   if subPass == 0:
     html = output_example_html(score, explanation, result, subPass)
 
-  html += output_summary_html([(score, explanation)])
+  # Rich visualization
+  html += _generate_drillhole_visualization(
+    subPass, holes, property_names, injected_errors,
+    suspects, true_positives, false_positives, false_negatives,
+    precision, recall, f1, score, exec_time, description
+  )
 
   return score, explanation, html
+
+
+def _generate_drillhole_visualization(
+    subPass, holes, property_names, injected_errors,
+    suspects, true_positives, false_positives, false_negatives,
+    precision, recall, f1, score, exec_time, description):
+  """Generate rich HTML visualization for drillhole validation results."""
+  import json as _json
+
+  num_holes = len(holes)
+  error_set = set(injected_errors)
+  suspect_set = set((s[0], s[1], s[2]) for s in suspects)
+  tp_set = error_set & suspect_set
+  fn_set = error_set - suspect_set
+  fp_set = suspect_set - error_set
+
+  score_color = "lime" if score >= 0.8 else "orange" if score >= 0.4 else "red"
+  viz_id = f"viz20_{subPass}"
+
+  # Stats bar (always shown)
+  stats_html = f"""
+  <div style="display:flex;gap:16px;flex-wrap:wrap;align-items:center;margin:8px 0;font-family:monospace;font-size:13px;color:#ccc;">
+    <span style="color:{score_color};font-weight:bold;font-size:15px;">{score:.2f}</span>
+    <span>({description})</span>
+    <span>Found: {len(suspects)}</span>
+    <span>Actual: {len(injected_errors)}</span>
+    <span style="color:#4f4;">TP: {true_positives}</span>
+    <span style="color:#f84;">FP: {false_positives}</span>
+    <span style="color:#f44;">FN: {false_negatives}</span>
+    <span>P: {precision:.2f}</span>
+    <span>R: {recall:.2f}</span>
+    <span>F1: {f1:.2f}</span>
+    <span>Time: {exec_time:.2f}s</span>
+  </div>"""
+
+  # For large subpasses (>=100 holes), show collapsed error table
+  if num_holes >= 100:
+    rows = []
+    # Show up to 50 errors
+    all_errors = []
+    for e in sorted(tp_set):
+      all_errors.append((*e, "TP", "#4f4"))
+    for e in sorted(fn_set):
+      all_errors.append((*e, "Missed", "#f44"))
+    for e in sorted(fp_set):
+      all_errors.append((*e, "FP", "#f84"))
+    for hid, sid, prop, label, color in all_errors[:50]:
+      rows.append(f'<tr><td>{hid}</td> <td>{sid}</td> <td>{prop}</td>'
+                   f'<td style="color:{color}">{label}</td></tr>')
+    if len(all_errors) > 50:
+      rows.append(f'<tr><td colspan="4">... and {len(all_errors)-50} more</td></tr>')
+
+    table_html = ""
+    if rows:
+      table_html = f"""<details style="margin:4px 0;">
+        <summary style="cursor:pointer;color:#aaa;">Error details ({len(all_errors)} entries)</summary>
+        <table style="border-collapse:collapse;font-size:12px;font-family:monospace;margin:4px 0;">
+          <tr style="color:#888;"><th style="padding:2px 8px;text-align:left;">Hole</th>
+          <th style="padding:2px 8px;text-align:left;">Sample</th>
+          <th style="padding:2px 8px;text-align:left;">Property</th>
+          <th style="padding:2px 8px;text-align:left;">Status</th></tr>
+          {''.join(rows)}
+        </table>
+      </details>"""
+
+    return stats_html + table_html
+
+  # ---- 3D visualization for small subpasses ----
+
+  # Build hole data for JS: each hole = {start, end, segments: [{p1, p2, values: {prop: val}}], errors: [...]}
+  holes_json = []
+  for hole in holes:
+    start = hole.start
+    end_pt = hole.point_at_depth(hole.length)
+    segments = []
+    for j, sample in enumerate(hole.samples):
+      p = hole.point_at_depth(sample["depth"])
+      # next point: midpoint to next sample, or end of hole
+      if j + 1 < len(hole.samples):
+        next_depth = hole.samples[j + 1]["depth"]
+      else:
+        next_depth = hole.length
+      p2 = hole.point_at_depth((sample["depth"] + next_depth) / 2.0)
+      vals = {}
+      for prop in property_names:
+        vals[prop] = sample[prop]
+      # Error classification for this sample
+      err_labels = []
+      for prop in property_names:
+        key = (hole.hole_id, j, prop)
+        if key in tp_set:
+          err_labels.append({"prop": prop, "type": "tp"})
+        elif key in fn_set:
+          err_labels.append({"prop": prop, "type": "fn"})
+        elif key in fp_set:
+          err_labels.append({"prop": prop, "type": "fp"})
+      segments.append({
+        "p1": [round(p[0], 2), round(p[1], 2), round(p[2], 2)],
+        "p2": [round(p2[0], 2), round(p2[1], 2), round(p2[2], 2)],
+        "vals": vals,
+        "errs": err_labels
+      })
+    holes_json.append({
+      "id": hole.hole_id,
+      "start": [round(start[0], 2), round(start[1], 2), round(start[2], 2)],
+      "end": [round(end_pt[0], 2), round(end_pt[1], 2), round(end_pt[2], 2)],
+      "segs": segments
+    })
+
+  # Compute global min/max per property for color mapping
+  prop_ranges = {}
+  for prop in property_names:
+    vals = []
+    for hole in holes:
+      for s in hole.samples:
+        vals.append(s[prop])
+    if vals:
+      p5 = sorted(vals)[max(0, int(len(vals) * 0.02))]
+      p95 = sorted(vals)[min(len(vals) - 1, int(len(vals) * 0.98))]
+      prop_ranges[prop] = [round(p5, 2), round(p95, 2)]
+    else:
+      prop_ranges[prop] = [0, 1]
+
+  data_json = _json.dumps(holes_json)
+  props_json = _json.dumps(property_names)
+  ranges_json = _json.dumps(prop_ranges)
+
+  return stats_html + f"""
+  <div id="{viz_id}_wrap" style="position:relative;margin:4px 0;">
+    <div style="display:flex;gap:4px;flex-wrap:wrap;margin-bottom:4px;" id="{viz_id}_btns"></div>
+    <div style="display:flex;gap:8px;">
+      <div id="{viz_id}" style="width:700px;height:450px;background:#1a1a2e;border-radius:4px;"></div>
+      <div id="{viz_id}_legend" style="width:160px;font-size:11px;font-family:monospace;color:#ccc;"></div>
+    </div>
+  </div>
+  <script>
+  (function() {{
+    var container = document.getElementById('{viz_id}');
+    if (!container) return;
+    function loadThree(cb) {{
+      if (window.THREE) {{ cb(); return; }}
+      var s = document.createElement('script');
+      s.src = 'https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js';
+      s.onload = function() {{
+        var s2 = document.createElement('script');
+        s2.src = 'https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js';
+        s2.onload = cb;
+        document.head.appendChild(s2);
+      }};
+      document.head.appendChild(s);
+    }}
+    loadThree(function() {{
+      var THREE = window.THREE;
+      var holesData = {data_json};
+      var propNames = {props_json};
+      var propRanges = {ranges_json};
+      var currentProp = propNames[0];
+
+      var W = 700, H = 450;
+      var scene = new THREE.Scene();
+      scene.background = new THREE.Color(0x1a1a2e);
+      var camera = new THREE.PerspectiveCamera(50, W / H, 0.1, 50000);
+      var renderer = new THREE.WebGLRenderer({{ antialias: true }});
+      renderer.setSize(W, H);
+      container.appendChild(renderer.domElement);
+      var controls = new THREE.OrbitControls(camera, renderer.domElement);
+      controls.enableDamping = true;
+
+      // Lighting
+      scene.add(new THREE.AmbientLight(0xffffff, 0.6));
+      var dl = new THREE.DirectionalLight(0xffffff, 0.8);
+      dl.position.set(1, 1, 1);
+      scene.add(dl);
+
+      // Compute bounds
+      var minX=1e9, minY=1e9, minZ=1e9, maxX=-1e9, maxY=-1e9, maxZ=-1e9;
+      holesData.forEach(function(h) {{
+        [h.start, h.end].forEach(function(p) {{
+          if(p[0]<minX)minX=p[0]; if(p[0]>maxX)maxX=p[0];
+          if(p[1]<minY)minY=p[1]; if(p[1]>maxY)maxY=p[1];
+          if(p[2]<minZ)minZ=p[2]; if(p[2]>maxZ)maxZ=p[2];
+        }});
+      }});
+      var cx=(minX+maxX)/2, cy=(minY+maxY)/2, cz=(minZ+maxZ)/2;
+      var span = Math.max(maxX-minX, maxY-minY, maxZ-minZ, 1);
+      controls.target.set(cx, cz, -cy);
+      camera.position.set(cx + span*0.8, cz + span*0.6, -cy + span*0.8);
+
+      // Color ramp: blue -> cyan -> green -> yellow -> red
+      function valToColor(v, lo, hi) {{
+        var t = (hi > lo) ? Math.max(0, Math.min(1, (v - lo) / (hi - lo))) : 0.5;
+        var r, g, b;
+        if (t < 0.25) {{ r=0; g=t*4; b=1; }}
+        else if (t < 0.5) {{ r=0; g=1; b=1-(t-0.25)*4; }}
+        else if (t < 0.75) {{ r=(t-0.5)*4; g=1; b=0; }}
+        else {{ r=1; g=1-(t-0.75)*4; b=0; }}
+        return new THREE.Color(r, g, b);
+      }}
+
+      // Build hole geometries
+      var segmentLines = []; // [{{line, hole, segIdx}}]
+      var errorMarkers = []; // [{{mesh, hole, segIdx, errType, prop}}]
+
+      holesData.forEach(function(h) {{
+        // Hole collar marker (small sphere at start)
+        var cg = new THREE.SphereGeometry(span * 0.005, 8, 8);
+        var cm = new THREE.Mesh(cg, new THREE.MeshPhongMaterial({{ color: 0xffffff }}));
+        cm.position.set(h.start[0], h.start[2], -h.start[1]);
+        scene.add(cm);
+
+        h.segs.forEach(function(seg, si) {{
+          // Segment line (thick via cylinder)
+          var p1 = new THREE.Vector3(seg.p1[0], seg.p1[2], -seg.p1[1]);
+          var p2 = new THREE.Vector3(seg.p2[0], seg.p2[2], -seg.p2[1]);
+          var dir = new THREE.Vector3().subVectors(p2, p1);
+          var len = dir.length();
+          if (len < 0.001) return;
+          var mid = new THREE.Vector3().addVectors(p1, p2).multiplyScalar(0.5);
+          var cylGeo = new THREE.CylinderGeometry(span * 0.003, span * 0.003, len, 6);
+          var mat = new THREE.MeshPhongMaterial({{ color: 0x888888 }});
+          var cyl = new THREE.Mesh(cylGeo, mat);
+          cyl.position.copy(mid);
+          // Orient cylinder along segment
+          var axis = new THREE.Vector3(0, 1, 0);
+          var quat = new THREE.Quaternion().setFromUnitVectors(axis, dir.normalize());
+          cyl.quaternion.copy(quat);
+          scene.add(cyl);
+          segmentLines.push({{ mesh: cyl, hole: h.id, segIdx: si, vals: seg.vals }});
+
+          // Error markers
+          seg.errs.forEach(function(err) {{
+            var markerSize = span * 0.012;
+            var color = err.type === 'tp' ? 0x44ff44 : err.type === 'fn' ? 0xff4444 : 0xff8844;
+            var geo = err.type === 'tp'
+              ? new THREE.SphereGeometry(markerSize, 8, 8)
+              : err.type === 'fn'
+                ? new THREE.OctahedronGeometry(markerSize)
+                : new THREE.BoxGeometry(markerSize, markerSize, markerSize);
+            var mmat = new THREE.MeshPhongMaterial({{
+              color: color, transparent: true, opacity: 0.25,
+              emissive: color, emissiveIntensity: 0.3
+            }});
+            var marker = new THREE.Mesh(geo, mmat);
+            marker.position.copy(mid);
+            marker.visible = true;
+            scene.add(marker);
+            errorMarkers.push({{ mesh: marker, hole: h.id, segIdx: si, errType: err.type, prop: err.prop }});
+          }});
+        }});
+      }});
+
+      // Update colors based on selected property
+      function updateColors(prop) {{
+        var range = propRanges[prop] || [0, 100];
+        segmentLines.forEach(function(sl) {{
+          var v = sl.vals[prop];
+          if (v !== undefined) {{
+            sl.mesh.material.color.copy(valToColor(v, range[0], range[1]));
+            sl.mesh.material.emissive.copy(valToColor(v, range[0], range[1]));
+            sl.mesh.material.emissiveIntensity = 0.15;
+          }} else {{
+            sl.mesh.material.color.set(0x444444);
+            sl.mesh.material.emissive.set(0x000000);
+          }}
+        }});
+        // Show/hide error markers: only show markers for current property or "all"
+        errorMarkers.forEach(function(em) {{
+          em.mesh.visible = (em.prop === prop);
+        }});
+        updateLegend(prop, range);
+      }}
+
+      // Legend
+      function updateLegend(prop, range) {{
+        var leg = document.getElementById('{viz_id}_legend');
+        if (!leg) return;
+        var canvas = document.createElement('canvas');
+        canvas.width = 20; canvas.height = 200;
+        var ctx = canvas.getContext('2d');
+        for (var i = 0; i < 200; i++) {{
+          var t = 1 - i / 199;
+          var r, g, b;
+          if (t < 0.25) {{ r=0; g=t*4; b=1; }}
+          else if (t < 0.5) {{ r=0; g=1; b=1-(t-0.25)*4; }}
+          else if (t < 0.75) {{ r=(t-0.5)*4; g=1; b=0; }}
+          else {{ r=1; g=1-(t-0.75)*4; b=0; }}
+          ctx.fillStyle = 'rgb('+Math.round(r*255)+','+Math.round(g*255)+','+Math.round(b*255)+')';
+          ctx.fillRect(0, i, 20, 1);
+        }}
+        leg.innerHTML = '<div style="margin-bottom:6px;font-weight:bold;color:#fff;">' + prop + '</div>'
+          + '<div style="display:flex;gap:6px;align-items:stretch;">'
+          + '<img src="' + canvas.toDataURL() + '" style="width:16px;height:150px;border-radius:2px;">'
+          + '<div style="display:flex;flex-direction:column;justify-content:space-between;height:150px;">'
+          + '<span>' + range[1].toFixed(1) + '</span>'
+          + '<span>' + ((range[0]+range[1])/2).toFixed(1) + '</span>'
+          + '<span>' + range[0].toFixed(1) + '</span>'
+          + '</div></div>'
+          + '<div style="margin-top:10px;">'
+          + '<div><span style="color:#4f4;">&#9679;</span> Detected (TP)</div>'
+          + '<div><span style="color:#f44;">&#9670;</span> Missed (FN)</div>'
+          + '<div><span style="color:#f84;">&#9632;</span> False Pos (FP)</div>'
+          + '</div>';
+      }}
+
+      // Property buttons
+      var btnDiv = document.getElementById('{viz_id}_btns');
+      propNames.forEach(function(prop) {{
+        var btn = document.createElement('button');
+        btn.textContent = prop;
+        btn.style.cssText = 'padding:3px 10px;font-size:11px;cursor:pointer;border:1px solid #555;'
+          + 'border-radius:3px;background:#333;color:#ccc;font-family:monospace;';
+        btn.onclick = function() {{
+          currentProp = prop;
+          updateColors(prop);
+          // Highlight active button
+          btnDiv.querySelectorAll('button').forEach(function(b) {{
+            b.style.background = b.textContent === prop ? '#556' : '#333';
+            b.style.color = b.textContent === prop ? '#fff' : '#ccc';
+          }});
+        }};
+        btnDiv.appendChild(btn);
+      }});
+      // "All errors" button
+      var allBtn = document.createElement('button');
+      allBtn.textContent = 'All Errors';
+      allBtn.style.cssText = 'padding:3px 10px;font-size:11px;cursor:pointer;border:1px solid #555;'
+        + 'border-radius:3px;background:#333;color:#f88;font-family:monospace;';
+      allBtn.onclick = function() {{
+        errorMarkers.forEach(function(em) {{ em.mesh.visible = true; }});
+        btnDiv.querySelectorAll('button').forEach(function(b) {{
+          b.style.background = b.textContent === 'All Errors' ? '#543' : '#333';
+          b.style.color = b.textContent === 'All Errors' ? '#f88' : '#ccc';
+        }});
+      }};
+      btnDiv.appendChild(allBtn);
+
+      // Initial state
+      updateColors(currentProp);
+      btnDiv.querySelector('button').style.background = '#556';
+      btnDiv.querySelector('button').style.color = '#fff';
+
+      // Animate
+      function animate() {{
+        requestAnimationFrame(animate);
+        controls.update();
+        renderer.render(scene, camera);
+      }}
+      animate();
+    }});
+  }})();
+  </script>"""
 
 
 def output_example_html(score: float, explanation: str, result: dict, subPass: int) -> str:

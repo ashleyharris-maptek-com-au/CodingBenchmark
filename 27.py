@@ -17,10 +17,11 @@ import sys
 import os
 import time
 import math
+import hashlib
 from typing import List, Tuple, Set, Dict, Optional, Any
 from pathlib import Path
 
-from native_compiler import CppCompiler, CompilationError, ExecutionError
+from native_compiler import CppCompiler, CompilationError, ExecutionError,describe_this_pc
 from solver_utils import StreamingInputFile
 
 title = "Graph Coloring (C++)"
@@ -28,15 +29,63 @@ TIMEOUT_SECONDS = 30
 RANDOM_SEED = 27272727
 
 
-def generate_graph(num_vertices: int, edge_probability: float, seed: int) -> List[Tuple[int, int]]:
-  """Generate random graph with given edge probability."""
+def _edge_generator(num_vertices: int, edge_probability: float, seed: int):
+  """Yield edges (u,v) for an Erdos-Renyi graph using geometric skip.
+  O(m) time, O(1) memory.  Based on Batagelj & Brandes (2005)."""
+  n = num_vertices
+  p = edge_probability
+  if p <= 0 or n < 2:
+    return
+  if p >= 1.0:
+    for i in range(n):
+      for j in range(i + 1, n):
+        yield (i, j)
+    return
   rng = random.Random(seed)
-  edges = []
-  for i in range(num_vertices):
-    for j in range(i + 1, num_vertices):
-      if rng.random() < edge_probability:
-        edges.append((i, j))
-  return edges
+  lp = math.log(1.0 - p)
+  v = 1
+  w = -1
+  while v < n:
+    r = rng.random()
+    if r <= 0:
+      r = 1e-300
+    w = w + 1 + int(math.log(r) / lp)
+    while w >= v and v < n:
+      w -= v
+      v += 1
+    if v < n:
+      yield (w, v)
+
+
+def _edge_count(num_vertices: int, edge_probability: float, seed: int) -> int:
+  """Count edges without storing them.  Same RNG sequence as _edge_generator."""
+  n = num_vertices
+  p = edge_probability
+  if p <= 0 or n < 2:
+    return 0
+  if p >= 1.0:
+    return n * (n - 1) // 2
+  rng = random.Random(seed)
+  lp = math.log(1.0 - p)
+  count = 0
+  v = 1
+  w = -1
+  while v < n:
+    r = rng.random()
+    if r <= 0:
+      r = 1e-300
+    w = w + 1 + int(math.log(r) / lp)
+    while w >= v and v < n:
+      w -= v
+      v += 1
+    if v < n:
+      count += 1
+  return count
+
+
+def generate_graph(num_vertices: int, edge_probability: float, seed: int) -> List[Tuple[int, int]]:
+  """Generate random graph with given edge probability.  O(m) via geometric skip."""
+  return list(_edge_generator(num_vertices, edge_probability, seed))
 
 
 def chromatic_number_upper_bound(num_vertices: int, edges: List[Tuple[int, int]]) -> int:
@@ -152,9 +201,24 @@ TEST_CASES = [
 
 GRAPH_CACHE: Dict[int, Any] = {}
 _INPUT_FILE_CACHE: Dict[int, StreamingInputFile] = {}
+LAST_COLORING_VIZ: Dict[Tuple[int, str], dict] = {}
 
 # Threshold for streaming (file-based) input
 STREAMING_THRESHOLD_EDGES = 1_000_000
+
+# Persistent cache directory in repo
+_PERSISTENT_CACHE_DIR = Path(__file__).parent / "cached_graphs" / "test27"
+
+
+def _get_persistent_cache_path(cache_key: str) -> Path:
+  """Get path to persistent cache file in repo."""
+  key_hash = hashlib.sha256(cache_key.encode('utf-8')).hexdigest()[:24]
+  return _PERSISTENT_CACHE_DIR / f"{key_hash}.txt"
+
+
+def _ensure_persistent_cache_dir():
+  """Ensure persistent cache directory exists."""
+  _PERSISTENT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def get_graph(subpass: int) -> Tuple[int, List[Tuple[int, int]], int]:
@@ -182,16 +246,71 @@ def _get_streaming_input(subpass: int) -> StreamingInputFile:
     return _INPUT_FILE_CACHE[subpass]
 
   case = TEST_CASES[subpass]
-  cache_key = f"graph27|v={case['vertices']}|p={case['edge_prob']}|c={case['colors']}|seed={RANDOM_SEED + subpass}"
+  cache_key = f"graph27v2|v={case['vertices']}|p={case['edge_prob']}|c={case['colors']}|seed={RANDOM_SEED + subpass}"
+
+  # Check persistent cache first
+  persistent_path = _get_persistent_cache_path(cache_key)
+  if persistent_path.exists():
+    # Create a StreamingInputFile that points to the persistent cache
+    class PersistentCacheFile:
+
+      def __init__(self, path):
+        self._path = path
+        self._is_generated = True
+
+      def get_file_path(self):
+        return self._path
+
+      def open_for_read(self):
+        return open(self._path, 'r', encoding='utf-8')
+
+      def get_size_bytes(self):
+        return self._path.stat().st_size
+
+    _INPUT_FILE_CACHE[subpass] = PersistentCacheFile(persistent_path)
+    return _INPUT_FILE_CACHE[subpass]
 
   def generator():
-    num_vertices, edges, num_colors = get_graph(subpass)
-    yield f"{num_vertices} {len(edges)} {num_colors}\n"
-    for u, v in edges:
+    n = case["vertices"]
+    p = case["edge_prob"]
+    nc = case["colors"]
+    s = RANDOM_SEED + subpass
+    # First pass: count edges (O(m) time, O(1) memory)
+    t0 = time.time()
+    edge_count = _edge_count(n, p, s)
+    count_time = time.time() - t0
+    if count_time > 1:
+      print(f"  Edge counting: {count_time:.2f}s")
+    yield f"{n} {edge_count} {nc}\n"
+    # Second pass: stream edges (same RNG sequence reproduces same edges)
+    for u, v in _edge_generator(n, p, s):
       yield f"{u} {v}\n"
 
   input_file = StreamingInputFile(cache_key, generator, "test27_graphs")
   _INPUT_FILE_CACHE[subpass] = input_file
+
+  # After generation, copy to persistent cache
+  def copy_to_persistent():
+    try:
+      _ensure_persistent_cache_dir()
+      temp_path = input_file.get_file_path()
+      if temp_path.exists():
+        import shutil
+        shutil.copy2(temp_path, persistent_path)
+        print(f"  Cached to repo: {persistent_path.name}")
+    except Exception as e:
+      print(f"  Warning: Failed to copy to persistent cache: {e}")
+
+  # Monkey-patch generate to also copy to persistent cache
+  original_generate = input_file.generate
+
+  def generate_with_copy(force=False):
+    result = original_generate(force)
+    copy_to_persistent()
+    return result
+
+  input_file.generate = generate_with_copy
+
   return input_file
 
 
@@ -209,17 +328,13 @@ def prepareSubpassPrompt(subPass: int) -> str:
 
   return f"""You are writing C++ code to solve the Graph Coloring problem.
 
-You must write a C++ solver that can handle ANY graph complexity from trivial to ludicrous scale:
-- **Trivial**: Small graphs (10-20 vertices, many colors), basic backtracking
-- **Medium**: Moderate graphs (50-100 vertices, moderate colors), DSatur algorithm
-- **Large**: Complex graphs (200-500 vertices, few colors), advanced heuristics
-- **Extreme**: Massive graphs (1000-5000 vertices, very few colors), sophisticated optimization
-
 **The Challenge:**
-Your C++ graph colorer will be tested with graphs ranging from simple coloring tasks to massive graphs with very few available colors. The same algorithm must work efficiently across ALL graph complexities.
+Your C++ graph colorer will be tested with graphs ranging from simple 50 nodes  
+to massive million-node graphs requiring 60 colours.
 
 **Problem:**
-Color a graph with exactly k colors such that no two adjacent vertices share the same color. This is NP-Complete and requires sophisticated algorithms for larger instances.
+Color a graph with exactly k colours such that no two adjacent vertices share the same colour. 
+This is NP-Complete and requires sophisticated algorithms for larger instances.
 
 **Input format (stdin):**
 ```
@@ -232,32 +347,6 @@ u v  (for each edge, 0-indexed)
 color_0 color_1 ... color_(n-1)  (color assignment for each vertex)
 ```
 
-**Critical Requirements:**
-1. **Scalability**: Your algorithm must adapt based on graph size and color availability
-2. **Performance**: Must complete within 5 minutes even for massive graphs
-3. **Quality**: Find valid colorings or correctly report impossibility
-
-**Algorithm Strategy Recommendations:**
-- **Small graphs (≤50 vertices, ≥5 colors)**: Can use backtracking with pruning
-- **Medium graphs (50-200 vertices, 3-4 colors)**: DSatur algorithm, constraint propagation
-- **Large graphs (200-1000 vertices, 2-3 colors)**: Advanced heuristics, local search
-- **Very Large graphs (>1000 vertices, 2 colors)**: Very fast heuristics, approximation methods
-
-**Key Techniques:**
-- **DSatur**: Degree of Saturation algorithm for greedy coloring
-- **Backtracking**: Systematic search with pruning
-- **Constraint propagation**: Forward checking to reduce search space
-- **Local search**: Hill climbing, tabu search for optimization
-- **Heuristics**: Largest degree ordering, Welsh-Powell algorithm
-
-**Implementation Hints:**
-- Detect graph complexity and choose appropriate coloring algorithm
-- Use efficient adjacency list representation
-- Implement adaptive quality vs speed tradeoffs
-- For very large graphs, focus on fast heuristics
-- Handle edge cases: bipartite graphs, complete graphs, impossible coloring
-- Use fast I/O for large inputs
-
 **Success Criteria:**
 - All vertices assigned valid colors (0 to k-1)
 - No adjacent vertices share the same color
@@ -267,6 +356,15 @@ color_0 color_1 ... color_(n-1)  (color assignment for each vertex)
 - Cannot find valid coloring within time limit
 - Invalid color assignment (adjacent vertices same color)
 - Incomplete coloring
+
+**Environment:**
+{describe_this_pc()}
+
+**C++ Compiler:**
+{CppCompiler("test_engine").describe()}
+
+Be sure that any deviation from the C++ standard library is supported by the given compiler,
+as referencing the wrong intrinsics or non-standard header like 'bits/stdc++.h' could fail your submission.
 
 **Requirements:**
 1. Program must compile with g++ or MSVC (C++17)
@@ -316,6 +414,40 @@ def verify_coloring(num_vertices: int, edges: List[Tuple[int, int]], colors: Lis
       return False, f"Adjacent vertices {u} and {v} have same color {colors[u]}"
 
   return True, "Valid coloring"
+
+
+def _build_coloring_viz(num_vertices: int, edges: List[Tuple[int, int]], colors: List[int],
+                        num_colors: int, valid: bool, msg: str) -> dict:
+  colors_list: List[Optional[int]] = []
+  for i in range(num_vertices):
+    colors_list.append(colors[i] if i < len(colors) else None)
+
+  invalid_nodes: List[int] = []
+  for i, c in enumerate(colors_list):
+    if c is None or c < 0 or c >= num_colors:
+      invalid_nodes.append(i)
+
+  invalid_edges: List[Tuple[int, int]] = []
+  for u, v in edges:
+    cu = colors_list[u]
+    cv = colors_list[v]
+    if cu is None or cv is None:
+      continue
+    if cu < 0 or cu >= num_colors or cv < 0 or cv >= num_colors:
+      continue
+    if cu == cv:
+      invalid_edges.append((u, v))
+
+  return {
+    "num_vertices": num_vertices,
+    "edges": edges,
+    "colors": colors_list,
+    "num_colors": num_colors,
+    "invalid_nodes": invalid_nodes,
+    "invalid_edges": invalid_edges,
+    "valid": valid,
+    "msg": msg,
+  }
 
 
 def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
@@ -385,6 +517,11 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
       colors = list(map(int, proc.stdout.strip().split()))
       valid, msg = verify_coloring(num_vertices, edges, colors, num_colors)
 
+    if case["vertices"] <= 1000:
+      LAST_COLORING_VIZ[(subPass, aiEngineName)] = _build_coloring_viz(
+        num_vertices, edges, colors, num_colors, valid, msg
+      )
+
     if valid:
       return 1.0, f"[{case['desc']}] Valid coloring in {exec_time:.2f}s"
     else:
@@ -404,13 +541,100 @@ def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
     return "<p style='color:red'>No result provided</p>"
   case = TEST_CASES[subPass]
   html = f"<h4>Graph Coloring - {case['desc']}</h4>"
-  if "reasoning" in result:
+  if "reasoning" in result and subPass == 0:
     r = result['reasoning'][:400] + ('...' if len(result.get('reasoning', '')) > 400 else '')
     html += f"<p><strong>Approach:</strong> {r.replace('<', '&lt;').replace('>', '&gt;')}</p>"
-  if "cpp_code" in result:
+  if "cpp_code" in result and subPass == 0:
     code = result["cpp_code"].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     html += f"<details><summary>View C++ Code ({len(result['cpp_code'])} chars)</summary><pre>{code}</pre></details>"
+  viz = LAST_COLORING_VIZ.get((subPass, aiEngineName))
+  if viz and viz.get("num_vertices", 0) <= 1000:
+    html += _generate_graph_svg(viz)
   return html
+
+
+def _generate_graph_svg(viz: dict) -> str:
+  num_vertices = viz["num_vertices"]
+  edges = viz["edges"]
+  colors = viz["colors"]
+  num_colors = max(1, viz["num_colors"])
+  invalid_nodes = set(viz["invalid_nodes"])
+  invalid_edges = set(tuple(sorted(e)) for e in viz["invalid_edges"])
+
+  size = 600
+  cx = cy = size / 2.0
+  radius = size * 0.42
+
+  positions = []
+  for i in range(num_vertices):
+    angle = 2 * math.pi * i / max(1, num_vertices)
+    x = cx + radius * math.cos(angle)
+    y = cy + radius * math.sin(angle)
+    positions.append((x, y))
+
+  if num_vertices <= 50:
+    node_r = 5.0
+  elif num_vertices <= 200:
+    node_r = 4.0
+  elif num_vertices <= 500:
+    node_r = 3.0
+  else:
+    node_r = 2.2
+
+  def color_for(c: Optional[int]) -> str:
+    if c is None or c < 0 or c >= num_colors:
+      return "#111827"
+    hue = (c * 360.0 / num_colors) % 360.0
+    return f"hsl({hue:.0f},70%,55%)"
+
+  edge_lines = []
+  for u, v in edges:
+    x1, y1 = positions[u]
+    x2, y2 = positions[v]
+    is_bad = tuple(sorted((u, v))) in invalid_edges
+    stroke = "#ef4444" if is_bad else "#334155"
+    opacity = "0.85" if is_bad else "0.25"
+    width = "1.4" if is_bad else "0.6"
+    edge_lines.append(
+      f"<line x1='{x1:.2f}' y1='{y1:.2f}' x2='{x2:.2f}' y2='{y2:.2f}' "
+      f"stroke='{stroke}' stroke-width='{width}' stroke-opacity='{opacity}' />"
+    )
+
+  node_circles = []
+  for i, (x, y) in enumerate(positions):
+    fill = color_for(colors[i])
+    if i in invalid_nodes:
+      node_circles.append(
+        f"<circle cx='{x:.2f}' cy='{y:.2f}' r='{node_r:.2f}' fill='{fill}' "
+        f"stroke='#ef4444' stroke-width='1.3' />"
+      )
+    else:
+      node_circles.append(
+        f"<circle cx='{x:.2f}' cy='{y:.2f}' r='{node_r:.2f}' fill='{fill}' stroke='#0f172a' stroke-width='0.4' />"
+      )
+
+  invalid_edge_count = len(invalid_edges)
+  invalid_node_count = len(invalid_nodes)
+  status = "Valid coloring" if viz.get("valid") else viz.get("msg", "Invalid coloring")
+
+  svg = "\n".join([
+    "<div style='margin:12px 0;padding:10px;border:1px solid #1f2937;border-radius:8px;background:#0b1120;'>",
+    f"<div style='color:#e2e8f0;font-size:13px;margin-bottom:6px;'><strong>Graph Visualization</strong> — {status}</div>",
+    f"<div style='color:#94a3b8;font-size:12px;margin-bottom:6px;'>"
+    f"Nodes: {num_vertices} | Edges: {len(edges)} | Invalid nodes: {invalid_node_count} | Invalid edges: {invalid_edge_count}</div>",
+    f"<svg width='100%' viewBox='0 0 {size} {size}' style='background:#0b1120;border:1px solid #334155;border-radius:6px;'>",
+    "<g>",
+    *edge_lines,
+    "</g>",
+    "<g>",
+    *node_circles,
+    "</g>",
+    "</svg>",
+    "<div style='color:#64748b;font-size:11px;margin-top:6px;'>Red edges highlight same-color conflicts. Red strokes on nodes mark invalid/missing colors.</div>",
+    "</div>",
+  ])
+
+  return svg
 
 
 highLevelSummary = """

@@ -16,6 +16,11 @@ import random
 import time
 from typing import List, Tuple, Dict
 
+import hashlib
+import os
+import tempfile
+from pathlib import Path
+
 from native_compiler import CppCompiler, compile_and_run, describe_this_pc
 
 title = "Job-Shop Scheduling (C++)"
@@ -25,6 +30,59 @@ TIMEOUT_SECONDS = 30
 
 # Seed for reproducibility
 RANDOM_SEED = 11111
+
+_BASELINE_MAKESPAN_CACHE: Dict[Tuple[int, str], int] = {}
+
+
+def _baseline_cache_dir() -> Path:
+  p = Path(tempfile.gettempdir()) / "CodingBenchmark" / "test16_baseline_cache"
+  try:
+    p.mkdir(parents=True, exist_ok=True)
+  except Exception:
+    pass
+  return p
+
+
+def _jobs_fingerprint(jobs: List[List[Dict]], num_machines: int) -> str:
+  h = hashlib.sha256()
+  h.update(f"m={num_machines};j={len(jobs)};".encode("utf-8"))
+  for job in jobs:
+    h.update(f"[{len(job)}]".encode("utf-8"))
+    for t in job:
+      h.update(f"{int(t['machine'])},{int(t['duration'])};".encode("utf-8"))
+  return h.hexdigest()
+
+
+def _get_baseline_makespan_cached(subpass: int, jobs: List[List[Dict]],
+                                  num_machines: int) -> Tuple[int, bool, float]:
+  """Return (baseline_makespan, from_cache, compute_time_seconds)."""
+  fp = _jobs_fingerprint(jobs, num_machines)
+  mem_key = (subpass, fp)
+  if mem_key in _BASELINE_MAKESPAN_CACHE:
+    return _BASELINE_MAKESPAN_CACHE[mem_key], True, 0.0
+
+  cache_dir = _baseline_cache_dir()
+  cache_path = cache_dir / f"s{subpass}_{fp}.txt"
+  try:
+    text = cache_path.read_text(encoding="utf-8").strip()
+    if text:
+      baseline_makespan = int(text)
+      _BASELINE_MAKESPAN_CACHE[mem_key] = baseline_makespan
+      return baseline_makespan, True, 0.0
+  except Exception:
+    pass
+
+  t0 = time.time()
+  baseline_makespan = greedy_schedule(jobs, num_machines)
+  dt = time.time() - t0
+  _BASELINE_MAKESPAN_CACHE[mem_key] = baseline_makespan
+  try:
+    tmp_path = cache_path.with_suffix(cache_path.suffix + f".{os.getpid()}.tmp")
+    tmp_path.write_text(str(int(baseline_makespan)), encoding="utf-8")
+    os.replace(str(tmp_path), str(cache_path))
+  except Exception:
+    pass
+  return baseline_makespan, False, dt
 
 
 def generate_jobs(num_jobs: int, tasks_per_job: int, num_machines: int, min_duration: int,
@@ -54,7 +112,8 @@ def generate_jobs(num_jobs: int, tasks_per_job: int, num_machines: int, min_dura
 TEST_CASES = [
   # Subpass 0: Simple - 3 jobs, 2 machines
   {
-    "jobs": [
+    "jobs":
+    lambda: [
       [{
         "machine": 0,
         "duration": 3
@@ -84,59 +143,74 @@ TEST_CASES = [
   },
   # Subpass 1: Medium - 4 jobs, 3 machines
   {
-    "jobs": generate_jobs(4, 3, 3, 2, 5, RANDOM_SEED),
+    "jobs": lambda: generate_jobs(4, 3, 3, 2, 5, RANDOM_SEED),
     "num_machines": 3,
     "description": "4 jobs, 3 machines"
   },
   # Subpass 2: Larger - 5 jobs, 4 machines
   {
-    "jobs": generate_jobs(5, 4, 4, 2, 6, RANDOM_SEED + 1),
+    "jobs": lambda: generate_jobs(5, 4, 4, 2, 6, RANDOM_SEED + 1),
     "num_machines": 4,
     "description": "5 jobs, 4 machines"
   },
   # Subpass 3: Complex - 6 jobs, 4 machines
   {
-    "jobs": generate_jobs(6, 4, 4, 3, 8, RANDOM_SEED + 2),
+    "jobs": lambda: generate_jobs(6, 4, 4, 3, 8, RANDOM_SEED + 2),
     "num_machines": 4,
     "description": "6 jobs, 4 machines"
   },
   # Subpass 4: Large - 8 jobs, 5 machines
   {
-    "jobs": generate_jobs(8, 5, 5, 2, 7, RANDOM_SEED + 3),
+    "jobs": lambda: generate_jobs(8, 5, 5, 2, 7, RANDOM_SEED + 3),
     "num_machines": 5,
     "description": "8 jobs, 5 machines"
   },
   # Subpass 5: Very large - 10 jobs, 6 machines
   {
-    "jobs": generate_jobs(10, 6, 6, 3, 10, RANDOM_SEED + 4),
+    "jobs": lambda: generate_jobs(10, 6, 6, 3, 10, RANDOM_SEED + 4),
     "num_machines": 6,
     "description": "10 jobs, 6 machines"
   },
   # Extreme cases
   {
-    "jobs": generate_jobs(20, 8, 8, 2, 15, RANDOM_SEED + 5),
+    "jobs": lambda: generate_jobs(20, 8, 8, 2, 15, RANDOM_SEED + 5),
     "num_machines": 8,
     "description": "20 jobs, 8 machines"
   },
   {
-    "jobs": generate_jobs(50, 10, 10, 2, 20, RANDOM_SEED + 6),
+    "jobs": lambda: generate_jobs(50, 10, 10, 2, 20, RANDOM_SEED + 6),
     "num_machines": 10,
     "description": "50 jobs, 10 machines"
   },
   {
-    "jobs": generate_jobs(100, 15, 15, 3, 25, RANDOM_SEED + 7),
+    "jobs": lambda: generate_jobs(100, 15, 15, 3, 25, RANDOM_SEED + 7),
     "num_machines": 15,
     "description": "100 jobs, 15 machines"
   },
   {
-    "jobs": generate_jobs(500, 20, 20, 2, 30, RANDOM_SEED + 8),
+    "jobs": lambda: generate_jobs(500, 20, 20, 2, 300, RANDOM_SEED + 8),
     "num_machines": 20,
     "description": "500 jobs, 20 machines (10k tasks)"
   },
   {
-    "jobs": generate_jobs(1000, 50, 50, 2, 50, RANDOM_SEED + 9),
+    "jobs": lambda: generate_jobs(1000, 50, 50, 2, 5000, RANDOM_SEED + 9),
     "num_machines": 50,
     "description": "1000 jobs, 50 machines (50k tasks)"
+  },
+  {
+    "jobs": lambda: generate_jobs(10000, 50, 50, 200, 5000, RANDOM_SEED + 10),
+    "num_machines": 50,
+    "description": "10000 jobs, 50 machines (50k tasks)"
+  },
+  {
+    "jobs": lambda: generate_jobs(100000, 50, 50, 2000, 50000, RANDOM_SEED + 11),
+    "num_machines": 50,
+    "description": "100000 jobs, 50 machines (50k tasks)"
+  },
+  {
+    "jobs": lambda: generate_jobs(1000000, 50, 50, 20000, 500000, RANDOM_SEED + 12),
+    "num_machines": 50,
+    "description": "1000000 jobs, 50 machines (50k tasks)"
   },
 ]
 
@@ -240,6 +314,7 @@ def validate_schedule(schedule: List[List[Tuple]], jobs: List[List[Dict]],
     return False, f"Schedule has {len(schedule)} jobs, expected {len(jobs)}", 0
 
   # Track machine usage: list of (start, end) intervals per machine
+  # Store (start, end, job_idx, task_idx) for better error messages
   machine_intervals = [[] for _ in range(num_machines)]
   makespan = 0
 
@@ -258,6 +333,9 @@ def validate_schedule(schedule: List[List[Tuple]], jobs: List[List[Dict]],
       expected_machine = task["machine"]
       end_time = start_time + duration
 
+      if start_time < 0:
+        return False, f"Job {job_idx} task {task_idx}: negative start time {start_time}", 0
+
       # Check machine assignment
       if machine != expected_machine:
         return False, f"Job {job_idx} task {task_idx}: wrong machine {machine}, expected {expected_machine}", 0
@@ -266,14 +344,22 @@ def validate_schedule(schedule: List[List[Tuple]], jobs: List[List[Dict]],
       if start_time < prev_end:
         return False, f"Job {job_idx} task {task_idx}: starts at {start_time} before previous ends at {prev_end}", 0
 
-      # Check machine conflicts
-      for interval_start, interval_end in machine_intervals[machine]:
-        if not (end_time <= interval_start or start_time >= interval_end):
-          return False, f"Job {job_idx} task {task_idx}: conflicts with another task on machine {machine}", 0
-
-      machine_intervals[machine].append((start_time, end_time))
+      machine_intervals[machine].append((start_time, end_time, job_idx, task_idx))
       prev_end = end_time
       makespan = max(makespan, end_time)
+
+  # Check machine conflicts efficiently: sort by start time and ensure no overlap.
+  for m in range(num_machines):
+    intervals = machine_intervals[m]
+    if len(intervals) <= 1:
+      continue
+    intervals.sort(key=lambda x: x[0])
+    prev_s, prev_e, prev_j, prev_t = intervals[0]
+    for s, e, j, t in intervals[1:]:
+      if s < prev_e:
+        return False, (
+          f"Job {j} task {t}: conflicts with Job {prev_j} task {prev_t} on machine {m}"), 0
+      prev_s, prev_e, prev_j, prev_t = s, e, j, t
 
   return True, "", makespan
 
@@ -393,7 +479,6 @@ def execute_solver(code: str,
 
 
 def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
-  """Grade the job-shop scheduler."""
   if not result:
     return 0.0, "No result provided"
 
@@ -401,10 +486,16 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
     return 0.0, "No C++ code provided"
 
   case = TEST_CASES[subPass]
-  jobs = case["jobs"]
+  jobsLambda = case["jobs"]
   num_machines = case["num_machines"]
   description = case["description"]
   code = result["cpp_code"]
+
+  time1 = time.time()
+  jobs = jobsLambda()
+  time2 = time.time() - time1
+  if time2 > 1:
+    print(f"Job generation time: {time2:.2f} seconds")
 
   # Execute solver
   solution, error, exec_time = execute_solver(code, jobs, num_machines, aiEngineName)
@@ -414,13 +505,22 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
 
   # Validate schedule
   schedule = solution.get("schedule", [])
+  time3 = time.time()
   is_valid, validation_error, actual_makespan = validate_schedule(schedule, jobs, num_machines)
+  time4 = time.time() - time3
+  if time4 > 1:
+    print(f"Validation time: {time4:.2f} seconds")
 
   if not is_valid:
     return 0.0, f"[{description}] Invalid: {validation_error}"
 
   # Get baseline
-  baseline_makespan = greedy_schedule(jobs, num_machines)
+  baseline_makespan, baseline_cached, baseline_time = _get_baseline_makespan_cached(
+    subPass, jobs, num_machines)
+  if baseline_cached:
+    pass
+  elif baseline_time > 1:
+    print(f"Baseline calculation time: {baseline_time:.2f} seconds")
 
   # Score based on makespan vs baseline
   ratio = actual_makespan / baseline_makespan if baseline_makespan > 0 else 1.0
@@ -429,14 +529,14 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
     score = 1.0
     quality = "excellent (≤ baseline)"
   elif ratio <= 1.1:
-    score = 0.85
+    score = 0.5
     quality = "good (≤ 1.1x baseline)"
   elif ratio <= 1.25:
-    score = 0.7
+    score = 0.1
     quality = "acceptable (≤ 1.25x baseline)"
   else:
-    score = 0.5
-    quality = f"valid but slow ({ratio:.2f}x baseline)"
+    score = 0.0
+    quality = f"valid but inefficient ({ratio:.2f}x baseline)"
 
   explanation = (f"[{description}] Makespan: {actual_makespan}, Baseline: {baseline_makespan}, "
                  f"Time: {exec_time:.1f}s - {quality}")

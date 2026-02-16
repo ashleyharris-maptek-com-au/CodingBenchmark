@@ -166,14 +166,14 @@ TEST_CASES = [
   {
     "num_points": 10_000,
     "num_clusters": 10,
-    "use_binary": False,
+    "use_binary": True,
     "description": "10K points, 10 clusters"
   },
   # Subpass 1: Medium
   {
     "num_points": 100_000,
     "num_clusters": 25,
-    "use_binary": False,
+    "use_binary": True,
     "description": "100K points, 25 clusters"
   },
   # Subpass 2: 1 million
