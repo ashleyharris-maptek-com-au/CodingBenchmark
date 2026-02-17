@@ -26,6 +26,14 @@ from autoland_sim import (
   M2FT,
   KT2MS,
   MS2KT,
+  TAXI_SPEED_KT,
+  RWY_REMAINING_FRAC,
+  HARD_LANDING_FPM,
+  CRASH_LANDING_FPM,
+  EMAS_LENGTH_M,
+  GO_AROUND_ALT_FT,
+  GO_AROUND_MAX,
+  GO_AROUND_PENALTY,
 )
 
 title = "Aircraft Autoland (Python)"
@@ -322,12 +330,34 @@ def autopilot_step(state: dict, dt: float) -> dict:
 2. **Approach** (1000ft-200ft): Stabilise on glideslope, speed, config
 3. **Flare** (<50ft radio alt): Reduce descent rate, idle thrust
 4. **Touchdown & Rollout**: Deploy spoilers, reverse thrust, autobrake
-5. **Go-around**: If unstable below 500ft, apply TOGA thrust, pitch up, retract
+
+**Go-Around:**
+If the approach is unstable or unsafe, abort the landing:
+- Apply TOGA thrust (throttle 1.0), pitch up, retract speedbrake
+- Climb to {GO_AROUND_ALT_FT}ft AGL — this completes the go-around
+- The sim will then **restart** from a stable approach position with the
+  **same failures and weather**. Your autopilot must land on the retry.
+- Each go-around costs a **{GO_AROUND_PENALTY} point penalty** on a perfect landing.
+- After **{GO_AROUND_MAX} go-arounds** the scenario fails (score 0.0).
+
+**Scoring:**
+- **1.0** — Normal landing: stopped on the runway, or slowed below {TAXI_SPEED_KT}kt
+  with >{RWY_REMAINING_FRAC:.0%} runway remaining (pilot takes over to taxi).
+  Minus {GO_AROUND_PENALTY} per go-around.
+- **0.5** — Hard landing: touchdown vertical speed {HARD_LANDING_FPM}–{CRASH_LANDING_FPM} fpm.
+  Aircraft needs inspection but is reusable, everyone walks away.
+- **0.1** — Minor overrun: aircraft rolls off the end but is caught by the
+  EMAS arrestor bed (within {EMAS_LENGTH_M}m past runway end). Everyone safe,
+  aircraft damaged.
+- **0.0** — Catastrophic: touchdown >{CRASH_LANDING_FPM} fpm, major overrun
+  beyond EMAS, runway excursion, CFIT, or failure to land. Write-off or
+  loss of life.
 
 **Test Scenarios ({len(SCENARIOS)} total):**
 {scenario_list}
 Your single autopilot function must handle ALL scenarios.
-Persistence: module-level variables persist across calls within a scenario.
+Persistence: module-level variables persist across calls within a scenario,
+but are **reset** between scenarios and between go-around attempts.
 """
 
 
@@ -407,267 +437,191 @@ def _setup_scenario(idx):
   return runner, sc
 
 
+def _clamp_controls(controls):
+  """Clamp control surface commands to valid ranges."""
+  for k in ['elevator', 'aileron', 'rudder', 'elevator_trim', 'speedbrake']:
+    if k in controls:
+      controls[k] = max(-1.0, min(1.0, float(controls[k])))
+  for k in ['throttle_1', 'throttle_2']:
+    if k in controls:
+      controls[k] = max(0.0, min(1.0, float(controls[k])))
+  return controls
+
+
+def _apply_scenario_effects(truth, sc, dt):
+  """Apply all scenario-specific environmental/failure effects in one place."""
+  import random as _rng
+
+  # Engine failure at specified distance
+  ef = sc.get('engine_fail')
+  if ef:
+    fail_dist_m = ef['at_dist_nm'] * 1852
+    eidx = ef['engine']
+    if truth['rwy_dist_m'] < fail_dist_m and truth['engine_running'][eidx]:
+      truth['engine_running'][eidx] = False
+      truth['n1'][eidx] = 0
+
+  # Windshear
+  ws = sc.get('windshear')
+  if ws:
+    alt_ft = truth['z'] * M2FT
+    if 50 < alt_ft < ws['start_alt_ft']:
+      factor = (ws['start_alt_ft'] - alt_ft) / ws['start_alt_ft']
+      truth['u'] += ws['headwind_change_kt'] * KT2MS * factor * dt * 0.1
+      truth['w'] += ws['downdraft_fps'] * FT2M * factor * dt * 0.05
+
+  # Crosswind / gusts
+  cw = sc.get('crosswind_kt')
+  if cw:
+    gust = sc.get('gust_kt', 0)
+    wind_kt = cw + _rng.gauss(0, gust * 0.3)
+    truth['rwy_offset_m'] += wind_kt * KT2MS * dt * 0.02
+
+  # Turbulence
+  if sc.get('turbulence'):
+    truth['p'] += _rng.gauss(0, 0.02) * dt
+    truth['q'] += _rng.gauss(0, 0.01) * dt
+    truth['r'] += _rng.gauss(0, 0.01) * dt
+    truth['u'] += _rng.gauss(0, 1.0) * dt
+    truth['w'] += _rng.gauss(0, 0.5) * dt
+
+
+def _run_scenario(runner, autopilot_fn, sc, max_steps=6000, dt=0.05):
+  """Unified sim loop for all scenarios.
+
+  Handles scenario effects, end-condition checks (crash, overrun, taxi-speed
+  exit, full stop) and go-around detection.  Sets runner flags so the caller
+  can inspect runner.went_around / runner.landed / runner.crashed.
+  """
+  was_below_1000 = False
+
+  for step in range(max_steps):
+    state = runner.sensors.build_state(runner.truth)
+    state['target_hdg_deg'] = runner.target_hdg_deg
+    state['target_ias_kt'] = runner.target_ias_kt
+
+    _apply_scenario_effects(runner.truth, sc, dt)
+
+    try:
+      controls = autopilot_fn(state, dt)
+      if not isinstance(controls, dict):
+        controls = {}
+    except Exception:
+      controls = {}
+
+    _clamp_controls(controls)
+    runner.truth = autoland_physics_step(runner.truth, controls, dt)
+
+    alt_ft = runner.truth['z'] * M2FT
+    V = math.sqrt(runner.truth['u']**2 + runner.truth['v']**2 + runner.truth['w']**2)
+
+    if alt_ft < 1000:
+      was_below_1000 = True
+
+    # ── Go-around detection ──
+    if was_below_1000 and not runner.truth['on_ground'] and alt_ft > GO_AROUND_ALT_FT:
+      runner.went_around = True
+      return
+
+    # ── Crash checks ──
+    if alt_ft < -10:
+      runner.crashed = True
+      runner.crash_reason = 'CFIT: below ground level'
+      return
+
+    if runner.truth['on_ground'] and abs(runner.truth.get('touchdown_vs', 0)) > CRASH_LANDING_FPM:
+      runner.crashed = True
+      runner.crash_reason = f'Catastrophic landing: {abs(runner.truth["touchdown_vs"]):.0f} fpm'
+      return
+
+    if runner.truth['on_ground'] and abs(runner.truth['rwy_offset_m']) > ILS['runway_width_m'] / 2:
+      runner.crashed = True
+      runner.crash_reason = f'Runway excursion: {runner.truth["rwy_offset_m"]:.0f}m offset'
+      return
+
+    overrun_m = -runner.truth['rwy_dist_m'] - ILS['runway_length_m']
+    if runner.truth['on_ground'] and overrun_m > EMAS_LENGTH_M:
+      runner.crashed = True
+      runner.crash_reason = f'Major overrun: {overrun_m:.0f}m past end (beyond EMAS)'
+      return
+    if runner.truth['on_ground'] and overrun_m > 0 and runner.truth.get('stopped'):
+      runner.landed = True
+      runner.outcome = 'overrun'
+      return
+
+    if V * MS2KT > AC['Vne_kt']:
+      runner.crashed = True
+      runner.crash_reason = f'Overspeed: {V * MS2KT:.0f} kt'
+      return
+
+    # ── Taxi-speed exit ──
+    if runner.truth['on_ground'] and not runner.truth.get('stopped'):
+      V_kt = math.sqrt(runner.truth['u']**2 + runner.truth['v']**2) * MS2KT
+      remaining_m = ILS['runway_length_m'] + runner.truth['rwy_dist_m']
+      remaining_frac = remaining_m / ILS['runway_length_m']
+      if V_kt < TAXI_SPEED_KT and remaining_frac > RWY_REMAINING_FRAC:
+        runner.landed = True
+        runner.taxi_exit = True
+        runner.outcome = 'taxi_exit'
+        return
+
+    # ── Full stop ──
+    if runner.truth.get('stopped'):
+      runner.landed = True
+      runner.outcome = 'stopped'
+      return
+
+    # ── History ──
+    if step % 20 == 0:
+      runner.history.append({
+        'time': runner.truth['time'],
+        'alt_ft': alt_ft,
+        'rwy_dist_m': runner.truth['rwy_dist_m'],
+        'rwy_offset_m': runner.truth.get('rwy_offset_m', 0),
+        'on_ground': runner.truth['on_ground'],
+      })
+
+
 def gradeAnswer(result, subPass, aiEngineName):
   if not result or 'python_code' not in result:
     return 0.0, 'No Python code provided'
 
   code = result['python_code']
-  try:
-    ns = {}
-    exec(compile(code, '<autoland>', 'exec'), ns)
-    if 'autopilot_step' not in ns:
-      return 0.0, 'Code does not define autopilot_step(state, dt)'
-    autopilot_fn = ns['autopilot_step']
-  except Exception as e:
-    return 0.0, f'Compilation failed: {e}'
 
   sc_idx = subPass
   if sc_idx >= len(SCENARIOS):
     return 0.0, f'Invalid subpass {sc_idx}'
-
   sc = SCENARIOS[sc_idx]
-  runner, _ = _setup_scenario(sc_idx)
-  print(f'  Scenario {sc_idx}: {sc["name"]}')
+  hist_ref = f' [Ref: {sc.get("historical_ref", "")}]' if sc.get('historical_ref') else ''
 
-  try:
-    if sc.get('engine_fail'):
-      _run_engine_fail(runner, autopilot_fn, sc)
-    elif sc.get('windshear'):
-      _run_windshear(runner, autopilot_fn, sc)
-    elif sc.get('crosswind_kt'):
-      _run_crosswind(runner, autopilot_fn, sc)
-    elif sc.get('turbulence'):
-      _run_turbulence(runner, autopilot_fn, sc)
-    else:
-      runner.run(autopilot_fn, steps=sc.get('steps', 6000))
-  except Exception as e:
-    tb = traceback.format_exc()
-    return 0.0, f'Simulation error: {e}\n{tb[:500]}'
+  # ── Go-around restart loop ──
+  for ga_attempt in range(GO_AROUND_MAX + 1):
+    # Re-exec code each attempt so module-level state is fresh
+    try:
+      ns = {}
+      exec(compile(code, '<autoland>', 'exec'), ns)
+      if 'autopilot_step' not in ns:
+        return 0.0, 'Code does not define autopilot_step(state, dt)'
+      autopilot_fn = ns['autopilot_step']
+    except Exception as e:
+      return 0.0, f'Compilation failed: {e}'
 
-  score, details = runner.score()
-  hist = f' [Ref: {sc.get("historical_ref", "")}]' if sc.get('historical_ref') else ''
-  return score, f'[{sc["name"]}]{hist} {details}'
-
-
-def _run_engine_fail(runner, autopilot_fn, sc):
-  """Engine fails at specified distance."""
-  fail_dist = sc['engine_fail']['at_dist_nm'] * 1852
-  engine_idx = sc['engine_fail']['engine']
-  failed = False
-  dt = 0.05
-  friction = sc.get('runway_friction', 1.0)
-
-  for step in range(6000):
-    state = runner.sensors.build_state(runner.truth)
-    state['target_hdg_deg'] = runner.target_hdg_deg
-    state['target_ias_kt'] = runner.target_ias_kt
-
-    if not failed and runner.truth['rwy_dist_m'] < fail_dist:
-      runner.truth['engine_running'][engine_idx] = False
-      runner.truth['n1'][engine_idx] = 0
-      failed = True
+    runner, _ = _setup_scenario(sc_idx)
+    runner.go_arounds = ga_attempt
+    print(f'  Scenario {sc_idx}: {sc["name"]} (attempt {ga_attempt + 1})')
 
     try:
-      controls = autopilot_fn(state, dt)
-      if not isinstance(controls, dict):
-        controls = {}
-    except Exception:
-      controls = {}
+      _run_scenario(runner, autopilot_fn, sc)
+    except Exception as e:
+      tb = traceback.format_exc()
+      return 0.0, f'Simulation error: {e}\n{tb[:500]}'
 
-    for k in ['elevator', 'aileron', 'rudder', 'elevator_trim', 'speedbrake']:
-      if k in controls:
-        controls[k] = max(-1.0, min(1.0, float(controls[k])))
-    for k in ['throttle_1', 'throttle_2']:
-      if k in controls:
-        controls[k] = max(0.0, min(1.0, float(controls[k])))
+    if runner.went_around:
+      print(f'    Go-around #{ga_attempt + 1} — restarting from approach')
+      continue
 
-    runner.truth = autoland_physics_step(runner.truth, controls, dt)
+    score, details = runner.score()
+    return score, f'[{sc["name"]}]{hist_ref} {details}'
 
-    # Apply crosswind if present
-    if sc.get('crosswind_kt'):
-      _apply_crosswind(runner.truth, sc['crosswind_kt'], sc.get('gust_kt', 0), dt)
-
-    alt_ft = runner.truth['z'] * M2FT
-    V = math.sqrt(runner.truth['u']**2 + runner.truth['v']**2 + runner.truth['w']**2)
-    ias_kt = runner.truth.get('ias_kt_approx', V * MS2KT)
-
-    if alt_ft < -10:
-      runner.crashed = True
-      runner.crash_reason = 'CFIT'
-      break
-    if runner.truth['on_ground'] and abs(runner.truth.get('touchdown_vs', 0)) > 600:
-      runner.crashed = True
-      runner.crash_reason = f'Hard landing: {abs(runner.truth["touchdown_vs"]):.0f} fpm'
-      break
-    if runner.truth.get('stopped'):
-      runner.landed = True
-      break
-
-    if step % 20 == 0:
-      runner.history.append({
-        'time': runner.truth['time'],
-        'alt_ft': alt_ft,
-        'rwy_dist_m': runner.truth['rwy_dist_m'],
-      })
-
-
-def _run_windshear(runner, autopilot_fn, sc):
-  """Windshear encounter on approach."""
-  ws = sc['windshear']
-  dt = 0.05
-  for step in range(6000):
-    state = runner.sensors.build_state(runner.truth)
-    state['target_hdg_deg'] = runner.target_hdg_deg
-    state['target_ias_kt'] = runner.target_ias_kt
-
-    alt_ft = runner.truth['z'] * M2FT
-
-    # Apply windshear effect
-    if alt_ft < ws['start_alt_ft'] and alt_ft > 50:
-      # Headwind decreases (performance-decreasing shear)
-      shear_factor = (ws['start_alt_ft'] - alt_ft) / ws['start_alt_ft']
-      runner.truth['u'] += ws['headwind_change_kt'] * KT2MS * shear_factor * dt * 0.1
-      runner.truth['w'] += ws['downdraft_fps'] * FT2M * shear_factor * dt * 0.05
-
-    try:
-      controls = autopilot_fn(state, dt)
-      if not isinstance(controls, dict):
-        controls = {}
-    except Exception:
-      controls = {}
-
-    for k in ['elevator', 'aileron', 'rudder', 'elevator_trim', 'speedbrake']:
-      if k in controls:
-        controls[k] = max(-1.0, min(1.0, float(controls[k])))
-    for k in ['throttle_1', 'throttle_2']:
-      if k in controls:
-        controls[k] = max(0.0, min(1.0, float(controls[k])))
-
-    runner.truth = autoland_physics_step(runner.truth, controls, dt)
-
-    if alt_ft < -10:
-      runner.crashed = True
-      runner.crash_reason = 'CFIT during windshear'
-      break
-    if runner.truth['on_ground'] and abs(runner.truth.get('touchdown_vs', 0)) > 600:
-      runner.crashed = True
-      runner.crash_reason = f'Hard landing: {abs(runner.truth["touchdown_vs"]):.0f} fpm'
-      break
-    if runner.truth.get('stopped'):
-      runner.landed = True
-      break
-
-    if step % 20 == 0:
-      runner.history.append({
-        'time': runner.truth['time'],
-        'alt_ft': alt_ft,
-        'rwy_dist_m': runner.truth['rwy_dist_m'],
-      })
-
-
-def _apply_crosswind(truth, base_kt, gust_kt, dt):
-  """Apply lateral wind to truth state."""
-  import random
-  wind_kt = base_kt + random.gauss(0, gust_kt * 0.3)
-  wind_ms = wind_kt * KT2MS
-  truth['rwy_offset_m'] += wind_ms * dt * 0.02  # small lateral push
-
-
-def _run_crosswind(runner, autopilot_fn, sc):
-  """Approach with crosswind."""
-  dt = 0.05
-  for step in range(6000):
-    state = runner.sensors.build_state(runner.truth)
-    state['target_hdg_deg'] = runner.target_hdg_deg
-    state['target_ias_kt'] = runner.target_ias_kt
-
-    _apply_crosswind(runner.truth, sc['crosswind_kt'], sc.get('gust_kt', 0), dt)
-
-    try:
-      controls = autopilot_fn(state, dt)
-      if not isinstance(controls, dict):
-        controls = {}
-    except Exception:
-      controls = {}
-
-    for k in ['elevator', 'aileron', 'rudder', 'elevator_trim', 'speedbrake']:
-      if k in controls:
-        controls[k] = max(-1.0, min(1.0, float(controls[k])))
-    for k in ['throttle_1', 'throttle_2']:
-      if k in controls:
-        controls[k] = max(0.0, min(1.0, float(controls[k])))
-
-    runner.truth = autoland_physics_step(runner.truth, controls, dt)
-
-    alt_ft = runner.truth['z'] * M2FT
-    if alt_ft < -10:
-      runner.crashed = True
-      runner.crash_reason = 'CFIT'
-      break
-    if runner.truth['on_ground'] and abs(runner.truth.get('touchdown_vs', 0)) > 600:
-      runner.crashed = True
-      runner.crash_reason = f'Hard landing: {abs(runner.truth["touchdown_vs"]):.0f} fpm'
-      break
-    if runner.truth.get('stopped'):
-      runner.landed = True
-      break
-
-    if step % 20 == 0:
-      runner.history.append({
-        'time': runner.truth['time'],
-        'alt_ft': alt_ft,
-        'rwy_dist_m': runner.truth['rwy_dist_m'],
-      })
-
-
-def _run_turbulence(runner, autopilot_fn, sc):
-  """Approach with turbulence disturbances."""
-  import random
-  dt = 0.05
-  for step in range(6000):
-    state = runner.sensors.build_state(runner.truth)
-    state['target_hdg_deg'] = runner.target_hdg_deg
-    state['target_ias_kt'] = runner.target_ias_kt
-
-    # Add turbulence
-    runner.truth['p'] += random.gauss(0, 0.02) * dt
-    runner.truth['q'] += random.gauss(0, 0.01) * dt
-    runner.truth['r'] += random.gauss(0, 0.01) * dt
-    runner.truth['u'] += random.gauss(0, 1.0) * dt
-    runner.truth['w'] += random.gauss(0, 0.5) * dt
-
-    try:
-      controls = autopilot_fn(state, dt)
-      if not isinstance(controls, dict):
-        controls = {}
-    except Exception:
-      controls = {}
-
-    for k in ['elevator', 'aileron', 'rudder', 'elevator_trim', 'speedbrake']:
-      if k in controls:
-        controls[k] = max(-1.0, min(1.0, float(controls[k])))
-    for k in ['throttle_1', 'throttle_2']:
-      if k in controls:
-        controls[k] = max(0.0, min(1.0, float(controls[k])))
-
-    runner.truth = autoland_physics_step(runner.truth, controls, dt)
-
-    alt_ft = runner.truth['z'] * M2FT
-    if alt_ft < -10:
-      runner.crashed = True
-      runner.crash_reason = 'CFIT in turbulence'
-      break
-    if runner.truth['on_ground'] and abs(runner.truth.get('touchdown_vs', 0)) > 600:
-      runner.crashed = True
-      runner.crash_reason = f'Hard landing: {abs(runner.truth["touchdown_vs"]):.0f} fpm'
-      break
-    if runner.truth.get('stopped'):
-      runner.landed = True
-      break
-
-    if step % 20 == 0:
-      runner.history.append({
-        'time': runner.truth['time'],
-        'alt_ft': alt_ft,
-        'rwy_dist_m': runner.truth['rwy_dist_m'],
-      })
+  # Exhausted all go-around attempts
+  return 0.0, f'[{sc["name"]}]{hist_ref} FAIL: {GO_AROUND_MAX} go-arounds exhausted'

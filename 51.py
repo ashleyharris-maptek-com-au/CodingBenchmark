@@ -306,8 +306,7 @@ SCENARIOS = [
   # ── 14: Barometric altimeter disagree — Helios 802 ──
   _scenario(
     'Altimeter disagree / pressurization',
-    'All three baro altimeters show different values due to pressurization leak. '
-    'Helios 802 (2005): pressurization failure went unnoticed; use radar alt and GPS for truth.',
+    'All three baro altimeters show different values due to pressurization leak. ',
     truth_kwargs={
       'alt_ft': 34000,
       'ias_kt': 250,
@@ -318,7 +317,6 @@ SCENARIOS = [
       'baro_alt_2': (SensorFailure.DRIFT, 5.0),
       'baro_alt_3': (SensorFailure.BIAS, -1500),
     },
-    historical_ref='Helios 802 (2005)',
   ),
 
   # ── 15: Wing icing — progressive CL degradation ──
@@ -435,7 +433,7 @@ SCENARIOS = [
     },
   ),
 
-  # ── 22: High altitude stall — Colgan 3407 type ──
+  # ── 22: Stall — Colgan 3407 type ──
   _scenario(
     'Approach stall in icing (Colgan 3407)',
     'Low speed at 3000 ft in icing conditions. Wings contaminated, stall margin reduced. '

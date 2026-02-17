@@ -49,7 +49,7 @@ layout(location = 0) in vec3 worldPos;   ; world-space position
 layout(location = 1) in vec3 normal;     ; world-space normal (interpolated, may need normalize)
 layout(location = 2) in vec2 uv;         ; texture coordinates in [0,1]
 layout(location = 3) in vec3 tangent;    ; tangent vector
-layout(location = 4) in vec3 color;      ; per-vertex color (smoothly varies: rgb = 0.5+0.5*xyz)
+layout(location = 4) in vec3 color;      ; per-vertex color (smoothly varies: typical value: rgb = 0.5+0.5*xyz)
 ```
 
 **Available uniform buffer (DescriptorSet 0, Binding 0):**
@@ -58,15 +58,15 @@ struct UBO {           // std140 layout
   mat4 model;          // offset 0   (column-major)
   mat4 view;           // offset 64
   mat4 projection;     // offset 128
-  vec4 lightPos;       // offset 192  -- value: (5.0, 5.0, 5.0, 1.0)
-  vec4 cameraPos;      // offset 208  -- value: (0.0, 0.0, 3.0, 1.0)
-  vec4 params;         // offset 224  -- value: (0.0, 0.5, 0.0, 0.0)
+  vec4 lightPos;       // offset 192  -- typical value: (5.0, 5.0, 5.0, 1.0)
+  vec4 cameraPos;      // offset 208  -- typical value: (0.0, 0.0, 3.0, 1.0)
+  vec4 params;         // offset 224  -- typical value: (0.0, 0.5, 0.0, 0.0)
 };
 ```
 
 **Required output:**
 ```
-layout(location = 0) out vec4 outColor;  ; RGBA float, will be stored as rgba8unorm
+layout(location = 0) out vec4 outColor;  RGBA float, will be stored as rgba8unorm
 ```
 
 **SPIR-V requirements:**
