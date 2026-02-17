@@ -329,6 +329,17 @@ class AutolandSensorModel(SensorModel):
 # ──────────────────────────────────────────────────────────────────────────────
 # Simulation Runner
 # ──────────────────────────────────────────────────────────────────────────────
+# Outcome thresholds
+TAXI_SPEED_KT = 50          # below this with runway left → pilot takes over
+RWY_REMAINING_FRAC = 0.30   # need >30% runway left for taxi-speed exit
+HARD_LANDING_FPM = 360      # inspection required but flyable again
+CRASH_LANDING_FPM = 600     # write-off / structural failure
+EMAS_LENGTH_M = 150         # arrestor bed saves minor overruns
+GO_AROUND_ALT_FT = 1500     # must climb to this altitude to complete GA
+GO_AROUND_MAX = 10          # fail after this many
+GO_AROUND_PENALTY = 0.1     # score penalty per GA
+
+
 class AutolandRunner:
 
   def __init__(self, truth, sensor_model, target_alt_ft=None, target_hdg_deg=90, target_ias_kt=137):
@@ -341,6 +352,10 @@ class AutolandRunner:
     self.crash_reason = ''
     self.history = []
     self.landed = False
+    self.go_arounds = 0
+    self.outcome = None        # set by score(): 'stopped', 'taxi_exit', 'hard', 'overrun', 'crash'
+    self.taxi_exit = False     # speed < 50kt with runway remaining
+    self.went_around = False   # set by external sim loop when GA detected
 
   def run(self, autopilot_fn, steps=3000, dt=0.05):
     for step in range(steps):
@@ -377,9 +392,9 @@ class AutolandRunner:
         self.crash_reason = 'CFIT: Below ground level'
         break
 
-      if self.truth['on_ground'] and abs(self.truth['touchdown_vs']) > 800:
+      if self.truth['on_ground'] and abs(self.truth['touchdown_vs']) > CRASH_LANDING_FPM:
         self.crashed = True
-        self.crash_reason = f'Hard landing: {abs(self.truth["touchdown_vs"]):.0f} fpm VS'
+        self.crash_reason = f'Catastrophic landing: {abs(self.truth["touchdown_vs"]):.0f} fpm VS'
         break
 
       if self.truth['on_ground'] and abs(self.truth['rwy_offset_m']) > ILS['runway_width_m'] / 2:
@@ -387,9 +402,14 @@ class AutolandRunner:
         self.crash_reason = f'Runway excursion: {self.truth["rwy_offset_m"]:.0f}m offset'
         break
 
-      if self.truth['on_ground'] and self.truth['rwy_dist_m'] < -ILS['runway_length_m']:
+      overrun_m = -self.truth['rwy_dist_m'] - ILS['runway_length_m']
+      if self.truth['on_ground'] and overrun_m > EMAS_LENGTH_M:
         self.crashed = True
-        self.crash_reason = f'Overrun: {-self.truth["rwy_dist_m"] - ILS["runway_length_m"]:.0f}m past end'
+        self.crash_reason = f'Major overrun: {overrun_m:.0f}m past end (beyond EMAS)'
+        break
+      if self.truth['on_ground'] and overrun_m > 0 and self.truth.get('stopped'):
+        self.landed = True
+        self.outcome = 'overrun'
         break
 
       if ias_kt > AC['Vne_kt']:
@@ -397,9 +417,21 @@ class AutolandRunner:
         self.crash_reason = f'Overspeed: {ias_kt:.0f} kt'
         break
 
-      # Check successful landing
+      # Check taxi-speed exit: < 50kt with >30% runway remaining
+      if self.truth['on_ground'] and not self.truth.get('stopped'):
+        V_kt = math.sqrt(self.truth['u']**2 + self.truth['v']**2) * MS2KT
+        remaining_m = ILS['runway_length_m'] + self.truth['rwy_dist_m']  # rwy_dist_m goes negative
+        remaining_frac = remaining_m / ILS['runway_length_m']
+        if V_kt < TAXI_SPEED_KT and remaining_frac > RWY_REMAINING_FRAC:
+          self.landed = True
+          self.taxi_exit = True
+          self.outcome = 'taxi_exit'
+          break
+
+      # Check full stop
       if self.truth.get('stopped'):
         self.landed = True
+        self.outcome = 'stopped'
         break
 
       # Record history
@@ -415,48 +447,32 @@ class AutolandRunner:
 
   def score(self):
     if self.crashed:
-      return 0.0, f'Crash: {self.crash_reason}'
+      return 0.0, f'WRITE-OFF: {self.crash_reason}'
 
-    if self.landed:
-      score = 1.0
-      details = []
+    if not self.landed:
+      alt = self.truth['z'] * M2FT
+      dist = self.truth['rwy_dist_m']
+      return 0.0, f'No landing: alt {alt:.0f}ft, dist {dist:.0f}m'
 
-      # Touchdown quality
-      vs = abs(self.truth.get('touchdown_vs', 0))
-      if vs > 400:
-        score -= 0.3
-        details.append(f'hard touchdown {vs:.0f} fpm')
-      elif vs > 250:
-        score -= 0.1
-        details.append(f'firm touchdown {vs:.0f} fpm')
+    vs = abs(self.truth.get('touchdown_vs', 0))
+    tdx = self.truth.get('touchdown_x', 0)
+    offset = abs(self.truth.get('rwy_offset_m', 0))
+    ga_penalty = self.go_arounds * GO_AROUND_PENALTY
+    base_info = f'VS:{vs:.0f}fpm TDZ:{tdx:.0f}m Off:{offset:.1f}m GAs:{self.go_arounds}'
 
-      # Touchdown position
-      tdx = self.truth.get('touchdown_x', 0)
-      if tdx > ILS['runway_length_m'] * 0.5:
-        score -= 0.2
-        details.append(f'late touchdown at {tdx:.0f}m')
-      elif tdx < 0:
-        score -= 0.3
-        details.append(f'short of runway by {-tdx:.0f}m')
+    # Minor overrun — saved by EMAS arrestor bed
+    if self.outcome == 'overrun':
+      overrun_m = max(0, -self.truth['rwy_dist_m'] - ILS['runway_length_m'])
+      return 0.1, f'MINOR OVERRUN ({overrun_m:.0f}m, saved by EMAS) | {base_info}'
 
-      # Centerline tracking
-      offset = abs(self.truth.get('rwy_offset_m', 0))
-      if offset > 15:
-        score -= 0.2
-        details.append(f'offset {offset:.0f}m from centerline')
+    # Hard landing — inspection required but aircraft reusable
+    if vs >= HARD_LANDING_FPM:
+      return 0.5, f'HARD LANDING ({vs:.0f}fpm, inspection required) | {base_info}'
 
-      score = max(0.0, score)
-      summary = f'Landed! VS: {vs:.0f}fpm, TDZ: {tdx:.0f}m, Offset: {offset:.1f}m'
-      if details:
-        summary += ' | ' + ', '.join(details)
-      return score, summary
-
-    # Didn't land, didn't crash - partial credit
-    alt = self.truth['z'] * M2FT
-    dist = self.truth['rwy_dist_m']
-    if dist < 500 and alt < 500:
-      return 0.4, f'Close but no landing: alt {alt:.0f}ft, dist {dist:.0f}m'
-    return 0.1, f'No landing attempt: alt {alt:.0f}ft, dist {dist:.0f}m'
+    # Good landing — stopped or taxi-speed exit
+    score = max(0.0, 1.0 - ga_penalty)
+    exit_type = 'taxi-speed exit' if self.taxi_exit else 'full stop'
+    return score, f'LANDED ({exit_type}) | {base_info} | score after GA penalty: {score:.1f}'
 
 
 def list_autoland_state_keys():

@@ -1,251 +1,297 @@
 """
-Test 38: Exact Cover Problem (Python Implementation)
+Test 38: Exact Cover (Python Implementation)
 
-The LLM must write Python code to find a subset of sets that partitions
-a universe exactly (each element covered exactly once). This is NP-Complete.
+The model must write Python code that selects set indices forming an exact cover:
+every universe element appears in exactly one chosen set.
 
-This is the foundation of Knuth's Algorithm X / Dancing Links, used in
-Sudoku solvers and many combinatorial problems.
-
-Solver times out after 5 minutes.
+This benchmark uses planted instances with a known unique solution, allowing
+strict pass/fail grading.
 """
 
 import random
 import subprocess
 import time
-from typing import List, Set, Tuple, Dict, Any
+from typing import List, Set, Tuple, Dict, Any, Iterable
 from solver_utils import StreamingInputFile
 
-title = "Exact Cover Problem (Python)"
+title = "Exact Cover (Python)"
 TIMEOUT_SECONDS = 30
 RANDOM_SEED = 38383838
 
 
-def generate_exact_cover(universe_size: int, num_sets: int, set_size_range: Tuple[int, int],
-                         seed: int) -> Tuple[Set[int], List[Set[int]]]:
-  """Generate exact cover instance with a known solution."""
+def _iter_instance_sets(solution_sets: int, block_size: int, decoy_sets: int,
+                        max_blocks_per_decoy: int, seed: int) -> Iterable[List[int]]:
+  """Yield sets for a planted unique exact-cover instance.
+
+  Construction:
+  - Universe is partitioned into `solution_sets` disjoint blocks of size `block_size`.
+  - The first `solution_sets` sets are exactly those blocks (the planted solution).
+  - Each block has an anchor element (first element) that appears only in its own
+    planted set, making the exact cover unique.
+  - Additional decoy sets contain only non-anchor elements.
+  """
+  if solution_sets <= 0:
+    raise ValueError("solution_sets must be > 0")
+  if block_size < 2:
+    raise ValueError("block_size must be >= 2")
+  if max_blocks_per_decoy < 2:
+    raise ValueError("max_blocks_per_decoy must be >= 2")
+
   rng = random.Random(seed)
-  universe = set(range(universe_size))
 
-  # Create a valid solution first
-  remaining = set(universe)
-  solution_sets = []
-  while remaining:
-    size = min(rng.randint(*set_size_range), len(remaining))
-    s = set(rng.sample(list(remaining), size))
-    solution_sets.append(s)
-    remaining -= s
+  # Planted sets (indices 0..solution_sets-1)
+  for b in range(solution_sets):
+    start = b * block_size
+    yield list(range(start, start + block_size))
 
-  # Add more random sets
-  all_sets = list(solution_sets)
-  while len(all_sets) < num_sets:
-    size = rng.randint(*set_size_range)
-    s = set(rng.sample(list(universe), min(size, universe_size)))
-    if s and s not in all_sets:
-      all_sets.append(s)
+  # Decoy sets (no anchors, so they can never replace planted sets in an exact cover)
+  for _ in range(decoy_sets):
+    blocks_to_mix = rng.randint(2, min(max_blocks_per_decoy, solution_sets))
+    chosen_blocks = rng.sample(range(solution_sets), blocks_to_mix)
+    elems = set()
+    for b in chosen_blocks:
+      start = b * block_size
+      picks = 1 if block_size <= 3 else rng.randint(1, min(3, block_size - 1))
+      while picks > 0:
+        e = start + 1 + rng.randrange(block_size - 1)  # skip anchor (start)
+        if e not in elems:
+          elems.add(e)
+          picks -= 1
+    yield sorted(elems)
 
-  rng.shuffle(all_sets)
-  return universe, all_sets
+
+def _get_case_params(subpass: int) -> Tuple[int, int, int, int, int, int]:
+  case = TEST_CASES[subpass]
+  solution_sets = case["solution_sets"]
+  block_size = case["block_size"]
+  decoy_sets = case["decoy_sets"]
+  max_blocks_per_decoy = case["max_blocks_per_decoy"]
+
+  if solution_sets <= 0:
+    raise ValueError(f"Invalid solution_sets={solution_sets} for subpass {subpass}")
+  if block_size < 2:
+    raise ValueError(f"Invalid block_size={block_size} for subpass {subpass}")
+  if max_blocks_per_decoy < 2:
+    raise ValueError(f"Invalid max_blocks_per_decoy={max_blocks_per_decoy} for subpass {subpass}")
+
+  universe_size = solution_sets * block_size
+  num_sets = solution_sets + decoy_sets
+  return solution_sets, block_size, decoy_sets, max_blocks_per_decoy, universe_size, num_sets
 
 
 TEST_CASES = [
   {
-    "universe": 20,
-    "sets": 30,
-    "size_range": (2, 5),
-    "desc": "20 elements, 30 sets"
+    "solution_sets": 8,
+    "block_size": 5,
+    "decoy_sets": 24,
+    "max_blocks_per_decoy": 3,
+    "desc": "tiny: universe=40, sets=32"
   },
   {
-    "universe": 40,
-    "sets": 80,
-    "size_range": (3, 7),
-    "desc": "40 elements, 80 sets"
+    "solution_sets": 16,
+    "block_size": 5,
+    "decoy_sets": 64,
+    "max_blocks_per_decoy": 3,
+    "desc": "small: universe=80, sets=80"
   },
   {
-    "universe": 60,
-    "sets": 150,
-    "size_range": (3, 8),
-    "desc": "60 elements, 150 sets"
+    "solution_sets": 24,
+    "block_size": 6,
+    "decoy_sets": 180,
+    "max_blocks_per_decoy": 3,
+    "desc": "universe=144, sets=204"
   },
   {
-    "universe": 100,
-    "sets": 300,
-    "size_range": (4, 10),
-    "desc": "100 elements, 300 sets"
+    "solution_sets": 40,
+    "block_size": 6,
+    "decoy_sets": 360,
+    "max_blocks_per_decoy": 3,
+    "desc": "universe=240, sets=400"
   },
   {
-    "universe": 150,
-    "sets": 500,
-    "size_range": (4, 12),
-    "desc": "150 elements, 500 sets"
+    "solution_sets": 70,
+    "block_size": 6,
+    "decoy_sets": 840,
+    "max_blocks_per_decoy": 4,
+    "desc": "universe=420, sets=910"
   },
   {
-    "universe": 200,
-    "sets": 800,
-    "size_range": (5, 15),
-    "desc": "200 elements, 800 sets"
+    "solution_sets": 120,
+    "block_size": 7,
+    "decoy_sets": 1680,
+    "max_blocks_per_decoy": 4,
+    "desc": "universe=840, sets=1.8K"
   },
   {
-    "universe": 300,
-    "sets": 1500,
-    "size_range": (5, 18),
-    "desc": "300 elements, 1.5K sets"
+    "solution_sets": 200,
+    "block_size": 7,
+    "decoy_sets": 3200,
+    "max_blocks_per_decoy": 4,
+    "desc": "universe=1.4K, sets=3.4K"
   },
   {
-    "universe": 500,
-    "sets": 3000,
-    "size_range": (6, 20),
-    "desc": "500 elements, 3K sets"
+    "solution_sets": 350,
+    "block_size": 7,
+    "decoy_sets": 7000,
+    "max_blocks_per_decoy": 4,
+    "desc": "universe=2.45K, sets=7.35K"
   },
   {
-    "universe": 750,
-    "sets": 5000,
-    "size_range": (6, 25),
-    "desc": "750 elements, 5K sets"
+    "solution_sets": 600,
+    "block_size": 8,
+    "decoy_sets": 15000,
+    "max_blocks_per_decoy": 4,
+    "desc": "universe=4.8K, sets=15.6K"
   },
   {
-    "universe": 1000,
-    "sets": 8000,
-    "size_range": (8, 30),
-    "desc": "1K elements, 8K sets"
+    "solution_sets": 1000,
+    "block_size": 8,
+    "decoy_sets": 30000,
+    "max_blocks_per_decoy": 4,
+    "desc": "universe=8K, sets=31K"
   },
   {
-    "universe": 2000,
-    "sets": 20000,
-    "size_range": (10, 40),
-    "desc": "2K elements, 20K sets"
-  },
-  # Ludicrous cases for streaming
-  {
-    "universe": 5000,
-    "sets": 100000,
-    "size_range": (15, 50),
-    "desc": "5K elements, 100K sets (~5MB)"
+    "solution_sets": 2000,
+    "block_size": 8,
+    "decoy_sets": 80000,
+    "max_blocks_per_decoy": 4,
+    "desc": "universe=16K, sets=82K"
   },
   {
-    "universe": 10000,
-    "sets": 500000,
-    "size_range": (20, 60),
-    "desc": "10K elements, 500K sets (~30MB)"
+    "solution_sets": 5000,
+    "block_size": 8,
+    "decoy_sets": 250000,
+    "max_blocks_per_decoy": 5,
+    "desc": "universe=40K, sets=255K"
   },
   {
-    "universe": 50000,
-    "sets": 2000000,
-    "size_range": (25, 80),
-    "desc": "50K elements, 2M sets (~150MB)"
+    "solution_sets": 10000,
+    "block_size": 8,
+    "decoy_sets": 600000,
+    "max_blocks_per_decoy": 5,
+    "desc": "universe=80K, sets=610K"
   },
   {
-    "universe": 100000,
-    "sets": 5000000,
-    "size_range": (30, 100),
-    "desc": "100K elements, 5M sets (~500MB)"
+    "solution_sets": 20000,
+    "block_size": 8,
+    "decoy_sets": 2000000,
+    "max_blocks_per_decoy": 5,
+    "desc": "universe=160K, sets=2.02M"
   },
   {
-    "universe": 200000,
-    "sets": 15000000,
-    "size_range": (40, 120),
-    "desc": "200K elements, 15M sets (~1.5GB)"
+    "solution_sets": 50000,
+    "block_size": 8,
+    "decoy_sets": 5000000,
+    "max_blocks_per_decoy": 5,
+    "desc": "universe=400K, sets=5.05M"
+  },
+  {
+    "solution_sets": 100000,
+    "block_size": 8,
+    "decoy_sets": 12000000,
+    "max_blocks_per_decoy": 5,
+    "desc": "universe=800K, sets=12.1M"
   },
 ]
 
 INSTANCE_CACHE: Dict[int, Any] = {}
 _INPUT_FILE_CACHE: Dict[int, StreamingInputFile] = {}
 STREAMING_THRESHOLD_SETS = 50_000
+LAST_EXACT_COVER_VIZ: Dict[Tuple[int, str], dict] = {}
 
 
 def get_instance(subpass: int):
   if subpass not in INSTANCE_CACHE:
-    case = TEST_CASES[subpass]
-    universe, sets = generate_exact_cover(case["universe"], case["sets"], case["size_range"],
-                                          RANDOM_SEED + subpass)
-    INSTANCE_CACHE[subpass] = (universe, sets)
+    solution_sets, block_size, decoy_sets, max_blocks_per_decoy, universe_size, _ = _get_case_params(subpass)
+    sets = list(_iter_instance_sets(solution_sets, block_size, decoy_sets, max_blocks_per_decoy,
+                                    RANDOM_SEED + subpass))
+    INSTANCE_CACHE[subpass] = (universe_size, sets, solution_sets)
   return INSTANCE_CACHE[subpass]
 
 
 def _should_use_streaming(subpass: int) -> bool:
-  return TEST_CASES[subpass]["sets"] > STREAMING_THRESHOLD_SETS
+  return _estimate_sets(subpass) > STREAMING_THRESHOLD_SETS
+
+
+def _estimate_sets(subpass: int) -> int:
+  solution_sets, _, decoy_sets, _, _, _ = _get_case_params(subpass)
+  return solution_sets + decoy_sets
 
 
 def _get_streaming_input(subpass: int) -> StreamingInputFile:
   if subpass in _INPUT_FILE_CACHE:
     return _INPUT_FILE_CACHE[subpass]
 
-  case = TEST_CASES[subpass]
-  cache_key = f"exactcover38|u={case['universe']}|s={case['sets']}|r={case['size_range']}|seed={RANDOM_SEED + subpass}"
+  solution_sets, block_size, decoy_sets, max_blocks_per_decoy, universe_size, num_sets = _get_case_params(subpass)
+  cache_key = (
+    f"exactcover38_v2|sol={solution_sets}|b={block_size}|d={decoy_sets}|"
+    f"mix={max_blocks_per_decoy}|seed={RANDOM_SEED + subpass}"
+  )
 
   def generator():
-    universe, sets = get_instance(subpass)
-    yield f"{len(universe)} {len(sets)}\n"
-    for s in sets:
-      yield " ".join(map(str, sorted(s))) + "\n"
+    yield f"{universe_size} {num_sets}\n"
+    for s in _iter_instance_sets(solution_sets, block_size, decoy_sets, max_blocks_per_decoy,
+                                 RANDOM_SEED + subpass):
+      yield " ".join(map(str, s)) + "\n"
 
   input_file = StreamingInputFile(cache_key, generator, "test38_exactcover")
   _INPUT_FILE_CACHE[subpass] = input_file
   return input_file
 
 
-def format_input(universe: Set[int], sets: List[Set[int]]) -> str:
-  lines = [f"{len(universe)} {len(sets)}"]
+def format_input(universe_size: int, sets: List[List[int]]) -> str:
+  lines = [f"{universe_size} {len(sets)}"]
   for s in sets:
-    lines.append(" ".join(map(str, sorted(s))))
+    lines.append(" ".join(map(str, s)))
   return "\n".join(lines)
 
 
 def prepareSubpassPrompt(subPass: int) -> str:
-  """Generate the prompt for subpass 0 that handles all difficulty levels."""
+  """Generate the prompt for subpass 0."""
   if subPass != 0:
     raise StopIteration
 
-  return f"""You are writing CPP code to solve the Maximum Matching problem.
+  return """You are writing Python code to solve the **Exact Cover** problem.
 
-You must write a CPP solver that can handle ANY problem complexity from trivial to ludicrous scale:
-- **Trivial**: Simple instances, basic algorithms
-- **Medium**: Moderate instances, efficient algorithms  
-- **Large**: Complex instances, advanced algorithms
-- **Extreme**: Massive instances, very fast heuristics
+Given a universe of elements and a list of sets, choose set indices such that:
+1) every element is covered, and
+2) no element is covered more than once.
 
-**The Challenge:**
-Your CPP solver will be tested with instances ranging from simple to very complex cases. The same algorithm must work efficiently across ALL problem complexities.
+The evaluator is strict: only the exact expected solution is accepted.
 
-**Problem:**
-Find a maximum set of edges without common vertices in a graph.
-
-**Input format (stdin):**
+**Input format (stdin)**
 ```
-[Input format varies by problem]
+U S
+e1 e2 e3 ...
+e1 e2 ...
+... (S lines total)
+```
+- `U` = number of elements in the universe (elements are `0..U-1`)
+- `S` = number of available sets
+- each following line is one set, listed as space-separated element IDs
+
+**Output format (stdout)**
+```
+SOLUTION
+i1 i2 i3 ... ik
+```
+or
+```
+NO SOLUTION
 ```
 
-**Output format (stdout):**
-```
-[Output format varies by problem]
-```
+- `i1..ik` are 0-based set indices into the input list.
 
-**Critical Requirements:**
-1. **Scalability**: Your algorithm must adapt based on problem size and complexity
-2. **Performance**: Must complete within 5 minutes even for the largest instances
-3. **Quality**: Find optimal or near-optimal solutions
+**What is checked**
+1. Output format is valid.
+2. Indices are valid and distinct.
+3. Chosen indices are exactly the planted exact-cover solution.
 
-**Algorithm Strategy Recommendations:**
-Small graphs (50 vertices): augmenting path algorithms, Medium (500 vertices): Hopcroft-Karp, Large (5000 vertices): very fast implementations, Extreme (50000+ vertices): streaming algorithms
+Write complete Python code that reads stdin and writes stdout.
+"""
 
-**Implementation Hints:**
-- Detect problem complexity and choose appropriate algorithm
-- Use efficient data structures and algorithms
-- Implement adaptive quality vs speed tradeoffs
-- For very large instances, focus on fast heuristics
-- Handle edge cases appropriately
-- Use fast I/O for large inputs
 
-**Requirements:**
-1. Program must compile with appropriate compiler
-2. Read from stdin, write to stdout
-3. Handle variable problem sizes
-4. Complete within 5 minutes
-5. Must handle varying problem complexities efficiently
-
-Write complete, compilable CPP code.
-Include adaptive logic that chooses different strategies based on problem complexity.
-"""# List of subpasses to grade the single answer against all difficulty levels
+# List of subpasses to grade the single answer against all difficulty levels
 
 
 extraGradeAnswerRuns = list(range(len(TEST_CASES)))
@@ -255,7 +301,7 @@ structure = {
   "properties": {
     "reasoning": {
       "type": "string",
-      "description": "Explain your algorithm approach and how it adapts to different problem sizes"
+      "description": "Explain your exact cover approach"
     },
     "python_code": {
       "type": "string",
@@ -267,31 +313,41 @@ structure = {
 }
 
 
-def verify_exact_cover(universe: Set[int], sets: List[Set[int]],
-                       indices: List[int]) -> Tuple[bool, str]:
-  if not indices:
-    return len(universe) == 0, "Empty solution"
+def _parse_solution_output(stdout: str) -> Tuple[str, List[int]]:
+  lines = [line.strip() for line in stdout.strip().splitlines() if line.strip()]
+  if not lines:
+    raise ValueError("No output")
 
-  for idx in indices:
-    if idx < 0 or idx >= len(sets):
-      return False, f"Invalid set index {idx}"
+  header = lines[0].upper()
+  if header not in ("SOLUTION", "NO SOLUTION"):
+    raise ValueError("First line must be SOLUTION or NO SOLUTION")
 
-  covered = set()
-  for idx in indices:
-    overlap = covered & sets[idx]
-    if overlap:
-      return False, f"Set {idx} overlaps with previous: {overlap}"
-    covered |= sets[idx]
+  indices: List[int] = []
+  for line in lines[1:]:
+    indices.extend(int(tok) for tok in line.split())
 
-  if covered != universe:
-    missing = universe - covered
-    extra = covered - universe
-    if missing:
-      return False, f"Missing elements: {missing}"
-    if extra:
-      return False, f"Extra elements: {extra}"
+  return header, indices
 
-  return True, "Valid exact cover"
+
+def _expected_solution_set(solution_sets: int) -> Set[int]:
+  return set(range(solution_sets))
+
+
+def _build_exact_cover_viz(universe_size: int, sets: List[List[int]], solution_sets: int,
+                           chosen_indices: List[int], valid: bool, msg: str) -> dict:
+  expected = _expected_solution_set(solution_sets)
+  chosen = set(chosen_indices)
+  return {
+    "universe_size": universe_size,
+    "sets": sets,
+    "solution_sets": solution_sets,
+    "chosen": sorted(chosen),
+    "expected": sorted(expected),
+    "missing": sorted(expected - chosen),
+    "extras": sorted(chosen - expected),
+    "valid": valid,
+    "msg": msg,
+  }
 
 
 def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
@@ -299,6 +355,8 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
     return 0.0, "No Python code provided"
 
   case = TEST_CASES[subPass]
+  solution_sets, _, _, _, universe_size, num_sets = _get_case_params(subPass)
+  expected_solution = _expected_solution_set(solution_sets)
   use_streaming = _should_use_streaming(subPass)
 
   try:
@@ -312,24 +370,6 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
       if time.time() - t > 1:
         print(f"  Time to generate: {time.time() - t:.2f}s")
 
-      # Skip verification for very large cases
-      if case["sets"] > 1_000_000:
-        start = time.time()
-        with open(input_file_path, 'r') as f:
-          proc = subprocess.run(["python", "-c", result["python_code"]],
-                                stdin=f,
-                                capture_output=True,
-                                text=True,
-                                timeout=TIMEOUT_SECONDS)
-        exec_time = time.time() - start
-        if proc.returncode == 0:
-          lines = proc.stdout.strip().split('\n')
-          if lines and lines[0].strip() == "SOLUTION":
-            return 0.8, f"[{case['desc']}] Found solution in {exec_time:.2f}s (verification skipped)"
-          elif lines and lines[0].strip() == "NO SOLUTION":
-            return 0.5, f"[{case['desc']}] Reports no solution in {exec_time:.2f}s"
-        return 0.0, f"Runtime error: {proc.stderr[:200]}"
-
       start = time.time()
       with open(input_file_path, 'r') as f:
         proc = subprocess.run(["python", "-c", result["python_code"]],
@@ -339,8 +379,8 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
                               timeout=TIMEOUT_SECONDS)
       exec_time = time.time() - start
     else:
-      universe, sets = get_instance(subPass)
-      input_data = format_input(universe, sets)
+      universe_size, sets, _ = get_instance(subPass)
+      input_data = format_input(universe_size, sets)
 
       start = time.time()
       proc = subprocess.run(["python", "-c", result["python_code"]],
@@ -353,29 +393,57 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
     if proc.returncode != 0:
       return 0.0, f"Runtime error: {proc.stderr[:200]}"
 
-    lines = proc.stdout.strip().split('\n')
-    if not lines:
-      return 0.0, "No output"
+    try:
+      status, indices = _parse_solution_output(proc.stdout)
+    except Exception as e:
+      return 0.0, f"[{case['desc']}] Invalid output format: {str(e)[:120]}"
 
-    if lines[0].strip() == "NO SOLUTION":
-      return 0.3, f"[{case['desc']}] Reports no solution (instance has one), {exec_time:.2f}s"
+    if status == "NO SOLUTION":
+      valid = False
+      msg = "Reported NO SOLUTION, but instance has a planted exact cover"
+      if universe_size <= 400 and num_sets <= 500:
+        u, s, sol_k = get_instance(subPass)
+        LAST_EXACT_COVER_VIZ[(subPass, aiEngineName)] = _build_exact_cover_viz(
+          u, s, sol_k, [], valid, msg
+        )
+      return 0.0, f"[{case['desc']}] FAIL: {msg}"
 
-    if lines[0].strip() == "SOLUTION":
-      if len(lines) < 2:
-        return 0.2, f"[{case['desc']}] SOLUTION but no indices"
+    seen = set()
+    for idx in indices:
+      if idx < 0 or idx >= num_sets:
+        return 0.0, f"[{case['desc']}] FAIL: invalid set index {idx}"
+      if idx in seen:
+        return 0.0, f"[{case['desc']}] FAIL: duplicate set index {idx}"
+      seen.add(idx)
 
-      indices = list(map(int, lines[1].split()))
-      valid, msg = verify_exact_cover(universe, sets, indices)
-
-      if valid:
-        return 1.0, f"[{case['desc']}] Valid exact cover with {len(indices)} sets, {exec_time:.2f}s"
+    if len(indices) != solution_sets:
+      valid = False
+      msg = f"Reported {len(indices)} sets, but minimum exact cover uses {solution_sets} sets"
+    else:
+      chosen = set(indices)
+      if chosen == expected_solution:
+        valid = True
+        msg = "Valid planted exact cover"
       else:
-        return 0.2, f"[{case['desc']}] {msg}"
+        missing = sorted(expected_solution - chosen)
+        extras = sorted(chosen - expected_solution)
+        miss_preview = ", ".join(map(str, missing[:6])) if missing else "none"
+        extra_preview = ", ".join(map(str, extras[:6])) if extras else "none"
+        valid = False
+        msg = f"Wrong index set (missing: {miss_preview}; extras: {extra_preview})"
 
-    return 0.1, f"[{case['desc']}] Unknown output format"
+    if universe_size <= 400 and num_sets <= 500:
+      u, s, sol_k = get_instance(subPass)
+      LAST_EXACT_COVER_VIZ[(subPass, aiEngineName)] = _build_exact_cover_viz(
+        u, s, sol_k, indices, valid, msg
+      )
+
+    if not valid:
+      return 0.0, f"[{case['desc']}] FAIL: {msg}"
+    return 1.0, f"[{case['desc']}] PASS: exact cover found with {solution_sets} sets in {exec_time:.2f}s"
 
   except subprocess.TimeoutExpired:
-    return 0.1, f"[{case['desc']}] Timeout"
+    return 0.0, f"[{case['desc']}] FAIL: Timeout"
   except Exception as e:
     return 0.0, f"[{case['desc']}] Error: {str(e)[:100]}"
 
@@ -384,24 +452,107 @@ def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
   if not result:
     return "<p style='color:red'>No result provided</p>"
   case = TEST_CASES[subPass]
+  solution_sets, block_size, decoy_sets, _, universe_size, num_sets = _get_case_params(subPass)
   html = f"<h4>Exact Cover - {case['desc']}</h4>"
+  html += (
+    f"<p style='font-size:12px;color:#475569;margin:6px 0;'>"
+    f"Universe: {universe_size:,} elements | Total sets: {num_sets:,} | "
+    f"Planted sets: {solution_sets:,} (block size {block_size}) | Decoys: {decoy_sets:,}</p>"
+  )
   if "reasoning" in result:
     r = result['reasoning'][:400] + ('...' if len(result.get('reasoning', '')) > 400 else '')
     html += f"<p><strong>Approach:</strong> {r.replace('<', '&lt;').replace('>', '&gt;')}</p>"
   if "python_code" in result:
     code = result["python_code"].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     html += f"<details><summary>View Python Code ({len(result['python_code'])} chars)</summary><pre>{code}</pre></details>"
+  viz = LAST_EXACT_COVER_VIZ.get((subPass, aiEngineName))
+  if viz and viz.get("universe_size", 0) <= 400 and len(viz.get("sets", [])) <= 500:
+    html += _generate_exact_cover_svg(viz)
   return html
 
 
 highLevelSummary = """
-Exact Cover finds subsets that partition a universe exactly once.
+Exact Cover asks for a subset of sets that covers each universe element exactly once.
 
-**Algorithms:**
-- **Algorithm X**: Knuth's dancing links (DLX)
-- **Backtracking**: Systematic search with pruning
-- **Reduction from SAT**: Many problems reduce to exact cover
+This test uses planted, uniquely-solvable instances for strict pass/fail grading.
 """
+
+
+def _generate_exact_cover_svg(viz: dict) -> str:
+  universe_size = viz["universe_size"]
+  sets = viz["sets"]
+  solution_sets = viz["solution_sets"]
+  chosen = set(viz["chosen"])
+  expected = set(viz["expected"])
+  missing = set(viz["missing"])
+  extras = set(viz["extras"])
+
+  display_elements = min(universe_size, 70)
+  display_sets = min(len(sets), 80)
+  cell = 8
+  margin_x = 70
+  margin_y = 44
+  width = margin_x + display_elements * cell + 24
+  height = margin_y + display_sets * cell + 40
+
+  def color_for_row(set_idx: int) -> str:
+    if set_idx in expected and set_idx in chosen:
+      return "#22c55e"
+    if set_idx in missing:
+      return "#ef4444"
+    if set_idx in extras:
+      return "#f59e0b"
+    if set_idx < solution_sets:
+      return "#64748b"
+    return "#334155"
+
+  cells = []
+  for r in range(display_sets):
+    row_color = color_for_row(r)
+    for e in sets[r]:
+      if e >= display_elements:
+        continue
+      x = margin_x + e * cell
+      y = margin_y + r * cell
+      cells.append(
+        f"<rect x='{x}' y='{y}' width='{cell-1}' height='{cell-1}' fill='{row_color}' fill-opacity='0.9' />"
+      )
+
+  axis = []
+  for e in range(0, display_elements, 5):
+    x = margin_x + e * cell
+    axis.append(f"<text x='{x}' y='32' font-size='8' fill='#94a3b8'>{e}</text>")
+  for r in range(0, display_sets, 5):
+    y = margin_y + r * cell + 7
+    axis.append(f"<text x='8' y='{y}' font-size='8' fill='#94a3b8'>{r}</text>")
+
+  status = "Valid exact cover" if viz.get("valid") else viz.get("msg", "Invalid")
+  footer = []
+  if universe_size > display_elements or len(sets) > display_sets:
+    footer.append(
+      f"Showing first {display_sets} sets × first {display_elements} elements "
+      f"(full instance: {len(sets)} × {universe_size})."
+    )
+
+  svg = "\n".join([
+    "<div style='margin:12px 0;padding:10px;border:1px solid #1f2937;border-radius:8px;background:#0b1120;'>",
+    f"<div style='color:#e2e8f0;font-size:13px;margin-bottom:6px;'><strong>Set-Element Matrix</strong> — {status}</div>",
+    f"<div style='color:#94a3b8;font-size:12px;margin-bottom:6px;'>"
+    f"Universe: {universe_size} | Sets: {len(sets)} | Expected picks: {len(expected)} | "
+    f"Chosen: {len(chosen)} | Missing: {len(missing)} | Extras: {len(extras)}</div>",
+    f"<svg width='100%' viewBox='0 0 {width} {height}' style='background:#0b1120;border:1px solid #334155;border-radius:6px;'>",
+    f"<rect x='{margin_x-1}' y='{margin_y-1}' width='{display_elements * cell + 2}' height='{display_sets * cell + 2}' fill='none' stroke='#334155' stroke-width='1' />",
+    *cells,
+    *axis,
+    "</svg>",
+    "<div style='color:#64748b;font-size:11px;margin-top:6px;'>"
+    "Rows are sets and columns are elements. Green rows are correctly chosen planted sets, "
+    "red rows are missing planted sets, amber rows are incorrect extra selections." +
+    (f" {' '.join(footer)}" if footer else "") +
+    "</div>",
+    "</div>",
+  ])
+  return svg
 
 
 def setup():
