@@ -21,6 +21,8 @@ import math
 import traceback
 from typing import Tuple
 
+from visualization_utils import generate_threejs_flight_path
+
 from autopilot_sim import (
   make_truth,
   SensorModel,
@@ -43,6 +45,8 @@ from autopilot_sim import (
 title = "Airliner Autopilot (Python)"
 
 TIMEOUT_SECONDS = 120  # generous for 30 subpasses
+
+_HISTORY_CACHE = {}  # {(aiEngineName, subPass): history_list}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -676,8 +680,7 @@ Key facts:
 **Output:** Return a dict with these control keys:
 ```
   elevator:       -1.0 (nose down) to +1.0 (nose up), RELATIVE TO TRIM
-                  (0.0 = maintain current trimmed flight, the aircraft is
-                  initially trimmed for level flight at the given conditions)
+                  (0.0 = maintain current trimmed attitude)
   aileron:        -1.0 (roll left) to +1.0 (roll right)
   rudder:         -1.0 (yaw left) to +1.0 (yaw right)
   throttle_1:     0.0 (idle) to 1.0 (full thrust) — left engine
@@ -687,26 +690,21 @@ Key facts:
   speedbrake:     0.0 to 1.0
   gear:           0 (up) or 1 (down)
 ```
-NOTE: If you omit a key, the current value is maintained. The aircraft
-starts in a trimmed state — elevator=0 keeps it level. Throttle defaults
+NOTE: If you omit a key, the current value is maintained. Throttle defaults
 to the current setting if not specified.
 
 **Critical Design Requirements:**
-1. **Sensor fusion**: Cross-check redundant sensors. If two agree and one disagrees,
-   the disagreeing one is likely failed. Use median or voting logic.
-2. **Stall protection**: Monitor AoA and airspeed. If approaching stall, push nose
-   down and add thrust regardless of altitude target.
-3. **Asymmetric thrust**: If one engine fails, apply rudder to counteract yaw.
-4. **Attitude recovery**: If in unusual attitude (high bank, extreme pitch),
-   prioritize wings-level recovery before altitude/heading.
-5. **Speed management**: Stay above stall speed but below Vne (~365 KIAS / Mach 0.82).
+1. **Sensor fusion**: Cross-check redundant sensors, and cross-check other physical 
+   properties. If GPS altitude is dropping, radar altitude is stable, and barometric
+   altitude is climbing - two failures have occured, and you have to pick wisely.
+2. **Aerodynamic simulation**: The flight model includes a full aerodynamic model, so
+   brush up on your knowledge of stalls, asymetric thurst, yaw dampening, and trim.
+5. Vne is (~365 KIAS / Mach 0.82).
 6. **Persistence**: You may define module-level variables for PID integral terms,
    previous values, etc. They persist across calls within a scenario.
 
-**Test Scenarios ({len(SCENARIOS)} total):**
-{scenario_descriptions}
-Your single autopilot function must handle ALL of these scenarios.
-The same code is tested against every scenario.
+Your single autopilot function must handle every scenario, including over a dozen
+historical aviation accidents. The same code is tested against every scenario.
 """
 
 
@@ -808,6 +806,9 @@ def gradeAnswer(result, subPass, aiEngineName):
 
   score, details = runner.score_recovery()
 
+  # Cache history for visualization
+  _HISTORY_CACHE[(aiEngineName, sc_idx)] = runner.history
+
   hist_note = ''
   if sc.get('historical_ref'):
     hist_note = f' [Ref: {sc["historical_ref"]}]'
@@ -869,3 +870,42 @@ def _run_windshear(runner, autopilot_fn):
         'roll_deg': runner.truth['phi'] * RAD2DEG,
         'vs_fpm': state.get('vertical_speed_fpm', 0),
       })
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Visualization for HTML report
+# ──────────────────────────────────────────────────────────────────────────────
+def _history_to_path(history):
+  """Dead-reckon XY position from heading + airspeed history.
+
+  Returns list of [x_m, y_m, alt_m] suitable for the 3-D viewer.
+  x = east, y = north, z = altitude (metres).
+  """
+  if not history:
+    return []
+  path = []
+  x, y = 0.0, 0.0
+  prev_time = None
+  for h in history:
+    alt_m = h['alt_ft'] * FT2M
+    path.append([round(x, 1), round(y, 1), round(alt_m, 1)])
+    if prev_time is not None:
+      dt = h['time'] - prev_time
+      hdg_rad = math.radians(h['hdg_deg'])
+      speed_ms = h['ias_kt'] * KT2MS
+      x += speed_ms * math.sin(hdg_rad) * dt
+      y += speed_ms * math.cos(hdg_rad) * dt
+    prev_time = h['time']
+  return path
+
+
+def resultToNiceReport(result, subPass, aiEngineName):
+  sc_idx = subPass
+  if sc_idx >= len(SCENARIOS):
+    return ''
+  sc = SCENARIOS[sc_idx]
+  history = _HISTORY_CACHE.get((aiEngineName, sc_idx), [])
+  if not history:
+    return ''
+  path = _history_to_path(history)
+  return generate_threejs_flight_path(path, scenario_name=sc['name'])

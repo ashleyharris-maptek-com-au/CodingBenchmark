@@ -14,9 +14,16 @@ import random
 import subprocess
 import time
 import math
+import hashlib
+import json
+import os
+import tempfile
+from pathlib import Path
 from typing import List, Tuple, Set, Dict, Any
 from native_compiler import CSharpCompiler, CompilationError, ExecutionError, describe_this_pc
-from solver_utils import StreamingInputFile
+from solver_utils import StreamingInputFile, GradeCache
+
+_grade_cache = GradeCache('test29')
 
 title = "Maximum Clique (C#)"
 TIMEOUT_SECONDS = 300
@@ -43,6 +50,72 @@ def generate_graph(num_vertices: int, edge_prob: float, clique_size: int,
       edges.append((u, v))
 
   # Random edges between clique and non-clique, excluding each node's forbidden clique vertex
+  _generate_cross_edges(edges, non_clique_nodes, clique_nodes, forbidden_for, edge_prob, rng)
+
+  # Random edges among non-clique nodes, disallowing edges within the same forbidden group
+  _generate_non_clique_edges(edges, non_clique_nodes, forbidden_for, edge_prob, rng)
+
+  return edges, clique_nodes
+
+
+def _generate_cross_edges(edges, non_clique_nodes, clique_nodes, forbidden_for, edge_prob, rng):
+  """Generate edges between clique and non-clique nodes, skipping each node's forbidden clique vertex."""
+  if edge_prob <= 0 or not non_clique_nodes or not clique_nodes:
+    return
+
+  try:
+    import numpy as _np
+  except ImportError:
+    _np = None
+
+  if _np is not None and len(non_clique_nodes) > 2000:
+    n_nc = len(non_clique_nodes)
+    n_c = len(clique_nodes)
+    nc_arr = _np.array(non_clique_nodes, dtype=_np.int32)
+    c_arr = _np.array(clique_nodes, dtype=_np.int32)
+    forb_arr = _np.array([forbidden_for[v] for v in non_clique_nodes], dtype=_np.int32)
+
+    # Each non-clique node has (n_c - 1) eligible clique partners
+    total_eligible = n_nc * (n_c - 1)
+    expected = int(total_eligible * edge_prob)
+
+    seed = rng.randint(0, 2**31)
+    np_rng = _np.random.RandomState(seed)
+
+    BATCH = min(expected + 1000, 20_000_000)
+    collected = 0
+    valid_frac = (n_c - 1) / n_c if n_c > 0 else 0
+
+    while collected < expected:
+      need = expected - collected
+      gen_size = min(int(need / max(valid_frac * 0.97, 0.01)), BATCH)
+      gen_size = max(gen_size, need + 100)
+      gen_size = min(gen_size, BATCH)
+
+      nc_idx = np_rng.randint(0, n_nc, size=gen_size)
+      c_idx = np_rng.randint(0, n_c, size=gen_size)
+
+      # Filter out forbidden pairs
+      mask = c_arr[c_idx] != forb_arr[nc_idx]
+      nc_idx = nc_idx[mask]
+      c_idx = c_idx[mask]
+
+      v_arr = nc_arr[nc_idx]
+      c_v = c_arr[c_idx]
+      lo = _np.minimum(v_arr, c_v)
+      hi = _np.maximum(v_arr, c_v)
+
+      remaining = expected - collected
+      if len(lo) > remaining:
+        lo = lo[:remaining]
+        hi = hi[:remaining]
+
+      result = _np.column_stack((lo, hi))
+      edges.extend(map(tuple, result.tolist()))
+      collected += len(lo)
+    return
+
+  # Fallback: pure Python
   for v in non_clique_nodes:
     forbidden = forbidden_for[v]
     for c in clique_nodes:
@@ -51,16 +124,115 @@ def generate_graph(num_vertices: int, edge_prob: float, clique_size: int,
       if rng.random() < edge_prob:
         edges.append((min(v, c), max(v, c)))
 
-  # Random edges among non-clique nodes, disallowing edges within the same forbidden group
-  for i, u in enumerate(non_clique_nodes):
-    forbidden_u = forbidden_for[u]
-    for v in non_clique_nodes[i + 1:]:
-      if forbidden_u == forbidden_for[v]:
-        continue
-      if rng.random() < edge_prob:
-        edges.append((u, v))
 
-  return edges, clique_nodes
+def _generate_non_clique_edges(edges, non_clique_nodes, forbidden_for, edge_prob, rng):
+  """Generate edges between non-clique nodes in different forbidden groups.
+  Uses numpy batch sampling when available, geometric skip as fallback."""
+  if edge_prob <= 0 or len(non_clique_nodes) < 2:
+    return
+
+  try:
+    import numpy as _np
+  except ImportError:
+    _np = None
+
+  # Use numpy fast path for large graphs
+  if _np is not None and len(non_clique_nodes) > 2000:
+    _generate_non_clique_edges_numpy(edges, non_clique_nodes, forbidden_for, edge_prob, rng, _np)
+    return
+
+  # Fallback: geometric skip (fast enough for small graphs)
+  groups = {}
+  for v in non_clique_nodes:
+    groups.setdefault(forbidden_for[v], []).append(v)
+  group_keys = sorted(groups.keys())
+
+  if edge_prob >= 1.0:
+    for gi in range(len(group_keys)):
+      ga = groups[group_keys[gi]]
+      for gj in range(gi + 1, len(group_keys)):
+        gb = groups[group_keys[gj]]
+        for a in ga:
+          for b in gb:
+            edges.append((min(a, b), max(a, b)))
+    return
+
+  log_1mp = math.log(1.0 - edge_prob)
+  for gi in range(len(group_keys)):
+    ga = groups[group_keys[gi]]
+    for gj in range(gi + 1, len(group_keys)):
+      gb = groups[group_keys[gj]]
+      na, nb = len(ga), len(gb)
+      total_pairs = na * nb
+      idx = -1
+      while True:
+        r = rng.random()
+        if r <= 0:
+          r = 1e-300
+        skip = int(math.log(r) / log_1mp)
+        idx += 1 + skip
+        if idx >= total_pairs:
+          break
+        i, j = divmod(idx, nb)
+        a, b = ga[i], gb[j]
+        edges.append((min(a, b), max(a, b)))
+
+
+def _generate_non_clique_edges_numpy(edges, non_clique_nodes, forbidden_for, edge_prob, rng, np):
+  """Fast numpy batch generation of non-clique edges."""
+  n = len(non_clique_nodes)
+  nodes = np.array(non_clique_nodes, dtype=np.int32)
+  forb = np.array([forbidden_for[v] for v in non_clique_nodes], dtype=np.int32)
+
+  # Compute expected edge count
+  from collections import Counter
+  group_sizes = Counter(forbidden_for[v] for v in non_clique_nodes)
+  total_pairs = n * (n - 1) // 2
+  same_pairs = sum(s * (s - 1) // 2 for s in group_sizes.values())
+  valid_frac = (total_pairs - same_pairs) / total_pairs if total_pairs > 0 else 0
+  expected = int(total_pairs * valid_frac * edge_prob)
+
+  seed = rng.randint(0, 2**31)
+  np_rng = np.random.RandomState(seed)
+
+  # Process in batches to limit peak memory
+  BATCH = min(expected + 1000, 20_000_000)
+  collected = 0
+  target = expected
+
+  while collected < target:
+    need = target - collected
+    # Oversample ~3% to cover rejections (same-node + same-group)
+    gen_size = min(int(need / max(valid_frac * 0.97, 0.01)), BATCH)
+    gen_size = max(gen_size, need + 100)
+    gen_size = min(gen_size, BATCH)
+
+    i_idx = np_rng.randint(0, n, size=gen_size)
+    j_idx = np_rng.randint(0, n, size=gen_size)
+
+    # Filter: i != j and different forbidden groups
+    mask = (i_idx != j_idx) & (forb[i_idx] != forb[j_idx])
+    i_idx = i_idx[mask]
+    j_idx = j_idx[mask]
+
+    # Canonical order
+    lo = np.minimum(i_idx, j_idx)
+    hi = np.maximum(i_idx, j_idx)
+
+    # Convert to node IDs
+    lo_n = nodes[lo]
+    hi_n = nodes[hi]
+
+    # Trim if we have enough
+    remaining = target - collected
+    if len(lo_n) > remaining:
+      lo_n = lo_n[:remaining]
+      hi_n = hi_n[:remaining]
+
+    # Append as tuples
+    result = np.column_stack((lo_n, hi_n))
+    edges.extend(map(tuple, result.tolist()))
+    collected += len(lo_n)
 
 
 TEST_CASES = [
@@ -218,7 +390,7 @@ def _get_streaming_input(subpass: int) -> StreamingInputFile:
 
   case = TEST_CASES[subpass]
   cache_key = (
-    f"graph29|v={case['vertices']}|p={case['edge_prob']}|k={case['clique_size']}|"
+    f"graph29v3|v={case['vertices']}|p={case['edge_prob']}|k={case['clique_size']}|"
     f"seed={RANDOM_SEED + subpass}"
   )
 
@@ -352,9 +524,24 @@ def greedy_clique_size(num_vertices: int, edges: List[Tuple[int, int]]) -> int:
   return len(clique)
 
 
+def _cache_key_parts(result: dict, subPass: int) -> tuple:
+  """Build cache key parts from code hash + test case params."""
+  case = TEST_CASES[subPass]
+  code = result.get("csharp_code", "")
+  return (
+    hashlib.sha256(code.encode('utf-8')).hexdigest()[:16],
+    f"v={case['vertices']}|p={case['edge_prob']}|k={case['clique_size']}|seed={RANDOM_SEED + subPass}",
+  )
+
+
 def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
   if not result or "csharp_code" not in result:
     return 0.0, "No C# code provided"
+
+  cache_parts = _cache_key_parts(result, subPass)
+  cached = _grade_cache.get_grade(*cache_parts)
+  if cached is not None:
+    return cached
 
   case = TEST_CASES[subPass]
   use_streaming = _should_use_streaming(subPass)
@@ -388,7 +575,9 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
       stdout, stderr, exec_time, retcode = compiler.execute(exe_path, input_data, TIMEOUT_SECONDS)
 
     if retcode != 0:
-      return 0.0, f"Runtime error: {stderr[:200]}"
+      grade = (0.0, f"Runtime error: {stderr[:200]}")
+      _grade_cache.put_grade(grade, *cache_parts)
+      return grade
 
     lines = stdout.strip().split('\n')
     clique_size = int(lines[0])
@@ -400,23 +589,39 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
       viz = _build_clique_viz(num_vertices, edges, clique, true_clique, valid, msg)
       LAST_CLIQUE_VIZ[(subPass, aiEngineName)] = viz
     if not valid:
-      return 0.0, f"[{case['desc']}] {msg}"
+      grade = (0.0, f"[{case['desc']}] {msg}")
+      _grade_cache.put_grade(grade, *cache_parts)
+      return grade
 
     ratio = len(clique) / len(true_clique) if len(true_clique) > 0 else 1.0
     if ratio < 0.7:
-      return 0.0, f"[{case['desc']}] Answered Clique size {len(clique)} (true: {len(true_clique)}), {exec_time:.2f}s"
+      grade = (0.0, f"[{case['desc']}] Answered Clique size {len(clique)} (true: {len(true_clique)}), {exec_time:.2f}s")
+      _grade_cache.put_grade(grade, *cache_parts)
+      return grade
 
-    return ratio, f"[{case['desc']}] Answered Clique size {len(clique)} (true: {len(true_clique)}), {exec_time:.2f}s"
+    grade = (ratio, f"[{case['desc']}] Answered Clique size {len(clique)} (true: {len(true_clique)}), {exec_time:.2f}s")
+    _grade_cache.put_grade(grade, *cache_parts)
+    return grade
 
   except ExecutionError as e:
-    return 0.0, f"[{case['desc']}] {str(e)[:100]}"
+    grade = (0.0, f"[{case['desc']}] {str(e)[:100]}")
+    _grade_cache.put_grade(grade, *cache_parts)
+    return grade
   except Exception as e:
-    return 0.0, f"[{case['desc']}] Error: {str(e)[:100]}"
+    grade = (0.0, f"[{case['desc']}] Error: {str(e)[:100]}")
+    _grade_cache.put_grade(grade, *cache_parts)
+    return grade
 
 
 def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
   if not result:
     return "<p style='color:red'>No result provided</p>"
+
+  cache_parts = _cache_key_parts(result, subPass)
+  cached = _grade_cache.get_report(*cache_parts)
+  if cached is not None:
+    return cached
+
   case = TEST_CASES[subPass]
   html = f"<h4>Maximum Clique - {case['desc']}</h4>"
   if "reasoning" in result:
@@ -428,6 +633,8 @@ def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
   viz = LAST_CLIQUE_VIZ.get((subPass, aiEngineName))
   if viz and viz.get("num_vertices", 0) <= 200:
     html += _generate_clique_svg(viz)
+
+  _grade_cache.put_report(html, *cache_parts)
   return html
 
 

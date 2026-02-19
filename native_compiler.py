@@ -1134,7 +1134,8 @@ class CSharpCompiler(NativeCompiler):
               exe_path: Path,
               stdin_data: str = "",
               timeout: float = 300,
-              env: Dict[str, str] = None) -> Tuple[str, str, float, int]:
+              env: Dict[str, str] = None,
+              stdin_file: Optional[Path] = None) -> Tuple[str, str, float, int]:
     """Execute compiled C# program."""
     start_time = time.time()
     process = None
@@ -1148,15 +1149,27 @@ class CSharpCompiler(NativeCompiler):
       cmd = [str(exe_path)]
 
     try:
-      process = subprocess.Popen(
-        cmd,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env=env,
-        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if self.is_windows else 0)
+      if stdin_file is not None:
+        stdin_handle = open(stdin_file, 'rb')
+        process = subprocess.Popen(
+          cmd,
+          stdin=stdin_handle,
+          stdout=subprocess.PIPE,
+          stderr=subprocess.PIPE,
+          env=env,
+          creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if self.is_windows else 0)
 
-      stdout, stderr = process.communicate(input=stdin_data.encode('utf-8'), timeout=timeout)
+        stdout, stderr = process.communicate(timeout=timeout)
+      else:
+        process = subprocess.Popen(
+          cmd,
+          stdin=subprocess.PIPE,
+          stdout=subprocess.PIPE,
+          stderr=subprocess.PIPE,
+          env=env,
+          creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if self.is_windows else 0)
+
+        stdout, stderr = process.communicate(input=stdin_data.encode('utf-8'), timeout=timeout)
 
       execution_time = time.time() - start_time
       return (stdout.decode('utf-8', errors='replace'), stderr.decode('utf-8', errors='replace'),

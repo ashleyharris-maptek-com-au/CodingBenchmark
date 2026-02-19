@@ -39,10 +39,12 @@ def _iter_instance_sets(solution_sets: int, block_size: int, decoy_sets: int,
 
   rng = random.Random(seed)
 
+  sets = []
+
   # Planted sets (indices 0..solution_sets-1)
   for b in range(solution_sets):
     start = b * block_size
-    yield list(range(start, start + block_size))
+    sets.append(list(range(start, start + block_size)))
 
   # Decoy sets (no anchors, so they can never replace planted sets in an exact cover)
   for _ in range(decoy_sets):
@@ -57,7 +59,11 @@ def _iter_instance_sets(solution_sets: int, block_size: int, decoy_sets: int,
         if e not in elems:
           elems.add(e)
           picks -= 1
-    yield sorted(elems)
+    sets.append(sorted(elems))
+
+  rng.shuffle(sets)
+  for s in sets:
+    yield s
 
 
 def _get_case_params(subpass: int) -> Tuple[int, int, int, int, int, int]:

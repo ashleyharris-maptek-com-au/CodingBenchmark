@@ -17,7 +17,12 @@ Buffer layout:
   Binding 2 (uniform):  Params - uint32[4]: [difficulty, range_start, range_size, 0]
 """
 
+import json
+import os
 import struct
+import subprocess
+import sys
+import tempfile
 import time
 from typing import Tuple, Optional
 
@@ -244,9 +249,10 @@ structure = {
 _runner_cache = None
 _base_data = None
 _ref_cache = {}
+_REPORT_CACHE = {}
 
 
-def gradeAnswer(result, subPass, aiEngineName):
+def _grade_answer_inner(result, subPass, aiEngineName):
   global _runner_cache, _base_data, _ref_cache
 
   if not result or "shader_code" not in result:
@@ -296,16 +302,42 @@ def gradeAnswer(result, subPass, aiEngineName):
     if _runner_cache is None:
       _runner_cache = ComputeShaderRunner()
 
+    details = {
+      "difficulty": difficulty,
+      "range_size": range_size,
+      "found": False,
+      "nonce": None,
+      "hash_lo": None,
+      "hash_hi": None,
+      "trailing_zeros": None,
+      "cpu_ref": _ref_cache.get(cache_key),
+    }
+
     def verify_fn(results):
       out = results[1]
       found, nonce, h0, h1 = struct.unpack_from('4I', out, 0)
 
       if found == 0:
+        details.update({
+          "found": False,
+          "nonce": None,
+          "hash_lo": None,
+          "hash_hi": None,
+          "trailing_zeros": None,
+        })
         return 0.0, f"No nonce found (difficulty={difficulty} bits)"
 
       # Verify the hash on CPU
       cpu_h0, cpu_h1 = custom_hash(_base_data, nonce)
       tz = count_trailing_zeros(cpu_h0, cpu_h1)
+
+      details.update({
+        "found": True,
+        "nonce": int(nonce),
+        "hash_lo": int(cpu_h0),
+        "hash_hi": int(cpu_h1),
+        "trailing_zeros": int(tz),
+      })
 
       if tz < difficulty:
         return 0.0, (f"Nonce {nonce} invalid: hash=({cpu_h0:#010x}, {cpu_h1:#010x}), "
@@ -315,7 +347,7 @@ def gradeAnswer(result, subPass, aiEngineName):
                    f"hash=({cpu_h0:#010x}, {cpu_h1:#010x}), "
                    f"trailing zeros={tz} >= {difficulty}")
 
-    return grade_compute(spirv,
+    score, explanation = grade_compute(spirv,
                          buffers={
                            0: base_buf,
                            1: result_buf,
@@ -331,6 +363,122 @@ def gradeAnswer(result, subPass, aiEngineName):
                          verify_fn=verify_fn,
                          runner=_runner_cache,
                          timeout=TIMEOUT_SECONDS)
+    return score, explanation, details
 
   except Exception as e:
-    return 0.0, f"GPU execution failed: {e}"
+    return 0.0, f"GPU execution failed: {e}", {"error": str(e)}
+
+
+def gradeAnswer(result, subPass, aiEngineName):
+  """Run grading in an isolated subprocess to survive GPU hangs/TDRs."""
+  if not result or "shader_code" not in result:
+    return 0.0, "No shader code provided"
+
+  payload = {
+    "shader_code": result.get("shader_code", ""),
+    "subPass": subPass,
+    "aiEngineName": aiEngineName,
+  }
+
+  with tempfile.TemporaryDirectory() as tmp_dir:
+    in_path = os.path.join(tmp_dir, "grade_input.json")
+    out_path = os.path.join(tmp_dir, "grade_output.json")
+    with open(in_path, "w", encoding="utf-8") as f:
+      json.dump(payload, f)
+
+    cmd = [sys.executable, __file__, "--grade", in_path, out_path]
+    try:
+      subprocess.run(
+        cmd,
+        check=False,
+        timeout=TIMEOUT_SECONDS + 10,
+        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
+      )
+    except subprocess.TimeoutExpired:
+      return 0.0, "GPU execution timed out or hung (subprocess killed)"
+    except Exception as e:
+      return 0.0, f"Subprocess failed: {e}"
+
+    if not os.path.exists(out_path):
+      return 0.0, "Subprocess produced no result (crash or TDR)"
+
+    try:
+      with open(out_path, "r", encoding="utf-8") as f:
+        out = json.load(f)
+      score = out.get("score", 0.0)
+      explanation = out.get("explanation", "No explanation")
+      _REPORT_CACHE[(aiEngineName, subPass)] = out.get("details", {})
+      return score, explanation
+    except Exception as e:
+      return 0.0, f"Failed to read subprocess result: {e}"
+
+
+def _run_grade_subprocess(in_path: str, out_path: str) -> int:
+  try:
+    with open(in_path, "r", encoding="utf-8") as f:
+      payload = json.load(f)
+    result = {"shader_code": payload.get("shader_code", "")}
+    subPass = int(payload.get("subPass", 0))
+    aiEngineName = payload.get("aiEngineName", "")
+    score, explanation, details = _grade_answer_inner(result, subPass, aiEngineName)
+    with open(out_path, "w", encoding="utf-8") as f:
+      json.dump({"score": score, "explanation": explanation, "details": details}, f)
+    return 0
+  except Exception as e:
+    try:
+      with open(out_path, "w", encoding="utf-8") as f:
+        json.dump({"score": 0.0, "explanation": f"Subprocess error: {e}",
+                   "details": {"error": str(e)}}, f)
+    except Exception:
+      pass
+    return 1
+
+
+if __name__ == "__main__":
+  if len(sys.argv) >= 4 and sys.argv[1] == "--grade":
+    sys.exit(_run_grade_subprocess(sys.argv[2], sys.argv[3]))
+
+
+def resultToNiceReport(result, subPass, aiEngineName):
+  report = _REPORT_CACHE.get((aiEngineName, subPass), {})
+  difficulty = report.get("difficulty")
+  range_size = report.get("range_size")
+  found = report.get("found")
+  nonce = report.get("nonce")
+  h0 = report.get("hash_lo")
+  h1 = report.get("hash_hi")
+  tz = report.get("trailing_zeros")
+  cpu_ref = report.get("cpu_ref")
+  error = report.get("error")
+
+  status = "VALID" if found and tz is not None and difficulty is not None and tz >= difficulty else "FAIL"
+  status_color = "#22c55e" if status == "VALID" else "#f97316"
+
+  def fmt_hex(val):
+    return f"0x{val:08x}" if isinstance(val, int) else "-"
+
+  ref_line = ""
+  if isinstance(cpu_ref, (list, tuple)) and cpu_ref and cpu_ref[0] is not None:
+    ref_line = (f"CPU ref nonce {cpu_ref[0]} | hash=({fmt_hex(cpu_ref[1])}, {fmt_hex(cpu_ref[2])})")
+  elif cpu_ref is None:
+    ref_line = "CPU ref: not found in limited search"
+ 
+  if range_size is None:
+    range_size = 0
+
+  return f"""
+  <div style='margin:10px 0;padding:10px;border:1px solid #e5e7eb;border-radius:8px;background:#f8fafc;'>
+    <div style='font-weight:600;margin-bottom:4px;'>Hash mining validation</div>
+    <div style='font-size:12px;color:#475569;'>
+      Difficulty: {difficulty} bits · Range: {range_size:,} · Status:
+      <span style='color:{status_color};font-weight:700;'>{status}</span>
+    </div>
+    <div style='margin-top:6px;font-size:12px;color:#0f172a;'>
+      Found nonce: {nonce if nonce is not None else '-'}<br>
+      Hash: ({fmt_hex(h0)}, {fmt_hex(h1)})<br>
+      Trailing zeros: {tz if tz is not None else '-'} (needs {difficulty})<br>
+      {ref_line}
+    </div>
+    {f"<div style='margin-top:6px;font-size:12px;color:#b91c1c;'>Error: {error}</div>" if error else ""}
+  </div>
+  """

@@ -28,6 +28,73 @@ except ImportError:
 # Directory for cached streaming data
 STREAMING_CACHE_DIR = Path(tempfile.gettempdir()) / "codingbenchmark_streaming_cache"
 
+# Directory for cached grade/report results
+GRADE_CACHE_DIR = Path(tempfile.gettempdir()) / "codingbenchmark_grade_cache"
+
+
+class GradeCache:
+  """Disk-based cache for gradeAnswer and resultToNiceReport results.
+
+  Cache key is derived from a hash of the code being graded plus the
+  test-case parameters (graph seed, size, etc.).
+  """
+
+  def __init__(self, test_name: str):
+    self.cache_dir = GRADE_CACHE_DIR / test_name
+    self.cache_dir.mkdir(parents=True, exist_ok=True)
+
+  @staticmethod
+  def _hash_key(*parts: str) -> str:
+    h = hashlib.sha256()
+    for p in parts:
+      h.update(p.encode('utf-8'))
+    return h.hexdigest()[:32]
+
+  def _path(self, key_hash: str, kind: str) -> Path:
+    return self.cache_dir / f"{key_hash}_{kind}.json"
+
+  def get_grade(self, *key_parts: str):
+    """Return cached (score, details) or None."""
+    h = self._hash_key(*key_parts)
+    p = self._path(h, "grade")
+    if p.exists():
+      try:
+        data = json.loads(p.read_text(encoding='utf-8'))
+        return (data["score"], data["details"])
+      except Exception:
+        pass
+    return None
+
+  def put_grade(self, result, *key_parts: str):
+    """Cache a (score, details) tuple."""
+    h = self._hash_key(*key_parts)
+    p = self._path(h, "grade")
+    try:
+      p.write_text(json.dumps({"score": result[0], "details": result[1]}),
+                    encoding='utf-8')
+    except Exception:
+      pass
+
+  def get_report(self, *key_parts: str):
+    """Return cached HTML string or None."""
+    h = self._hash_key(*key_parts)
+    p = self._path(h, "report")
+    if p.exists():
+      try:
+        return p.read_text(encoding='utf-8')
+      except Exception:
+        pass
+    return None
+
+  def put_report(self, html: str, *key_parts: str):
+    """Cache an HTML report string."""
+    h = self._hash_key(*key_parts)
+    p = self._path(h, "report")
+    try:
+      p.write_text(html, encoding='utf-8')
+    except Exception:
+      pass
+
 
 class StreamingInputFile:
   """

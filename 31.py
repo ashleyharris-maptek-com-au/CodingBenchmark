@@ -15,7 +15,7 @@ from native_compiler import RustCompiler, CompilationError, ExecutionError,descr
 from solver_utils import StreamingInputFile
 
 title = "Subset Sum (Rust)"
-TIMEOUT_SECONDS = 30
+TIMEOUT_SECONDS = 300
 RANDOM_SEED = 31313131
 
 

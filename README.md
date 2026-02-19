@@ -1,109 +1,101 @@
 # Ash's LLM Coding Benchmark
 
-A programming benchmark that tests LLM capabilities in algorithm design and optimization. Everything from:
+A growing suite of **54 tests** that measure LLM ability to design algorithms, write systems code, and reason about performance constraints. The benchmark now spans classic algorithms, systems engineering, GPU compute, physics simulation, and shader authoring (GLSL/HLSL/SPIR-V).
 
-- "Write a C# algorithm to plan an asteroid intercept." to
-- "Write a Python solver for travelling salesman."
-- "Write a Rust application to find errors in geology data"
-- "Write a C++ application that can bisect a 1gb graph"
+Live report example: <https://ashleyharris-maptek-com-au.github.io/CodingBenchmark/results/gpt-5-mini.html>
 
-Still a work in progress. See a test run at <https://ashleyharris-maptek-com-au.github.io/CodingBenchmark/results/gpt-5-mini.html>
+## What this benchmark covers
 
-## Overview
+- Algorithm design and optimization under time limits
+- NP-hard heuristics and approximation strategies
+- Robustness and input handling for large files/streams
+- Numerical simulation correctness (physics, fluids, orbital mechanics)
+- GPU compute and shader authoring (GLSL/HLSL/SPIR-V)
+- Visualization and report generation for interpretability
 
-This benchmark evaluates whether LLMs can:
+Each test defines its own prompt, input generation, scoring, and report visualization. Many tests include multiple **subpasses** to stress scaling behavior.
 
-- Write efficient algorithms that scale
-- Discover and implement heuristics for NP-hard problems
-- Optimize code to meet time constraints
+## Repository layout
 
-The LLM must write a Python solver for TSP that handles varying city counts within a **5-minute timeout**.
-
-## Test Structure
-
-### Test 1: Travelling Salesman Problem
-
-**Subpasses by city count:**
-
-| Subpass | Cities | Difficulty |
-|---------|--------|------------|
-| 0 | 10 | Easy - brute force possible |
-| 1 | 20 | Medium - needs heuristics |
-| 2 | 30 | Medium-Hard |
-| 3 | 40 | Hard |
-| 4 | 100 | Very Hard |
-| 5 | 1000 | Extreme - needs efficient implementation |
-
-**Scoring:**
-
-- **1.0**: Route within 10% of baseline (excellent)
-- **0.85**: Route within 50% of baseline (good)
-- **0.7**: Route within 2x baseline (acceptable)
-- **0.5**: Valid route but poor quality
-- **0.0**: Invalid route or solver error/timeout
+- `CodingBenchmark.py` - main entrypoint
+- `LLMBenchCore/` - runner framework, model adapters, caching, reporting
+- `placebo_data/` - baseline implementations ("Human with tools")
+- `results/` - HTML reports and run artifacts
+- `visualization_utils.py` - shared rendering helpers for reports
+- `1.py` ... `54.py` - individual tests
 
 ## Installation
 
 ```bash
-# Clone with submodules
 git clone --recursive <repo-url>
-
-# Install dependencies
 pip install -r requirements.txt
 ```
 
 ## Usage
 
+Run the benchmark via `CodingBenchmark.py` (the CLI has evolved from the original single-test script).
+
 ```bash
-# Run all tests on all available models
-python TSPBenchmark.py
+# Run all tests on all models
+python CodingBenchmark.py
 
 # Run specific models
-python TSPBenchmark.py -m gpt-5-nano
-python TSPBenchmark.py -m "claude-*"
+python CodingBenchmark.py -m gpt-5-nano
+python CodingBenchmark.py -m "claude-*"
 
-# Run in parallel
-python TSPBenchmark.py --parallel
+# Run specific tests
+python CodingBenchmark.py -t 1,2,3
+python CodingBenchmark.py -t 5-10
+
+# Run a specific subpass (test.subpass)
+python CodingBenchmark.py -t 2.3
+python CodingBenchmark.py -t 2.0,2.3,2.5
 
 # List available models
-python TSPBenchmark.py --list-models
+python CodingBenchmark.py --list-models
 
 # Force bypass cache
-python TSPBenchmark.py --force
+python CodingBenchmark.py --force
+
+# Offline mode (cache only)
+python CodingBenchmark.py --offline
+
+# Parallel execution (one process per model)
+python CodingBenchmark.py --parallel
+
+# Batch mode (where supported by provider)
+python CodingBenchmark.py --batch
+python CodingBenchmark.py --batch -m "gpt-*,claude-*"
+
+# Import results from a cancelled batch
+python CodingBenchmark.py --import-batch <batch_id_or_jsonl> --import-model gpt-5.2
+
+# Setup mode: download/build reference data
+python CodingBenchmark.py --setup
 ```
 
-## Baseline (Placebo)
+Full CLI options live in `LLMBenchCore/TestRunner.py` (`create_argument_parser`).
 
-The "Human with tools" baseline uses a naive **nearest-neighbor heuristic**:
+## Scoring and reporting
 
-- O(n²) time complexity
-- No optimizations (2-opt, etc.)
-- Provides a reasonable approximation
+- Each test returns a score per subpass (0.0 to 1.0).
+- Subpass scores roll up to a test score.
+- Reports are generated as HTML with per-test visualizations where applicable.
 
-LLMs are expected to match or beat this baseline.
+Outputs are written to `results/`, and model-specific reports are saved under `results/models/<model>/`.
 
-## What We're Measuring
+## Baselines (Placebo)
 
-1. **Algorithm Knowledge**: Does the LLM know TSP heuristics?
-2. **Code Quality**: Can it write correct, runnable Python?
-3. **Scalability Awareness**: Does it adapt approach for larger inputs?
-4. **Optimization Skills**: Can it implement efficient data structures?
+The benchmark includes multiple baseline behaviors to control against in `placebo_data/`:
 
-## Expected Approaches
+- naive
+- naive-optimised
+- best-published
+- random
+- human
 
-Successful solvers typically implement:
-
-- **Nearest Neighbor**: O(n²), simple greedy
-- **2-opt**: Local search improvement
-- **Christofides**: Near-optimal for metric TSP
-- **Genetic Algorithms**: Population-based optimization
-- **Simulated Annealing**: Probabilistic local search
+These are used for sanity checks and to provide a reference for LLM performance. Consider these a work in progress at the moment.
 
 ## License
 
-MIT License - see LLMBenchCore/LICENSE for details.
-
-## Additional ideas
-
-- Inspect code with backdoors such as reverse shells or buffer overflows.
-- Give it a NP hard problem, a test harness that tries to solve it and times out, and ability to edit the file. And see if it edits the test framework to cheat.
+MIT License - see `LLMBenchCore/LICENSE` for details.

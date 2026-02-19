@@ -12,6 +12,8 @@ sensor failures, thruster failures, and uncommanded thrust events.
 import math
 import traceback
 
+from visualization_utils import generate_threejs_docking_viz
+
 from orbital_sim import (
   make_dock_truth,
   DockSensorModel,
@@ -30,6 +32,9 @@ from orbital_sim import (
 
 title = "Spacecraft Orbital Docking Autopilot (Python)"
 TIMEOUT_SECONDS = 120
+
+_HISTORY_CACHE = {}   # {(aiEngineName, subPass): history_list}
+_OUTCOME_CACHE = {}   # {(aiEngineName, subPass): (docked, crashed, crash_reason)}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -386,4 +391,39 @@ def gradeAnswer(result, subPass, aiEngineName):
     return 0.0, f'Simulation error: {e}\n{tb[:500]}'
 
   score, details = runner.score()
+
+  # Cache for visualization
+  _HISTORY_CACHE[(aiEngineName, sc_idx)] = runner.history
+  _OUTCOME_CACHE[(aiEngineName, sc_idx)] = (
+    runner.docked, runner.crashed, runner.crash_reason)
+
   return score, f'[{sc["name"]}] {details}'
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Visualization for HTML report
+# ──────────────────────────────────────────────────────────────────────────────
+def resultToNiceReport(result, subPass, aiEngineName):
+  sc_idx = subPass
+  if sc_idx >= len(SCENARIOS):
+    return ''
+  sc = SCENARIOS[sc_idx]
+  history = _HISTORY_CACHE.get((aiEngineName, sc_idx), [])
+  if not history:
+    return ''
+  # Extract LVLH relative positions [x_rad, y_along, z_cross]
+  path = [
+    [round(h['rel_pos'][0], 2),
+     round(h['rel_pos'][1], 2),
+     round(h['rel_pos'][2], 2)]
+    for h in history
+  ]
+  docked, crashed, crash_reason = _OUTCOME_CACHE.get(
+    (aiEngineName, sc_idx), (False, False, ''))
+  return generate_threejs_docking_viz(
+    path,
+    scenario_name=sc['name'],
+    docked=docked,
+    crashed=crashed,
+    crash_reason=crash_reason,
+  )

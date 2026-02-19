@@ -496,7 +496,7 @@ class CarSimRunner:
 
       # Check crashes
       y = self.truth['y']
-      if y < -1.0 or y > self.road.road_right_y() + 1.0:
+      if y < -3.0 or y > self.road.road_right_y() + 3.0:
         self.crashed = True
         self.crash_reason = f'Left roadway (y={y:.1f}m)'
         break

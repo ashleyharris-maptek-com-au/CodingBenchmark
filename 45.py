@@ -29,11 +29,13 @@ Fragment output:
 
 import os
 import sys
-from typing import Tuple, Optional
+from typing import Tuple, Optional, Dict
+from PIL import Image
 
 from shader_test_utils import (
     ShaderRenderer, validate_spirv,
-    compare_images, load_reference, grade_shader_binary
+    compare_images, load_reference, save_reference, get_reference_path,
+    image_pair_html
 )
 
 title = "Binary SPIR-V Fragment Shaders"
@@ -105,177 +107,140 @@ SUBPASSES = [
         "description": "Solid Red",
         "prompt": f"""{BINARY_SPIRV_INTERFACE_DESC}
 
-**Task:** Output a solid red color: outColor = vec4(1.0, 0.0, 0.0, 1.0).
-This is the simplest possible fragment shader. Just store a constant red color.
-
-Hint: A minimal shader needs ~25-30 instructions. The hex output should be
-around 200-400 hex characters.
+**Task:** Output a solid red color (vec4(1.0, 0.0, 0.0, 1.0)).
 """,
     },
     {
         "description": "Normal to RGB",
         "prompt": f"""{BINARY_SPIRV_INTERFACE_DESC}
 
-**Task:** Visualize the surface normal as color.
-Normalize the interpolated normal, then map from [-1,1] to [0,1]: rgb = N*0.5+0.5, a=1.0.
+**Task:** Visualize the surface normal as color by mapping the normalized normal from [-1, 1] into [0, 1] with alpha 1.0.
 """,
     },
     {
         "description": "UV to RG",
         "prompt": f"""{BINARY_SPIRV_INTERFACE_DESC}
 
-**Task:** Visualize texture coordinates as color.
-outColor = vec4(uv.x, uv.y, 0.0, 1.0).
+**Task:** Visualize texture coordinates as color (R=uv.x, G=uv.y, B=0, A=1).
 """,
     },
     {
         "description": "Vertex Color",
         "prompt": f"""{BINARY_SPIRV_INTERFACE_DESC}
 
-**Task:** Pass through the per-vertex color directly.
-outColor = vec4(color.r, color.g, color.b, 1.0).
+**Task:** Pass through the per-vertex color directly with alpha 1.0.
 """,
     },
     {
         "description": "Lambertian Diffuse",
         "prompt": f"""{BINARY_SPIRV_INTERFACE_DESC}
 
-**Task:** Implement Lambertian diffuse lighting.
-N = normalize(normal), L = normalize(lightPos.xyz - worldPos).
-d = max(dot(N, L), 0.0). outColor = vec4(d, d, d, 1.0).
+**Task:** Implement Lambertian diffuse lighting using N=normalize(normal), L=normalize(lightPos.xyz - worldPos), and grayscale intensity d=max(dot(N,L),0) with alpha 1.0.
 """,
     },
     {
         "description": "Phong Specular",
         "prompt": f"""{BINARY_SPIRV_INTERFACE_DESC}
 
-**Task:** Implement Phong specular highlights.
-N, L, V = normalized normal, light dir, view dir.
-R = reflect(-L, N). spec = pow(max(dot(R,V),0), 32). diff = max(dot(N,L),0).
-outColor = vec4(vec3(0.2 + 0.5*diff + 0.8*spec), 1.0).
+**Task:** Implement Phong specular highlights using N, L, V and R=reflect(-L,N), with diffuse=max(dot(N,L),0) and specular=pow(max(dot(R,V),0),32). Output grayscale intensity (0.2 + 0.5*diffuse + 0.8*specular) with alpha 1.0.
 """,
     },
     {
         "description": "Blinn-Phong",
         "prompt": f"""{BINARY_SPIRV_INTERFACE_DESC}
 
-**Task:** Implement Blinn-Phong shading.
-H = normalize(L+V). diff = max(dot(N,L),0). spec = pow(max(dot(N,H),0), 64).
-outColor = vec4(vec3(0.1 + 0.6*diff + 0.8*spec), 1.0).
+**Task:** Implement Blinn-Phong shading using N, L, V and half-vector H=normalize(L+V), with diffuse=max(dot(N,L),0) and specular=pow(max(dot(N,H),0),64). Output grayscale intensity (0.1 + 0.6*diffuse + 0.8*specular) with alpha 1.0.
 """,
     },
     {
         "description": "Rim Lighting",
         "prompt": f"""{BINARY_SPIRV_INTERFACE_DESC}
 
-**Task:** Implement rim (Fresnel) lighting.
-rim = pow(1 - max(dot(N,V),0), 3). base = vec3(0.2, 0.3, 0.8).
-outColor = vec4(base*(0.3+0.5*diff) + vec3(1,0.8,0.5)*rim, 1.0).
+**Task:** Implement rim (Fresnel) lighting with rim = pow(1 - max(dot(N,V),0), 3). Use base color (0.2, 0.3, 0.8) modulated by (0.3 + 0.5*diffuse), and add rim tint (1.0, 0.8, 0.5) * rim. Output alpha 1.0.
 """,
     },
     {
         "description": "Toon Shading",
         "prompt": f"""{BINARY_SPIRV_INTERFACE_DESC}
 
-**Task:** Toon shading with 4 quantized bands.
-d = max(dot(N,L),0). shade = d>0.75?1.0 : d>0.5?0.7 : d>0.25?0.4 : 0.2.
-outColor = vec4(color * shade, 1.0).
+**Task:** Implement toon/cel shading by quantizing the Lambertian diffuse term d=max(dot(N,L),0) into bands with thresholds 0.75/0.5/0.25 and values 1.0/0.7/0.4/0.2. Multiply the vertex color by the band and output alpha 1.0.
 """,
     },
     {
         "description": "Checkerboard",
         "prompt": f"""{BINARY_SPIRV_INTERFACE_DESC}
 
-**Task:** Checkerboard pattern using UV coordinates.
-checker = floor(uv.x*8) + floor(uv.y*8). Even=white(0.9), odd=dark(0.2).
-Add diffuse shading. outColor = vec4(checkerColor * shade, 1.0).
+**Task:** Render a UV checkerboard at 8x8 frequency, alternating colors 0.9 and 0.2 by parity. Apply Lambertian shading and output alpha 1.0.
 """,
     },
     {
         "description": "Horizontal Stripes",
         "prompt": f"""{BINARY_SPIRV_INTERFACE_DESC}
 
-**Task:** Horizontal stripes via sin(uv.y * pi * 16).
-Positive = red(0.9,0.1,0.1), negative = blue(0.1,0.1,0.9). Add diffuse.
+**Task:** Render horizontal stripes driven by sin(uv.y * pi * 16), alternating red (0.9, 0.1, 0.1) and blue (0.1, 0.1, 0.9). Apply Lambertian shading and output alpha 1.0.
 """,
     },
     {
         "description": "Polka Dots",
         "prompt": f"""{BINARY_SPIRV_INTERFACE_DESC}
 
-**Task:** Polka dots pattern. Scale UV by 6, check distance from cell center.
-dist < 0.3 = yellow(1,0.8,0), else = dark blue(0.1,0.1,0.3). Add diffuse.
+**Task:** Render a 6x6 UV polka-dot pattern with circular dots of radius 0.3 (in cell space). Dots are yellow (1.0, 0.8, 0.0) on a dark blue background (0.1, 0.1, 0.3). Apply Lambertian shading and output alpha 1.0.
 """,
     },
     {
         "description": "Hemisphere Lighting",
         "prompt": f"""{BINARY_SPIRV_INTERFACE_DESC}
 
-**Task:** Hemisphere ambient lighting.
-blend = N.y*0.5+0.5. ambient = mix(ground(0.3,0.15,0.05), sky(0.4,0.6,1.0), blend).
-Add directional: outColor = vec4(ambient + vec3(0.3)*d, 1.0).
+**Task:** Implement hemisphere ambient lighting with skyColor (0.4, 0.6, 1.0) and groundColor (0.3, 0.15, 0.05) blended by N.y * 0.5 + 0.5. Add a small diffuse term 0.3*d and output alpha 1.0.
 """,
     },
     {
         "description": "Y-Gradient",
         "prompt": f"""{BINARY_SPIRV_INTERFACE_DESC}
 
-**Task:** Color by world Y position.
-t = clamp(worldPos.y*0.5+0.5, 0, 1). Mix green(0.1,0.4,0.1) to white(1,1,1).
+**Task:** Color based on world-space Y: t=clamp(worldPos.y * 0.5 + 0.5), mix bottom (0.1, 0.4, 0.1) to top (1.0, 1.0, 1.0), output alpha 1.0.
 """,
     },
     {
         "description": "Fog Effect",
         "prompt": f"""{BINARY_SPIRV_INTERFACE_DESC}
 
-**Task:** Distance-based fog.
-baseColor from diffuse lit red sphere. dist = length(worldPos - camPos).
-fog = clamp((dist-1.5)/3, 0, 1). Mix base with fogColor(0.7,0.7,0.8).
+**Task:** Apply distance-based fog: base color is (0.8, 0.2, 0.2) with Lambertian factor (0.3 + 0.7*diffuse). Fog factor is clamp((dist - 1.5) / 3.0), fog color (0.7, 0.7, 0.8), and output the mix with alpha 1.0.
 """,
     },
     {
         "description": "Gooch Shading",
         "prompt": f"""{BINARY_SPIRV_INTERFACE_DESC}
 
-**Task:** Gooch warm/cool shading.
-t = dot(N,L)*0.5+0.5. cool=(0.2,0.2,0.75), warm=(0.7,0.7,0.4).
-outColor = vec4(mix(cool, warm, t), 1.0).
+**Task:** Implement Gooch warm/cool shading with cool (0.2, 0.2, 0.75), warm (0.7, 0.7, 0.4), and t = dot(N,L) * 0.5 + 0.5. Output alpha 1.0.
 """,
     },
     {
         "description": "Mandelbrot Set",
         "prompt": f"""{BINARY_SPIRV_INTERFACE_DESC}
 
-**Task:** Mandelbrot set on UV coordinates.
-c = (uv.x*3-2, uv.y*2-1). Iterate z=z²+c up to 20 times.
-t = iter/20. Color = (t, t*0.5, 1-t, 1).
+**Task:** Render the Mandelbrot set using UVs mapped to c = (uv.x*3-2, uv.y*2-1). Iterate up to 20 steps, escape when |z|^2 > 4, and color with t=iterations/20 as (t, t*0.5, 1.0-t), alpha 1.0.
 """,
     },
     {
         "description": "Brick Pattern",
         "prompt": f"""{BINARY_SPIRV_INTERFACE_DESC}
 
-**Task:** Procedural bricks.
-Scale UV (8x, 16y), offset alternating rows. Mortar if fract < threshold.
-brick=(0.7,0.2,0.1), mortar=(0.7,0.7,0.7). Add diffuse shading.
+**Task:** Render a procedural brick pattern at 8x16 UV scale with staggered rows (half-brick offset every other row). Mortar thickness is 0.05 in X and 0.1 in Y; mortar color is (0.7, 0.7, 0.7) and brick color is (0.7, 0.2, 0.1). Apply Lambertian shading and output alpha 1.0.
 """,
     },
     {
         "description": "Fresnel Heatmap",
         "prompt": f"""{BINARY_SPIRV_INTERFACE_DESC}
 
-**Task:** Heatmap from viewing angle.
-NdotV = max(dot(N,V),0). Map to red→yellow→blue color ramp.
-<0.5: (1, NdotV*2, 0). >=0.5: (1-x*2, 1-x*2, x*2) where x=NdotV-0.5.
+**Task:** Create a heatmap based on viewing angle using NdotV = max(dot(N, V), 0). If NdotV < 0.5 use (r=1, g=2*NdotV, b=0); otherwise use r=g=1-(NdotV-0.5)*2 and b=(NdotV-0.5)*2. Output alpha 1.0.
 """,
     },
     {
         "description": "Full Phong Model",
         "prompt": f"""{BINARY_SPIRV_INTERFACE_DESC}
 
-**Task:** Complete Phong model with colored material.
-ambient=(0.1,0.05,0.05), diffuse=color*NdotL, specular=white*pow(RdotV,32).
-outColor = vec4(clamp(ambient+diffuse+specular, 0, 1), 1.0).
+**Task:** Complete Phong lighting with colored materials: ambient (0.1, 0.05, 0.05), diffuse uses vertex color with max(dot(N,L),0), specular uses (1,1,1) with shininess 32 and R=reflect(-L,N). Clamp the sum to [0,1], output alpha 1.0.
 """,
     },
 ]
@@ -309,6 +274,7 @@ def prepareSubpassPrompt(subPass: int) -> str:
 
 extraGradeAnswerRuns = []
 _renderer_instance = None
+_OUTPUT_IMAGE_CACHE: Dict[Tuple[int, str], str] = {}
 
 
 def _get_renderer():
@@ -347,10 +313,25 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
     except Exception as e:
         return 0.0, f"[{desc}] Failed to create renderer: {e}"
 
-    score, explanation = grade_shader_binary(
-        frag_spirv, test_num=45, subpass=subPass, renderer=renderer,
-        color_tolerance=2, spatial_tolerance=1, ref_test_num=41
+    valid, err = validate_spirv(frag_spirv)
+    if not valid:
+        return 0.0, f"[{desc}] SPIR-V validation failed: {err}"
+
+    try:
+        pixels = renderer.render(frag_spirv)
+    except Exception as e:
+        return 0.0, f"[{desc}] Rendering failed: {e}"
+
+    _OUTPUT_IMAGE_CACHE[(subPass, aiEngineName)] = _save_rendered_image(
+        45, subPass, aiEngineName, pixels
     )
+
+    reference = load_reference(41, subPass)
+    if reference is None:
+        save_reference(pixels, 41, subPass)
+        return 1.0, f"[{desc}] No reference - saved current render as reference"
+
+    score, explanation = compare_images(pixels, reference, color_tolerance=2, spatial_tolerance=1)
     return score, f"[{desc}] {explanation}"
 
 
@@ -365,7 +346,28 @@ def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
     if "spirv_hex" in result:
         hex_data = result["spirv_hex"][:200] + ('...' if len(result.get('spirv_hex', '')) > 200 else '')
         html += f"<details><summary>View hex ({len(result['spirv_hex'])} chars)</summary><pre>{hex_data}</pre></details>"
+    html += image_pair_html(
+        _OUTPUT_IMAGE_CACHE.get((subPass, aiEngineName), ""),
+        str(get_reference_path(41, subPass))
+    )
     return html
+
+
+def resultToImage(result: dict, subPass: int, aiEngineName: str) -> str:
+    return _OUTPUT_IMAGE_CACHE.get((subPass, aiEngineName), "")
+
+
+def getReferenceImage(subPass: int, aiEngineName: str) -> str:
+    return str(get_reference_path(41, subPass))
+
+
+def _save_rendered_image(test_num: int, subPass: int, aiEngineName: str, pixels) -> str:
+    base_dir = os.path.dirname(__file__)
+    out_dir = os.path.join(base_dir, "results", "models", aiEngineName, "renders")
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, f"test{test_num}_subpass_{subPass:02d}.png")
+    Image.fromarray(pixels, "RGBA").save(out_path)
+    return out_path
 
 
 highLevelSummary = """

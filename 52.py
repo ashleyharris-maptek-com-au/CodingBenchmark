@@ -12,13 +12,19 @@ loss of traction (ice/aquaplaning), flickering sensors, tire blowouts, etc.
 import math
 import traceback
 
+from visualization_utils import generate_threejs_car_path
+
 from car_sim import (
   make_car_truth, CarSensorModel, CarSimRunner, RoadModel, Obstacle,
   CAR, DEG2RAD, RAD2DEG, car_physics_step, list_car_state_keys,
+  LANE_WIDTH,
 )
 
 title = "Self-Driving Car Highway Autopilot (Python)"
 TIMEOUT_SECONDS = 90
+
+_HISTORY_CACHE = {}    # {(aiEngineName, subPass): history_list}
+_OBSTACLE_CACHE = {}   # {(aiEngineName, subPass): obstacle_list}
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Scenarios
@@ -183,6 +189,211 @@ SCENARIOS = [
       failures={'gyro_1': ('dead', 0), 'wheel_speed_fl': ('dead', 0)},
       obstacles=[{'x': 80, 'y': 5.55, 'vx': 16.7}]),
 ]
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Scenario severity & context-aware grading
+# ──────────────────────────────────────────────────────────────────────────────
+# Severity describes how justified a safe stop / pullover is.
+#   'none'     – normal driving, no reason to stop
+#   'minor'    – single sensor glitch, should keep driving
+#   'moderate' – multiple degraded sensors, pullover understandable
+#   'major'    – dangerous condition, pullover is wise
+#   'obstacle' – must react to obstacle (special rules)
+_SCENARIO_SEVERITY = {
+    0: 'none',       # Normal cruise
+    1: 'none',       # Gentle curve
+    2: 'obstacle',   # Slow vehicle ahead
+    3: 'obstacle',   # Stopped vehicle
+    4: 'obstacle',   # Cut-in
+    5: 'major',      # Ice
+    6: 'major',      # Aquaplaning
+    7: 'minor',      # Single wheel speed sensor
+    8: 'moderate',   # Two wheel speed sensors
+    9: 'minor',      # Gyro failure
+    10: 'minor',     # GPS denied
+    11: 'minor',     # Vision 1 failure
+    12: 'moderate',  # All vision flickering
+    13: 'minor',     # Front lidar fail
+    14: 'minor',     # Steering sensor disagree
+    15: 'major',     # Total brake failure
+    16: 'major',     # Throttle stuck
+    17: 'obstacle',  # Road debris
+    18: 'obstacle',  # Dense traffic
+    19: 'moderate',  # Crosswind
+    20: 'major',     # Steering jammed
+    21: 'major',     # Ice + stopped vehicle
+    22: 'moderate',  # Flickering + curve
+    23: 'none',      # Reduced visibility
+    24: 'major',     # Multi-failure + obstacle
+}
+
+# Score for a controlled shoulder stop, indexed by severity
+_SHOULDER_STOP_SCORE = {
+    'none':     0.0,   # No reason to pull over – complete failure
+    'minor':    0.1,   # Overreacted but at least safe
+    'moderate': 0.3,   # Understandable caution
+    'major':    0.85,  # Good judgement
+    'obstacle': 0.4,   # Could have avoided obstacle, but safe
+}
+
+
+def _stopped_safely_near_obstacle(runner):
+  """True if car stopped at a safe following distance behind an obstacle."""
+  if not runner.obstacles:
+    return False
+  truth = runner.truth
+  car_x, car_y = truth['x'], truth['y']
+  for obs in runner.obstacles:
+    if abs(car_y - obs.y) < LANE_WIDTH:
+      gap = obs.x - car_x
+      if 2.0 < gap < 150.0:
+        return True
+  return False
+
+
+def _is_path_blocked(runner, sc_idx):
+  """True if there's no clear lane to pass an obstacle."""
+  sc = SCENARIOS[sc_idx]
+  obs_list = sc.get('obstacles', [])
+  if not obs_list:
+    return False
+  road = runner.road
+  # Check which lanes have obstacles
+  blocked = set()
+  for odef in obs_list:
+    oy = odef.get('y', 0)
+    ovx = odef.get('vx', 0)
+    if ovx < 1.0:  # stationary or nearly so
+      lane = int(oy / road.lane_width)
+      lane = max(0, min(road.num_lanes - 1, lane))
+      blocked.add(lane)
+  return len(blocked) >= road.num_lanes
+
+
+def _grade_scenario(runner, sc_idx):
+  """Context-aware grading that considers scenario severity and end state."""
+  sc = SCENARIOS[sc_idx]
+  severity = _SCENARIO_SEVERITY.get(sc_idx, 'none')
+  road = runner.road
+
+  # ── Final truth state (more accurate than last history sample) ──
+  final_speed_ms = math.sqrt(runner.truth['vx']**2 + runner.truth['vy']**2)
+  final_speed_kmh = final_speed_ms * 3.6
+  final_y = runner.truth['y']
+  tgt_speed = road.speed_limit * 3.6
+
+  on_road = 0 <= final_y <= road.road_right_y()
+  on_left_shoulder = -3.5 <= final_y < 0
+  on_right_shoulder = road.road_right_y() < final_y <= road.road_right_y() + 3.5
+  on_shoulder = on_left_shoulder or on_right_shoulder
+
+  # ── Crashed ──
+  if runner.crashed:
+    # Check if this was actually a controlled shoulder pullover
+    if on_shoulder and final_speed_kmh < 20:
+      s = _SHOULDER_STOP_SCORE.get(severity, 0.0)
+      side = 'left' if on_left_shoulder else 'right'
+      return s, (f'Controlled shoulder stop ({side}, {final_speed_kmh:.0f} km/h) '
+                 f'[severity={severity}]')
+    # Check if stopped behind obstacle (collision detection may have been marginal)
+    if runner.crash_reason.startswith('Collision') and _stopped_safely_near_obstacle(runner):
+      return 0.3, f'Near-miss with obstacle ({runner.crash_reason})'
+    return 0.0, f'Crash: {runner.crash_reason}'
+
+  if not runner.history:
+    return 0.0, 'No history'
+
+  recent = runner.history[-10:] if len(runner.history) >= 10 else runner.history
+  avg_speed = sum(h['speed_kmh'] for h in recent) / len(recent)
+  is_stopped = avg_speed < 5.0
+  is_very_slow = avg_speed < 20.0
+
+  # ── Stopped on shoulder ──
+  if is_stopped and on_shoulder:
+    s = _SHOULDER_STOP_SCORE.get(severity, 0.0)
+    side = 'left' if on_left_shoulder else 'right'
+    return s, (f'Safe shoulder stop ({side}, {avg_speed:.0f} km/h) '
+               f'[severity={severity}]')
+
+  # ── Slow on shoulder (decelerating pullover in progress) ──
+  if is_very_slow and on_shoulder:
+    s = _SHOULDER_STOP_SCORE.get(severity, 0.0) * 0.8
+    side = 'left' if on_left_shoulder else 'right'
+    return s, (f'Pulling over to shoulder ({side}, {avg_speed:.0f} km/h) '
+               f'[severity={severity}]')
+
+  # ── Stopped on road ──
+  if is_stopped and on_road:
+    # Good: stopped safely behind a stopped/slow obstacle
+    if _stopped_safely_near_obstacle(runner):
+      return 1.0, f'Stopped safely behind obstacle ({avg_speed:.0f} km/h)'
+    # Good: path is completely blocked
+    if _is_path_blocked(runner, sc_idx):
+      return 1.0, f'Stopped — path completely blocked ({avg_speed:.0f} km/h)'
+    # Acceptable: steering jammed, can't safely manoeuvre
+    if sc.get('steer_jam') is not None:
+      return 0.5, f'Stopped on road — steering jammed ({avg_speed:.0f} km/h)'
+    # Acceptable: brake failure AND managed to stop (impressive)
+    if sc.get('brake_fail'):
+      return 0.7, f'Stopped on road — no brakes, managed to stop ({avg_speed:.0f} km/h)'
+    # Otherwise: extremely dangerous regardless of severity
+    if severity == 'major':
+      return 0.1, f'Stopped on road ({avg_speed:.0f} km/h) — dangerous even in emergency'
+    return 0.0, f'Stopped on road ({avg_speed:.0f} km/h) — extremely dangerous'
+
+  # ── Very slow on road with no failure ──
+  if is_very_slow and on_road and severity == 'none':
+    frac = avg_speed / max(tgt_speed, 1)
+    return max(0.0, min(0.3, frac * 0.3)), (
+        f'Dangerously slow ({avg_speed:.0f} km/h, target {tgt_speed:.0f}) with no failure')
+
+  # ── Still driving normally: standard metric scoring ──
+  return _score_driving(runner, road, tgt_speed, recent)
+
+
+def _score_driving(runner, road, tgt_speed, recent):
+  """Standard deduction-based scoring for a car that kept driving."""
+  score = 1.0
+  details = []
+
+  # Lane keeping
+  avg_offset = sum(
+      abs(runner.sensors._distance_to_nearest_lane_center(h['y'], road))
+      for h in recent) / len(recent)
+  if avg_offset > 1.5:
+    score -= 0.3
+    details.append(f'lane offset {avg_offset:.1f}m')
+  elif avg_offset > 0.5:
+    score -= 0.1
+
+  # Speed management
+  avg_spd = sum(h['speed_kmh'] for h in recent) / len(recent)
+  if avg_spd > tgt_speed * 1.15:
+    score -= 0.2
+    details.append(f'speeding {avg_spd:.0f}/{tgt_speed:.0f} km/h')
+  elif avg_spd < tgt_speed * 0.5 and tgt_speed > 30:
+    score -= 0.15
+    details.append(f'slow {avg_spd:.0f}/{tgt_speed:.0f} km/h')
+
+  # Stability
+  yaw_var = sum((h['yaw_deg'] - recent[0]['yaw_deg'])**2 for h in recent) / len(recent)
+  if yaw_var > 100:
+    score -= 0.2
+    details.append('unstable yaw')
+
+  # Near edge
+  last_y = recent[-1]['y']
+  if last_y < 0.5 or last_y > road.road_right_y() - 0.5:
+    score -= 0.2
+    details.append('near edge')
+
+  score = max(0.0, score)
+  summary = (f'Speed: {avg_spd:.0f} km/h (tgt {tgt_speed:.0f}), '
+             f'Lane offset: {avg_offset:.2f}m, Yaw var: {yaw_var:.1f}')
+  if details:
+    summary += ' | ' + ', '.join(details)
+  return score, summary
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Prompt
@@ -370,7 +581,15 @@ def gradeAnswer(result, subPass, aiEngineName):
     tb = traceback.format_exc()
     return 0.0, f'Simulation error: {e}\n{tb[:500]}'
 
-  score, details = runner.score()
+  score, details = _grade_scenario(runner, sc_idx)
+
+  # Cache for visualization
+  _HISTORY_CACHE[(aiEngineName, sc_idx)] = runner.history
+  _OBSTACLE_CACHE[(aiEngineName, sc_idx)] = [
+    {'x': o.x, 'y': o.y, 'width': o.width, 'length': o.length, 'label': o.label}
+    for o in runner.obstacles
+  ]
+
   return score, f'[{sc["name"]}] {details}'
 
 
@@ -400,7 +619,7 @@ def _run_crosswind(runner, autopilot_fn):
     runner.truth = car_physics_step(runner.truth, controls, runner.road, dt)
 
     y = runner.truth['y']
-    if y < -1.0 or y > runner.road.road_right_y() + 1.0:
+    if y < -3.0 or y > runner.road.road_right_y() + 3.0:
       runner.crashed = True
       runner.crash_reason = f'Left roadway during crosswind (y={y:.1f}m)'
       break
@@ -415,3 +634,27 @@ def _run_crosswind(runner, autopilot_fn):
         'yaw_deg': runner.truth['yaw'] * RAD2DEG,
         'lane': runner.sensors._current_lane(runner.truth['y'], runner.road),
       })
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Visualization for HTML report
+# ──────────────────────────────────────────────────────────────────────────────
+def resultToNiceReport(result, subPass, aiEngineName):
+  sc_idx = subPass
+  if sc_idx >= len(SCENARIOS):
+    return ''
+  sc = SCENARIOS[sc_idx]
+  history = _HISTORY_CACHE.get((aiEngineName, sc_idx), [])
+  if not history:
+    return ''
+  # Build [x, y, yaw_deg] points for the 3-D viewer
+  path = [
+    [round(h['x'], 2), round(h['y'], 2), round(h.get('yaw_deg', 0), 1)]
+    for h in history
+  ]
+  obstacles = _OBSTACLE_CACHE.get((aiEngineName, sc_idx), [])
+  return generate_threejs_car_path(
+    path,
+    scenario_name=sc['name'],
+    obstacles=obstacles,
+  )

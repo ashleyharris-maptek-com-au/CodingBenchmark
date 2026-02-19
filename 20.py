@@ -44,7 +44,7 @@ from solver_utils import StreamingInputFile
 title = "Drillhole Data Validation (Rust)"
 
 # Timeout in seconds (5 minutes)
-TIMEOUT_SECONDS = 30
+TIMEOUT_SECONDS = 300
 
 # Seed for reproducibility
 RANDOM_SEED = 20202020

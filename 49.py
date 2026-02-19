@@ -123,16 +123,10 @@ Local size: 256 x 1 x 1
 - Input:  [a0, a1, a2, a3, ...]
 - Output: [a0, a0+a1, a0+a1+a2, a0+a1+a2+a3, ...]
 
-For a single workgroup (N <= 256), use shared memory:
-1. Load input[gl_GlobalInvocationID.x] into shared memory
-2. Barrier
-3. Hillis-Steele scan: for stride = 1, 2, 4, ..., 128:
-     if (local_id >= stride): shared[local_id] += shared[local_id - stride]
-     Barrier after each step
-4. Write shared[local_id] to output[gl_GlobalInvocationID.x]
-
-For N > 256, a naive fallback is acceptable (each thread sums all previous
-elements), though it will be slow. Full marks require a multi-workgroup scan.
+Compute an inclusive scan over the input array. For N <= 256, use a shared-memory
+scan within a single workgroup (synchronize as needed). For N > 256, a naive
+fallback (each thread sums all previous elements) is acceptable but slow; full
+marks require a multi-workgroup scan.
 
 **SPIR-V binary encoding notes:**
 - Little-endian uint32 words
@@ -196,6 +190,7 @@ structure = {
 }
 
 _runner_cache = None
+_REPORT_CACHE = {}
 
 
 def gradeAnswer(result, subPass, aiEngineName):
@@ -245,7 +240,16 @@ def gradeAnswer(result, subPass, aiEngineName):
 
     def verify_fn(results):
       gpu_arr = buffer_to_array(results[1], n)
-      return compare_arrays(gpu_arr, ref_arr)
+      score, desc = compare_arrays(gpu_arr, ref_arr)
+      _REPORT_CACHE[(aiEngineName, subPass)] = {
+        "n": n,
+        "input_arr": input_arr,
+        "ref_arr": ref_arr,
+        "gpu_arr": gpu_arr,
+        "score": score,
+        "desc": desc,
+      }
+      return score, desc
 
     return grade_compute(
         spirv,
@@ -259,3 +263,122 @@ def gradeAnswer(result, subPass, aiEngineName):
 
   except Exception as e:
     return 0.0, f"GPU execution failed: {e}"
+
+
+# ---------------------------------------------------------------------------
+# Visualization helpers
+# ---------------------------------------------------------------------------
+
+def _sparkline_svg(values, width=220, height=48, color="#22c55e", label=""):
+  if len(values) == 0:
+    return ""
+  vmin = float(np.min(values))
+  vmax = float(np.max(values))
+  if vmax - vmin < 1e-9:
+    vmax = vmin + 1.0
+  xs = np.linspace(0, width, num=len(values))
+  ys = height - (values - vmin) / (vmax - vmin) * height
+  points = " ".join(f"{x:.1f},{y:.1f}" for x, y in zip(xs, ys))
+  return (
+    f"<svg width='{width}' height='{height}' viewBox='0 0 {width} {height}' "
+    f"style='display:block;background:#0b1220;border:1px solid #1f2937;"
+    f"border-radius:4px;'>"
+    f"<polyline fill='none' stroke='{color}' stroke-width='1.5' "
+    f"points='{points}' />"
+    f"</svg>"
+    f"<div style='font-size:10px;color:#94a3b8;margin-top:4px;'>{label}</div>"
+  )
+
+
+def _block_accuracy_svg(matches, width=300, height=18):
+  if len(matches) == 0:
+    return ""
+  n = len(matches)
+  blocks = 64
+  block_size = max(1, n // blocks)
+  acc = []
+  for i in range(0, n, block_size):
+    chunk = matches[i:i + block_size]
+    acc.append(float(np.mean(chunk)))
+  bar_w = width / len(acc)
+  rects = []
+  for i, a in enumerate(acc):
+    if a >= 0.99:
+      color = "#22c55e"
+    elif a >= 0.9:
+      color = "#84cc16"
+    elif a >= 0.5:
+      color = "#f59e0b"
+    else:
+      color = "#ef4444"
+    rects.append(
+      f"<rect x='{i * bar_w:.2f}' y='0' width='{bar_w + 0.2:.2f}' height='{height}' "
+      f"fill='{color}' />")
+  return (
+    f"<svg width='{width}' height='{height}' viewBox='0 0 {width} {height}' "
+    f"style='display:block;background:#0b1220;border:1px solid #1f2937;"
+    f"border-radius:4px;'>" + "".join(rects) + "</svg>"
+  )
+
+
+def resultToNiceReport(result, subPass, aiEngineName):
+  from html import escape
+
+  report = _REPORT_CACHE.get((aiEngineName, subPass))
+  if not report:
+    return "<div style='color:#94a3b8;'>No visualization data captured</div>"
+
+  n = report["n"]
+  input_arr = report["input_arr"]
+  ref_arr = report["ref_arr"]
+  gpu_arr = report["gpu_arr"]
+  score = report["score"]
+  desc = escape(report["desc"])
+
+  matches = (gpu_arr[:n] == ref_arr)
+  match_count = int(np.sum(matches))
+  first_bad = int(np.argmax(~matches)) if match_count < n else None
+
+  sample_n = min(n, 256)
+  input_sample = input_arr[:sample_n].astype(np.float64)
+  ref_sample = ref_arr[:sample_n].astype(np.float64)
+  gpu_sample = gpu_arr[:sample_n].astype(np.float64)
+
+  input_svg = _sparkline_svg(input_sample, color="#38bdf8", label="Input values")
+  ref_svg = _sparkline_svg(ref_sample, color="#22c55e", label="CPU prefix sum")
+  gpu_svg = _sparkline_svg(gpu_sample, color="#f97316", label="GPU prefix sum")
+  block_svg = _block_accuracy_svg(matches)
+
+  status = "PASS" if score >= 1.0 else "PARTIAL" if score > 0 else "FAIL"
+  sc = "#22c55e" if score >= 1.0 else "#f59e0b" if score > 0 else "#ef4444"
+
+  mismatch_line = "All elements match" if first_bad is None else (
+    f"First mismatch @ {first_bad}: got {gpu_arr[first_bad]}, expected {ref_arr[first_bad]}")
+
+  return f"""
+  <div style='margin:10px 0;padding:14px;border:1px solid #1f2937;
+              border-radius:8px;background:#0f172a;'>
+    <div style='font-weight:600;color:#e2e8f0;font-size:14px;margin-bottom:2px;'>
+      Parallel Prefix Sum (inclusive scan)</div>
+    <div style='font-size:12px;color:#64748b;margin-bottom:10px;'>
+      N={n:,} elements · Correct {match_count:,}/{n:,} ·
+      <span style='color:{sc};font-weight:700;'>{status}</span></div>
+
+    <div style='display:flex;gap:10px;flex-wrap:wrap;align-items:flex-start;'>
+      <div>{input_svg}</div>
+      <div>{ref_svg}</div>
+      <div>{gpu_svg}</div>
+    </div>
+
+    <div style='margin-top:10px;'>
+      <div style='font-size:11px;color:#94a3b8;font-weight:600;margin-bottom:4px;'>
+        Block accuracy (green = correct, red = wrong)</div>
+      {block_svg}
+    </div>
+
+    <div style='margin-top:8px;font-size:11px;color:#94a3b8;'>
+      {escape(mismatch_line)}</div>
+    <div style='margin-top:6px;font-size:11px;color:#64748b;'>
+      {desc}</div>
+  </div>
+  """

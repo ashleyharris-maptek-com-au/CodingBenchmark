@@ -286,22 +286,13 @@ layout(set = 0, binding = 2) uniform Params {
 ```
 
 **Task:** Write a compute shader that performs ONE timestep of 3D boid
-flocking simulation using Reynolds' rules:
-
-For each boid i (gl_GlobalInvocationID.x):
-1. Read position and velocity from inData
-2. For each other boid j, compute distance and apply:
-   - **Separation**: If dist < sepRadius, accumulate (pos_i - pos_j) / dist
-   - **Alignment**: If dist < alignRadius, accumulate vel_j
-   - **Cohesion**: If dist < cohRadius, accumulate pos_j
-3. Compute acceleration:
-   - sep_force = sepWeight * avg(separation vectors)
-   - align_force = alignWeight * (avg(neighbor velocities) - my_velocity)
-   - cohesion_force = cohWeight * (avg(neighbor positions) - my_position)
-4. Boundary force: if |pos.x| > boundSize*0.4, push toward center:
-   accel -= boundForce * (pos / (boundSize*0.5))  (same for y, z)
-5. Update: vel += accel * dt; clamp speed to maxSpeed; pos += vel * dt
-6. Write to outData
+flocking simulation (Reynolds' rules). Each invocation handles one boid
+(gl_GlobalInvocationID.x), reading its position/velocity from inData and
+writing updated values to outData. Use separation/align/cohesion with the
+provided radii and weights, average neighbor contributions, and apply the
+boundary force when a component exceeds boundSize*0.4 (push toward center
+using boundForce and boundSize*0.5 scaling). Update velocity by accel*dt,
+clamp speed to maxSpeed, then update position by vel*dt.
 
 **Critical Requirements:**
 - Guard against gl_GlobalInvocationID.x >= N

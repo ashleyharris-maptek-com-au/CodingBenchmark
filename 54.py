@@ -12,6 +12,8 @@ windshear, sensor failures, slippery runways, and historical disasters.
 import math
 import traceback
 
+from visualization_utils import generate_threejs_flight_path
+
 from autoland_sim import (
   make_autoland_truth,
   AutolandSensorModel,
@@ -38,6 +40,8 @@ from autoland_sim import (
 
 title = "Aircraft Autoland (Python)"
 TIMEOUT_SECONDS = 120
+
+_HISTORY_CACHE = {}  # {(aiEngineName, subPass): history_list}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -621,7 +625,50 @@ def gradeAnswer(result, subPass, aiEngineName):
       continue
 
     score, details = runner.score()
+    _HISTORY_CACHE[(aiEngineName, sc_idx)] = runner.history
     return score, f'[{sc["name"]}]{hist_ref} {details}'
 
   # Exhausted all go-around attempts
   return 0.0, f'[{sc["name"]}]{hist_ref} FAIL: {GO_AROUND_MAX} go-arounds exhausted'
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Visualization for HTML report
+# ──────────────────────────────────────────────────────────────────────────────
+def _history_to_path(history):
+  """Convert autoland history to [x, y, z] path in metres.
+
+  x = distance along runway (rwy_dist_m, positive = before threshold),
+  y = lateral offset (rwy_offset_m),
+  z = altitude in metres.
+  """
+  if not history:
+    return []
+  path = []
+  for h in history:
+    alt_m = h['alt_ft'] * FT2M
+    path.append([
+      round(h['rwy_dist_m'], 1),
+      round(h.get('rwy_offset_m', 0), 1),
+      round(alt_m, 1),
+    ])
+  return path
+
+
+def resultToNiceReport(result, subPass, aiEngineName):
+  sc_idx = subPass
+  if sc_idx >= len(SCENARIOS):
+    return ''
+  sc = SCENARIOS[sc_idx]
+  history = _HISTORY_CACHE.get((aiEngineName, sc_idx), [])
+  if not history:
+    return ''
+  path = _history_to_path(history)
+  runway = {
+    'x': -ILS['runway_length_m'] / 2,  # center of runway
+    'y': 0,
+    'length': ILS['runway_length_m'],
+    'width': ILS['runway_width_m'],
+  }
+  return generate_threejs_flight_path(
+    path, scenario_name=sc['name'], runway=runway)

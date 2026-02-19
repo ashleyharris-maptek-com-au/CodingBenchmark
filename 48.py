@@ -18,10 +18,12 @@ Buffer layout:
                         omega = 1/(3*viscosity + 0.5) relaxation parameter
 """
 
+import base64
 import math
 import random
 import struct
 import time
+import zlib
 from typing import Tuple, Optional
 
 import numpy as np
@@ -198,16 +200,19 @@ k=8: ( 1,-1)  w=1/36   (SE)
 - Binding 1 (storage, read-write): float array, length W*H*9 (output, NOT writeonly)
 - Binding 2 (uniform): { uvec4(W, H, 0, 0), vec4(omega, 0, 0, 0) }
 
-**Algorithm per cell (x, y) = gl_GlobalInvocationID.xy:**
-1. Guard: if x >= W or y >= H, return
-2. Compute macroscopic density rho = sum(f[k] for k=0..8)
-3. Compute macroscopic velocity: ux = sum(cx[k]*f[k])/rho, uy = sum(cy[k]*f[k])/rho
-4. BGK collision: for each k:
-     cu = cx[k]*ux + cy[k]*uy
-     feq = w[k] * rho * (1 + 3*cu + 4.5*cu*cu - 1.5*(ux*ux + uy*uy))
-     f_out = f[k] + omega * (feq - f[k])
-5. Streaming: write f_out to neighbor cell (x+cx[k], y+cy[k]) with periodic wrap
-   output[(((y+cy[k]) mod H) * W + ((x+cx[k]) mod W)) * 9 + k] = f_out
+**Algorithm (per cell at gl_GlobalInvocationID.xy):**
+Compute one LBM step (collision + streaming) for each lattice cell. Guard against
+out-of-bounds (x >= W or y >= H). For the cell distributions f[0..8], compute
+macroscopic density rho and velocity (ux, uy) using the D2Q9 directions. Apply
+the BGK collision update with:
+
+  cu = cx[k]*ux + cy[k]*uy
+  feq = w[k] * rho * (1 + 3*cu + 4.5*cu*cu - 1.5*(ux*ux + uy*uy))
+  f_out = f[k] + omega * (feq - f[k])
+
+Then stream each f_out to the neighbor cell (x+cx[k], y+cy[k]) with periodic
+wraparound in both axes. Write to the output buffer at the corresponding
+neighbor index for k.
 
 **SPIR-V requirements:**
 - OpCapability Shader
@@ -261,6 +266,7 @@ structure = {
 
 _runner_cache = None
 _ref_cache = {}
+_REPORT_CACHE = {}
 
 
 def gradeAnswer(result, subPass, aiEngineName):
@@ -306,7 +312,13 @@ def gradeAnswer(result, subPass, aiEngineName):
       gpu_grid = buffer_to_grid(output_bytes, w, h)
       # Scale tolerance with timesteps
       val_tol = 0.05 * (1 + timesteps / 200)
-      return compare_grids(gpu_grid, ref_grid, mass_tol=0.01, val_tol=val_tol)
+      score, desc = compare_grids(gpu_grid, ref_grid, mass_tol=0.01, val_tol=val_tol)
+      _REPORT_CACHE[(aiEngineName, subPass)] = {
+        "gpu_grid": gpu_grid, "w": w, "h": h,
+        "timesteps": timesteps, "viscosity": viscosity,
+        "score": score, "desc": desc,
+      }
+      return score, desc
 
     return grade_compute_pingpong(spirv,
                                   input_data,
@@ -320,3 +332,256 @@ def gradeAnswer(result, subPass, aiEngineName):
 
   except Exception as e:
     return 0.0, f"GPU execution failed: {e}"
+
+
+# ---------------------------------------------------------------------------
+# Visualization helpers
+# ---------------------------------------------------------------------------
+
+def _extract_density(grid):
+  """Sum distribution functions to get macroscopic density per cell."""
+  return np.sum(grid, axis=2)
+
+
+def _cpu_lbm_step_fast(grid, w, h, omega):
+  """Vectorized LBM step (numpy) for visualization frame generation."""
+  rho = np.sum(grid, axis=2)
+  ux = sum(D2Q9_CX[k] * grid[:, :, k] for k in range(9))
+  uy = sum(D2Q9_CY[k] * grid[:, :, k] for k in range(9))
+  mask = rho > 1e-10
+  ux[mask] /= rho[mask]
+  uy[mask] /= rho[mask]
+
+  new_grid = np.zeros_like(grid)
+  for k in range(9):
+    cu = D2Q9_CX[k] * ux + D2Q9_CY[k] * uy
+    feq = D2Q9_W[k] * rho * (1.0 + 3.0 * cu + 4.5 * cu**2
+                              - 1.5 * (ux**2 + uy**2))
+    f_out = grid[:, :, k] + omega * (feq - grid[:, :, k])
+    new_grid[:, :, k] = np.roll(
+      np.roll(f_out, D2Q9_CX[k], axis=1), D2Q9_CY[k], axis=0)
+
+  return new_grid
+
+
+def _downsample(data_2d, max_dim=96):
+  """Stride-based downsampling for visualization."""
+  h, w = data_2d.shape
+  if max(h, w) <= max_dim:
+    return data_2d
+  step = max(1, max(h, w) // max_dim)
+  return data_2d[::step, ::step]
+
+
+def _colormap_fluid(t):
+  """Ocean-thermal colormap for fluid density."""
+  t = max(0.0, min(1.0, t))
+  stops = [
+    (0.00, (8, 12, 60)),  (0.15, (15, 40, 130)),
+    (0.30, (20, 100, 180)), (0.50, (40, 180, 170)),
+    (0.65, (120, 210, 100)), (0.80, (220, 220, 60)),
+    (0.95, (250, 160, 40)), (1.00, (255, 255, 255)),
+  ]
+  for i in range(len(stops) - 1):
+    t0, c0 = stops[i]
+    t1, c1 = stops[i + 1]
+    if t <= t1:
+      s = (t - t0) / (t1 - t0)
+      return tuple(int(c0[j] + s * (c1[j] - c0[j])) for j in range(3))
+  return stops[-1][1]
+
+
+def _colormap_error(t):
+  """Error heatmap: black -> red -> orange -> yellow -> white."""
+  t = max(0.0, min(1.0, t))
+  stops = [
+    (0.00, (0, 0, 4)),    (0.25, (100, 8, 8)),
+    (0.50, (200, 40, 15)), (0.75, (250, 180, 40)),
+    (1.00, (255, 255, 255)),
+  ]
+  for i in range(len(stops) - 1):
+    t0, c0 = stops[i]
+    t1, c1 = stops[i + 1]
+    if t <= t1:
+      s = (t - t0) / (t1 - t0)
+      return tuple(int(c0[j] + s * (c1[j] - c0[j])) for j in range(3))
+  return stops[-1][1]
+
+
+def _png_chunk(tag, data):
+  body = tag + data
+  return (struct.pack('>I', len(data)) + body
+          + struct.pack('>I', zlib.crc32(body) & 0xFFFFFFFF))
+
+
+def _make_heatmap_png(data_2d, colormap_fn, max_dim=96,
+                      vmin=None, vmax=None):
+  """Render a 2D numpy array as a base64-encoded PNG heatmap."""
+  data_2d = _downsample(data_2d, max_dim)
+  h, w = data_2d.shape
+  if vmin is None:
+    vmin = float(np.min(data_2d))
+  if vmax is None:
+    vmax = float(np.max(data_2d))
+  if vmax - vmin < 1e-10:
+    vmax = vmin + 1.0
+  data_2d = data_2d[::-1]  # flip y so row 0 is at bottom
+  norm = np.clip((data_2d - vmin) / (vmax - vmin), 0.0, 1.0)
+
+  raw = bytearray()
+  for y in range(h):
+    raw.append(0)  # PNG row filter: None
+    for x in range(w):
+      r, g, b = colormap_fn(float(norm[y, x]))
+      raw.extend([r, g, b])
+
+  sig = b'\x89PNG\r\n\x1a\n'
+  ihdr = _png_chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0))
+  idat = _png_chunk(b'IDAT', zlib.compress(bytes(raw), 9))
+  iend = _png_chunk(b'IEND', b'')
+  return base64.b64encode(sig + ihdr + idat + iend).decode('ascii')
+
+
+def _frame_html(b64_png, label, px=140):
+  return (
+    f"<div style='text-align:center;flex-shrink:0;'>"
+    f"<img src='data:image/png;base64,{b64_png}' "
+    f"style='width:{px}px;height:{px}px;image-rendering:pixelated;"
+    f"border:1px solid #334155;border-radius:4px;display:block;'>"
+    f"<div style='font-size:10px;color:#94a3b8;margin-top:3px;'>"
+    f"{label}</div></div>"
+  )
+
+
+# ---------------------------------------------------------------------------
+# HTML report
+# ---------------------------------------------------------------------------
+
+def resultToNiceReport(result, subPass, aiEngineName):
+  from html import escape
+
+  report = _REPORT_CACHE.get((aiEngineName, subPass))
+  if not report:
+    return "<div style='color:#94a3b8;'>No visualization data captured</div>"
+
+  w = report["w"]
+  h = report["h"]
+  timesteps = report["timesteps"]
+  viscosity = report["viscosity"]
+  omega = 1.0 / (3.0 * viscosity + 0.5)
+  score = report["score"]
+  desc = escape(report["desc"])
+  gpu_grid = report["gpu_grid"]
+
+  # Recompute initial grid and fetch cached CPU reference
+  init_g = init_grid(w, h)
+  ref_grid = _ref_cache.get((w, h, timesteps, viscosity))
+  init_rho = _extract_density(init_g)
+  gpu_rho = _extract_density(gpu_grid)
+  ref_rho = _extract_density(ref_grid) if ref_grid is not None else None
+
+  # Consistent color range across all density panels
+  rho_min = float(np.min(init_rho))
+  rho_max = float(np.max(init_rho))
+  for rho in [gpu_rho, ref_rho]:
+    if rho is not None:
+      rho_min = min(rho_min, float(np.min(rho)))
+      rho_max = max(rho_max, float(np.max(rho)))
+
+  # --- Evolution filmstrip (fast vectorized CPU LBM) ---
+  n_frames = 6
+  frame_times = sorted(set(
+    int(timesteps * i / (n_frames - 1)) for i in range(n_frames)))
+
+  evo_frames = []
+  g = init_g.astype(np.float64).copy()
+  step_done = 0
+  for ft in frame_times:
+    while step_done < ft:
+      g = _cpu_lbm_step_fast(g, w, h, omega)
+      step_done += 1
+    rho = _extract_density(g)
+    b64 = _make_heatmap_png(rho, _colormap_fluid,
+                            vmin=rho_min, vmax=rho_max)
+    evo_frames.append((f"t={ft}", b64))
+
+  evo_panels = []
+  for i, (label, b64) in enumerate(evo_frames):
+    if i > 0:
+      evo_panels.append(
+        "<div style='color:#475569;font-size:18px;"
+        "align-self:center;padding:0 1px;'>&#x203A;</div>")
+    evo_panels.append(_frame_html(b64, label))
+
+  evo_html = (
+    "<div style='font-size:11px;color:#94a3b8;font-weight:600;"
+    "margin-bottom:4px;'>Density evolution (CPU reference)</div>"
+    "<div style='display:flex;gap:4px;align-items:flex-start;"
+    "flex-wrap:wrap;margin-bottom:14px;'>"
+    + "".join(evo_panels) + "</div>"
+  )
+
+  # --- Verification row: CPU ref | GPU output | Error | Stats ---
+  verify_panels = []
+
+  if ref_rho is not None:
+    b64 = _make_heatmap_png(ref_rho, _colormap_fluid,
+                            vmin=rho_min, vmax=rho_max)
+    verify_panels.append(_frame_html(b64, f"CPU ref (t={timesteps})"))
+
+  b64 = _make_heatmap_png(gpu_rho, _colormap_fluid,
+                          vmin=rho_min, vmax=rho_max)
+  verify_panels.append(_frame_html(b64, f"GPU output (t={timesteps})"))
+
+  if ref_rho is not None:
+    error = np.abs(gpu_rho - ref_rho)
+    b64 = _make_heatmap_png(error, _colormap_error)
+    verify_panels.append(_frame_html(b64, "|GPU &#x2212; CPU| error"))
+
+  # Stats card
+  status = "PASS" if score > 0 else "FAIL"
+  sc = "#22c55e" if score > 0 else "#f97316"
+  gpu_mass = float(np.sum(gpu_grid))
+  ref_mass = float(np.sum(ref_grid)) if ref_grid is not None else gpu_mass
+  mass_pct = abs(gpu_mass - ref_mass) / max(abs(ref_mass), 1e-10) * 100
+
+  stats = (
+    f"<div style='align-self:center;padding:10px 14px;font-size:11px;"
+    f"color:#cbd5e1;background:#1e293b;border-radius:6px;"
+    f"border:1px solid #334155;min-width:130px;'>"
+    f"<div style='font-weight:700;color:{sc};font-size:15px;"
+    f"margin-bottom:6px;'>{status}</div>"
+    f"<div>Score: <b>{score:.1f}</b></div>"
+    f"<div>Mass &#x394;: {mass_pct:.4f}%</div>"
+    f"<div style='margin-top:4px;border-top:1px solid #334155;"
+    f"padding-top:4px;'>Grid: {w}&#xd7;{h}</div>"
+    f"<div>Steps: {timesteps}</div>"
+    f"<div>&#x3bd;: {viscosity}</div>"
+    f"<div>&#x3c9;: {omega:.4f}</div>"
+    f"</div>"
+  )
+  verify_panels.append(stats)
+
+  verify_html = (
+    "<div style='font-size:11px;color:#94a3b8;font-weight:600;"
+    "margin-bottom:4px;'>GPU vs CPU verification</div>"
+    "<div style='display:flex;gap:8px;align-items:flex-start;"
+    "flex-wrap:wrap;'>"
+    + "".join(verify_panels) + "</div>"
+  )
+
+  return f"""
+  <div style='margin:10px 0;padding:14px;border:1px solid #1f2937;
+              border-radius:8px;background:#0f172a;'>
+    <div style='font-weight:600;color:#e2e8f0;font-size:14px;
+                margin-bottom:2px;'>
+      Lattice Boltzmann D2Q9 Fluid Simulation</div>
+    <div style='font-size:12px;color:#64748b;margin-bottom:12px;'>
+      {w}&#xd7;{h} grid &#xb7; {timesteps} timesteps &#xb7;
+      viscosity={viscosity} &#xb7; &#x3c9;={omega:.4f}</div>
+    {evo_html}
+    {verify_html}
+    <div style='font-size:11px;color:#64748b;margin-top:10px;'>
+      {desc}</div>
+  </div>
+  """

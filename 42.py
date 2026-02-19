@@ -41,11 +41,13 @@ Fragment shader outputs: vec4(inColor, 1.0)
 
 import os
 import sys
-from typing import Tuple, Optional
+from typing import Tuple, Optional, Dict
+from PIL import Image
 
 from shader_test_utils import (
     assemble_spirv, validate_spirv, compare_images,
-    load_reference, save_reference, UBO_SIZE
+    load_reference, save_reference, UBO_SIZE,
+    get_reference_path, image_pair_html
 )
 
 title = "SPIR-V Assembly Geometry Shaders"
@@ -299,7 +301,7 @@ SUBPASSES = [
 3. Compute line direction: dir = p1 - p0.
 4. Compute perpendicular: perp = normalize(-dir.y, dir.x) * thickness, where thickness = 0.03.
 5. Emit 4 vertices as triangle strip:
-   - p0 + perp, p0 - perp, p1 + perp, p1 - perp
+   - p0 + perp, p0 - perp, p1 + perp, p1 - perp.
 6. Interpolate color from c0 to c1.
 7. OutputTriangleStrip, OutputVertices 4.
 """,
@@ -318,7 +320,7 @@ SUBPASSES = [
 3. Use thick_start = 0.04 at p0, thick_end = 0.005 at p1.
 4. Emit 4 vertices as triangle strip:
    - p0 + perp*thick_start, p0 - perp*thick_start,
-   - p1 + perp*thick_end, p1 - perp*thick_end
+   - p1 + perp*thick_end, p1 - perp*thick_end.
 5. Color: c0 at start vertices, c1 at end vertices.
 6. OutputTriangleStrip, OutputVertices 4.
 """,
@@ -570,7 +572,7 @@ extraGradeAnswerRuns = []
 _vert_spv = None
 _frag_spv = None
 _renderer = None
-
+_OUTPUT_IMAGE_CACHE: Dict[Tuple[int, str], str] = {}
 
 def _get_fixed_shaders():
     global _vert_spv, _frag_spv
@@ -652,6 +654,10 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
     except Exception as e:
         return 0.0, f"[{desc}] Rendering failed: {e}"
 
+    _OUTPUT_IMAGE_CACHE[(subPass, aiEngineName)] = _save_rendered_image(
+        42, subPass, aiEngineName, pixels
+    )
+
     # Compare to reference
     import numpy as np
     reference = load_reference(42, subPass)
@@ -675,7 +681,28 @@ def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
     if "spirv_code" in result:
         code = result["spirv_code"].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
         html += f"<details><summary>View SPIR-V ({len(result['spirv_code'])} chars)</summary><pre>{code}</pre></details>"
+    html += image_pair_html(
+        _OUTPUT_IMAGE_CACHE.get((subPass, aiEngineName), ""),
+        str(get_reference_path(42, subPass))
+    )
     return html
+
+
+def resultToImage(result: dict, subPass: int, aiEngineName: str) -> str:
+    return _OUTPUT_IMAGE_CACHE.get((subPass, aiEngineName), "")
+
+
+def getReferenceImage(subPass: int, aiEngineName: str) -> str:
+    return str(get_reference_path(42, subPass))
+
+
+def _save_rendered_image(test_num: int, subPass: int, aiEngineName: str, pixels) -> str:
+    base_dir = os.path.dirname(__file__)
+    out_dir = os.path.join(base_dir, "results", "models", aiEngineName, "renders")
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, f"test{test_num}_subpass_{subPass:02d}.png")
+    Image.fromarray(pixels, "RGBA").save(out_path)
+    return out_path
 
 
 highLevelSummary = """

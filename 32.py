@@ -23,30 +23,67 @@ TIMEOUT_SECONDS = 30
 RANDOM_SEED = 32323232
 
 
-def generate_graph(num_vertices: int, num_edges: int, num_terminals: int,
-                   seed: int) -> Tuple[List[Tuple[int, int, int]], List[int]]:
-  """Generate weighted graph and terminal vertices."""
+def _generate_planted_meta(num_vertices: int, num_edges: int, num_terminals: int,
+                           seed: int) -> Tuple[List[int], List[Tuple[int, int, int]], int, int]:
+  """Generate terminals and a planted Steiner tree with known weight."""
   rng = random.Random(seed)
+  terminals = rng.sample(range(num_vertices), num_terminals)
+  terminal_set = set(terminals)
 
-  # Ensure connected by creating spanning tree first
-  edges = []
-  in_tree = {0}
-  for v in range(1, num_vertices):
-    u = rng.choice(list(in_tree))
-    weight = rng.randint(1, 100)
-    edges.append((u, v, weight))
-    in_tree.add(v)
+  non_terminals = [v for v in range(num_vertices) if v not in terminal_set]
+  steiner_count = min(len(non_terminals), max(1, num_terminals // 4))
+  steiner_nodes = rng.sample(non_terminals, steiner_count) if non_terminals else []
 
-  # Add random edges
-  while len(edges) < num_edges:
+  tree_nodes = terminals + steiner_nodes
+  rng.shuffle(tree_nodes)
+
+  planted_edges: List[Tuple[int, int, int]] = []
+  if tree_nodes:
+    for idx in range(1, len(tree_nodes)):
+      v = tree_nodes[idx]
+      u = rng.choice(tree_nodes[:idx])
+      weight = rng.randint(1, 6)
+      planted_edges.append((min(u, v), max(u, v), weight))
+
+  planted_weight = sum(w for _, _, w in planted_edges)
+  min_edges = len(planted_edges)
+  max_possible = (num_vertices * (num_vertices - 1)) // 2
+  target_edges = min(num_edges, max_possible)
+  decoy_count = max(0, target_edges - min_edges)
+
+  return terminals, planted_edges, planted_weight, decoy_count
+
+
+def _build_edges_from_meta(num_vertices: int, planted_edges: List[Tuple[int, int, int]],
+                           decoy_count: int, seed: int) -> List[Tuple[int, int, int]]:
+  rng = random.Random(seed + 991)
+  edges = list(planted_edges)
+  planted_set = { (u, v) for u, v, _ in planted_edges }
+  edge_set = set(planted_set)
+
+  while len(edges) < len(planted_edges) + decoy_count:
     u = rng.randint(0, num_vertices - 1)
     v = rng.randint(0, num_vertices - 1)
-    if u != v:
-      weight = rng.randint(1, 100)
-      edges.append((min(u, v), max(u, v), weight))
+    if u == v:
+      continue
+    a, b = (u, v) if u < v else (v, u)
+    if (a, b) in edge_set:
+      continue
+    weight = rng.randint(50, 120)
+    edges.append((a, b, weight))
+    edge_set.add((a, b))
 
-  terminals = rng.sample(range(num_vertices), num_terminals)
-  return edges, terminals
+  return edges
+
+
+def generate_graph(num_vertices: int, num_edges: int, num_terminals: int,
+                   seed: int) -> Tuple[List[Tuple[int, int, int]], List[int], List[Tuple[int, int, int]], int, int]:
+  """Generate weighted graph with planted Steiner tree + decoy edges."""
+  terminals, planted_edges, planted_weight, decoy_count = _generate_planted_meta(
+    num_vertices, num_edges, num_terminals, seed
+  )
+  edges = _build_edges_from_meta(num_vertices, planted_edges, decoy_count, seed)
+  return edges, terminals, planted_edges, planted_weight, decoy_count
 
 
 TEST_CASES = [
@@ -149,13 +186,36 @@ LAST_STEINER_VIZ: Dict[Tuple[int, str], dict] = {}
 STREAMING_THRESHOLD_EDGES = 1_000_000
 
 
-def get_instance(subpass: int):
+def get_instance(subpass: int, include_edges: bool = True):
   if subpass not in INSTANCE_CACHE:
     case = TEST_CASES[subpass]
-    edges, terminals = generate_graph(case["vertices"], case["edges"], case["terminals"],
-                                      RANDOM_SEED + subpass)
-    INSTANCE_CACHE[subpass] = (case["vertices"], edges, terminals)
-  return INSTANCE_CACHE[subpass]
+    terminals, planted_edges, planted_weight, decoy_count = _generate_planted_meta(
+      case["vertices"], case["edges"], case["terminals"], RANDOM_SEED + subpass
+    )
+    INSTANCE_CACHE[subpass] = {
+      "num_vertices": case["vertices"],
+      "edges": None,
+      "terminals": terminals,
+      "planted_edges": planted_edges,
+      "planted_weight": planted_weight,
+      "decoy_count": decoy_count,
+    }
+
+  cached = INSTANCE_CACHE[subpass]
+  if include_edges and cached["edges"] is None:
+    cached["edges"] = _build_edges_from_meta(
+      cached["num_vertices"], cached["planted_edges"], cached["decoy_count"],
+      RANDOM_SEED + subpass
+    )
+
+  return (
+    cached["num_vertices"],
+    cached["edges"],
+    cached["terminals"],
+    cached["planted_edges"],
+    cached["planted_weight"],
+    cached["decoy_count"],
+  )
 
 
 def _should_use_streaming(subpass: int) -> bool:
@@ -170,10 +230,33 @@ def _get_streaming_input(subpass: int) -> StreamingInputFile:
   cache_key = f"steiner32|v={case['vertices']}|e={case['edges']}|t={case['terminals']}|seed={RANDOM_SEED + subpass}"
 
   def generator():
-    num_vertices, edges, terminals = get_instance(subpass)
-    yield f"{num_vertices} {len(edges)} {len(terminals)}\n"
-    for u, v, w in edges:
+    num_vertices, _, terminals, planted_edges, _, decoy_count = get_instance(
+      subpass, include_edges=False
+    )
+    total_edges = len(planted_edges) + decoy_count
+    yield f"{num_vertices} {total_edges} {len(terminals)}\n"
+    for u, v, w in planted_edges:
       yield f"{u} {v} {w}\n"
+
+    planted_set = {(u, v) for u, v, _ in planted_edges}
+    rng = random.Random(RANDOM_SEED + subpass + 991)
+    count = 0
+    u = 0
+    v = 1
+    while count < decoy_count:
+      if u >= num_vertices - 1:
+        u = 0
+        v = 1
+      if v >= num_vertices:
+        u += 1
+        v = u + 1
+        continue
+      if (u, v) not in planted_set:
+        weight = rng.randint(50, 120)
+        yield f"{u} {v} {weight}\n"
+        count += 1
+      v += 1
+
     yield " ".join(map(str, terminals)) + "\n"
 
   input_file = StreamingInputFile(cache_key, generator, "test32_steiner")
@@ -296,6 +379,48 @@ def verify_steiner_tree(num_vertices: int, edges: List[Tuple[int, int, int]], te
   return True, total_weight, "Valid"
 
 
+def _verify_planted_tree(terminals: Set[int], tree_edges: List[Tuple[int, int]],
+                         planted_edges: List[Tuple[int, int, int]],
+                         planted_weight: int) -> Tuple[bool, int, str]:
+  planted_set = {(min(u, v), max(u, v)) for u, v, _ in planted_edges}
+  planted_weights = { (min(u, v), max(u, v)): w for u, v, w in planted_edges }
+
+  if len(tree_edges) != len(set(tree_edges)):
+    return False, 0, "Duplicate edges in tree"
+
+  total_weight = 0
+  adj: Dict[int, List[int]] = {}
+  for u, v in tree_edges:
+    key = (min(u, v), max(u, v))
+    if key not in planted_set:
+      return False, 0, f"Edge ({u},{v}) not in planted tree"
+    total_weight += planted_weights[key]
+    adj.setdefault(u, []).append(v)
+    adj.setdefault(v, []).append(u)
+
+  if not tree_edges:
+    return len(terminals) <= 1, 0, "Empty tree"
+
+  start = tree_edges[0][0]
+  visited = {start}
+  queue = [start]
+  while queue:
+    v = queue.pop(0)
+    for u in adj.get(v, []):
+      if u not in visited:
+        visited.add(u)
+        queue.append(u)
+
+  missing = terminals - visited
+  if missing:
+    return False, total_weight, f"Terminals not connected: {missing}"
+
+  if total_weight != planted_weight:
+    return False, total_weight, "Weight mismatch"
+
+  return True, total_weight, "Valid"
+
+
 def mst_upper_bound(num_vertices: int, edges: List[Tuple[int, int, int]],
                     terminals: List[int]) -> int:
   """Compute MST on metric closure of terminals as upper bound."""
@@ -386,18 +511,9 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
       if return_code != 0:
         return 0.0, f"Runtime error: {stderr[:200]}"
 
-      # Skip verification for very large cases
-      if case["edges"] > 10_000_000:
-        lines = stdout.strip().split('\n')
-        if lines:
-          header = lines[0].split()
-          reported_weight = int(header[0])
-          return 0.8, f"[{case['desc']}] Weight {reported_weight} in {exec_time:.2f}s (verification skipped)"
-        return 0.2, f"[{case['desc']}] No output"
-
       proc_stdout = stdout
     else:
-      num_vertices, edges, terminals = get_instance(subPass)
+      num_vertices, edges, terminals, _, _, _ = get_instance(subPass)
       input_data = format_input(num_vertices, edges, terminals)
 
       start = time.time()
@@ -416,7 +532,7 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
     header = lines[0].split()
     reported_weight = int(header[0])
     num_tree_edges = int(header[1])
-    num_vertices, edges, terminals = get_instance(subPass)
+    num_vertices, edges, terminals, planted_edges, planted_weight, _ = get_instance(subPass)
 
     tree_edges = []
     for i in range(1, num_tree_edges + 1):
@@ -425,9 +541,15 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
         tree_edges.append((int(parts[0]), int(parts[1])))
 
     t = time.time()
-    valid, actual_weight, msg = verify_steiner_tree(num_vertices, edges, set(terminals), tree_edges)
+    if use_streaming:
+      valid, actual_weight, msg = _verify_planted_tree(
+        set(terminals), tree_edges, planted_edges, planted_weight
+      )
+    else:
+      valid, actual_weight, msg = verify_steiner_tree(num_vertices, edges, set(terminals), tree_edges)
     d = time.time() - t
-    if d > 1: print(f"  Verification time: {d:.2f}s")
+    if d > 1:
+      print(f"  Verification time: {d:.2f}s")
 
     if num_vertices <= 150 and not use_streaming:
       LAST_STEINER_VIZ[(subPass, aiEngineName)] = _build_steiner_viz(
@@ -436,6 +558,9 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
 
     if not valid:
       return 0.2, f"[{case['desc']}] {msg}"
+
+    if use_streaming:
+      return 1.0, f"[{case['desc']}] Weight {actual_weight}, {exec_time:.2f}s"
 
     upper = mst_upper_bound(num_vertices, edges, terminals)
     ratio = actual_weight / upper if upper > 0 else 1.0
@@ -564,12 +689,12 @@ def _generate_steiner_svg(viz: dict) -> str:
     f"<div style='color:#94a3b8;font-size:11px;margin-bottom:6px;'>{viz['message']}</div>"
     f"<svg width='100%' viewBox='0 0 {width} {height}' "
     "style='background:#0b1120;border:1px solid #334155;border-radius:6px;'>"
-     "".join(edge_lines) +
-     "".join(tree_lines) +
-     "".join(node_circles) +
-    legend +
-    "</svg>"
-    "</div>"
+    + "".join(edge_lines)
+    + "".join(tree_lines)
+    + "".join(node_circles)
+    + legend
+    + "</svg>"
+    + "</div>"
   )
 
 

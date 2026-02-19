@@ -8,8 +8,6 @@ Instances are planted with a known unique optimum, enabling strict pass/fail
 grading and fast verification.
 """
 
-skip = False
-
 import random
 import subprocess
 import time

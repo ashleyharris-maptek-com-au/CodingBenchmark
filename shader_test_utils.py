@@ -8,6 +8,7 @@ Shared module for tests 41-60. Provides:
 - UV sphere mesh generation with positions, normals, UVs, tangents, colors
 """
 
+import base64
 import hashlib
 import math
 import os
@@ -883,6 +884,30 @@ def load_reference(test_num: int, subpass: int) -> Optional[np.ndarray]:
     return None
   img = Image.open(str(path))
   return np.array(img)
+
+
+def image_pair_html(render_path: Optional[str], reference_path: Optional[str]) -> str:
+  def _img_tag(path: Optional[str], label: str) -> str:
+    if not path or not os.path.exists(path):
+      return f"<div style='color:#ef4444;font-size:12px'>{label}: missing</div>"
+    try:
+      with open(path, "rb") as img_file:
+        data = base64.b64encode(img_file.read()).decode("utf-8")
+      return (
+        f"<div style='text-align:center;font-size:12px;color:#cbd5f5'>"
+        f"{label}</div>"
+        f"<img src='data:image/png;base64,{data}' "
+        "style='max-width:320px;width:100%;height:auto;border:1px solid #334155;border-radius:6px;'/>"
+      )
+    except Exception:
+      return f"<div style='color:#ef4444;font-size:12px'>{label}: failed to read</div>"
+
+  return (
+    "<div style='display:flex;gap:12px;align-items:flex-start;flex-wrap:wrap;margin-top:8px;'>"
+    f"<div style='flex:1;min-width:220px'>{_img_tag(render_path, 'Rendered')}</div>"
+    f"<div style='flex:1;min-width:220px'>{_img_tag(reference_path, 'Reference')}</div>"
+    "</div>"
+  )
 
 
 # ---------------------------------------------------------------------------

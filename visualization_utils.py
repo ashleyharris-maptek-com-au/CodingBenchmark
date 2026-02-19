@@ -1400,3 +1400,1023 @@ def generate_threejs_graph_visualization(nodes: List[Tuple[float, float]],
     """
 
   return html
+
+
+def generate_threejs_flight_path(path_points,
+                                 scenario_name: str = "Flight Path",
+                                 runway=None) -> str:
+  """
+  Generate a three.js 3D flight path visualization.
+
+  Args:
+      path_points: list of [x, y, z] coordinates (metres).
+      scenario_name: label for the collapsible summary.
+      runway: optional dict with keys 'x', 'y', 'length', 'width'
+              to draw a runway rectangle on the ground plane.
+
+  Returns:
+      HTML string with embedded three.js visualization.
+  """
+  if not path_points or len(path_points) < 2:
+    return ""
+
+  viz_id = str(uuid.uuid4())[:8]
+  pts_json = json.dumps(path_points)
+  rwy_json = json.dumps(runway) if runway else "null"
+  n_pts = len(path_points)
+
+  html = f"""
+    <div class="flight-path-visualization" style="margin: 15px 0;">
+        <details>
+            <summary style="cursor: pointer; padding: 8px; background: #e8e8e8;
+                            border-radius: 4px; font-weight: bold; color: #333;
+                            border: 1px solid #ccc;">
+                &#9992; 3D Flight Path: {scenario_name} ({n_pts} samples)
+            </summary>
+            <div style="margin-top: 10px;">
+                <div id="fp-container-{viz_id}"
+                     style="width:100%; height:500px; position:relative;">
+                    <div id="fp-renderer-{viz_id}"
+                         style="width:100%; height:100%; border:1px solid #ccc;
+                                background:#fafafa; border-radius:4px;
+                                display:flex; align-items:center;
+                                justify-content:center; color:#999;">
+                        <span class="viz-placeholder">Scroll here to activate 3D view</span>
+                    </div>
+                    <div style="position:absolute; top:10px; left:10px;
+                                background:rgba(255,255,255,0.9); padding:5px;
+                                border-radius:3px; border:1px solid #ddd;
+                                font-size:12px;">
+                        <button onclick="fpReset_{viz_id}()"
+                                style="padding:3px 8px; background:#f0f0f0;
+                                       border:1px solid #ccc; border-radius:3px;
+                                       cursor:pointer;">Reset View</button>
+                        <span style="margin-left:12px; color:#666;">
+                            Drag=rotate | Scroll=zoom | Right-drag=pan
+                        </span>
+                    </div>
+                </div>
+                <div style="margin-top:6px; font-size:12px; color:#666;
+                            background:#f8f8f8; padding:5px; border-radius:3px;">
+                    &#x1F7E2; Start &nbsp; &#x1F534; End &nbsp;
+                    Line colour: green (start) &rarr; red (end)
+                </div>
+            </div>
+        </details>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/three@0.132.2/build/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.132.2/examples/js/controls/OrbitControls.js"></script>
+    <script>
+    (function() {{
+        const vizId = 'fp_{viz_id}';
+        const rawPts = {pts_json};
+        const runwayData = {rwy_json};
+
+        let scene, camera, renderer, controls, animationId;
+        let isActive = false;
+
+        function activate() {{
+            if (isActive) return;
+            isActive = true;
+            if (typeof THREE === 'undefined') return;
+            const container = document.getElementById('fp-renderer-{viz_id}');
+            if (!container) return;
+            const ph = container.querySelector('.viz-placeholder');
+            if (ph) ph.style.display = 'none';
+
+            let minX=Infinity,minY=Infinity,minZ=Infinity;
+            let maxX=-Infinity,maxY=-Infinity,maxZ=-Infinity;
+            for (const p of rawPts) {{
+                if (p[0]<minX) minX=p[0]; if (p[0]>maxX) maxX=p[0];
+                if (p[1]<minY) minY=p[1]; if (p[1]>maxY) maxY=p[1];
+                if (p[2]<minZ) minZ=p[2]; if (p[2]>maxZ) maxZ=p[2];
+            }}
+            const cx=(minX+maxX)/2, cy=(minY+maxY)/2, cz=(minZ+maxZ)/2;
+            const span = Math.max(maxX-minX, maxY-minY, maxZ-minZ, 1);
+            const sc = 16.0 / span;
+
+            function tr(p) {{ return [(p[0]-cx)*sc, (p[2]-cz)*sc, -(p[1]-cy)*sc]; }}
+
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0xf0f0f0);
+
+            camera = new THREE.PerspectiveCamera(
+                60, container.clientWidth / container.clientHeight, 0.01, 500);
+            camera.position.set(12, 10, 12);
+            camera.lookAt(0, 0, 0);
+
+            renderer = new THREE.WebGLRenderer({{ antialias: true }});
+            renderer.setSize(container.clientWidth, container.clientHeight);
+            container.appendChild(renderer.domElement);
+
+            controls = new THREE.OrbitControls(camera, renderer.domElement);
+            controls.enableDamping = true;
+            controls.dampingFactor = 0.05;
+
+            scene.add(new THREE.AmbientLight(0x808080));
+            const dl = new THREE.DirectionalLight(0xffffff, 0.7);
+            dl.position.set(5, 10, 5);
+            scene.add(dl);
+
+            const groundY = (minZ - cz) * sc;
+            const gSize = 24;
+            const gGeom = new THREE.PlaneGeometry(gSize, gSize);
+            const gMat = new THREE.MeshLambertMaterial({{
+                color: 0xbbddbb, transparent: true, opacity: 0.35,
+                side: THREE.DoubleSide}});
+            const ground = new THREE.Mesh(gGeom, gMat);
+            ground.rotation.x = -Math.PI / 2;
+            ground.position.y = groundY;
+            scene.add(ground);
+
+            const grid = new THREE.GridHelper(gSize, 20, 0x999999, 0xcccccc);
+            grid.position.y = groundY;
+            scene.add(grid);
+
+            if (runwayData) {{
+                const rc = tr([runwayData.x, runwayData.y, minZ]);
+                const rl = runwayData.length * sc;
+                const rw = runwayData.width * sc;
+                const rGeom = new THREE.PlaneGeometry(rl, rw);
+                const rMat = new THREE.MeshLambertMaterial({{
+                    color: 0x555555, transparent: true, opacity: 0.7,
+                    side: THREE.DoubleSide}});
+                const rMesh = new THREE.Mesh(rGeom, rMat);
+                rMesh.rotation.x = -Math.PI / 2;
+                rMesh.position.set(rc[0], groundY + 0.01, rc[2]);
+                scene.add(rMesh);
+
+                const tGeom = new THREE.PlaneGeometry(0.1, rw);
+                const tMat = new THREE.MeshBasicMaterial({{
+                    color: 0xffffff, side: THREE.DoubleSide}});
+                const tMesh = new THREE.Mesh(tGeom, tMat);
+                tMesh.rotation.x = -Math.PI / 2;
+                const thPt = tr([0, runwayData.y, minZ]);
+                tMesh.position.set(thPt[0], groundY + 0.02, thPt[2]);
+                scene.add(tMesh);
+            }}
+
+            const positions = [];
+            const colors = [];
+            const n = rawPts.length;
+            for (let i = 0; i < n; i++) {{
+                const t = tr(rawPts[i]);
+                positions.push(t[0], t[1], t[2]);
+                const frac = i / Math.max(n - 1, 1);
+                colors.push(1 - frac, 0.2, frac);
+            }}
+            const segPos = [];
+            const segCol = [];
+            for (let i = 0; i < n - 1; i++) {{
+                segPos.push(
+                    positions[i*3], positions[i*3+1], positions[i*3+2],
+                    positions[(i+1)*3], positions[(i+1)*3+1], positions[(i+1)*3+2]);
+                segCol.push(
+                    colors[i*3], colors[i*3+1], colors[i*3+2],
+                    colors[(i+1)*3], colors[(i+1)*3+1], colors[(i+1)*3+2]);
+            }}
+            const lineGeom = new THREE.BufferGeometry();
+            lineGeom.setAttribute('position',
+                new THREE.Float32BufferAttribute(segPos, 3));
+            lineGeom.setAttribute('color',
+                new THREE.Float32BufferAttribute(segCol, 3));
+            const lineMat = new THREE.LineBasicMaterial({{
+                vertexColors: true, linewidth: 2 }});
+            scene.add(new THREE.LineSegments(lineGeom, lineMat));
+
+            const dropPos = [];
+            const dropCol = [];
+            for (let i = 0; i < n; i += Math.max(1, Math.floor(n / 30))) {{
+                const t = tr(rawPts[i]);
+                dropPos.push(t[0], t[1], t[2], t[0], groundY, t[2]);
+                dropCol.push(0.6, 0.6, 0.6, 0.6, 0.6, 0.6);
+            }}
+            if (dropPos.length) {{
+                const dGeom = new THREE.BufferGeometry();
+                dGeom.setAttribute('position',
+                    new THREE.Float32BufferAttribute(dropPos, 3));
+                dGeom.setAttribute('color',
+                    new THREE.Float32BufferAttribute(dropCol, 3));
+                const dMat = new THREE.LineBasicMaterial({{
+                    vertexColors: true, transparent: true, opacity: 0.3 }});
+                scene.add(new THREE.LineSegments(dGeom, dMat));
+            }}
+
+            const sGeom = new THREE.SphereGeometry(0.25, 12, 12);
+            const startPt = tr(rawPts[0]);
+            const endPt = tr(rawPts[n - 1]);
+            const ss = new THREE.Mesh(sGeom.clone(),
+                new THREE.MeshLambertMaterial({{ color: 0x22cc22 }}));
+            ss.position.set(startPt[0], startPt[1], startPt[2]);
+            scene.add(ss);
+            const es = new THREE.Mesh(sGeom.clone(),
+                new THREE.MeshLambertMaterial({{ color: 0xcc2222 }}));
+            es.position.set(endPt[0], endPt[1], endPt[2]);
+            scene.add(es);
+
+            function animate() {{
+                if (!isActive) return;
+                animationId = requestAnimationFrame(animate);
+                controls.update();
+                renderer.render(scene, camera);
+            }}
+            animate();
+        }}
+
+        function dispose() {{
+            if (!isActive) return;
+            isActive = false;
+            if (animationId) {{ cancelAnimationFrame(animationId); animationId = null; }}
+            const container = document.getElementById('fp-renderer-{viz_id}');
+            if (renderer) {{
+                renderer.dispose();
+                if (renderer.domElement && renderer.domElement.parentNode)
+                    renderer.domElement.parentNode.removeChild(renderer.domElement);
+                renderer = null;
+            }}
+            if (scene) {{
+                scene.traverse(function(o) {{
+                    if (o.geometry) o.geometry.dispose();
+                    if (o.material) {{
+                        if (Array.isArray(o.material)) o.material.forEach(m=>m.dispose());
+                        else o.material.dispose();
+                    }}
+                }});
+                scene = null;
+            }}
+            camera = null; controls = null;
+            if (container) {{
+                const ph = container.querySelector('.viz-placeholder');
+                if (ph) ph.style.display = '';
+            }}
+        }}
+
+        window.fpReset_{viz_id} = function() {{
+            if (camera && controls) {{
+                camera.position.set(12, 10, 12);
+                camera.lookAt(0, 0, 0);
+                controls.update();
+            }}
+        }};
+
+        if (window.VizManager) {{
+            window.VizManager.register({{
+                id: vizId,
+                containerId: 'fp-renderer-{viz_id}',
+                activate: activate,
+                dispose: dispose
+            }});
+        }} else {{
+            activate();
+        }}
+    }})();
+    </script>
+    """
+  return html
+
+
+def generate_threejs_car_path(path_points,
+                              scenario_name: str = "Car Path",
+                              road_width: float = 11.1,
+                              lane_width: float = 3.7,
+                              num_lanes: int = 3,
+                              obstacles=None) -> str:
+  """
+  Generate a three.js 3D car path visualization.
+
+  Args:
+      path_points: list of [x, y] coordinates in metres (x=forward, y=lateral).
+      scenario_name: label for the collapsible summary.
+      road_width: total road width in metres.
+      lane_width: width of each lane in metres.
+      num_lanes: number of lanes.
+      obstacles: optional list of dicts with 'x', 'y', 'width', 'length', 'label'.
+
+  Returns:
+      HTML string with embedded three.js visualization.
+  """
+  if not path_points or len(path_points) < 2:
+    return ""
+
+  viz_id = str(uuid.uuid4())[:8]
+  pts_json = json.dumps(path_points)
+  obs_json = json.dumps(obstacles or [])
+  n_pts = len(path_points)
+
+  html = f"""
+    <div class="car-path-visualization" style="margin: 15px 0;">
+        <details>
+            <summary style="cursor: pointer; padding: 8px; background: #e8e8e8;
+                            border-radius: 4px; font-weight: bold; color: #333;
+                            border: 1px solid #ccc;">
+                &#x1F697; Car Path: {scenario_name} ({n_pts} samples)
+            </summary>
+            <div style="margin-top: 10px;">
+                <div id="cp-container-{viz_id}"
+                     style="width:100%; height:500px; position:relative;">
+                    <div id="cp-renderer-{viz_id}"
+                         style="width:100%; height:100%; border:1px solid #ccc;
+                                background:#fafafa; border-radius:4px;
+                                display:flex; align-items:center;
+                                justify-content:center; color:#999;">
+                        <span class="viz-placeholder">Scroll here to activate 3D view</span>
+                    </div>
+                    <div style="position:absolute; top:10px; left:10px;
+                                background:rgba(255,255,255,0.9); padding:5px;
+                                border-radius:3px; border:1px solid #ddd;
+                                font-size:12px;">
+                        <button onclick="cpReset_{viz_id}()"
+                                style="padding:3px 8px; background:#f0f0f0;
+                                       border:1px solid #ccc; border-radius:3px;
+                                       cursor:pointer;">Reset View</button>
+                        <span style="margin-left:12px; color:#666;">
+                            Drag=rotate | Scroll=zoom | Right-drag=pan
+                        </span>
+                    </div>
+                </div>
+                <div style="margin-top:6px; font-size:12px; color:#666;
+                            background:#f8f8f8; padding:5px; border-radius:3px;">
+                    &#x1F7E2; Start &nbsp; &#x1F534; End &nbsp;
+                    &#x1F7E7; Obstacles &nbsp;
+                    Line colour: green (start) &rarr; red (end)
+                </div>
+            </div>
+        </details>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/three@0.132.2/build/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.132.2/examples/js/controls/OrbitControls.js"></script>
+    <script>
+    (function() {{
+        const vizId = 'cp_{viz_id}';
+        const rawPts = {pts_json};
+        const obstaclesData = {obs_json};
+        const roadWidth = {road_width};
+        const laneWidth = {lane_width};
+        const numLanes = {num_lanes};
+
+        let scene, camera, renderer, controls, animationId;
+        let isActive = false;
+
+        function activate() {{
+            if (isActive) return;
+            isActive = true;
+            if (typeof THREE === 'undefined') return;
+            const container = document.getElementById('cp-renderer-{viz_id}');
+            if (!container) return;
+            const ph = container.querySelector('.viz-placeholder');
+            if (ph) ph.style.display = 'none';
+
+            /* bounding box of car path */
+            let minX = Infinity, maxX = -Infinity;
+            for (const p of rawPts) {{
+                if (p[0] < minX) minX = p[0];
+                if (p[0] > maxX) maxX = p[0];
+            }}
+            /* include obstacles in x range */
+            for (const o of obstaclesData) {{
+                if (o.x - o.length/2 < minX) minX = o.x - o.length/2;
+                if (o.x + o.length/2 > maxX) maxX = o.x + o.length/2;
+            }}
+            const xPad = 20;
+            minX -= xPad;
+            maxX += xPad;
+            const roadLen = maxX - minX;
+            const cx = (minX + maxX) / 2;
+            const cy = roadWidth / 2;
+
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0x87ceeb);  /* sky blue */
+
+            const aspect = container.clientWidth / container.clientHeight;
+            camera = new THREE.PerspectiveCamera(50, aspect, 0.1, 5000);
+            /* top-down angled view */
+            camera.position.set(cx, 60, cy + 40);
+            camera.lookAt(cx, 0, cy);
+
+            renderer = new THREE.WebGLRenderer({{ antialias: true }});
+            renderer.setSize(container.clientWidth, container.clientHeight);
+            container.appendChild(renderer.domElement);
+
+            controls = new THREE.OrbitControls(camera, renderer.domElement);
+            controls.enableDamping = true;
+            controls.dampingFactor = 0.05;
+            controls.target.set(cx, 0, cy);
+
+            scene.add(new THREE.AmbientLight(0xcccccc));
+            const dl = new THREE.DirectionalLight(0xffffff, 0.6);
+            dl.position.set(cx, 50, -20);
+            scene.add(dl);
+
+            /* ground (grass) */
+            const grassGeo = new THREE.PlaneGeometry(roadLen + 100, roadWidth + 40);
+            const grassMat = new THREE.MeshLambertMaterial({{ color: 0x4a7c3f }});
+            const grass = new THREE.Mesh(grassGeo, grassMat);
+            grass.rotation.x = -Math.PI / 2;
+            grass.position.set(cx, -0.02, cy);
+            scene.add(grass);
+
+            /* road surface */
+            const roadGeo = new THREE.PlaneGeometry(roadLen, roadWidth);
+            const roadMat = new THREE.MeshLambertMaterial({{ color: 0x444444 }});
+            const road = new THREE.Mesh(roadGeo, roadMat);
+            road.rotation.x = -Math.PI / 2;
+            road.position.set(cx, -0.01, cy);
+            scene.add(road);
+
+            /* lane markings */
+            for (let i = 0; i <= numLanes; i++) {{
+                const ly = i * laneWidth;
+                const isSolid = (i === 0 || i === numLanes);
+                if (isSolid) {{
+                    /* solid edge lines */
+                    const lGeo = new THREE.PlaneGeometry(roadLen, 0.15);
+                    const lMat = new THREE.MeshBasicMaterial({{ color: 0xffffff }});
+                    const line = new THREE.Mesh(lGeo, lMat);
+                    line.rotation.x = -Math.PI / 2;
+                    line.position.set(cx, 0.001, ly);
+                    scene.add(line);
+                }} else {{
+                    /* dashed lane lines */
+                    const dashLen = 3.0;
+                    const gapLen = 6.0;
+                    const step = dashLen + gapLen;
+                    for (let dx = minX; dx < maxX; dx += step) {{
+                        const dGeo = new THREE.PlaneGeometry(dashLen, 0.12);
+                        const dMat = new THREE.MeshBasicMaterial({{ color: 0xffffff }});
+                        const dash = new THREE.Mesh(dGeo, dMat);
+                        dash.rotation.x = -Math.PI / 2;
+                        dash.position.set(dx + dashLen / 2, 0.001, ly);
+                        scene.add(dash);
+                    }}
+                }}
+            }}
+
+            /* obstacles */
+            for (const o of obstaclesData) {{
+                const oLen = o.length || 4.5;
+                const oW = o.width || 2.0;
+                const oH = 1.5;
+                const oGeo = new THREE.BoxGeometry(oLen, oH, oW);
+                const oMat = new THREE.MeshLambertMaterial({{
+                    color: 0xff6600, transparent: true, opacity: 0.85 }});
+                const oMesh = new THREE.Mesh(oGeo, oMat);
+                oMesh.position.set(o.x, oH / 2, o.y);
+                scene.add(oMesh);
+
+                /* wireframe outline */
+                const oEdge = new THREE.EdgesGeometry(oGeo);
+                const oLine = new THREE.LineSegments(oEdge,
+                    new THREE.LineBasicMaterial({{ color: 0x993300 }}));
+                oLine.position.copy(oMesh.position);
+                scene.add(oLine);
+
+                /* label */
+                if (o.label) {{
+                    const canvas = document.createElement('canvas');
+                    canvas.width = 128; canvas.height = 32;
+                    const ctx = canvas.getContext('2d');
+                    ctx.fillStyle = '#ff6600';
+                    ctx.fillRect(0, 0, 128, 32);
+                    ctx.fillStyle = '#fff';
+                    ctx.font = 'bold 18px Arial';
+                    ctx.textAlign = 'center';
+                    ctx.fillText(o.label, 64, 22);
+                    const tex = new THREE.CanvasTexture(canvas);
+                    const spMat = new THREE.SpriteMaterial({{ map: tex }});
+                    const sprite = new THREE.Sprite(spMat);
+                    sprite.position.set(o.x, oH + 1.0, o.y);
+                    sprite.scale.set(4, 1, 1);
+                    scene.add(sprite);
+                }}
+            }}
+
+            /* car path line (gradient green to red) */
+            const n = rawPts.length;
+            const segPos = [];
+            const segCol = [];
+            for (let i = 0; i < n - 1; i++) {{
+                const frac0 = i / Math.max(n - 1, 1);
+                const frac1 = (i + 1) / Math.max(n - 1, 1);
+                segPos.push(rawPts[i][0], 0.15, rawPts[i][1]);
+                segPos.push(rawPts[i+1][0], 0.15, rawPts[i+1][1]);
+                segCol.push(0, 1 - frac0, frac0);
+                segCol.push(0, 1 - frac1, frac1);
+            }}
+            if (segPos.length) {{
+                const lineGeom = new THREE.BufferGeometry();
+                lineGeom.setAttribute('position',
+                    new THREE.Float32BufferAttribute(segPos, 3));
+                lineGeom.setAttribute('color',
+                    new THREE.Float32BufferAttribute(segCol, 3));
+                const lineMat = new THREE.LineBasicMaterial({{
+                    vertexColors: true, linewidth: 2 }});
+                scene.add(new THREE.LineSegments(lineGeom, lineMat));
+            }}
+
+            /* car silhouette along path (every Nth point) */
+            const carGeo = new THREE.BoxGeometry(4.5, 0.6, 2.0);
+            const carMat = new THREE.MeshLambertMaterial({{
+                color: 0x2266cc, transparent: true, opacity: 0.25 }});
+            const interval = Math.max(1, Math.floor(n / 15));
+            for (let i = 0; i < n; i += interval) {{
+                const car = new THREE.Mesh(carGeo.clone(), carMat.clone());
+                car.position.set(rawPts[i][0], 0.3, rawPts[i][1]);
+                if (rawPts[i].length > 2) {{
+                    car.rotation.y = -rawPts[i][2] * Math.PI / 180;
+                }}
+                scene.add(car);
+            }}
+
+            /* start / end markers */
+            const sGeo = new THREE.SphereGeometry(0.6, 12, 12);
+            const ss = new THREE.Mesh(sGeo.clone(),
+                new THREE.MeshLambertMaterial({{ color: 0x22cc22 }}));
+            ss.position.set(rawPts[0][0], 0.6, rawPts[0][1]);
+            scene.add(ss);
+            const es = new THREE.Mesh(sGeo.clone(),
+                new THREE.MeshLambertMaterial({{ color: 0xcc2222 }}));
+            es.position.set(rawPts[n-1][0], 0.6, rawPts[n-1][1]);
+            scene.add(es);
+
+            function animate() {{
+                if (!isActive) return;
+                animationId = requestAnimationFrame(animate);
+                controls.update();
+                renderer.render(scene, camera);
+            }}
+            animate();
+        }}
+
+        function dispose() {{
+            if (!isActive) return;
+            isActive = false;
+            if (animationId) {{ cancelAnimationFrame(animationId); animationId = null; }}
+            const container = document.getElementById('cp-renderer-{viz_id}');
+            if (renderer) {{
+                renderer.dispose();
+                if (renderer.domElement && renderer.domElement.parentNode)
+                    renderer.domElement.parentNode.removeChild(renderer.domElement);
+                renderer = null;
+            }}
+            if (scene) {{
+                scene.traverse(function(o) {{
+                    if (o.geometry) o.geometry.dispose();
+                    if (o.material) {{
+                        if (o.material.map) o.material.map.dispose();
+                        if (Array.isArray(o.material)) o.material.forEach(m=>m.dispose());
+                        else o.material.dispose();
+                    }}
+                }});
+                scene = null;
+            }}
+            camera = null; controls = null;
+            if (container) {{
+                const ph = container.querySelector('.viz-placeholder');
+                if (ph) ph.style.display = '';
+            }}
+        }}
+
+        window.cpReset_{viz_id} = function() {{
+            if (camera && controls) {{
+                const pts = rawPts;
+                let mnX=Infinity, mxX=-Infinity;
+                for (const p of pts) {{ if(p[0]<mnX)mnX=p[0]; if(p[0]>mxX)mxX=p[0]; }}
+                const ccx = (mnX+mxX)/2;
+                camera.position.set(ccx, 60, roadWidth/2 + 40);
+                controls.target.set(ccx, 0, roadWidth/2);
+                controls.update();
+            }}
+        }};
+
+        if (window.VizManager) {{
+            window.VizManager.register({{
+                id: vizId,
+                containerId: 'cp-renderer-{viz_id}',
+                activate: activate,
+                dispose: dispose
+            }});
+        }} else {{
+            activate();
+        }}
+    }})();
+    </script>
+    """
+  return html
+
+
+def generate_threejs_docking_viz(path_points,
+                                 scenario_name: str = "Docking",
+                                 docked: bool = False,
+                                 crashed: bool = False,
+                                 crash_reason: str = "") -> str:
+  """
+  Generate a three.js 3D orbital docking visualization.
+
+  Args:
+      path_points: list of [x_lvlh, y_lvlh, z_lvlh] in metres
+                   (x=radial/up, y=along-track, z=cross-track).
+      scenario_name: label for the collapsible summary.
+      docked: True if spacecraft successfully docked.
+      crashed: True if spacecraft crashed into station.
+      crash_reason: text description of crash.
+
+  Returns:
+      HTML string with embedded three.js visualization.
+  """
+  if not path_points or len(path_points) < 2:
+    return ""
+
+  viz_id = str(uuid.uuid4())[:8]
+  pts_json = json.dumps(path_points)
+  n_pts = len(path_points)
+  outcome = "DOCKED" if docked else ("CRASH: " + crash_reason if crashed else "timeout")
+  outcome_color = "#22cc22" if docked else ("#cc2222" if crashed else "#cc8800")
+
+  html = f"""
+    <div class="docking-visualization" style="margin: 15px 0;">
+        <details>
+            <summary style="cursor: pointer; padding: 8px; background: #e8e8e8;
+                            border-radius: 4px; font-weight: bold; color: #333;
+                            border: 1px solid #ccc;">
+                &#x1F6F0; Docking Path: {scenario_name} ({n_pts} samples)
+                &mdash; <span style="color:{outcome_color}">{outcome}</span>
+            </summary>
+            <div style="margin-top: 10px;">
+                <div id="dk-container-{viz_id}"
+                     style="width:100%; height:550px; position:relative;">
+                    <div id="dk-renderer-{viz_id}"
+                         style="width:100%; height:100%; border:1px solid #ccc;
+                                background:#000011; border-radius:4px;
+                                display:flex; align-items:center;
+                                justify-content:center; color:#999;">
+                        <span class="viz-placeholder">Scroll here to activate 3D view</span>
+                    </div>
+                    <div style="position:absolute; top:10px; left:10px;
+                                background:rgba(0,0,0,0.7); padding:5px 10px;
+                                border-radius:3px; font-size:12px; color:#ccc;">
+                        <button onclick="dkReset_{viz_id}()"
+                                style="padding:3px 8px; background:#333;
+                                       color:#ccc; border:1px solid #555;
+                                       border-radius:3px; cursor:pointer;">Reset View</button>
+                        <span style="margin-left:12px;">
+                            Drag=rotate | Scroll=zoom | Right-drag=pan
+                        </span>
+                    </div>
+                </div>
+                <div style="margin-top:6px; font-size:12px; color:#666;
+                            background:#f8f8f8; padding:5px; border-radius:3px;">
+                    &#x1F7E2; Start &nbsp;
+                    &#x1F534; End/Impact &nbsp;
+                    &#x1F7E1; Station &nbsp;
+                    LVLH frame: Y=along-track, Up=radial (away from Earth)
+                </div>
+            </div>
+        </details>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/three@0.132.2/build/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.132.2/examples/js/controls/OrbitControls.js"></script>
+    <script>
+    (function() {{
+        const vizId = 'dk_{viz_id}';
+        const rawPts = {pts_json};
+        const didDock = {'true' if docked else 'false'};
+        const didCrash = {'true' if crashed else 'false'};
+
+        let scene, camera, renderer, controls, animationId;
+        let isActive = false;
+
+        function buildStation(sc) {{
+            /* Simplified ISS-like model at origin.
+               Oriented so docking port faces -Y (toward approaching chaser
+               in V-bar approach where chaser is at negative along-track).
+               Truss runs along Z (cross-track), modules along Y (along-track). */
+            const station = new THREE.Group();
+
+            const moduleMat = new THREE.MeshPhongMaterial({{
+                color: 0xcccccc, specular: 0x333333, shininess: 30 }});
+            const goldMat = new THREE.MeshPhongMaterial({{
+                color: 0xddaa33, specular: 0x886622, shininess: 20 }});
+            const panelMat = new THREE.MeshPhongMaterial({{
+                color: 0x1a237e, specular: 0x111155, shininess: 10,
+                side: THREE.DoubleSide }});
+            const dockMat = new THREE.MeshPhongMaterial({{
+                color: 0x44ff44, emissive: 0x115511 }});
+
+            /* Main pressurised modules (along Y = along-track) */
+            const mainLen = 6 * sc;
+            const modR = 0.5 * sc;
+            const mainGeo = new THREE.CylinderGeometry(modR, modR, mainLen, 12);
+            mainGeo.rotateX(Math.PI / 2);           /* align along Z initially */
+            mainGeo.rotateY(Math.PI / 2);            /* now along X ... */
+            /* Actually let's just orient manually */
+            const mainMod = new THREE.Mesh(
+                new THREE.CylinderGeometry(modR, modR, mainLen, 12),
+                moduleMat);
+            mainMod.rotation.x = Math.PI / 2;        /* axis along Z(three)=Z(lvlh) cross-track */
+            mainMod.rotation.z = Math.PI / 2;        /* nope, let me just position it along Y */
+            mainMod.rotation.set(0, 0, 0);
+            /* Cylinder default axis = Y. We want it along three.js X (=LVLH y along-track). */
+            mainMod.rotation.z = Math.PI / 2;
+            station.add(mainMod);
+
+            /* Second module perpendicular (along Z = cross-track) — the truss */
+            const trussLen = 12 * sc;
+            const trussR = 0.15 * sc;
+            const truss = new THREE.Mesh(
+                new THREE.CylinderGeometry(trussR, trussR, trussLen, 8),
+                goldMat);
+            /* Default Y axis → rotate to Z axis */
+            truss.rotation.x = Math.PI / 2;
+            station.add(truss);
+
+            /* Node module at junction */
+            const node = new THREE.Mesh(
+                new THREE.SphereGeometry(modR * 0.7, 12, 12), moduleMat);
+            station.add(node);
+
+            /* Forward module (along +X in three.js = +Y LVLH along-track) */
+            const fwdMod = new THREE.Mesh(
+                new THREE.CylinderGeometry(modR * 0.8, modR * 0.8, 3 * sc, 10),
+                moduleMat);
+            fwdMod.rotation.z = Math.PI / 2;
+            fwdMod.position.x = 4.5 * sc;
+            station.add(fwdMod);
+
+            /* Docking port — faces -X in three.js (= -Y LVLH = toward approaching V-bar chaser) */
+            const dockGeo = new THREE.TorusGeometry(modR * 0.5, modR * 0.1, 8, 16);
+            const dockPort = new THREE.Mesh(dockGeo, dockMat);
+            dockPort.rotation.y = Math.PI / 2;
+            dockPort.position.x = -mainLen / 2 - modR * 0.1;
+            station.add(dockPort);
+
+            /* Docking guide cone */
+            const coneGeo = new THREE.ConeGeometry(modR * 0.3, 0.8 * sc, 8, 1, true);
+            const coneMat = new THREE.MeshPhongMaterial({{
+                color: 0x44ff44, transparent: true, opacity: 0.25,
+                side: THREE.DoubleSide }});
+            const cone = new THREE.Mesh(coneGeo, coneMat);
+            cone.rotation.z = -Math.PI / 2;
+            cone.position.x = -mainLen / 2 - 0.5 * sc;
+            station.add(cone);
+
+            /* Solar panels (4 arrays at ends of truss) */
+            const panelW = 4 * sc;
+            const panelH = 1.5 * sc;
+            const panelGeo = new THREE.PlaneGeometry(panelW, panelH);
+            const panelPositions = [
+                [0, 0, trussLen / 2 - 1 * sc],
+                [0, 0, trussLen / 2 - 3.5 * sc],
+                [0, 0, -trussLen / 2 + 1 * sc],
+                [0, 0, -trussLen / 2 + 3.5 * sc],
+            ];
+            for (const pp of panelPositions) {{
+                const panel = new THREE.Mesh(panelGeo.clone(), panelMat);
+                panel.position.set(pp[0], pp[1], pp[2]);
+                /* Panels face up (Y in three.js = radial) */
+                panel.rotation.x = Math.PI / 2;
+                station.add(panel);
+                /* Back side slightly different */
+                const panelBack = new THREE.Mesh(panelGeo.clone(),
+                    new THREE.MeshPhongMaterial({{ color: 0x333344, side: THREE.DoubleSide }}));
+                panelBack.position.set(pp[0], pp[1] - 0.02 * sc, pp[2]);
+                panelBack.rotation.x = Math.PI / 2;
+                station.add(panelBack);
+            }}
+
+            return station;
+        }}
+
+        function activate() {{
+            if (isActive) return;
+            isActive = true;
+            if (typeof THREE === 'undefined') return;
+            const container = document.getElementById('dk-renderer-{viz_id}');
+            if (!container) return;
+            const ph = container.querySelector('.viz-placeholder');
+            if (ph) ph.style.display = 'none';
+
+            /* Coordinate mapping: LVLH [x_rad, y_along, z_cross]
+               → three.js: X = y_along, Y = x_rad (up), Z = z_cross */
+            function lvlhToThree(p) {{ return [p[1], p[0], p[2]]; }}
+
+            /* Determine scale: fit path into reasonable view */
+            let maxDist = 1;
+            for (const p of rawPts) {{
+                const d = Math.sqrt(p[0]*p[0] + p[1]*p[1] + p[2]*p[2]);
+                if (d > maxDist) maxDist = d;
+            }}
+            /* Scale so max distance maps to ~15 units */
+            const sc = 15.0 / maxDist;
+            /* Station model scale */
+            const stSc = Math.max(0.3, Math.min(2.0, maxDist / 200));
+
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0x000811);
+
+            const aspect = container.clientWidth / container.clientHeight;
+            camera = new THREE.PerspectiveCamera(55, aspect, 0.01, 2000);
+            camera.position.set(18, 12, 18);
+            camera.lookAt(0, 0, 0);
+
+            renderer = new THREE.WebGLRenderer({{ antialias: true }});
+            renderer.setSize(container.clientWidth, container.clientHeight);
+            container.appendChild(renderer.domElement);
+
+            controls = new THREE.OrbitControls(camera, renderer.domElement);
+            controls.enableDamping = true;
+            controls.dampingFactor = 0.05;
+
+            /* Lights */
+            scene.add(new THREE.AmbientLight(0x404050));
+            const sun = new THREE.DirectionalLight(0xffffff, 1.0);
+            sun.position.set(20, 15, 10);
+            scene.add(sun);
+            const fill = new THREE.DirectionalLight(0x334466, 0.3);
+            fill.position.set(-10, -5, -10);
+            scene.add(fill);
+
+            /* Stars background — scattered points */
+            const starCount = 800;
+            const starPos = new Float32Array(starCount * 3);
+            for (let i = 0; i < starCount; i++) {{
+                const theta = Math.random() * Math.PI * 2;
+                const phi = Math.acos(2 * Math.random() - 1);
+                const r = 500 + Math.random() * 500;
+                starPos[i*3] = r * Math.sin(phi) * Math.cos(theta);
+                starPos[i*3+1] = r * Math.sin(phi) * Math.sin(theta);
+                starPos[i*3+2] = r * Math.cos(phi);
+            }}
+            const starGeo = new THREE.BufferGeometry();
+            starGeo.setAttribute('position', new THREE.BufferAttribute(starPos, 3));
+            const starMat = new THREE.PointsMaterial({{ color: 0xffffff, size: 0.8, sizeAttenuation: false }});
+            scene.add(new THREE.Points(starGeo, starMat));
+
+            /* Earth — large sphere below (LVLH -x = three.js -Y) */
+            const earthR = 40;
+            const earthGeo = new THREE.SphereGeometry(earthR, 48, 32);
+            /* Create a simple Earth-like look with vertex colors */
+            const earthMat = new THREE.MeshPhongMaterial({{
+                color: 0x2244aa, emissive: 0x050510, specular: 0x224488,
+                shininess: 15 }});
+            const earth = new THREE.Mesh(earthGeo, earthMat);
+            earth.position.y = -(earthR + 25);
+            scene.add(earth);
+            /* Atmosphere glow */
+            const atmosGeo = new THREE.SphereGeometry(earthR * 1.02, 32, 24);
+            const atmosMat = new THREE.MeshPhongMaterial({{
+                color: 0x4488ff, transparent: true, opacity: 0.15,
+                side: THREE.BackSide }});
+            const atmos = new THREE.Mesh(atmosGeo, atmosMat);
+            atmos.position.copy(earth.position);
+            scene.add(atmos);
+
+            /* Station model */
+            const station = buildStation(stSc);
+            scene.add(station);
+
+            /* Spacecraft path (gradient green → red) */
+            const n = rawPts.length;
+            const segPos = [];
+            const segCol = [];
+            for (let i = 0; i < n - 1; i++) {{
+                const a = lvlhToThree(rawPts[i]);
+                const b = lvlhToThree(rawPts[i+1]);
+                const f0 = i / Math.max(n - 1, 1);
+                const f1 = (i+1) / Math.max(n - 1, 1);
+                segPos.push(a[0]*sc, a[1]*sc, a[2]*sc,
+                            b[0]*sc, b[1]*sc, b[2]*sc);
+                segCol.push(0, 1-f0, f0,  0, 1-f1, f1);
+            }}
+            if (segPos.length) {{
+                const lg = new THREE.BufferGeometry();
+                lg.setAttribute('position', new THREE.Float32BufferAttribute(segPos, 3));
+                lg.setAttribute('color', new THREE.Float32BufferAttribute(segCol, 3));
+                scene.add(new THREE.LineSegments(lg,
+                    new THREE.LineBasicMaterial({{ vertexColors: true, linewidth: 2 }})));
+            }}
+
+            /* Start sphere (green) */
+            const startPt = lvlhToThree(rawPts[0]);
+            const sph = new THREE.SphereGeometry(0.3, 10, 10);
+            const startM = new THREE.Mesh(sph.clone(),
+                new THREE.MeshLambertMaterial({{ color: 0x22ff22, emissive: 0x114411 }}));
+            startM.position.set(startPt[0]*sc, startPt[1]*sc, startPt[2]*sc);
+            scene.add(startM);
+
+            /* End sphere */
+            const endPt = lvlhToThree(rawPts[n-1]);
+            let endColor = 0xffaa00;   /* timeout = orange */
+            let endEmit = 0x554400;
+            if (didDock) {{ endColor = 0x22ff22; endEmit = 0x114411; }}
+            if (didCrash) {{ endColor = 0xff2222; endEmit = 0x441111; }}
+            const endM = new THREE.Mesh(sph.clone(),
+                new THREE.MeshLambertMaterial({{ color: endColor, emissive: endEmit }}));
+            endM.position.set(endPt[0]*sc, endPt[1]*sc, endPt[2]*sc);
+            scene.add(endM);
+
+            /* If crashed, add impact flash */
+            if (didCrash) {{
+                const flashGeo = new THREE.SphereGeometry(0.6, 12, 12);
+                const flashMat = new THREE.MeshBasicMaterial({{
+                    color: 0xff4400, transparent: true, opacity: 0.5 }});
+                const flash = new THREE.Mesh(flashGeo, flashMat);
+                flash.position.copy(endM.position);
+                scene.add(flash);
+                /* Debris ring */
+                const ringGeo = new THREE.TorusGeometry(0.8, 0.1, 8, 24);
+                const ringMat = new THREE.MeshBasicMaterial({{
+                    color: 0xff6600, transparent: true, opacity: 0.4 }});
+                const ring = new THREE.Mesh(ringGeo, ringMat);
+                ring.position.copy(endM.position);
+                scene.add(ring);
+            }}
+
+            /* If docked, add docking indicator */
+            if (didDock) {{
+                const dkRing = new THREE.Mesh(
+                    new THREE.TorusGeometry(0.5, 0.08, 8, 24),
+                    new THREE.MeshBasicMaterial({{ color: 0x44ff44, transparent: true, opacity: 0.6 }}));
+                dkRing.rotation.y = Math.PI / 2;
+                scene.add(dkRing);
+            }}
+
+            /* LVLH axis helper (small) */
+            const axLen = 3;
+            const axOrigin = new THREE.Vector3(0, 0, 0);
+            /* Y along-track = three.js +X (blue) */
+            scene.add(new THREE.ArrowHelper(
+                new THREE.Vector3(1, 0, 0), axOrigin, axLen, 0x4444ff, 0.3, 0.15));
+            /* X radial = three.js +Y (red) */
+            scene.add(new THREE.ArrowHelper(
+                new THREE.Vector3(0, 1, 0), axOrigin, axLen, 0xff4444, 0.3, 0.15));
+            /* Z cross-track = three.js +Z (green) */
+            scene.add(new THREE.ArrowHelper(
+                new THREE.Vector3(0, 0, 1), axOrigin, axLen, 0x44ff44, 0.3, 0.15));
+
+            function animate() {{
+                if (!isActive) return;
+                animationId = requestAnimationFrame(animate);
+                /* Slowly rotate Earth to give life */
+                earth.rotation.y += 0.001;
+                atmos.rotation.y += 0.001;
+                controls.update();
+                renderer.render(scene, camera);
+            }}
+            animate();
+        }}
+
+        function dispose() {{
+            if (!isActive) return;
+            isActive = false;
+            if (animationId) {{ cancelAnimationFrame(animationId); animationId = null; }}
+            const container = document.getElementById('dk-renderer-{viz_id}');
+            if (renderer) {{
+                renderer.dispose();
+                if (renderer.domElement && renderer.domElement.parentNode)
+                    renderer.domElement.parentNode.removeChild(renderer.domElement);
+                renderer = null;
+            }}
+            if (scene) {{
+                scene.traverse(function(o) {{
+                    if (o.geometry) o.geometry.dispose();
+                    if (o.material) {{
+                        if (Array.isArray(o.material)) o.material.forEach(m=>m.dispose());
+                        else o.material.dispose();
+                    }}
+                }});
+                scene = null;
+            }}
+            camera = null; controls = null;
+            if (container) {{
+                const ph = container.querySelector('.viz-placeholder');
+                if (ph) ph.style.display = '';
+            }}
+        }}
+
+        window.dkReset_{viz_id} = function() {{
+            if (camera && controls) {{
+                camera.position.set(18, 12, 18);
+                camera.lookAt(0, 0, 0);
+                controls.target.set(0, 0, 0);
+                controls.update();
+            }}
+        }};
+
+        if (window.VizManager) {{
+            window.VizManager.register({{
+                id: vizId,
+                containerId: 'dk-renderer-{viz_id}',
+                activate: activate,
+                dispose: dispose
+            }});
+        }} else {{
+            activate();
+        }}
+    }})();
+    </script>
+    """
+  return html
+
