@@ -382,26 +382,11 @@ def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
 
 
 highLevelSummary = """
-Longest Common Substring finds the longest contiguous sequence appearing in all input strings.
-
-**Algorithms by complexity:**
-
-1. **Naive O(n²·m):** Check all substrings of shortest string against others.
-
-2. **DP O(n·m²):** Build suffix table, find longest common suffix ending at each position.
-
-3. **Binary search + Rolling hash O(n·m·log m):**
-   - Binary search on substring length
-   - Use Rabin-Karp rolling hash to find all substrings of given length
-   - Check if any hash appears in all strings
-
-4. **Generalized Suffix Array O(n·m·log(n·m)):**
-   - Concatenate strings with unique separators
-   - Build suffix array and LCP array
-   - Find longest common prefix spanning all original strings
-
-**Key insight:** Binary search works because if a common substring of length k exists, 
-then common substrings of all lengths < k also exist.
-
-The baseline uses Python's difflib which works for small inputs but times out on large ones.
+<p>Given several strings, find the longest chunk of text that appears identically
+in every one of them. For example, if the strings are &ldquo;abcdef&rdquo; and
+&ldquo;xbcdey&rdquo;, the answer is &ldquo;bcde&rdquo;.</p>
+<p>Na&iuml;ve approaches check every possible substring and become far too slow on
+large inputs. Subpasses increase the string lengths into the millions, so the
+AI must use efficient data structures or hashing. The baseline uses a simple
+library call that times out on the bigger cases.</p>
 """

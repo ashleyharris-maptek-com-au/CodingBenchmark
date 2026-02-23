@@ -658,3 +658,14 @@ def resultToNiceReport(result, subPass, aiEngineName):
     scenario_name=sc['name'],
     obstacles=obstacles,
   )
+
+
+highLevelSummary = """
+<p>Write a Python autopilot for a simulated car on a multi-lane freeway. The car
+receives around 150 sensor readings each tick &mdash; redundant wheel speeds, gyros,
+accelerometers, laser range finders, and camera-based object detection &mdash; and
+must output steering and throttle/brake commands to drive safely.</p>
+<p>The 25 scenarios include normal highway driving, sudden obstacles, sensor failures,
+loss of traction (ice and aquaplaning), tire blowouts, and flickering sensors. The
+AI must fuse noisy data, detect faults, and react in real time.</p>
+"""

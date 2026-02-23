@@ -518,23 +518,10 @@ def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
 
 
 highLevelSummary = """
-Packing regular tetrahedrons into a polyhedron is a challenging 3D geometry problem.
-
-**Key facts:**
-- Regular tetrahedrons do NOT tile 3D space (unlike cubes)
-- Maximum packing density for tetrahedra ≈ 85.6% (Haji-Akbari et al.)
-- Random packing typically achieves ~36% density
-
-**Approaches:**
-- Grid-based placement with collision detection
-- Greedy placement from corners/edges
-- Optimization methods (simulated annealing, genetic algorithms)
-- Space-filling curves for systematic coverage
-
-**Challenges:**
-- Point-in-polyhedron testing
-- Tetrahedron-tetrahedron intersection detection
-- Rotation optimization for better fit
-
-The baseline uses simple axis-aligned grid placement.
+<p>Pack as many identical triangular pyramids (tetrahedra) as possible inside a
+given 3D shape without any overlaps. Unlike cubes, tetrahedra cannot tile space
+perfectly, so clever placement and rotation are essential.</p>
+<p>The AI must handle 3D collision detection and geometry. Subpasses use
+increasingly complex container shapes. The baseline uses a simple grid
+placement strategy.</p>
 """

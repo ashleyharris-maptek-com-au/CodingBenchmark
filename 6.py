@@ -1182,25 +1182,11 @@ def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
 
 
 highLevelSummary = """
-Orbital TSP combines the Travelling Salesman Problem with orbital mechanics.
-
-**Challenges:**
-- Stations are moving targets (orbiting at ~7 km/s)
-- Transfer costs depend on timing and orbital geometry
-- Plane changes are very expensive
-- Need to solve Lambert's problem for optimal transfers
-
-**Key orbital mechanics:**
-- **Two-body problem**: Kepler's laws govern motion
-- **Hohmann transfer**: Minimum fuel for coplanar circular orbits
-- **Lambert's problem**: Find orbit connecting two positions in given time
-- **Delta-V**: Velocity change = fuel consumption
-
-**Approaches:**
-- Simplify: Use energy/distance heuristics
-- Full solution: Implement orbital propagation + Lambert solver
-- Optimization: Try multiple orderings, pick minimum delta-V
-
-The baseline uses a greedy nearest-neighbor approach with simplified
-delta-V estimation based on orbital energy differences.
+<p>Visit a series of space stations orbiting Earth using the least fuel possible,
+then return to the starting station. Unlike a normal route-planning problem, every
+target is moving at thousands of metres per second and the &ldquo;cost&rdquo; of
+travelling between two stations depends on orbital physics, not straight-line distance.</p>
+<p>The AI must combine route optimisation with orbital mechanics. Subpasses add
+more stations and trickier orbit geometries. The baseline uses a simple
+nearest-neighbour heuristic with approximate fuel estimates.</p>
 """

@@ -89,7 +89,7 @@ class ComputeShaderRunner:
     if read_back is None:
       read_back = [k for k, v in buffer_types.items() if v == 'readwrite']
 
-    # Create shader module
+    # Create shader module (accepts SPIR-V bytes or WGSL string)
     shader_module = self.device.create_shader_module(code=spirv_binary)
 
     # Create GPU buffers
@@ -189,7 +189,8 @@ class ComputeShaderRunner:
                    extra_types: Optional[Dict[int, str]] = None,
                    workgroups: Tuple[int, int, int] = (1, 1, 1),
                    iterations: int = 1,
-                   entry_point: str = "main") -> bytes:
+                   entry_point: str = "main",
+                   capture_every: int = 0) -> bytes:
     """
     Run a compute shader with ping-pong buffers for iterative simulation.
 
@@ -210,10 +211,12 @@ class ComputeShaderRunner:
         entry_point: Shader entry point
 
     Returns:
-        Final output buffer contents as bytes
+        If capture_every == 0: Final output buffer contents as bytes
+        If capture_every > 0: Tuple of (final_bytes, list_of_captured_frame_bytes)
     """
     wgpu = self._wgpu
 
+    # Create shader module (accepts SPIR-V bytes or WGSL string)
     shader_module = self.device.create_shader_module(code=spirv_binary)
 
     # Create ping-pong buffers
@@ -275,6 +278,7 @@ class ComputeShaderRunner:
     bg_ba = make_bind_group(buf_b, buf_a)
 
     # Run iterations
+    captured_frames = []
     for i in range(iterations):
       bg = bg_ab if (i % 2 == 0) else bg_ba
       encoder = self.device.create_command_encoder()
@@ -285,10 +289,19 @@ class ComputeShaderRunner:
       compute_pass.end()
       self.device.queue.submit([encoder.finish()])
 
+      # Capture intermediate frame if requested
+      if capture_every > 0 and ((i + 1) % capture_every == 0 or i == iterations - 1):
+        out_buf = buf_b if (i % 2 == 0) else buf_a
+        captured_frames.append(bytes(self.device.queue.read_buffer(out_buf)))
+
     # Read final output (in buf_b if even iterations, buf_a if odd)
     final_buf = buf_b if (iterations % 2 != 0) else buf_a
     data = self.device.queue.read_buffer(final_buf)
-    return bytes(data)
+    final_bytes = bytes(data)
+
+    if capture_every > 0:
+      return final_bytes, captured_frames
+    return final_bytes
 
 
 def grade_compute(spirv_binary: bytes,
@@ -314,10 +327,11 @@ def grade_compute(spirv_binary: bytes,
   Returns:
       (score, explanation)
   """
-  # Validate SPIR-V
-  valid, err = validate_spirv(spirv_binary)
-  if not valid:
-    return 0.0, f"SPIR-V validation failed: {err}"
+  # Validate SPIR-V (skip for WGSL strings — already validated by compile_wgsl)
+  if not isinstance(spirv_binary, str):
+    valid, err = validate_spirv(spirv_binary)
+    if not valid:
+      return 0.0, f"SPIR-V validation failed: {err}"
 
   # Run
   try:
@@ -341,7 +355,7 @@ def grade_compute(spirv_binary: bytes,
     return 0.0, f"Verification failed: {e}"
 
 
-def grade_compute_pingpong(spirv_binary: bytes,
+def grade_compute_pingpong(spirv_binary,
                            initial_data: bytes,
                            extra_buffers: Optional[Dict[int, bytes]],
                            extra_types: Optional[Dict[int, str]],
@@ -349,7 +363,8 @@ def grade_compute_pingpong(spirv_binary: bytes,
                            iterations: int,
                            verify_fn,
                            runner: Optional[ComputeShaderRunner] = None,
-                           timeout: float = 30.0) -> Tuple[float, str]:
+                           timeout: float = 30.0,
+                           capture_every: int = 0) -> Tuple[float, str]:
   """
   Grade a ping-pong compute shader (iterative simulation).
 
@@ -367,9 +382,10 @@ def grade_compute_pingpong(spirv_binary: bytes,
   Returns:
       (score, explanation)
   """
-  valid, err = validate_spirv(spirv_binary)
-  if not valid:
-    return 0.0, f"SPIR-V validation failed: {err}"
+  if not isinstance(spirv_binary, str):
+    valid, err = validate_spirv(spirv_binary)
+    if not valid:
+      return 0.0, f"SPIR-V validation failed: {err}"
 
   try:
     if runner is None:
@@ -377,7 +393,8 @@ def grade_compute_pingpong(spirv_binary: bytes,
     t0 = time.perf_counter()
     result = runner.run_pingpong(
       spirv_binary, initial_data, len(initial_data),
-      extra_buffers, extra_types, workgroups, iterations)
+      extra_buffers, extra_types, workgroups, iterations,
+      capture_every=capture_every)
     elapsed = time.perf_counter() - t0
   except Exception as e:
     return 0.0, f"Compute dispatch failed: {e}"

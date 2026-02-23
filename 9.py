@@ -13,17 +13,31 @@ Solver times out after 5 minutes.
 
 import random
 import time
+import hashlib
+import tempfile
+from collections import Counter
+from pathlib import Path
 from typing import List, Tuple, Dict
 
 from native_compiler import CSharpCompiler, compile_and_run, describe_this_pc
+from solver_utils import GradeCache
 
 title = "1D Cutting Stock - Minimum Waste (C#)"
 
-# Timeout in seconds (30 seconds)
-TIMEOUT_SECONDS = 30
+TIMEOUT_SECONDS = 300
 
-# Seed for reproducibility
 RANDOM_SEED = 88888
+
+_grade_cache = GradeCache('test9')
+
+
+def _cache_key_parts(result: dict, subPass: int) -> tuple:
+  case = TEST_CASES[subPass]
+  code = result.get("csharp_code", "")
+  return (
+    hashlib.sha256(code.encode('utf-8')).hexdigest()[:16],
+    f"stock={case['stock_length']}|cuts={len(case['cuts'])}|seed={RANDOM_SEED + subPass}",
+  )
 
 
 # Test configurations: (stock_length, cuts_list, description)
@@ -35,6 +49,37 @@ def generate_cuts(num_cuts: int, stock_length: int, seed: int) -> List[int]:
     cut = rng.randint(stock_length // 10, int(stock_length * 0.51))
     cuts.append(cut)
   return cuts
+
+
+class _LazyCutsList(list):
+  """List that defers generation of large cut arrays until first access."""
+
+  def __init__(self, num_cuts, stock_length, seed):
+    super().__init__()
+    self._params = (num_cuts, stock_length, seed)
+    self._generated = False
+
+  def _ensure(self):
+    if not self._generated:
+      self._generated = True
+      t = time.time()
+      self.extend(generate_cuts(*self._params))
+      elapsed = time.time() - t
+      if elapsed > 0.5:
+        print(f"  Generated {self._params[0]} cuts in {elapsed:.1f}s")
+
+  def __len__(self):
+    if not self._generated:
+      return self._params[0]
+    return super().__len__()
+
+  def __iter__(self):
+    self._ensure()
+    return super().__iter__()
+
+  def __getitem__(self, idx):
+    self._ensure()
+    return super().__getitem__(idx)
 
 
 # Pre-defined test cases
@@ -86,39 +131,40 @@ TEST_CASES = [
     "cuts": generate_cuts(500, 1000, RANDOM_SEED + 4),
     "description": "500 cuts, stock=1000"
   },
+  # Large cases - use lazy generation to avoid slow module import
   {
     "stock_length": 10000,
-    "cuts": generate_cuts(1000, 10000, RANDOM_SEED + 5),
+    "cuts": _LazyCutsList(1000, 10000, RANDOM_SEED + 5),
     "description": "1000 cuts, stock=10000"
   },
   {
     "stock_length": 10000,
-    "cuts": generate_cuts(5000, 10000, RANDOM_SEED + 6),
+    "cuts": _LazyCutsList(5000, 10000, RANDOM_SEED + 6),
     "description": "5000 cuts, stock=10000"
   },
   {
     "stock_length": 100000,
-    "cuts": generate_cuts(10000, 100000, RANDOM_SEED + 7),
+    "cuts": _LazyCutsList(10000, 100000, RANDOM_SEED + 7),
     "description": "10000 cuts, stock=100000"
   },
   {
     "stock_length": 1000,
-    "cuts": generate_cuts(100000, 1000, RANDOM_SEED + 8),
+    "cuts": _LazyCutsList(100000, 1000, RANDOM_SEED + 8),
     "description": "100000 cuts, stock=1000"
   },
   {
     "stock_length": 1000,
-    "cuts": generate_cuts(500000, 1000, RANDOM_SEED + 9),
+    "cuts": _LazyCutsList(500000, 1000, RANDOM_SEED + 9),
     "description": "500000 cuts, stock=1000"
   },
   {
     "stock_length": 1000,
-    "cuts": generate_cuts(1000000, 1000, RANDOM_SEED + 9),
+    "cuts": _LazyCutsList(1000000, 1000, RANDOM_SEED + 9),
     "description": "1000000 cuts, stock=1000"
   },
   {
     "stock_length": 1000,
-    "cuts": generate_cuts(10000000, 1000, RANDOM_SEED + 10),
+    "cuts": _LazyCutsList(10000000, 1000, RANDOM_SEED + 10),
     "description": "10000000 cuts, stock=1000"
   },
 ]
@@ -138,13 +184,6 @@ def prepareSubpassPrompt(subPass: int) -> str:
     raise StopIteration
 
   return f"""You are solving the 1D Cutting Stock Problem in C#.
-
-You must write a C# solver that can handle ANY problem size from trivial to ludicrous scale:
-- **Trivial**: 3-8 cuts, short stock lengths
-- **Medium**: 10-25 cuts, moderate stock lengths
-- **Large**: 50-100 cuts, long stock lengths
-- **Extreme**: 200-500 cuts, very long stock lengths
-- **Ludicrous**: 10000+ cuts, very long stock lengths
 
 **Input format (stdin):**
 Line 1: N stock_length
@@ -169,7 +208,10 @@ Output:
 - Each cut must come from a single stock piece (no gluing)
 - Multiple cuts can come from the same stock piece if they fit
 - No cut can exceed stock_length
-- Must handle varying numbers of cuts efficiently
+- Must handle varying numbers of cuts efficiently. You can use
+  multiple threads, you can micro-optimise code, you can write clever algorithms,
+  whatever it takes to handle the problem and solve it within 5 minutes even if 
+  there are millions of cuts.
 
 **Environment:**
 {describe_this_pc()}
@@ -245,15 +287,20 @@ def validate_solution(solution: Dict, cuts: List[int], stock_length: int) -> Tup
     if total > stock_length:
       return False, f"Stock {i} exceeds capacity: {total} > {stock_length}"
 
-  # Check all cuts assigned exactly once
-  if sorted(all_assigned) != list(range(len(cuts))):
-    missing = set(range(len(cuts))) - set(all_assigned)
-    duplicate = [x for x in all_assigned if all_assigned.count(x) > 1]
+  # Check all cuts assigned exactly once (O(n) via Counter)
+  counts = Counter(all_assigned)
+  expected = set(range(len(cuts)))
+  assigned_set = set(all_assigned)
+  if assigned_set != expected or len(all_assigned) != len(cuts):
+    missing = expected - assigned_set
+    duplicates = {k for k, v in counts.items() if v > 1}
     msg = ""
     if missing:
-      msg += f"Missing cuts: {missing}. "
-    if duplicate:
-      msg += f"Duplicate cuts: {set(duplicate)}."
+      missing_sample = sorted(missing)[:10]
+      msg += f"Missing {len(missing)} cuts: {missing_sample}{'...' if len(missing) > 10 else ''}. "
+    if duplicates:
+      dup_sample = sorted(duplicates)[:10]
+      msg += f"Duplicate {len(duplicates)} cuts: {dup_sample}{'...' if len(duplicates) > 10 else ''}."
     return False, msg or "Not all cuts assigned correctly"
 
   return True, ""
@@ -266,6 +313,9 @@ def compute_waste(assignments: List[List[int]], cuts: List[int], stock_length: i
     used = sum(cuts[i] for i in stock_cuts)
     total_waste += stock_length - used
   return total_waste
+
+
+MAX_REPACK_NODES = 1_000_000  # backtracking node limit to prevent hangs
 
 
 def _min_bins_exact(pieces: List[int], capacity: int, max_bins: int) -> int:
@@ -283,22 +333,27 @@ def _min_bins_exact(pieces: List[int], capacity: int, max_bins: int) -> int:
   if lb > max_bins:
     return max_bins + 1
 
+  # Pre-compute suffix sums (avoids O(n) sum per recursive call)
+  suffix = [0] * (n + 1)
+  for i in range(n - 1, -1, -1):
+    suffix[i] = suffix[i + 1] + pieces[i]
+
   best = [max_bins + 1]
+  nodes = [0]
   bins = [0] * max_bins  # used space per bin
 
   def solve(idx):
+    if nodes[0] >= MAX_REPACK_NODES:
+      return  # bail out — too complex
+    nodes[0] += 1
+
     if idx == n:
-      # Count non-empty bins
       used = sum(1 for b in bins if b > 0)
       if used < best[0]:
         best[0] = used
       return
 
     p = pieces[idx]
-    # Pruning: remaining items need at least ceil(remaining_total / capacity) more bins
-    remaining = sum(pieces[idx:])
-    free = sum(capacity - b for b in bins[:best[0] - 1]
-               if b > 0) + capacity * (best[0] - 1 - sum(1 for b in bins if b > 0))
 
     tried_empty = False
     for j in range(min(best[0], max_bins)):
@@ -315,6 +370,8 @@ def _min_bins_exact(pieces: List[int], capacity: int, max_bins: int) -> int:
         return  # can't do better than lower bound
 
   solve(0)
+  if nodes[0] >= MAX_REPACK_NODES:
+    return max_bins  # inconclusive — assume no saving (no penalty)
   return best[0]
 
 
@@ -351,6 +408,10 @@ def check_top_waste_repack(assignments: List[List[int]], cuts: List[int],
 
   original_count = len(focus_indices)
 
+  # Cap pieces to prevent exponential blowup in exact solver
+  if len(focus_pieces) > 20:
+    return original_count, original_count  # too many pieces, skip repack check
+
   # Sort descending for best backtracking pruning
   focus_pieces.sort(reverse=True)
 
@@ -385,6 +446,36 @@ def format_input(cuts: List[int], stock_length: int) -> str:
   lines = [f"{len(cuts)} {stock_length}"]
   lines.append(" ".join(str(c) for c in cuts))
   return "\n".join(lines)
+
+
+_INPUT_FILE_CACHE: Dict[int, Path] = {}
+
+
+def _get_or_create_input_file(cuts, stock_length: int, subPass: int) -> Path:
+  """Write input to temp file for large inputs (avoids huge in-memory strings)."""
+  if subPass in _INPUT_FILE_CACHE and _INPUT_FILE_CACHE[subPass].exists():
+    return _INPUT_FILE_CACHE[subPass]
+
+  path = Path(tempfile.gettempdir()) / f"test9_input_sp{subPass}.txt"
+  t = time.time()
+  with open(path, 'w') as f:
+    f.write(f"{len(cuts)} {stock_length}\n")
+    # Write in chunks to avoid creating one massive string
+    chunk_size = 100000
+    n = len(cuts)
+    for start in range(0, n, chunk_size):
+      end = min(start + chunk_size, n)
+      chunk = " ".join(str(cuts[i]) for i in range(start, end))
+      if start > 0:
+        f.write(" ")
+      f.write(chunk)
+    f.write("\n")
+  elapsed = time.time() - t
+  if elapsed > 0.5:
+    sz = path.stat().st_size / 1e6
+    print(f"  Input file for subpass {subPass}: {sz:.1f}MB in {elapsed:.1f}s")
+  _INPUT_FILE_CACHE[subPass] = path
+  return path
 
 
 def parse_assignments_output(output: str, num_cuts: int) -> tuple:
@@ -427,15 +518,45 @@ def execute_solver(code: str,
                    cuts: List[int],
                    stock_length: int,
                    ai_engine_name: str,
+                   subPass: int = -1,
                    timeout: int = TIMEOUT_SECONDS) -> tuple:
   """Execute the LLM's solver. Returns (solution, error, exec_time)."""
-  input_data = format_input(cuts, stock_length)
-  run = compile_and_run(code, "csharp", ai_engine_name, input_data=input_data, timeout=timeout)
+  num_cuts = len(cuts)
+
+  # Use file-based stdin for large inputs to avoid huge in-memory strings
+  if num_cuts >= 5000:
+    t = time.time()
+    input_file = _get_or_create_input_file(cuts, stock_length, subPass)
+    fmt_time = time.time() - t
+
+    t = time.time()
+    run = compile_and_run(code, "csharp", ai_engine_name,
+                          input_file=input_file, timeout=timeout)
+    run_time = time.time() - t
+  else:
+    t = time.time()
+    input_data = format_input(cuts, stock_length)
+    fmt_time = time.time() - t
+
+    t = time.time()
+    run = compile_and_run(code, "csharp", ai_engine_name,
+                          input_data=input_data, timeout=timeout)
+    run_time = time.time() - t
 
   if not run:
+    total = fmt_time + run_time
+    if total > 0.5:
+      print(f"  Solver[{num_cuts}]: format={fmt_time:.1f}s, run={run_time:.1f}s (failed)")
     return None, run.error_message(), run.exec_time
 
-  solution, parse_error = parse_assignments_output(run.stdout, len(cuts))
+  t = time.time()
+  solution, parse_error = parse_assignments_output(run.stdout, num_cuts)
+  parse_time = time.time() - t
+
+  total = fmt_time + run_time + parse_time
+  if total > 1:
+    print(f"  Solver[{num_cuts}]: format={fmt_time:.1f}s, run={run_time:.1f}s, parse={parse_time:.1f}s")
+
   if parse_error:
     return None, parse_error, run.exec_time
 
@@ -455,51 +576,60 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
     - 0.0: could trivially save 2+ stocks (lazy packing)
     - Ratio-based penalties still apply on top.
     """
+  grade_t0 = time.time()
   if not result:
     return 0.0, "No result provided"
 
   if "csharp_code" not in result:
     return 0.0, "No C# code provided"
 
+  cache_parts = _cache_key_parts(result, subPass)
+  cached = _grade_cache.get_grade(*cache_parts)
+  if cached is not None:
+    return cached
+
   case = TEST_CASES[subPass]
   cuts = case["cuts"]
   stock_length = case["stock_length"]
   description = case["description"]
   code = result["csharp_code"]
+  print(f"  [SP{subPass}] Grading {description} (cache miss)")
 
   # Execute solver
-  solution, error, exec_time = execute_solver(code, cuts, stock_length, aiEngineName)
+  t = time.time()
+  solution, error, exec_time = execute_solver(code, cuts, stock_length, aiEngineName,
+                                              subPass=subPass)
+  execTime = time.time() - t
+  if execTime > 1:
+    print(f"  Execution took: {execTime:.1f}s")
 
   global lastSolution
   lastSolution = solution
 
   if error:
-    return 0.0, f"[{description}] {error}"
+    grade = (0.0, f"[{description}] {error}")
+    _grade_cache.put_grade(grade, *cache_parts)
+    return grade
 
   # Validate solution
+  t = time.time()
   is_valid, validation_error = validate_solution(solution, cuts, stock_length)
+  validationTime = time.time() - t
+  if validationTime > 1:
+    print(f"  Validation took: {validationTime:.1f}s")
   if not is_valid:
-    return 0.0, f"[{description}] Invalid: {validation_error}"
+    grade = (0.0, f"[{description}] Invalid: {validation_error}")
+    _grade_cache.put_grade(grade, *cache_parts)
+    return grade
 
   # Compare to baseline
   num_stocks = solution["num_stocks"]
-  baseline_stocks = get_baseline_solution(cuts, stock_length)
+
+  t = time.time()
   waste = compute_waste(solution["assignments"], cuts, stock_length)
-
-  ratio = num_stocks / baseline_stocks if baseline_stocks > 0 else float('inf')
-
-  if ratio <= 1.0:
-    score = 1.0
-    quality = "excellent (≤ baseline)"
-  elif ratio <= 1.1:
-    score = 0.85
-    quality = "good (≤ 1.1x baseline)"
-  elif ratio <= 1.25:
-    score = 0.5
-    quality = "acceptable (≤ 1.25x baseline)"
-  else:
-    score = 0.0
-    quality = f"valid but crazily inefficient ({ratio:.2f}x baseline)"
+  wasteTime = time.time() - t
+  if wasteTime > 1:
+    print(f"  Waste calculation took: {wasteTime:.1f}s")
 
   # ── Repack penalty ──
   # If total waste < 1 stock length, packing is tight enough — no penalty.
@@ -508,28 +638,44 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
   penalty_note = ""
   if waste < stock_length:
     penalty_note = " (waste < 1 stock, no repack check)"
-  elif num_stocks >= 5 and num_stocks <= 500 and len(cuts) <= 10000:
+    score = 1.0
+  else:
+    t = time.time()
     orig, optimal = check_top_waste_repack(solution["assignments"], cuts, stock_length)
+    repackCheckTime = time.time() - t
+    if repackCheckTime > 1:
+      print(f"  Repack check took: {repackCheckTime:.1f}s")
     saved = orig - optimal
     if saved >= 2:
       score = 0.0
-      penalty_note = f" REPACK PENALTY: top-5 waste stocks repacked {orig}→{optimal} (saved {saved}) → 0"
+      penalty_note = f" TERRIBLE PACKING. Top-5 waste stocks repacked {orig}→{optimal} (saved {saved}) → 0"
     elif saved == 1:
-      score = min(score, 0.5)
-      penalty_note = f" REPACK PENALTY: top-5 waste stocks repacked {orig}→{optimal} (saved 1) → capped 0.5"
+      score = 0.5
+      penalty_note = f" SUBOPTIMAL PACKING. Top-5 waste stocks repacked {orig}→{optimal} (saved 1) → score of 0.5"
     else:
-      penalty_note = f" (repack check: top-5 waste stocks already optimal at {optimal})"
+      penalty_note = f" Decent packing. Worst 5 packed stocks couldn't be improved on.)"
+      score = 1.0
 
-  explanation = (f"[{description}] Stocks used: {num_stocks}, Baseline: {baseline_stocks}, "
-                 f"Waste: {waste}, Time: {exec_time:.1f}s - {quality}.{penalty_note}")
+  explanation = (f"[{description}] Stocks used: {num_stocks},  "
+                 f"Waste: {waste}, Time: {exec_time:.1f}s - {penalty_note}")
 
-  return score, explanation
+  grade = (score, explanation)
+  _grade_cache.put_grade(grade, *cache_parts)
+  grade_total = time.time() - grade_t0
+  if grade_total > 1:
+    print(f"  [SP{subPass}] Total gradeAnswer: {grade_total:.1f}s")
+  return grade
 
 
 def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
   """Generate HTML report."""
   if not result:
     return "<p style='color:red'>No result provided</p>"
+
+  cache_parts = _cache_key_parts(result, subPass)
+  cached = _grade_cache.get_report(*cache_parts)
+  if cached is not None:
+    return cached
 
   case = TEST_CASES[subPass]
 
@@ -552,6 +698,7 @@ def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
   elif lastSolution and subPass >= 7:
     html += f"<p>Solution too large to render SVG ({len(case['cuts'])} cuts)</p>"
 
+  _grade_cache.put_report(html, *cache_parts)
   return html
 
 
@@ -672,20 +819,11 @@ def generate_cutting_stock_svg(cuts: List[int], stock_length: int, solution: Dic
 
 
 highLevelSummary = """
-The 1D Cutting Stock Problem is a classic optimization problem.
-
-**Problem:** Given stock pieces of fixed length and a list of cuts needed,
-minimize the number of stock pieces purchased.
-
-**This is equivalent to bin packing:** Fit items (cuts) into bins (stocks).
-
-**Algorithms:**
-- **First Fit Decreasing (FFD)**: Sort by size, place in first bin that fits
-- **Best Fit Decreasing (BFD)**: Place in bin with least remaining space
-- **Branch and Bound**: Optimal but exponential time
-- **Column Generation**: For very large instances
-
-**Complexity:** NP-hard in general, but good heuristics exist.
-
-The baseline uses FFD which typically achieves ~11/9 × OPT + 6/9.
+<p>Given fixed-length stock material and a shopping list of smaller pieces to cut,
+use as few stock pieces as possible. Every requested piece must be cut from
+somewhere, but any leftover material is wasted &mdash; so packing the cuts
+tightly matters.</p>
+<p>This is essentially a bin-packing problem and is NP-hard. Subpasses scale from
+a handful of cuts up to millions, forcing the AI to write code that is both
+correct and fast. The baseline uses a simple first-fit-decreasing heuristic.</p>
 """

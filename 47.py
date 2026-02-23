@@ -1,14 +1,14 @@
 """
-Test 47: Hash Mining / Proof of Work (HLSL Compute Shader)
+Test 47: Hash Mining / Proof of Work (WGSL Compute Shader)
 
-The LLM must write an HLSL compute shader that searches for a uint32 nonce
+The LLM must write a WGSL compute shader that searches for a uint32 nonce
 such that a custom hash of (base_data XOR nonce) has D trailing zero bits.
 This is a classic GPU-parallel brute-force search problem.
 
 This tests:
-1. HLSL compute shader proficiency
+1. WGSL compute shader proficiency
 2. Bitwise operations and hash function implementation on GPU
-3. Parallel search with atomic result reporting
+3. Parallel search with result reporting (no atomics needed)
 4. Performance at scale (embarrassingly parallel)
 
 Buffer layout:
@@ -28,10 +28,10 @@ from typing import Tuple, Optional
 
 import numpy as np
 
-from shader_test_utils import compile_hlsl, validate_spirv
+from shader_test_utils import compile_wgsl
 from compute_test_utils import ComputeShaderRunner, grade_compute
 
-title = "Hash Mining / Proof of Work (HLSL Compute)"
+title = "Hash Mining / Proof of Work (WGSL Compute)"
 
 RANDOM_SEED = 47474747
 TIMEOUT_SECONDS = 60
@@ -141,22 +141,16 @@ def make_params_buffer(difficulty, range_start, range_size):
 # Prompt
 # ---------------------------------------------------------------------------
 
-HLSL_INTERFACE = """**HLSL Compute Shader Interface:**
+WGSL_INTERFACE = """**WGSL Compute Shader Interface:**
 
-```hlsl
-// Binding 0: Base data to hash (16 uint values)
-[[vk::binding(0, 0)]] StructuredBuffer<uint> baseData;  // length 16
+```wgsl
+@group(0) @binding(0) var<storage, read>       baseData : array<u32, 16>;
+@group(0) @binding(1) var<storage, read_write>  result   : array<u32, 4>;
+@group(0) @binding(2) var<uniform>              params   : vec4<u32>;
+// params.x = difficulty, params.y = range_start, params.z = range_size
 
-// Binding 1: Result buffer [found_flag, nonce, hash_lo, hash_hi]
-[[vk::binding(1, 0)]] RWStructuredBuffer<uint> result;   // length 4
-
-// Binding 2: Parameters [difficulty, range_start, range_size, 0]
-[[vk::binding(2, 0)]] cbuffer Params {
-    uint4 params;  // .x=difficulty, .y=range_start, .z=range_size
-};
-
-[numthreads(256, 1, 1)]
-void main(uint3 dtid : SV_DispatchThreadID) { ... }
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid : vec3<u32>) { ... }
 ```
 
 **Task:** Write a compute shader that searches for a uint32 nonce such that
@@ -187,20 +181,20 @@ function custom_hash(data[16], nonce) -> (h0, h1):
 That is, count from h0's LSB first; if h0 == 0, add 32 and continue counting from h1.
 
 **Algorithm:**
-1. Each thread computes: my_nonce = params.y + dtid.x  (range_start + thread ID)
-2. Guard: if my_nonce >= params.y + params.z, return (out of range)
+1. Each thread computes: my_nonce = params.y + gid.x  (range_start + thread ID)
+2. Guard: if gid.x >= params.z, return (out of range)
 3. Compute hash, count trailing zeros
 4. If trailing_zeros >= difficulty:
-   Write result[0]=1, result[1]=nonce, result[2]=h0, result[3]=h1
+   Write result[0]=1u, result[1]=nonce, result[2]=h0, result[3]=h1
    (Race writes are acceptable - any valid nonce will be verified on CPU)
 
-**Important implementation notes:**
+**Important WGSL notes:**
+- Use `var state : array<u32, 16>` for the mutable hash state.
+- WGSL rotation: `(x << shift) | (x >> (32u - shift))` — all values must be u32.
 - The inner quarter-round loop MUST be unrolled (write out all 4 groups
-  of s[0..3], s[4..7], s[8..11], s[12..15] explicitly). Do NOT use
-  a `for (g = 0; g < 16; g += 4)` loop with dynamic array indexing.
-- For counting trailing zeros, use a binary search approach (check
-  lower 16 bits, then 8, then 4, etc.) rather than `firstbitlow()`.
-- Do NOT use InterlockedCompareExchange or any atomic operations.
+  of state[0..3], state[4..7], state[8..11], state[12..15] explicitly).
+- Do NOT use atomics. Plain stores to result[] are sufficient.
+- All integer literals must be typed: use `0u`, `1u`, `16u`, `32u` etc.
 
 The shader will be dispatched with ceil(range_size / 256) workgroups.
 Only ONE dispatch is performed - find the nonce in a single pass.
@@ -215,16 +209,15 @@ def prepareSubpassPrompt(subPass):
   for i, (diff, rng) in enumerate(SUBPASSES):
     configs.append(f"  Subpass {i}: difficulty={diff} bits, search_range={rng:,}")
 
-  return f"""Write an HLSL compute shader for hash mining (proof-of-work).
+  return f"""Write a WGSL compute shader for hash mining (proof-of-work).
 
-{HLSL_INTERFACE}
+{WGSL_INTERFACE}
 
 **Test Configurations:**
 {chr(10).join(configs)}
 
-Write the complete HLSL compute shader source code.
+Write the complete WGSL compute shader source code.
 The shader must implement the exact hash function described above.
-Use InterlockedCompareExchange to safely report the first valid nonce found.
 """
 
 
@@ -239,7 +232,7 @@ structure = {
     },
     "shader_code": {
       "type": "string",
-      "description": "Complete HLSL compute shader source code"
+      "description": "Complete WGSL compute shader source code"
     }
   },
   "required": ["reasoning", "shader_code"],
@@ -260,15 +253,11 @@ def _grade_answer_inner(result, subPass, aiEngineName):
 
   code = result["shader_code"]
 
-  # Compile HLSL to SPIR-V
+  # Validate WGSL
   try:
-    spirv = compile_hlsl(code, stage="comp")
+    wgsl = compile_wgsl(code)
   except RuntimeError as e:
-    return 0.0, f"HLSL compilation failed: {e}"
-
-  valid, err = validate_spirv(spirv)
-  if not valid:
-    return 0.0, f"SPIR-V validation failed: {err}"
+    return 0.0, f"WGSL compilation failed: {e}", {}
 
   difficulty, range_size = SUBPASSES[subPass]
 
@@ -347,7 +336,7 @@ def _grade_answer_inner(result, subPass, aiEngineName):
                    f"hash=({cpu_h0:#010x}, {cpu_h1:#010x}), "
                    f"trailing zeros={tz} >= {difficulty}")
 
-    score, explanation = grade_compute(spirv,
+    score, explanation = grade_compute(wgsl,
                          buffers={
                            0: base_buf,
                            1: result_buf,
@@ -482,3 +471,14 @@ def resultToNiceReport(result, subPass, aiEngineName):
     {f"<div style='margin-top:6px;font-size:12px;color:#b91c1c;'>Error: {error}</div>" if error else ""}
   </div>
   """
+
+
+highLevelSummary = """
+<p>Write a GPU compute shader in WGSL that performs hash mining &mdash; the same kind
+of brute-force search used in cryptocurrency proof-of-work. The shader must find a
+number (nonce) whose hash has a specified number of trailing zero bits, searching
+millions of candidates in parallel on the GPU.</p>
+<p>Subpasses increase the difficulty (more trailing zeros required), demanding that the
+shader correctly implement bitwise hashing and parallel search. The found nonce is
+verified on the CPU.</p>
+"""

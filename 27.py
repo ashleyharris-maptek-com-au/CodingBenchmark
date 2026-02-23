@@ -638,12 +638,12 @@ def _generate_graph_svg(viz: dict) -> str:
 
 
 highLevelSummary = """
-Graph coloring assigns colors to vertices such that no adjacent vertices share a color.
-
-**Algorithms:**
-- **Greedy**: O(V+E), simple but may use more colors than optimal
-- **DSatur**: Prioritizes vertices with most colored neighbors
-- **Backtracking**: Exact but exponential for chromatic number
+<p>Colour the nodes of a graph using as few colours as possible, with the rule that
+no two connected nodes may share the same colour. This is the same idea as
+colouring a map so that no neighbouring countries are the same colour.</p>
+<p>Finding the minimum number of colours is NP-hard. Subpasses increase the graph
+size and connectivity. The AI&rsquo;s colouring must be valid (no clashes) and
+use as few colours as possible.</p>
 """
 
 

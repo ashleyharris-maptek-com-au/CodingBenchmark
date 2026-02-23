@@ -22,6 +22,7 @@ from pathlib import Path
 
 # Import our native compiler helper
 from native_compiler import CppCompiler, CompilationError, ExecutionError, describe_this_pc
+from solver_utils import GradeCache
 
 title = "3D Lunar Lander Game (C++)"
 
@@ -33,6 +34,19 @@ RANDOM_SEED = 24242424
 
 MAX_VIS_VOLUME = 2_000_000
 LAST_LANDER_STATS: Dict[Tuple[int, str], Dict] = {}
+
+_grade_cache = GradeCache("test24")
+
+
+def _cache_key_parts(result: dict, subPass: int) -> tuple:
+  case = TEST_CASES[subPass]
+  code = result.get("cpp_code", "")
+  return (
+    hashlib.sha256(code.encode("utf-8")).hexdigest()[:16],
+    (f"w={case['width']}|d={case['depth']}|h={case['height']}|"
+     f"g={case['gravity']}|th={case['max_thrust']}|fuel={case['fuel']}|"
+     f"t={case['max_time']}|seed={RANDOM_SEED + subPass}"),
+  )
 
 
 def _perlin_fade(t: float) -> float:
@@ -1244,6 +1258,11 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
   if "cpp_code" not in result:
     return 0.0, "No C++ code provided"
 
+  cache_parts = _cache_key_parts(result, subPass)
+  cached = _grade_cache.get_grade(*cache_parts)
+  if cached is not None:
+    return cached
+
   case = TEST_CASES[subPass]
   description = case["description"]
   t = time.time()
@@ -1270,12 +1289,18 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
                  f"Distance: {distance:.1f}m, "
                  f"Time: {exec_time:.2f}s")
 
-  return score, explanation
+  grade = (score, explanation)
+  _grade_cache.put_grade(grade, *cache_parts)
+  return grade
 
 
 def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
   if not result:
     return "<p style='color:red'>No result provided</p>"
+  cache_parts = _cache_key_parts(result, subPass)
+  cached = _grade_cache.get_report(*cache_parts)
+  if cached is not None:
+    return cached
   case = TEST_CASES[subPass]
   html = f"<h4>3D Lunar Lander - {case['description']}</h4>"
   if "reasoning" in result:
@@ -1348,16 +1373,17 @@ def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
           f"<pre style='white-space: pre-wrap; background: #0b1120; color: #e2e8f0; padding: 10px; border-radius: 6px;'>"
           f"{log_text}</pre></details>"
         )
+
+  _grade_cache.put_report(html, *cache_parts)
   return html
 
 
 highLevelSummary = """
-3D Lunar Lander extends lander control to full 3D with attitude control.
-
-**Key concepts:**
-- 6DOF physics (position + orientation)
-- Thrust vectoring via pitch/yaw
-- Binary terrain file with ground + floating rock layers (3x uint16 per cell)
-- 3D Perlin noise terrain generation
-- Real-time async IO with startup grace period for terrain parsing
+<p>Land a spacecraft on a 3D lunar surface with full attitude control. Unlike the
+2D version, the lander can pitch, yaw, and roll, and the terrain is a detailed
+3D heightmap with floating rock obstacles. The AI must parse a binary terrain
+file and navigate to a safe touchdown.</p>
+<p>Subpasses vary the terrain complexity, starting conditions, and obstacle density.
+The AI must handle 6-degree-of-freedom physics and real-time control in three
+dimensions.</p>
 """

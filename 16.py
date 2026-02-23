@@ -568,26 +568,10 @@ def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
 
 
 highLevelSummary = """
-Job-Shop Scheduling is a classic NP-hard optimization problem.
-
-**Problem:** Assign tasks to machines, respecting precedence and resource constraints,
-to minimize makespan (total completion time).
-
-**Constraints:**
-- Each job has ordered sequence of tasks
-- Each task requires specific machine
-- Machine can only run one task at a time
-- Tasks are non-preemptive
-
-**Algorithms:**
-1. **Priority dispatch rules:** SPT, LPT, FIFO, Most Work Remaining
-2. **Shifting Bottleneck:** Iteratively solve single-machine subproblems
-3. **Genetic algorithms:** Evolve operation permutations
-4. **Constraint programming:** Model and solve with CP-SAT
-5. **Branch and bound:** Exact but exponential
-
-**Complexity:** NP-hard, but good heuristics achieve near-optimal results.
-
-The baseline uses greedy first-fit scheduling - always schedule the task
-that can start earliest.
+<p>Schedule a set of jobs across several machines to finish everything as quickly
+as possible. Each job is a sequence of tasks that must run in order, and each
+task needs a specific machine &mdash; but a machine can only do one thing at a time.</p>
+<p>This classic factory-scheduling problem is NP-hard. Subpasses increase the
+number of jobs and machines. The baseline greedily starts whichever task can
+begin earliest.</p>
 """

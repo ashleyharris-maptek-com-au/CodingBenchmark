@@ -875,10 +875,9 @@ def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
 
 
 highLevelSummary = """
-Lunar Lander controls thrust to achieve soft landing on lunar surface.
-
-**Key concepts:**
-- Physics simulation (gravity, thrust, fuel)
-- PID control or optimal control theory
-- State estimation and trajectory planning
+<p>Land a spacecraft softly on the Moon. The lander starts above the surface with
+some velocity, and the AI must control the main thruster and side jets to touch
+down gently &mdash; too fast and it crashes, too much fuel wasted and it runs dry.</p>
+<p>Subpasses vary the starting altitude, velocity, and terrain. The AI must handle
+2D physics, fuel management, and real-time control to achieve a safe landing.</p>
 """

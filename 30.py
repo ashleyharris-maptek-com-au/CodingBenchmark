@@ -583,9 +583,12 @@ def _generate_sat_svg(viz: dict) -> str:
 
 
 highLevelSummary = """
-3-SAT asks whether a boolean formula (each clause has 3 literals joined by OR,
-all clauses joined by AND) can be satisfied.  All test instances have a planted
-satisfying assignment; the solver must discover one.
+<p>Given a logic puzzle made of true/false variables &mdash; where each rule says
+&ldquo;at least one of these three things must be true&rdquo; and all rules must hold
+simultaneously &mdash; find an assignment that satisfies every rule.</p>
+<p>This is the classic 3-SAT problem, one of the first problems proven to be
+NP-complete. Every test instance has a hidden satisfying assignment the AI must
+discover. Subpasses increase the number of variables and clauses.</p>
 """
 
 

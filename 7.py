@@ -1018,25 +1018,10 @@ def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
 
 
 highLevelSummary = """
-CSG (Constructive Solid Geometry) Union combines two 3D shapes into one.
-
-**The challenge:**
-- Handle intersecting geometry correctly
-- Split faces along intersection curves
-- Determine which faces are inside/outside
-- Produce valid watertight mesh
-
-**Approaches:**
-1. **BSP Trees**: Binary space partitioning for face classification
-2. **Mesh boolean libraries**: trimesh, pycsg, pymesh
-3. **External tools**: OpenSCAD, CGAL
-4. **Voxelization**: Convert to voxels, union, convert back
-
-**Key operations:**
-- Triangle-triangle intersection
-- Point-in-polyhedron tests
-- Edge-face intersection
-- Mesh merging and cleanup
-
-The placebo uses an existing CSG library for correctness.
+<p>Given two overlapping 3D shapes (triangle meshes), merge them into a single
+combined shape &mdash; like gluing two lumps of clay together and keeping only the
+outer surface. The output mesh must be watertight with no self-intersections.</p>
+<p>The AI must correctly handle the tricky geometry where the two shapes overlap:
+splitting triangles, discarding interior faces, and stitching everything back
+together. Subpasses use increasingly complex shape pairs.</p>
 """

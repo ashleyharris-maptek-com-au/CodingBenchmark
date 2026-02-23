@@ -845,25 +845,10 @@ def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
 
 
 highLevelSummary = """
-3D Bin Packing with polyhedra is a challenging geometric optimization problem.
-
-**Problem:** Pack as many copies of a polyhedron into a box as possible.
-
-**Key challenges:**
-- 3D rotation adds complexity (quaternions)
-- Collision detection in 3D
-- Irregular shapes don't pack efficiently
-
-**Algorithms:**
-- **Grid-based**: For regular shapes, use grid placement
-- **Layer-by-layer**: Pack 2D layers, stack them
-- **Greedy bottom-left-back**: Place at first valid position
-- **Genetic algorithms**: For complex shapes
-
-**Required operations:**
-- Quaternion rotation
-- AABB containment check
-- Mesh-mesh intersection (simplified: AABB overlap)
-
-The baseline uses simple grid placement without rotation optimization.
+<p>Pack as many copies of an irregular 3D shape into a box as possible, without
+any overlaps or pieces poking outside. The shapes can be rotated freely, so
+finding the best orientations is part of the puzzle.</p>
+<p>The AI must handle 3D collision detection and spatial reasoning. Subpasses
+use increasingly awkward shapes that resist neat stacking. The baseline uses
+a simple grid placement without rotation optimisation.</p>
 """

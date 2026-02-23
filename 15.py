@@ -15,13 +15,19 @@ Goals:
 Solver times out after 5 minutes.
 """
 
+import hashlib
 import json
 import math
+import os
 import random
 import time
 from typing import List, Tuple, Dict, Set
 
+import numpy as np
+from PIL import Image, ImageDraw
+
 from native_compiler import RustCompiler, compile_and_run, describe_this_pc
+from solver_utils import GradeCache
 
 title = "Tetrahedron Shadow Covering (Rust)"
 
@@ -40,6 +46,10 @@ TETRA_VERTICES = [
 ]
 
 TETRA_SIZE = 2.0  # Approximate size
+MAX_TETRA_SCALE = 10.0  # Maximum allowed scale factor per tetrahedron
+
+# Numpy array of tetrahedron vertices for vectorized ops: shape (4, 3)
+TETRA_VERTICES_NP = np.array(TETRA_VERTICES, dtype=np.float64)
 
 
 def make_rectangle_poly(w: float, h: float) -> List[Tuple[float, float]]:
@@ -189,6 +199,7 @@ Vertices (before transform):
 **Constraints:**
 - Combined shadows must completely cover target polygon
 - Tetrahedrons must not intersect each other in 3D
+- Maximum scale factor per tetrahedron: 10.0
 - Minimize number of tetrahedrons
 
 **Environment:**
@@ -305,24 +316,9 @@ def get_tetrahedron_shadow(position, quaternion, scale, sun_vector):
   return convex_hull_2d(shadow_points)
 
 
-def point_in_polygon(point, polygon):
-  """Ray casting point-in-polygon test."""
-  x, y = point
-  n = len(polygon)
-  inside = False
-  j = n - 1
-  for i in range(n):
-    xi, yi = polygon[i]
-    xj, yj = polygon[j]
-    if ((yi > y) != (yj > y)) and (x < (xj - xi) * (y - yi) / (yj - yi) + xi):
-      inside = not inside
-    j = i
-  return inside
-
-
-def check_coverage_rasterized(shadows, target_polygon, resolution=100):
+def check_coverage_rasterized(shadows, target_polygon, resolution=None):
   """
-    Check shadow coverage using rasterization.
+    Check shadow coverage using PIL rasterization.
     Returns (coverage_ratio, covered_pixels, total_pixels).
     """
   bounds = polygon_bounds(target_polygon)
@@ -334,42 +330,97 @@ def check_coverage_rasterized(shadows, target_polygon, resolution=100):
   if width <= 0 or height <= 0:
     return 1.0, 0, 0
 
-  step_x = width / resolution
-  step_y = height / resolution
+  # Scale resolution with target size for accuracy, capped for performance
+  if resolution is None:
+    resolution = max(100, min(500, int(max(width, height))))
 
-  total_in_target = 0
-  covered = 0
+  scale_x = resolution / width
+  scale_y = resolution / height
 
-  for i in range(resolution):
-    for j in range(resolution):
-      px = min_x + (i + 0.5) * step_x
-      py = min_y + (j + 0.5) * step_y
+  def world_to_pixel(poly):
+    return [(int((x - min_x) * scale_x), int((y - min_y) * scale_y)) for x, y in poly]
 
-      if point_in_polygon((px, py), target_polygon):
-        total_in_target += 1
-        # Check if covered by any shadow
-        for shadow in shadows:
-          if len(shadow) >= 3 and point_in_polygon((px, py), shadow):
-            covered += 1
-            break
+  # Rasterize target polygon
+  target_img = Image.new('L', (resolution, resolution), 0)
+  target_draw = ImageDraw.Draw(target_img)
+  target_draw.polygon(world_to_pixel(target_polygon), fill=255)
+  target_arr = np.array(target_img)
 
+  # Rasterize union of all shadows
+  shadow_img = Image.new('L', (resolution, resolution), 0)
+  shadow_draw = ImageDraw.Draw(shadow_img)
+  for shadow in shadows:
+    if len(shadow) >= 3:
+      shadow_draw.polygon(world_to_pixel(shadow), fill=255)
+  shadow_arr = np.array(shadow_img)
+
+  # Compute coverage
+  target_mask = target_arr > 0
+  total_in_target = int(np.count_nonzero(target_mask))
   if total_in_target == 0:
     return 1.0, 0, 0
 
+  covered = int(np.count_nonzero(target_mask & (shadow_arr > 0)))
   return covered / total_in_target, covered, total_in_target
 
 
-def aabb_intersect_3d(verts1, verts2):
-  """Check if AABBs of two vertex sets intersect."""
-  min1 = [min(v[i] for v in verts1) for i in range(3)]
-  max1 = [max(v[i] for v in verts1) for i in range(3)]
-  min2 = [min(v[i] for v in verts2) for i in range(3)]
-  max2 = [max(v[i] for v in verts2) for i in range(3)]
+def _quat_rotate_batch(q, points):
+  """
+  Rotate an array of points by quaternion q [w,x,y,z] using numpy.
+  q: (4,) array  [w, x, y, z]
+  points: (N, 3) array
+  Returns: (N, 3) array
+  """
+  w, qx, qy, qz = q
+  px, py, pz = points[:, 0], points[:, 1], points[:, 2]
 
-  for i in range(3):
-    if max1[i] < min2[i] - 0.01 or min1[i] > max2[i] + 0.01:
-      return False
-  return True
+  t0 = w * w - qx * qx - qy * qy - qz * qz
+  t1 = 2 * (qx * px + qy * py + qz * pz)
+  t2 = 2 * w
+
+  rx = t0 * px + t1 * qx + t2 * (qy * pz - qz * py)
+  ry = t0 * py + t1 * qy + t2 * (qz * px - qx * pz)
+  rz = t0 * pz + t1 * qz + t2 * (qx * py - qy * px)
+
+  return np.column_stack([rx, ry, rz])
+
+
+def _batch_compute_shadows(placements, sun_vector):
+  """
+  Vectorized shadow computation for all placements at once.
+  Returns list of shadow polygons (as lists of tuples).
+  """
+  n = len(placements)
+  if n == 0:
+    return []
+
+  sun = np.array(sun_vector, dtype=np.float64)
+  # For each placement, transform 4 tetra vertices -> project -> convex hull
+  shadows = []
+  for p in placements:
+    pos = np.array(p.get("position", [0, 0, 1]), dtype=np.float64)
+    quat = np.array(p.get("quaternion", [1, 0, 0, 0]), dtype=np.float64)
+    scale = p.get("scale", 1.0)
+
+    # Scale + rotate + translate all 4 vertices at once
+    scaled = TETRA_VERTICES_NP * scale
+    rotated = _quat_rotate_batch(quat, scaled)
+    transformed = rotated + pos
+
+    # Project to shadow plane (z=0)
+    if abs(sun[2]) < 0.001:
+      shadow_pts = transformed[:, :2]
+    else:
+      t = -transformed[:, 2] / sun[2]
+      shadow_x = transformed[:, 0] + t * sun[0]
+      shadow_y = transformed[:, 1] + t * sun[1]
+      shadow_pts = np.column_stack([shadow_x, shadow_y])
+
+    pts_tuples = [tuple(row) for row in shadow_pts]
+    hull = convex_hull_2d(pts_tuples)
+    shadows.append(hull)
+
+  return shadows
 
 
 def validate_solution(solution, target_polygon, sun_vector):
@@ -386,26 +437,16 @@ def validate_solution(solution, target_polygon, sun_vector):
   if len(placements) != count:
     return False, f"Placement count mismatch", 0, 0
 
-  # Collect shadows and check intersections
-  shadows = []
-  tetra_verts = []
-
+  # Validate scales
   for i, p in enumerate(placements):
-    pos = p.get("position", [0, 0, 1])
-    quat = p.get("quaternion", [1, 0, 0, 0])
     scale = p.get("scale", 1.0)
+    if scale > MAX_TETRA_SCALE:
+      return False, f"Tetrahedron {i} scale {scale:.1f} exceeds max {MAX_TETRA_SCALE}", 0, 0
+    if scale <= 0:
+      return False, f"Tetrahedron {i} has invalid scale {scale}", 0, 0
 
-    verts = transform_tetrahedron(pos, quat, scale)
-    shadow = get_tetrahedron_shadow(pos, quat, scale, sun_vector)
-
-    # Check intersection with previous tetrahedrons (AABB only)
-    for j, prev_verts in enumerate(tetra_verts):
-      if aabb_intersect_3d(verts, prev_verts):
-        # Note: This is approximate - full intersection test is complex
-        pass  # Allow for now, rely on AABB
-
-    tetra_verts.append(verts)
-    shadows.append(shadow)
+  # Batch compute all shadows using numpy
+  shadows = _batch_compute_shadows(placements, sun_vector)
 
   # Check coverage
   coverage, covered, total = check_coverage_rasterized(shadows, target_polygon)
@@ -492,6 +533,16 @@ def execute_solver(code: str,
   return solution, None, run.exec_time
 
 
+_grade_cache = GradeCache('test15')
+
+
+def _cache_key_parts(result, subPass):
+  """Build cache key from code hash + subpass."""
+  code = result.get("rust_code", "") if isinstance(result, dict) else ""
+  code_hash = hashlib.sha256(code.encode('utf-8')).hexdigest()[:16]
+  return (code_hash, str(subPass))
+
+
 def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
   """Grade the shadow covering solver."""
   if not result:
@@ -499,6 +550,12 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
 
   if "rust_code" not in result:
     return 0.0, "No Rust code provided"
+
+  # Check cache
+  cache_parts = _cache_key_parts(result, subPass)
+  cached = _grade_cache.get_grade(*cache_parts)
+  if cached is not None:
+    return cached
 
   case = TEST_CASES[subPass]
   target = case["polygon"]
@@ -515,13 +572,17 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
   lastCase = case
 
   if error:
-    return 0.0, f"[{description}] {error}"
+    grade = (0.0, f"[{description}] {error}")
+    _grade_cache.put_grade(grade, *cache_parts)
+    return grade
 
   # Validate solution
   is_valid, validation_error, coverage, count = validate_solution(solution, target, sun)
 
   if not is_valid:
-    return 0.0, f"[{description}] {validation_error}"
+    grade = (0.0, f"[{description}] {validation_error}")
+    _grade_cache.put_grade(grade, *cache_parts)
+    return grade
 
   # Score based on coverage
   if coverage >= 0.95:
@@ -539,7 +600,9 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
 
   explanation = (f"[{description}] {quality}, Time: {exec_time:.1f}s")
 
-  return coverage_score, explanation
+  grade = (coverage_score, explanation)
+  _grade_cache.put_grade(grade, *cache_parts)
+  return grade
 
 
 lastSolution = None
@@ -550,6 +613,11 @@ def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
   """Generate HTML report."""
   if not result:
     return "<p style='color:red'>No result provided</p>"
+
+  cache_parts = _cache_key_parts(result, subPass)
+  cached = _grade_cache.get_report(*cache_parts)
+  if cached is not None:
+    return cached
 
   case = TEST_CASES[subPass]
 
@@ -789,29 +857,15 @@ def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
     except Exception as e:
       html += f"<p style='color:orange;'>3D visualization error: {str(e)}</p>"
 
+  _grade_cache.put_report(html, *cache_parts)
   return html
 
 
 highLevelSummary = """
-Shadow covering with tetrahedrons is a geometric optimization problem.
-
-**Problem:** Place 3D tetrahedrons such that their projected shadows cover a 2D target.
-
-**Key concepts:**
-- **Shadow projection:** Project 3D vertices along sun vector to z=0 plane
-- **Convex hull:** Tetrahedron shadow is convex hull of 4 projected vertices
-- **Coverage:** Union of all shadows must contain target polygon
-
-**Approaches:**
-1. **Grid placement:** Place tetrahedrons in grid above target, scale to cover
-2. **Greedy covering:** Iteratively place tetrahedrons to cover uncovered areas
-3. **Optimization:** Minimize count while maximizing coverage
-
-**Geometric operations:**
-- Quaternion rotation
-- Projection along direction vector
-- Convex hull computation
-- Point-in-polygon testing
-
-The baseline uses simple grid-based placement with scaled tetrahedrons.
+<p>Place 3D tetrahedra (triangular pyramids) above a flat surface so that their
+shadows, cast by a directional light, completely cover a given 2D target shape.
+Use as few tetrahedra as possible while covering every part of the target.</p>
+<p>The AI must reason about 3D-to-2D projection, rotation, and coverage geometry.
+Subpasses use more complex target shapes and trickier light angles. The baseline
+uses a simple grid of tetrahedra above the target.</p>
 """

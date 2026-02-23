@@ -28,8 +28,11 @@ Pixel shader output:
   float4 : SV_Target0  -- RGBA, format rgba8unorm
 """
 
+import json
 import os
+import subprocess
 import sys
+import tempfile
 from typing import Tuple, Optional, Dict
 from PIL import Image
 
@@ -40,6 +43,8 @@ from shader_test_utils import (
 )
 
 title = "HLSL Fragment Shaders"
+
+TIMEOUT_SECONDS = 60
 
 _renderer_instance: Optional[ShaderRenderer] = None
 _OUTPUT_IMAGE_CACHE: Dict[Tuple[int, str], str] = {}
@@ -277,11 +282,11 @@ def prepareSubpassPrompt(subPass: int) -> str:
 extraGradeAnswerRuns = []
 
 
-def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
+def _grade_answer_inner(result: dict, subPass: int, aiEngineName: str) -> tuple:
     if not result:
-        return 0.0, "No result provided"
+        return 0.0, "No result provided", {"error": "no_result"}
     if "shader_code" not in result:
-        return 0.0, "No shader code provided"
+        return 0.0, "No shader code provided", {"error": "no_shader_code"}
 
     desc = SUBPASSES[subPass]["description"]
     hlsl_src = result["shader_code"]
@@ -290,33 +295,106 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
     try:
         frag_spirv = compile_hlsl(hlsl_src, stage="frag", entry_point="main")
     except RuntimeError as e:
-        return 0.0, f"[{desc}] HLSL compilation failed: {e}"
+        return 0.0, f"[{desc}] HLSL compilation failed: {e}", {"error": str(e)}
 
     try:
         renderer = _get_renderer()
     except Exception as e:
-        return 0.0, f"[{desc}] Failed to create renderer: {e}"
+        return 0.0, f"[{desc}] Failed to create renderer: {e}", {"error": str(e)}
 
     valid, err = validate_spirv(frag_spirv)
     if not valid:
-        return 0.0, f"[{desc}] SPIR-V validation failed: {err}"
+        return 0.0, f"[{desc}] SPIR-V validation failed: {err}", {"error": err}
 
     try:
         pixels = renderer.render(frag_spirv)
     except Exception as e:
-        return 0.0, f"[{desc}] Rendering failed: {e}"
+        return 0.0, f"[{desc}] Rendering failed: {e}", {"error": str(e)}
 
-    _OUTPUT_IMAGE_CACHE[(subPass, aiEngineName)] = _save_rendered_image(
-        43, subPass, aiEngineName, pixels
-    )
+    output_image = _save_rendered_image(43, subPass, aiEngineName, pixels)
 
     reference = load_reference(41, subPass)
     if reference is None:
         save_reference(pixels, 41, subPass)
-        return 1.0, f"[{desc}] No reference - saved current render as reference"
+        return 1.0, f"[{desc}] No reference - saved current render as reference", {
+            "output_image": output_image
+        }
 
     score, explanation = compare_images(pixels, reference, color_tolerance=2, spatial_tolerance=1)
-    return score, f"[{desc}] {explanation}"
+    return score, f"[{desc}] {explanation}", {"output_image": output_image}
+
+
+def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
+    """Run grading in an isolated subprocess to survive GPU hangs/TDRs."""
+    if not result or "shader_code" not in result:
+        return 0.0, "No shader code provided"
+
+    payload = {
+        "shader_code": result.get("shader_code", ""),
+        "subPass": subPass,
+        "aiEngineName": aiEngineName,
+    }
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        in_path = os.path.join(tmp_dir, "grade_input.json")
+        out_path = os.path.join(tmp_dir, "grade_output.json")
+        with open(in_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+
+        cmd = [sys.executable, __file__, "--grade", in_path, out_path]
+        try:
+            subprocess.run(
+                cmd,
+                check=False,
+                timeout=TIMEOUT_SECONDS + 10,
+                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
+            )
+        except subprocess.TimeoutExpired:
+            return 0.0, "GPU execution timed out or hung (subprocess killed)"
+        except Exception as e:
+            return 0.0, f"Subprocess failed: {e}"
+
+        if not os.path.exists(out_path):
+            return 0.0, "Subprocess produced no result (crash or TDR)"
+
+        try:
+            with open(out_path, "r", encoding="utf-8") as f:
+                out = json.load(f)
+            score = out.get("score", 0.0)
+            explanation = out.get("explanation", "No explanation")
+            details = out.get("details", {}) or {}
+            output_image = details.get("output_image")
+            if output_image:
+                _OUTPUT_IMAGE_CACHE[(subPass, aiEngineName)] = output_image
+            return score, explanation
+        except Exception as e:
+            return 0.0, f"Failed to read subprocess result: {e}"
+
+
+def _run_grade_subprocess(in_path: str, out_path: str) -> int:
+    try:
+        with open(in_path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        result = {"shader_code": payload.get("shader_code", "")}
+        subPass = int(payload.get("subPass", 0))
+        aiEngineName = payload.get("aiEngineName", "")
+        score, explanation, details = _grade_answer_inner(result, subPass, aiEngineName)
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump({"score": score, "explanation": explanation, "details": details}, f)
+        return 0
+    except Exception as e:
+        try:
+            with open(out_path, "w", encoding="utf-8") as f:
+                json.dump({"score": 0.0, "explanation": f"Subprocess error: {e}",
+                           "details": {"error": str(e)}}, f)
+        except Exception:
+            pass
+        return 1
+
+
+if __name__ == "__main__":
+    if len(sys.argv) >= 4 and sys.argv[1] == "--grade":
+        sys.exit(_run_grade_subprocess(sys.argv[2], sys.argv[3]))
 
 
 def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
@@ -355,11 +433,10 @@ def _save_rendered_image(test_num: int, subPass: int, aiEngineName: str, pixels)
 
 
 highLevelSummary = """
-HLSL Fragment Shaders tests the ability to write GPU pixel shaders in HLSL for Vulkan.
-
-**Key concepts:**
-- HLSL syntax and intrinsics (normalize, dot, reflect, pow, lerp, clamp, etc.)
-- Vulkan-specific HLSL attributes ([[vk::location]], [[vk::binding]])
-- Same 20 rendering tasks as test 41 (lighting, patterns, procedural effects)
-- Compiled to SPIR-V via glslangValidator
+<p>Write GPU pixel shaders in HLSL (Microsoft&rsquo;s high-level shading language)
+targeting Vulkan. The same 20 visual effects from the SPIR-V assembly test
+(lighting, patterns, fractals on a sphere) must be reproduced, but this time
+using HLSL&rsquo;s C-like syntax with Vulkan-specific attributes.</p>
+<p>The code is compiled to SPIR-V behind the scenes and rendered; the output is
+compared pixel-by-pixel against the reference images.</p>
 """

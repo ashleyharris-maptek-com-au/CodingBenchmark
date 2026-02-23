@@ -625,30 +625,11 @@ def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
 
 
 highLevelSummary = """
-Minesweeper solving is a constraint satisfaction problem (CSP).
-
-**Rules:**
-- Each numbered cell indicates exactly that many mines in its 8 neighbors
-- Goal: Find cells guaranteed to be safe without guessing
-
-**Deduction techniques:**
-
-1. **Basic satisfaction:** If numbered cell's adjacent mine count equals flagged neighbors,
-   all other neighbors are safe.
-
-2. **Basic flagging:** If numbered cell's unknown neighbors equal remaining mine count,
-   all unknowns are mines.
-
-3. **Subset/superset analysis:** Compare constraints between neighboring numbered cells.
-   If one's unknowns are a subset of another's, combine constraints.
-
-4. **CSP solving:** Model as constraint satisfaction, use backtracking with arc consistency.
-
-5. **Probabilistic (for guessing):** When no certain moves, calculate mine probability per cell.
-
-**Complexity:** Minesweeper is NP-complete in general, but local constraint propagation
-works well for most practical boards.
-
-The baseline uses simple constraint satisfaction - if a number's mines are all flagged,
-remaining neighbors are safe.
+<p>Given a partially-revealed Minesweeper board, deduce which hidden cells are safe
+to click and which contain mines. Each visible number tells you exactly how many
+of its neighbours are mined &mdash; the AI must combine these clues to make
+guaranteed-safe moves without guessing.</p>
+<p>Larger boards and denser mine layouts make the logic harder. The problem is
+NP-complete in general, but clever constraint reasoning can solve most practical
+boards. The baseline uses only the simplest single-cell deduction rules.</p>
 """

@@ -14,13 +14,25 @@ import math
 import random
 import subprocess
 import time
+import hashlib
 from typing import List, Tuple, Dict, Any, Iterable, Optional
 from native_compiler import CppCompiler, CompilationError, ExecutionError, describe_this_pc
-from solver_utils import StreamingInputFile
+from solver_utils import StreamingInputFile, GradeCache
 
 title = "Maximum Independent Set (C++)"
 TIMEOUT_SECONDS = 30
 RANDOM_SEED = 36363636
+
+_grade_cache = GradeCache("test36")
+
+
+def _cache_key_parts(result: dict, subPass: int) -> tuple:
+  case = TEST_CASES[subPass]
+  code = result.get("cpp_code", "")
+  return (
+    hashlib.sha256(code.encode("utf-8")).hexdigest()[:16],
+    f"k={case['solution_vertices']}|d={case['base_degree']}|seed={RANDOM_SEED + subPass}",
+  )
 
 
 def _iter_graph_edges(solution_vertices: int, base_degree: int,
@@ -353,6 +365,11 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
   if not result or "cpp_code" not in result:
     return 0.0, "No C++ code provided"
 
+  cache_parts = _cache_key_parts(result, subPass)
+  cached = _grade_cache.get_grade(*cache_parts)
+  if cached is not None:
+    return cached
+
   case = TEST_CASES[subPass]
   solution_vertices, base_degree, num_vertices, _ = _get_case_params(subPass)
   use_streaming = _should_use_streaming(subPass)
@@ -425,21 +442,36 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
       )
 
     if not valid:
-      return 0.0, f"[{case['desc']}] FAIL: {msg}"
+      grade = (0.0, f"[{case['desc']}] FAIL: {msg}")
+      _grade_cache.put_grade(grade, *cache_parts)
+      return grade
 
-    return 1.0, f"[{case['desc']}] PASS: maximum independent set size {solution_vertices} in {exec_time:.2f}s"
+    grade = (1.0,
+             f"[{case['desc']}] PASS: maximum independent set size {solution_vertices} in {exec_time:.2f}s")
+    _grade_cache.put_grade(grade, *cache_parts)
+    return grade
 
   except subprocess.TimeoutExpired:
-    return 0.1, f"[{case['desc']}] Timeout"
+    grade = (0.1, f"[{case['desc']}] Timeout")
+    _grade_cache.put_grade(grade, *cache_parts)
+    return grade
   except ExecutionError as e:
-    return 0.1, f"[{case['desc']}] {str(e)[:100]}"
+    grade = (0.1, f"[{case['desc']}] {str(e)[:100]}")
+    _grade_cache.put_grade(grade, *cache_parts)
+    return grade
   except Exception as e:
-    return 0.0, f"[{case['desc']}] Error: {str(e)[:100]}"
+    grade = (0.0, f"[{case['desc']}] Error: {str(e)[:100]}")
+    _grade_cache.put_grade(grade, *cache_parts)
+    return grade
 
 
 def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
   if not result:
     return "<p style='color:red'>No result provided</p>"
+  cache_parts = _cache_key_parts(result, subPass)
+  cached = _grade_cache.get_report(*cache_parts)
+  if cached is not None:
+    return cached
   case = TEST_CASES[subPass]
   solution_vertices, _, num_vertices, estimated_edges = _get_case_params(subPass)
   html = f"<h4>Maximum Independent Set - {case['desc']}</h4>"
@@ -456,6 +488,7 @@ def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
   viz = LAST_MIS_VIZ.get((subPass, aiEngineName))
   if viz and viz.get("num_vertices", 0) <= 500:
     html += _generate_mis_svg(viz)
+  _grade_cache.put_report(html, *cache_parts)
   return html
 
 
@@ -563,10 +596,12 @@ def _generate_mis_svg(viz: dict) -> str:
 
 
 highLevelSummary = """
-Maximum Independent Set asks for the largest set of vertices with no edges between any pair.
-
-This test uses planted instances where the true optimum size is known exactly,
-enabling strict pass/fail verification.
+<p>Find the largest group of nodes in a graph such that no two nodes in the group
+are connected by an edge. Think of seating people at a dinner party where certain
+pairs don&rsquo;t get along &mdash; seat as many guests as possible with no
+feuding neighbours at the same table.</p>
+<p>This is NP-hard. The test uses planted instances with a known optimal answer for
+strict pass/fail grading. Subpasses increase the graph size.</p>
 """
 
 

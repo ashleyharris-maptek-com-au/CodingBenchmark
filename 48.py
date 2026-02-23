@@ -19,9 +19,14 @@ Buffer layout:
 """
 
 import base64
+import json
 import math
+import os
 import random
 import struct
+import subprocess
+import sys
+import tempfile
 import time
 import zlib
 from typing import Tuple, Optional
@@ -269,11 +274,11 @@ _ref_cache = {}
 _REPORT_CACHE = {}
 
 
-def gradeAnswer(result, subPass, aiEngineName):
+def _grade_answer_inner(result, subPass, aiEngineName):
   global _runner_cache, _ref_cache
 
   if not result or "spirv_code" not in result:
-    return 0.0, "No SPIR-V code provided"
+    return 0.0, "No SPIR-V code provided", {"error": "no_spirv_code"}
 
   code = result["spirv_code"]
 
@@ -281,11 +286,11 @@ def gradeAnswer(result, subPass, aiEngineName):
   try:
     spirv = assemble_spirv(code)
   except RuntimeError as e:
-    return 0.0, f"SPIR-V assembly failed: {e}"
+    return 0.0, f"SPIR-V assembly failed: {e}", {"error": str(e)}
 
   valid, err = validate_spirv(spirv)
   if not valid:
-    return 0.0, f"SPIR-V validation failed: {err}"
+    return 0.0, f"SPIR-V validation failed: {err}", {"error": err}
 
   w, h, timesteps, viscosity = SUBPASSES[subPass]
 
@@ -300,6 +305,16 @@ def gradeAnswer(result, subPass, aiEngineName):
     print(f"  Computing CPU LBM reference for {w}x{h}, {timesteps} steps...")
     _ref_cache[cache_key] = cpu_reference(grid, w, h, timesteps, viscosity)
   ref_grid = _ref_cache[cache_key]
+  ref_bytes = ref_grid.astype(np.float32).tobytes()
+  ref_b64 = base64.b64encode(ref_bytes).decode('ascii')
+
+  report_data = {
+    "w": w,
+    "h": h,
+    "timesteps": timesteps,
+    "viscosity": viscosity,
+    "ref_grid_b64": ref_b64,
+  }
 
   # Run on GPU
   try:
@@ -313,25 +328,117 @@ def gradeAnswer(result, subPass, aiEngineName):
       # Scale tolerance with timesteps
       val_tol = 0.05 * (1 + timesteps / 200)
       score, desc = compare_grids(gpu_grid, ref_grid, mass_tol=0.01, val_tol=val_tol)
-      _REPORT_CACHE[(aiEngineName, subPass)] = {
-        "gpu_grid": gpu_grid, "w": w, "h": h,
-        "timesteps": timesteps, "viscosity": viscosity,
-        "score": score, "desc": desc,
-      }
+      report_data.update({
+        "gpu_grid_b64": base64.b64encode(output_bytes).decode('ascii'),
+        "score": score,
+        "desc": desc,
+      })
       return score, desc
 
-    return grade_compute_pingpong(spirv,
-                                  input_data,
-                                  extra_buffers={2: params},
-                                  extra_types={2: 'uniform'},
-                                  workgroups=workgroups,
-                                  iterations=timesteps,
-                                  verify_fn=verify_fn,
-                                  runner=_runner_cache,
-                                  timeout=TIMEOUT_SECONDS)
+    grade = grade_compute_pingpong(spirv,
+                                   input_data,
+                                   extra_buffers={2: params},
+                                   extra_types={2: 'uniform'},
+                                   workgroups=workgroups,
+                                   iterations=timesteps,
+                                   verify_fn=verify_fn,
+                                   runner=_runner_cache,
+                                   timeout=TIMEOUT_SECONDS)
+    return grade[0], grade[1], report_data
 
   except Exception as e:
-    return 0.0, f"GPU execution failed: {e}"
+    return 0.0, f"GPU execution failed: {e}", {"error": str(e)}
+
+
+def gradeAnswer(result, subPass, aiEngineName):
+  """Run grading in an isolated subprocess to survive GPU hangs/TDRs."""
+  if not result or "spirv_code" not in result:
+    return 0.0, "No SPIR-V code provided"
+
+  payload = {
+    "spirv_code": result.get("spirv_code", ""),
+    "subPass": subPass,
+    "aiEngineName": aiEngineName,
+  }
+
+  with tempfile.TemporaryDirectory() as tmp_dir:
+    in_path = os.path.join(tmp_dir, "grade_input.json")
+    out_path = os.path.join(tmp_dir, "grade_output.json")
+    with open(in_path, "w", encoding="utf-8") as f:
+      json.dump(payload, f)
+
+    cmd = [sys.executable, __file__, "--grade", in_path, out_path]
+    try:
+      subprocess.run(
+        cmd,
+        check=False,
+        timeout=TIMEOUT_SECONDS + 10,
+        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
+      )
+    except subprocess.TimeoutExpired:
+      return 0.0, "GPU execution timed out or hung (subprocess killed)"
+    except Exception as e:
+      return 0.0, f"Subprocess failed: {e}"
+
+    if not os.path.exists(out_path):
+      return 0.0, "Subprocess produced no result (crash or TDR)"
+
+    try:
+      with open(out_path, "r", encoding="utf-8") as f:
+        out = json.load(f)
+      score = out.get("score", 0.0)
+      explanation = out.get("explanation", "No explanation")
+      details = out.get("details", {}) or {}
+      w = details.get("w")
+      h = details.get("h")
+      timesteps = details.get("timesteps")
+      viscosity = details.get("viscosity")
+      gpu_b64 = details.get("gpu_grid_b64")
+      ref_b64 = details.get("ref_grid_b64")
+      if w and h and gpu_b64:
+        gpu_grid = buffer_to_grid(base64.b64decode(gpu_b64), int(w), int(h))
+        report = {
+          "gpu_grid": gpu_grid,
+          "w": int(w),
+          "h": int(h),
+          "timesteps": int(timesteps),
+          "viscosity": float(viscosity),
+          "score": score,
+          "desc": details.get("desc", ""),
+        }
+        _REPORT_CACHE[(aiEngineName, subPass)] = report
+      if w and h and timesteps is not None and viscosity is not None and ref_b64:
+        ref_grid = buffer_to_grid(base64.b64decode(ref_b64), int(w), int(h))
+        _ref_cache[(int(w), int(h), int(timesteps), float(viscosity))] = ref_grid
+      return score, explanation
+    except Exception as e:
+      return 0.0, f"Failed to read subprocess result: {e}"
+
+
+def _run_grade_subprocess(in_path: str, out_path: str) -> int:
+  try:
+    with open(in_path, "r", encoding="utf-8") as f:
+      payload = json.load(f)
+    result = {"spirv_code": payload.get("spirv_code", "")}
+    subPass = int(payload.get("subPass", 0))
+    aiEngineName = payload.get("aiEngineName", "")
+    score, explanation, details = _grade_answer_inner(result, subPass, aiEngineName)
+    with open(out_path, "w", encoding="utf-8") as f:
+      json.dump({"score": score, "explanation": explanation, "details": details}, f)
+    return 0
+  except Exception as e:
+    try:
+      with open(out_path, "w", encoding="utf-8") as f:
+        json.dump({"score": 0.0, "explanation": f"Subprocess error: {e}",
+                   "details": {"error": str(e)}}, f)
+    except Exception:
+      pass
+    return 1
+
+
+if __name__ == "__main__":
+  if len(sys.argv) >= 4 and sys.argv[1] == "--grade":
+    sys.exit(_run_grade_subprocess(sys.argv[2], sys.argv[3]))
 
 
 # ---------------------------------------------------------------------------
@@ -585,3 +692,14 @@ def resultToNiceReport(result, subPass, aiEngineName):
       {desc}</div>
   </div>
   """
+
+
+highLevelSummary = """
+<p>Write a GPU compute shader in SPIR-V assembly that simulates 2D fluid flow using
+the Lattice Boltzmann method. The shader iterates a grid of fluid cells, streaming
+and colliding particle distributions each timestep, producing realistic fluid
+behaviour from simple local rules.</p>
+<p>The final grid state is compared against a CPU reference. Subpasses increase the
+grid resolution and timestep count, testing both correctness and numerical
+stability of the simulation.</p>
+"""

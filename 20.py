@@ -1035,3 +1035,13 @@ def setup():
       input_path = streaming_input.generate()
       size_mb = streaming_input.get_size_bytes() / (1024 * 1024)
       print(f"    Subpass {subpass}: {size_mb:.1f} MB cached")
+
+
+highLevelSummary = """
+<p>Given a set of mining drillholes &mdash; each a 3D path with measurements taken
+at intervals along its length &mdash; identify the data entries that are most likely
+to be errors (typos, instrument glitches, or transcription mistakes).</p>
+<p>The AI must compare each measurement against its spatial neighbours: a reading
+that disagrees with nearby drillholes is suspect. Subpasses increase the number
+of drillholes and properties, requiring efficient spatial reasoning at scale.</p>
+"""

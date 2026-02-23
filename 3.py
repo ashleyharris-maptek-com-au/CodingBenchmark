@@ -610,23 +610,10 @@ def svg_graph(num_nodes: int, edges: list, positions: list) -> str:
 
 
 highLevelSummary = """
-Graph layout with edge crossing minimization is related to 1-planar graphs.
-
-**Key concepts:**
-- Planar graphs can be drawn with 0 crossings
-- 1-planar graphs can be drawn with each edge crossed at most once
-- General graphs may require many crossings
-
-**Algorithm approaches:**
-- Force-directed (Fruchterman-Reingold, spring embeddings)
-- Spectral methods (eigenvector-based positioning)
-- Tutte's barycentric method (for 3-connected planar graphs)
-- Stress majorization
-
-**Complexity:**
-- Testing planarity: O(n) - linear time
-- Testing 1-planarity: NP-complete
-- Minimizing crossings: NP-hard in general
-
-The baseline uses a simple circular layout.
+<p>Given a graph (a set of dots connected by lines), arrange the dots on a 2D canvas
+so that as few lines cross each other as possible. A clean, readable layout is the
+goal &mdash; tangled spaghetti is the enemy.</p>
+<p>Minimising crossings is extremely hard in general. The AI must place nodes
+intelligently; the baseline simply puts them in a circle. Subpasses increase the
+number of nodes and edges.</p>
 """

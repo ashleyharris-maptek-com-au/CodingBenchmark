@@ -538,12 +538,12 @@ def _generate_cover_svg(viz: dict) -> str:
 
 
 highLevelSummary = """
-Minimum Vertex Cover finds the smallest set of vertices covering all edges.
-
-**Algorithms:**
-- **2-Approximation**: Greedy edge-picking, O(V+E)
-- **Branch and Bound**: Exact but exponential
-- **Kernelization**: Reduce problem size for FPT algorithms
+<p>Find the smallest set of nodes in a graph such that every edge has at least one
+endpoint in the set. Imagine placing guards at intersections so that every road
+is watched by at least one guard &mdash; use as few guards as possible.</p>
+<p>This is a classic NP-hard problem. The test uses planted instances with a known
+optimal answer, so grading is strict pass/fail. Subpasses increase the graph
+size.</p>
 """
 
 

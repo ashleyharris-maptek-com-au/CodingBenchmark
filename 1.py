@@ -548,21 +548,11 @@ def generate_route_svg(cities: list, route: list, city_count: int) -> str:
 
 
 highLevelSummary = """
-This test evaluates whether LLMs can write efficient algorithms that scale.
-
-The Travelling Salesman Problem is NP-hard, meaning brute-force solutions 
-become intractable very quickly:
-- 10 cities: 3.6 million routes (feasible)
-- 20 cities: 2.4 × 10^18 routes (impossible to brute-force)
-- 1000 cities: astronomical number of routes
-
-To pass this test, the LLM must discover and implement heuristics such as:
-- Nearest Neighbor
-- 2-opt local search
-- Christofides algorithm
-- Genetic algorithms
-- Simulated annealing
-
-The baseline uses a simple nearest-neighbor heuristic. LLMs are scored on
-whether their solution is valid and how close it comes to the baseline distance.
+<p>Given a list of cities, find the shortest round-trip route that visits every city
+exactly once and returns to the start. This is one of the most famous hard problems
+in computer science &mdash; checking every possible route is only feasible for a handful
+of cities, so the AI must use clever shortcuts to find a good route quickly.</p>
+<p>Subpasses scale from 10 cities up to 1&thinsp;000, so brute-force is impossible for the
+larger cases. The AI's route length is compared against a simple baseline; beating it
+earns full marks.</p>
 """

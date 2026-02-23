@@ -496,23 +496,9 @@ def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
 
 
 highLevelSummary = """
-3D Bin Packing with axis-aligned boxes is a classic optimization problem.
-
-**Problem:** Pack rectangular boxes into a container, maximizing utilization.
-
-**Algorithms:**
-1. **First Fit Decreasing (FFD):** Sort boxes by volume, place each in first valid spot
-2. **Bottom-Left-Back (BLB):** Place at lowest, leftmost, backmost position
-3. **Extreme Points:** Track valid placement points at box corners
-4. **Guillotine:** Recursively split remaining space with cuts
-5. **Maximal Spaces:** Track largest empty rectangular regions
-
-**Key considerations:**
-- Box rotation (6 orientations possible)
-- Placement order affects packing efficiency
-- Trade-off between speed and optimality
-
-**Complexity:** NP-hard, but heuristics work well in practice.
-
-The baseline uses greedy first-fit with extreme points heuristic.
+<p>Pack a collection of rectangular boxes into a shipping container, fitting as
+much total volume in as possible. Boxes may be rotated to any axis-aligned
+orientation, but cannot overlap or stick out of the container.</p>
+<p>This 3D packing problem is NP-hard. Subpasses increase the number and variety
+of box sizes. The baseline uses a greedy first-fit approach.</p>
 """

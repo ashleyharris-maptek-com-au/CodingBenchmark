@@ -419,11 +419,12 @@ def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
 
 
 highLevelSummary = """
-0/1 Integer Linear Programming optimizes a linear objective under linear constraints
-with binary decision variables.
-
-This test uses planted pairwise constraints with known unique optimum for strict
-pass/fail grading.
+<p>Maximise a score by choosing which items to switch &ldquo;on&rdquo; or &ldquo;off&rdquo;,
+subject to a set of rules that restrict certain combinations. Each item has a value,
+and the rules say things like &ldquo;you can&rsquo;t pick both A and B&rdquo;.</p>
+<p>This is 0/1 Integer Linear Programming, a fundamental NP-hard optimisation problem.
+The test uses planted instances with a known unique optimum for strict pass/fail
+grading. Subpasses increase the number of variables and constraints.</p>
 """
 
 

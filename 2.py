@@ -510,77 +510,190 @@ def force_directed_layout(num_nodes: int, edges: list, iterations: int = 50) -> 
 
 
 def generate_route_svg(edges: list, route: list, node_count: int) -> str:
-  """Generate SVG visualization of the Chinese Postman route."""
+  """Generate interactive path traversal visualization for Chinese Postman route."""
   if not edges or not route:
     return "<p>No route to visualize</p>"
+
+  import json as _json
 
   # Use force-directed layout for better positioning
   positions = force_directed_layout(node_count, edges, iterations=50)
 
-  # Generate edge lines (all edges in the graph)
-  edge_lines = ""
-  edge_weights = {}
-  for a, b, w in edges:
-    x1, y1 = positions[a]
-    x2, y2 = positions[b]
-    edge_weights[(a, b)] = w
-    edge_weights[(b, a)] = w
-    edge_lines += f'<line x1="{x1}" y1="{y1}" x2="{x2}" y2="{y2}" stroke="#ddd" stroke-width="1" opacity="0.5"/>'
-
-  # Generate route path (highlighted)
-  route_path = ""
+  # Count how many times each edge is traversed
+  edge_visits = defaultdict(int)
   for i in range(len(route) - 1):
-    a, b = route[i], route[i + 1]
-    x1, y1 = positions[a]
-    x2, y2 = positions[b]
-    # Make route edges thicker and colored
-    route_path += f'<line x1="{x1}" y1="{y1}" x2="{x2}" y2="{y2}" stroke="#ff4444" stroke-width="2.5" opacity="0.8"/>'
+    e = tuple(sorted([route[i], route[i + 1]]))
+    edge_visits[e] += 1
 
-  # Generate node circles
-  node_circles = ""
-  for i in range(node_count):
-    x, y = positions[i]
-    color = "#ff4444" if i == 0 else "#4444ff"  # Start node in red
-    node_circles += f'<circle cx="{x}" cy="{y}" r="5" fill="{color}" stroke="white" stroke-width="1" title="Node {i}"/>'
-    node_circles += f'<text x="{x}" y="{y-8}" text-anchor="middle" font-size="10" fill="#333">{i}</text>'
+  # Build data for JS
+  pos_list = [positions[i] for i in range(node_count)]
+  edges_data = [[a, b, w] for a, b, w in edges]
+  visits_data = {f"{a},{b}": c for (a, b), c in edge_visits.items()}
 
-  svg_html = f'''
-  <div style="margin: 10px 0; width: 100%">
-    <h5>Route Visualization ({node_count} nodes, {len(edges)} edges)</h5>
-    <svg width="100%" style="border: 1px solid #ccc; background: white;" viewBox="0 0 400 400">
-      {edge_lines}
-      {route_path}
-      {node_circles}
-    </svg>
-    <p style="font-size: 12px; color: #666;">
-      <span style="color: #ff4444;">● Start node (0)</span> | 
-      <span style="color: #4444ff;">● Other nodes</span> | 
-      <span style="color: #ff4444; font-weight: bold;">— Route path</span> | 
-      Route length: {len(route)} nodes
-    </p>
-  </div>'''
+  uid = f"cpv_{abs(hash(tuple(route[:20]))) % 10000000}"
 
-  return svg_html
+  return f"""
+  <div style="margin:10px 0;">
+    <h5>Path Traversal ({node_count} nodes, {len(edges)} edges, {len(route)-1} steps)</h5>
+    <canvas id="{uid}" width="600" height="450" style="border:1px solid #ccc;background:#fafafa;width:100%;max-width:700px;"></canvas>
+    <div style="display:flex;align-items:center;gap:8px;margin-top:6px;max-width:700px;">
+      <button id="{uid}_play" style="padding:4px 12px;cursor:pointer;">▶</button>
+      <input id="{uid}_slider" type="range" min="0" max="{len(route)-1}" value="0" style="flex:1;">
+      <span id="{uid}_lbl" style="font-size:12px;color:#555;min-width:80px;">Step 0/{len(route)-1}</span>
+      <select id="{uid}_spd" style="font-size:12px;"><option value="1">1x</option><option value="3" selected>3x</option><option value="10">10x</option><option value="50">50x</option></select>
+    </div>
+    <div style="font-size:11px;color:#666;margin-top:4px;">
+      <span style="color:#ff4444;">●</span> Start (node 0) &nbsp;
+      <span style="color:#4444ff;">●</span> Other nodes &nbsp;
+      Edge color: <span style="color:#3388cc;">■</span> 1 visit → <span style="color:#cc3333;">■</span> 2+ visits &nbsp;
+      Arrows show direction.
+    </div>
+  </div>
+  <script>
+  (function(){{
+    var pos={_json.dumps(pos_list)},
+        edges={_json.dumps(edges_data)},
+        route={_json.dumps(route)},
+        visits={_json.dumps(visits_data)};
+    var canvas=document.getElementById('{uid}'),
+        ctx=canvas.getContext('2d'),
+        slider=document.getElementById('{uid}_slider'),
+        lbl=document.getElementById('{uid}_lbl'),
+        playBtn=document.getElementById('{uid}_play'),
+        spdSel=document.getElementById('{uid}_spd');
+    var step=0, playing=false, timer=null;
+    var W=canvas.width, H=canvas.height, pad=30;
+    // Map positions to canvas
+    var xs=pos.map(p=>p[0]), ys=pos.map(p=>p[1]);
+    var mnx=Math.min(...xs), mxx=Math.max(...xs), mny=Math.min(...ys), mxy=Math.max(...ys);
+    var sx=mnx===mxx?1:(W-2*pad)/(mxx-mnx), sy=mny===mxy?1:(H-2*pad)/(mxy-mny);
+    var sc=Math.min(sx,sy);
+    function tx(i){{return pad+(pos[i][0]-mnx)*sc;}}
+    function ty(i){{return pad+(pos[i][1]-mny)*sc;}}
+    function edgeKey(a,b){{return Math.min(a,b)+','+Math.max(a,b);}}
+    function lerpColor(t){{// blue->cyan->yellow->red
+      t=Math.max(0,Math.min(1,t));
+      var r,g,b;
+      if(t<0.33){{var s=t/0.33; r=Math.round(50+s*0);g=Math.round(136+s*119);b=Math.round(204-s*4);}}
+      else if(t<0.66){{var s=(t-0.33)/0.33; r=Math.round(50+s*205);g=Math.round(255-s*55);b=Math.round(200-s*200);}}
+      else{{var s=(t-0.66)/0.34; r=Math.round(255-s*55);g=Math.round(200-s*160);b=Math.round(0);}}
+      return 'rgb('+r+','+g+','+b+')';
+    }}
+    function drawArrow(x1,y1,x2,y2,color,width,offset){{
+      var dx=x2-x1, dy=y2-y1, len=Math.sqrt(dx*dx+dy*dy);
+      if(len<1)return;
+      // Offset perpendicular for multi-visit
+      var nx=-dy/len*offset, ny=dx/len*offset;
+      x1+=nx;y1+=ny;x2+=nx;y2+=ny;
+      ctx.strokeStyle=color; ctx.lineWidth=width;
+      ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2); ctx.stroke();
+      // Arrowhead at 70% along
+      var mx=x1+dx*0.7+nx*0, my=y1+dy*0.7+ny*0;
+      var aLen=6, aAng=0.5;
+      var ux=dx/len, uy=dy/len;
+      ctx.fillStyle=color; ctx.beginPath();
+      ctx.moveTo(mx+ux*aLen, my+uy*aLen);
+      ctx.lineTo(mx-ux*aLen-uy*aLen*aAng, my-uy*aLen+ux*aLen*aAng);
+      ctx.lineTo(mx-ux*aLen+uy*aLen*aAng, my-uy*aLen-ux*aLen*aAng);
+      ctx.fill();
+    }}
+    function draw(){{
+      ctx.clearRect(0,0,W,H);
+      // Draw all graph edges (light)
+      ctx.strokeStyle='#ddd'; ctx.lineWidth=1;
+      for(var i=0;i<edges.length;i++){{
+        var a=edges[i][0],b=edges[i][1];
+        ctx.beginPath(); ctx.moveTo(tx(a),ty(a)); ctx.lineTo(tx(b),ty(b)); ctx.stroke();
+        // Weight label
+        var mx=(tx(a)+tx(b))/2, my=(ty(a)+ty(b))/2;
+        ctx.fillStyle='#bbb'; ctx.font='9px sans-serif'; ctx.textAlign='center';
+        ctx.fillText(edges[i][2], mx, my-3);
+      }}
+      // Draw traversed edges up to current step
+      var edgeCount={{}}; // count visits per directed edge at this step
+      for(var i=0;i<step;i++){{
+        var a=route[i], b=route[i+1];
+        var dk=a+'>'+b;
+        if(!edgeCount[dk])edgeCount[dk]=0;
+        edgeCount[dk]++;
+        var ek=edgeKey(a,b);
+        var totalVisits=parseInt(visits[ek])||1;
+        var thisVisitNum=edgeCount[dk];
+        // Offset based on direction and visit number
+        var offset=0;
+        var revK=b+'>'+a;
+        var revCount=edgeCount[revK]||0;
+        // Positive offset for a->b, negative for b->a
+        if(a<b) offset=(thisVisitNum-1)*3+1.5;
+        else offset=-((thisVisitNum-1)*3+1.5);
+        if(totalVisits===1 && !revCount) offset=0;
+        var t=i/(Math.max(1,step-1));
+        var color=lerpColor(t);
+        drawArrow(tx(a),ty(a),tx(b),ty(b),color,2,offset);
+      }}
+      // Edge visit count badges
+      var shown={{}};
+      for(var i=0;i<step;i++){{
+        var ek=edgeKey(route[i],route[i+1]);
+        if(!shown[ek]){{
+          shown[ek]=0;
+        }}
+        shown[ek]++;
+      }}
+      for(var ek in shown){{
+        if(shown[ek]>1){{
+          var parts=ek.split(',');
+          var a=parseInt(parts[0]),b=parseInt(parts[1]);
+          var mx=(tx(a)+tx(b))/2, my=(ty(a)+ty(b))/2;
+          ctx.fillStyle='#c00'; ctx.font='bold 10px sans-serif'; ctx.textAlign='center';
+          ctx.fillText('x'+shown[ek], mx, my+12);
+        }}
+      }}
+      // Draw nodes
+      for(var i=0;i<pos.length;i++){{
+        var x=tx(i),y=ty(i);
+        ctx.beginPath(); ctx.arc(x,y,5,0,Math.PI*2);
+        ctx.fillStyle=(i===0)?'#ff4444':'#4466cc';
+        ctx.fill(); ctx.strokeStyle='#fff'; ctx.lineWidth=1; ctx.stroke();
+        ctx.fillStyle='#333'; ctx.font='10px sans-serif'; ctx.textAlign='center';
+        ctx.fillText(i, x, y-8);
+      }}
+      // Current position marker
+      if(step<route.length){{
+        var ci=route[step];
+        ctx.beginPath(); ctx.arc(tx(ci),ty(ci),9,0,Math.PI*2);
+        ctx.strokeStyle='#ff8800'; ctx.lineWidth=3; ctx.stroke();
+      }}
+      lbl.textContent='Step '+step+'/'+(route.length-1)+' (node '+route[Math.min(step,route.length-1)]+')';
+    }}
+    function tick(){{
+      if(!playing)return;
+      var spd=parseInt(spdSel.value)||1;
+      spd /= 100;
+      step=Math.min(step+spd, route.length-1);
+      slider.value=step;
+      draw();
+      if(step>=route.length-1){{playing=false;playBtn.textContent='▶';}}
+      else timer=requestAnimationFrame(tick);
+    }}
+    slider.oninput=function(){{step=parseInt(this.value);draw();}};
+    playBtn.onclick=function(){{
+      if(playing){{playing=false;playBtn.textContent='▶';return;}}
+      if(step>=route.length-1)step=0;
+      playing=true;playBtn.textContent='⏸';
+      timer=requestAnimationFrame(tick);
+    }};
+    draw();
+  }})();
+  </script>
+  """
 
 
 highLevelSummary = """
-The Chinese Postman Problem (Route Inspection Problem) asks:
-Find the shortest closed walk that traverses every edge of a graph at least once.
-
-**Key concepts:**
-- If all vertices have even degree → Eulerian circuit exists (optimal)
-- If odd-degree vertices exist → must duplicate some edges
-
-**Algorithm approaches:**
-1. Find all odd-degree vertices
-2. Find minimum-weight perfect matching of odd vertices
-3. Duplicate matched path edges
-4. Find Eulerian circuit in the resulting multigraph
-
-The optimal solution uses:
-- Dijkstra/Floyd-Warshall for shortest paths between odd vertices
-- Minimum-weight perfect matching (Blossom algorithm)
-- Hierholzer's algorithm for Eulerian circuit
-
-The baseline uses a greedy matching approach which is suboptimal.
+<p>Imagine a mail carrier who must walk along every street in a neighbourhood and
+return home. Some streets may need to be walked twice if the network doesn't
+allow a perfect loop &mdash; the goal is to minimise that extra walking.</p>
+<p>The AI must figure out which streets (edges) to re-traverse and produce a
+complete route. Subpasses increase the graph size, making the problem harder
+to solve efficiently.</p>
 """

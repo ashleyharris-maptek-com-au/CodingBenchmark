@@ -550,12 +550,12 @@ def _generate_vrp_svg(viz: dict) -> str:
 
 
 highLevelSummary = """
-VRP finds optimal routes for vehicles to service customers.
-
-**Algorithms:**
-- **Nearest Neighbor**: Simple greedy heuristic
-- **Clarke-Wright Savings**: Merge routes by savings
-- **Genetic Algorithms**: Evolutionary optimization
+<p>Plan delivery routes for a fleet of vehicles so that every customer is visited
+and the total distance travelled is minimised. Each vehicle has a capacity limit,
+so the AI must decide which customers go on which truck and in what order.</p>
+<p>This is the Vehicle Routing Problem, a generalisation of the Travelling Salesman
+Problem. Subpasses increase the number of customers and vehicles. The baseline
+uses a simple nearest-neighbour heuristic.</p>
 """
 
 

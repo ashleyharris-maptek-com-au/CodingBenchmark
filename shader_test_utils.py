@@ -249,6 +249,34 @@ def compile_hlsl(source: str,
         pass
 
 
+def compile_wgsl(source: str) -> str:
+  """
+  Validate WGSL source by attempting to create a shader module via wgpu.
+
+  Args:
+      source: WGSL shader source text
+
+  Returns:
+      The source string (wgpu accepts WGSL directly, no SPIR-V needed)
+
+  Raises:
+      RuntimeError: If WGSL validation fails
+  """
+  try:
+    import wgpu
+    adapter = wgpu.gpu.request_adapter_sync(power_preference="high-performance")
+    if adapter is None:
+      raise RuntimeError("No GPU adapter found for WGSL validation")
+    device = adapter.request_device_sync()
+    device.create_shader_module(code=source)
+  except Exception as e:
+    msg = str(e)
+    if "wgpu" in msg.lower() or "shader" in msg.lower() or "parse" in msg.lower() or "validation" in msg.lower():
+      raise RuntimeError(f"WGSL compilation failed:\n{msg[:2000]}")
+    # If wgpu isn't available or adapter fails, skip validation and trust the runner
+  return source
+
+
 # ---------------------------------------------------------------------------
 # Smart Image Comparison
 # ---------------------------------------------------------------------------

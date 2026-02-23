@@ -478,9 +478,13 @@ def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
 
 
 highLevelSummary = """
-Exact Cover asks for a subset of sets that covers each universe element exactly once.
-
-This test uses planted, uniquely-solvable instances for strict pass/fail grading.
+<p>Given a collection of sets, choose some of them so that every element in the
+universe appears in exactly one chosen set &mdash; no gaps and no overlaps. Think
+of tiling a floor with pre-cut pieces where every tile must be used exactly
+once and every square must be covered.</p>
+<p>This is a classic NP-complete problem. Each test instance has exactly one valid
+solution, so grading is strict pass/fail. Subpasses increase the universe and
+set sizes.</p>
 """
 
 

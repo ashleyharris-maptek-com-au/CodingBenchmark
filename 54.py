@@ -672,3 +672,15 @@ def resultToNiceReport(result, subPass, aiEngineName):
   }
   return generate_threejs_flight_path(
     path, scenario_name=sc['name'], runway=runway)
+
+
+highLevelSummary = """
+<p>Write a Python autopilot that lands an airliner using an instrument landing
+system (ILS). The aircraft must follow the glideslope and localiser beams down to
+the runway, flare, touch down gently, then brake to a stop &mdash; all under
+automatic control.</p>
+<p>The 25 scenarios include normal approaches, engine failures on final, windshear,
+sensor dropouts, slippery runways, and situations inspired by real landing
+accidents. The AI must handle ground contact physics, reverse thrust, spoilers,
+and braking in addition to flight control.</p>
+"""

@@ -699,12 +699,12 @@ def _generate_steiner_svg(viz: dict) -> str:
 
 
 highLevelSummary = """
-Steiner Tree finds minimum cost tree connecting a set of terminal vertices.
-
-**Algorithms:**
-- **MST Heuristic**: 2-approximation using minimum spanning tree
-- **Shortest Path Heuristic**: Connect terminals via shortest paths
-- **Dynamic Programming**: Exact for small terminal sets
+<p>Connect a set of important nodes in a weighted graph using the cheapest possible
+tree of edges. Unlike a minimum spanning tree, the solution may pass through
+intermediate nodes that aren&rsquo;t in the required set if doing so saves cost
+&mdash; like building a road network that connects key cities via junctions.</p>
+<p>This is NP-hard. The test uses planted instances with a known optimal tree for
+strict grading. Subpasses increase the graph size.</p>
 """
 
 

@@ -909,3 +909,15 @@ def resultToNiceReport(result, subPass, aiEngineName):
     return ''
   path = _history_to_path(history)
   return generate_threejs_flight_path(path, scenario_name=sc['name'])
+
+
+highLevelSummary = """
+<p>Write a Python autopilot for a simulated twin-engine airliner. The autopilot
+receives over 200 sensor readings each tick (altitude, airspeed, attitude, engine
+data, etc.) &mdash; many triple-redundant &mdash; and must output control surface
+commands (elevator, aileron, rudder, throttle) to keep the aircraft flying safely.</p>
+<p>The 30 scenarios range from calm cruise to catastrophic failures inspired by real
+aviation disasters: frozen pitot tubes, stuck trim, engine flameouts, sensor
+disagreements, and severe turbulence. The AI must handle sensor fusion, fault
+detection, and adaptive control.</p>
+"""

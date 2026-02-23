@@ -434,12 +434,13 @@ def _generate_qap_svg(viz: dict) -> str:
 
 
 highLevelSummary = """
-QAP assigns facilities to locations minimizing flow*distance cost.
-
-**Algorithms:**
-- **Simulated Annealing**: Good quality solutions
-- **Tabu Search**: Avoids local minima
-- **Branch and Bound**: Exact but slow for large instances
+<p>Assign N facilities to N locations so that the total cost is minimised, where
+cost depends on how much material flows between each pair of facilities multiplied
+by the distance between their assigned locations. Think of arranging departments
+in an office to minimise how far people walk between them.</p>
+<p>This is the Quadratic Assignment Problem, one of the hardest combinatorial
+optimisation problems. The test uses planted instances with a known optimum for
+strict grading. Subpasses increase the problem size.</p>
 """
 
 

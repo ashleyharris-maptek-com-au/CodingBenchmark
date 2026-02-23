@@ -818,27 +818,10 @@ def generate_polygon_cutting_svg(stock: List[Tuple[float, float]], pieces: List[
 
 
 highLevelSummary = """
-2D Polygon Cutting Stock is a generalization of rectangle packing.
-
-**Problem:** Cut arbitrary polygons from stock polygons, minimizing waste.
-
-**Key challenges:**
-- Polygon containment testing
-- Polygon-polygon intersection detection
-- Rotation optimization
-- Irregular shapes don't pack as efficiently
-
-**Algorithms:**
-- **Greedy First Fit**: Place each piece in first stock where it fits
-- **Bottom-Left**: Try positions from bottom-left corner
-- **No-Fit Polygon (NFP)**: Compute valid placement regions
-- **Genetic algorithms**: For complex instances
-
-**Required geometry operations:**
-- Point-in-polygon (ray casting)
-- Line segment intersection
-- Polygon area calculation
-- Bounding box computation
-
-The baseline uses greedy first-fit with grid search for positions.
+<p>Cut a set of irregular polygon shapes out of stock sheets with as little waste
+as possible. Unlike rectangle packing, the pieces can be any shape &mdash; stars,
+L-shapes, curves &mdash; so fitting them together is much harder.</p>
+<p>The AI must handle polygon geometry (containment, intersection, rotation) and
+plan efficient layouts. Subpasses increase the number and complexity of the
+pieces. The baseline uses a simple greedy placement strategy.</p>
 """

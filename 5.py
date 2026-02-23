@@ -1153,24 +1153,11 @@ def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
 
 
 highLevelSummary = """
-Finding a Hamiltonian path on a grid with obstacles is NP-complete.
-
-**Problem:**
-- Visit every free cell exactly once
-- Move only to adjacent cells (no diagonals)
-- Start at (0, 0)
-- Optionally return to start (Hamiltonian cycle)
-
-**Approaches:**
-- **Backtracking/DFS**: Basic exhaustive search
-- **Warnsdorff's rule**: Prefer cells with fewer unvisited neighbors
-- **Connectivity pruning**: Abandon paths that disconnect remaining cells
-- **Dead-end detection**: Avoid creating isolated cells
-
-**Complexity:**
-- NP-complete in general
-- Grid structure provides some exploitable properties
-- Obstacles can make problems harder or easier
-
-The baseline uses simple DFS without optimizations.
+<p>Find a path on a grid that visits every open cell exactly once, moving only
+up/down/left/right. Some cells are blocked by obstacles. Starting from the
+top-left corner, the AI must thread a single continuous path through every
+remaining cell &mdash; no revisits allowed.</p>
+<p>This is an NP-complete problem, so brute-force search blows up quickly.
+Subpasses increase the grid size and obstacle count. The baseline uses a
+simple depth-first search.</p>
 """

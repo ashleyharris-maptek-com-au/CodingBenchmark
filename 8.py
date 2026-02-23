@@ -192,16 +192,19 @@ EXTREME_MAZE_SIZES = [
 
 
 def get_maze(subpass: int) -> str:
-  """Get maze for subpass, generating extreme ones on demand."""
+  """Get maze for subpass, generating extreme ones on demand (cached)."""
+  if subpass in _MAZE_CACHE:
+    return _MAZE_CACHE[subpass]
+
   if subpass < len(MAZES):
-    if subpass not in _MAZE_CACHE:
-      _MAZE_CACHE[subpass] = ensure_solvable_maze(MAZES[subpass])
+    _MAZE_CACHE[subpass] = ensure_solvable_maze(MAZES[subpass])
     return _MAZE_CACHE[subpass]
 
   extreme_idx = subpass - len(MAZES)
   if extreme_idx < len(EXTREME_MAZE_SIZES):
     w, h = EXTREME_MAZE_SIZES[extreme_idx]
-    return generate_random_maze(w, h, 0.3, RANDOM_SEED + subpass)
+    _MAZE_CACHE[subpass] = generate_random_maze(w, h, 0.3, RANDOM_SEED + subpass)
+    return _MAZE_CACHE[subpass]
 
   raise StopIteration
 
@@ -604,19 +607,10 @@ def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
 
 
 highLevelSummary = """
-Maze solving is a classic pathfinding problem.
-
-**Algorithms:**
-- **BFS (Breadth-First Search)**: Finds shortest path, O(V+E)
-- **DFS (Depth-First Search)**: Finds a path (not shortest), O(V+E)
-- **A* Search**: Optimal with admissible heuristic
-- **Dijkstra**: For weighted graphs
-
-**Key concepts:**
-- Graph representation of maze
-- Visited set to avoid cycles
-- Queue (BFS) vs Stack (DFS)
-- Manhattan distance heuristic for A*
-
-The baseline uses simple BFS for optimal shortest paths.
+<p>Find the shortest path through a maze from a start cell to an end cell.
+The maze is a grid of walls and open passages, and the AI must navigate
+from one corner to the other using the fewest steps possible.</p>
+<p>Subpasses increase the maze size dramatically, testing whether the AI's
+approach scales to very large mazes. The baseline finds the true shortest
+path using breadth-first search.</p>
 """

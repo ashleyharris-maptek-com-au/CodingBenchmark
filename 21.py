@@ -550,10 +550,11 @@ def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
 
 
 highLevelSummary = """
-N-Dimensional Snake generalizes classic snake to arbitrary dimensions.
-
-**Key concepts:**
-- State space grows exponentially with dimensions
-- Collision detection in N-D grid
-- Path planning to food while avoiding self
+<p>Play the classic Snake game, but in more than two dimensions. The snake moves
+through an N-dimensional grid, eating food to grow while avoiding its own body
+and the walls. In higher dimensions the grid is enormous but self-collision
+becomes far trickier to reason about.</p>
+<p>Subpasses increase the number of dimensions, making the state space explode.
+The AI must write a strategy that plans a safe path to food without boxing
+itself in.</p>
 """

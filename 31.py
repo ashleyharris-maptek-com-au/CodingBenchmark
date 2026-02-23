@@ -483,12 +483,12 @@ def _generate_subset_viz_html(viz: dict) -> str:
 
 
 highLevelSummary = """
-Subset Sum determines if a subset of numbers sums to a target value.
-
-**Algorithms:**
-- **Dynamic Programming**: O(n*target) pseudo-polynomial
-- **Meet in the Middle**: O(2^(n/2)) for smaller sets
-- **Approximation**: FPTAS for optimization variant
+<p>Given a list of numbers and a target total, find a subset of those numbers that
+adds up to exactly the target. It sounds simple, but with large lists the number
+of possible subsets is astronomical.</p>
+<p>This is a classic NP-hard problem. The test uses planted instances with a known
+solution for strict pass/fail grading. Subpasses increase the list size and
+target magnitude.</p>
 """
 
 

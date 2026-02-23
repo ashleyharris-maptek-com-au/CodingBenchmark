@@ -469,10 +469,12 @@ def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
 
 
 highLevelSummary = """
-Graph Bisection partitions vertices into two equal parts minimizing crossing edges.
-
-This test uses planted two-component graphs with known optimum cut value 0,
-so grading is strict pass/fail.
+<p>Split a graph&rsquo;s nodes into two equally-sized groups so that as few edges
+as possible cross between the groups. Think of dividing a school into two teams
+where friends want to stay together &mdash; minimise the number of friendships
+that get split.</p>
+<p>The test uses planted graphs that can be perfectly bisected with zero crossing
+edges, so grading is strict pass/fail. Subpasses increase the graph size.</p>
 """
 
 

@@ -1380,18 +1380,13 @@ def _generate_mission_3d(viz_data: dict, case: dict) -> str:
 
 
 highLevelSummary = """
-Asteroid interception is a trajectory optimization problem requiring N-body gravitational simulation.
-
-**Key Concepts:**
-- **N-body simulation**: Accurate modeling of gravitational forces from Sun, planets
-- **Lambert's problem**: Computing transfer orbits between two positions
-- **Gravity assists**: Using planetary flybys to save delta-V
-- **Kinetic impactor**: Deflecting asteroid by momentum transfer
-
-**Algorithm approaches:**
-- Direct trajectory optimization for short warning times
-- Multi-flyby planning for longer missions with tight delta-V
-- Patched conics for initial trajectory estimation
+<p>Launch an interceptor spacecraft to collide with a dangerous asteroid before it
+reaches Earth. The AI must plan a trajectory through the solar system, accounting
+for the gravitational pull of the Sun and planets, to hit a moving target millions
+of kilometres away.</p>
+<p>Harder subpasses give less warning time or tighter fuel budgets, potentially
+requiring planetary gravity assists (slingshots) to reach the asteroid. The AI
+must implement orbital mechanics and trajectory optimisation from scratch.</p>
 """
 
 if __name__ == "__main__":

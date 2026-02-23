@@ -854,12 +854,11 @@ def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
 
 
 highLevelSummary = """
-3D Voxel Mining optimises open-pit mine planning in a block model.
-
-**Key concepts:**
-- Block model with mass and ore-value per voxel
-- Precedence constraints (only dig exposed voxels)
-- Haul-road slope limits and fuel economics
-- Processing plant revenue vs. junk penalties
-- Strategic waste dumping that doesn't block future access
+<p>Plan an open-pit mine in a 3D block model. Each block has a value (ore worth
+money, waste costs money to move) and you can only dig a block once the blocks
+above it have been removed. The goal is to maximise profit by choosing which
+blocks to extract and where to dump the waste.</p>
+<p>The AI must balance revenue against haulage costs, respect slope constraints for
+road access, and avoid dumping waste where it blocks future digging. Subpasses
+increase the pit size and complexity.</p>
 """

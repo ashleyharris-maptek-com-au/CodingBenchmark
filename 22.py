@@ -739,10 +739,10 @@ def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
 
 
 highLevelSummary = """
-Tetris AI evaluates board states to maximize line clears.
-
-**Key heuristics:**
-- Aggregate height, holes, bumpiness
-- Line clear potential
-- Lookahead for upcoming pieces
+<p>Write an AI that plays Tetris. Given the current board state and the next piece,
+choose where to place it to survive as long as possible and clear as many lines
+as you can. Good play means keeping the board flat, avoiding buried holes, and
+setting up multi-line clears.</p>
+<p>Subpasses increase the board size and speed, demanding smarter lookahead and
+evaluation. The AI must balance short-term survival with long-term board health.</p>
 """

@@ -16,7 +16,13 @@ Buffer layout:
   Binding 2 (uniform):   Params - uint32[4]: [N, 0, 0, 0]
 """
 
+import base64
+import json
+import os
 import struct
+import subprocess
+import sys
+import tempfile
 import time
 from typing import Tuple, Optional
 
@@ -193,34 +199,36 @@ _runner_cache = None
 _REPORT_CACHE = {}
 
 
-def gradeAnswer(result, subPass, aiEngineName):
+def _grade_answer_inner(result, subPass, aiEngineName):
   global _runner_cache
 
   if not result or "spirv_hex" not in result:
-    return 0.0, "No SPIR-V hex provided"
+    return 0.0, "No SPIR-V hex provided", {"error": "no_spirv_hex"}
 
   hex_str = result["spirv_hex"].strip().replace(" ", "").replace("\n", "")
 
   # Validate hex string
   if len(hex_str) % 2 != 0:
-    return 0.0, "Hex string has odd length"
+    return 0.0, "Hex string has odd length", {"error": "odd_length"}
 
   try:
     spirv = bytes.fromhex(hex_str)
   except ValueError as e:
-    return 0.0, f"Invalid hex: {e}"
+    return 0.0, f"Invalid hex: {e}", {"error": str(e)}
 
   if len(spirv) < 20:
-    return 0.0, f"SPIR-V binary too short ({len(spirv)} bytes)"
+    return 0.0, f"SPIR-V binary too short ({len(spirv)} bytes)", {"error": "binary_too_short"}
 
   # Check magic number
   magic = struct.unpack_from('<I', spirv, 0)[0]
   if magic != 0x07230203:
-    return 0.0, f"Bad SPIR-V magic: {magic:#010x} (expected 0x07230203)"
+    return 0.0, f"Bad SPIR-V magic: {magic:#010x} (expected 0x07230203)", {
+      "error": "bad_magic"
+    }
 
   valid, err = validate_spirv(spirv)
   if not valid:
-    return 0.0, f"SPIR-V validation failed: {err}"
+    return 0.0, f"SPIR-V validation failed: {err}", {"error": err}
 
   (n,) = SUBPASSES[subPass]
 
@@ -234,6 +242,12 @@ def gradeAnswer(result, subPass, aiEngineName):
 
   workgroups = ((n + 255) // 256, 1, 1)
 
+  report_data = {
+    "n": n,
+    "input_b64": base64.b64encode(input_arr.tobytes()).decode('ascii'),
+    "ref_b64": base64.b64encode(ref_arr.tobytes()).decode('ascii'),
+  }
+
   try:
     if _runner_cache is None:
       _runner_cache = ComputeShaderRunner()
@@ -241,17 +255,14 @@ def gradeAnswer(result, subPass, aiEngineName):
     def verify_fn(results):
       gpu_arr = buffer_to_array(results[1], n)
       score, desc = compare_arrays(gpu_arr, ref_arr)
-      _REPORT_CACHE[(aiEngineName, subPass)] = {
-        "n": n,
-        "input_arr": input_arr,
-        "ref_arr": ref_arr,
-        "gpu_arr": gpu_arr,
+      report_data.update({
+        "gpu_b64": base64.b64encode(gpu_arr.astype(np.uint32).tobytes()).decode('ascii'),
         "score": score,
         "desc": desc,
-      }
+      })
       return score, desc
 
-    return grade_compute(
+    grade = grade_compute(
         spirv,
         buffers={0: input_buf, 1: output_size, 2: params_buf},
         buffer_types={0: 'read', 1: 'readwrite', 2: 'uniform'},
@@ -260,9 +271,97 @@ def gradeAnswer(result, subPass, aiEngineName):
         verify_fn=verify_fn,
         runner=_runner_cache,
         timeout=TIMEOUT_SECONDS)
+    return grade[0], grade[1], report_data
 
   except Exception as e:
-    return 0.0, f"GPU execution failed: {e}"
+    return 0.0, f"GPU execution failed: {e}", {"error": str(e)}
+
+
+def gradeAnswer(result, subPass, aiEngineName):
+  """Run grading in an isolated subprocess to survive GPU hangs/TDRs."""
+  if not result or "spirv_hex" not in result:
+    return 0.0, "No SPIR-V hex provided"
+
+  payload = {
+    "spirv_hex": result.get("spirv_hex", ""),
+    "subPass": subPass,
+    "aiEngineName": aiEngineName,
+  }
+
+  with tempfile.TemporaryDirectory() as tmp_dir:
+    in_path = os.path.join(tmp_dir, "grade_input.json")
+    out_path = os.path.join(tmp_dir, "grade_output.json")
+    with open(in_path, "w", encoding="utf-8") as f:
+      json.dump(payload, f)
+
+    cmd = [sys.executable, __file__, "--grade", in_path, out_path]
+    try:
+      subprocess.run(
+        cmd,
+        check=False,
+        timeout=TIMEOUT_SECONDS + 10,
+        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
+      )
+    except subprocess.TimeoutExpired:
+      return 0.0, "GPU execution timed out or hung (subprocess killed)"
+    except Exception as e:
+      return 0.0, f"Subprocess failed: {e}"
+
+    if not os.path.exists(out_path):
+      return 0.0, "Subprocess produced no result (crash or TDR)"
+
+    try:
+      with open(out_path, "r", encoding="utf-8") as f:
+        out = json.load(f)
+      score = out.get("score", 0.0)
+      explanation = out.get("explanation", "No explanation")
+      details = out.get("details", {}) or {}
+      n = details.get("n")
+      input_b64 = details.get("input_b64")
+      ref_b64 = details.get("ref_b64")
+      gpu_b64 = details.get("gpu_b64")
+      if n and input_b64 and ref_b64 and gpu_b64:
+        n = int(n)
+        input_arr = buffer_to_array(base64.b64decode(input_b64), n)
+        ref_arr = buffer_to_array(base64.b64decode(ref_b64), n)
+        gpu_arr = buffer_to_array(base64.b64decode(gpu_b64), n)
+        _REPORT_CACHE[(aiEngineName, subPass)] = {
+          "n": n,
+          "input_arr": input_arr,
+          "ref_arr": ref_arr,
+          "gpu_arr": gpu_arr,
+          "score": score,
+          "desc": details.get("desc", ""),
+        }
+      return score, explanation
+    except Exception as e:
+      return 0.0, f"Failed to read subprocess result: {e}"
+
+
+def _run_grade_subprocess(in_path: str, out_path: str) -> int:
+  try:
+    with open(in_path, "r", encoding="utf-8") as f:
+      payload = json.load(f)
+    result = {"spirv_hex": payload.get("spirv_hex", "")}
+    subPass = int(payload.get("subPass", 0))
+    aiEngineName = payload.get("aiEngineName", "")
+    score, explanation, details = _grade_answer_inner(result, subPass, aiEngineName)
+    with open(out_path, "w", encoding="utf-8") as f:
+      json.dump({"score": score, "explanation": explanation, "details": details}, f)
+    return 0
+  except Exception as e:
+    try:
+      with open(out_path, "w", encoding="utf-8") as f:
+        json.dump({"score": 0.0, "explanation": f"Subprocess error: {e}",
+                   "details": {"error": str(e)}}, f)
+    except Exception:
+      pass
+    return 1
+
+
+if __name__ == "__main__":
+  if len(sys.argv) >= 4 and sys.argv[1] == "--grade":
+    sys.exit(_run_grade_subprocess(sys.argv[2], sys.argv[3]))
 
 
 # ---------------------------------------------------------------------------
@@ -382,3 +481,14 @@ def resultToNiceReport(result, subPass, aiEngineName):
       {desc}</div>
   </div>
   """
+
+
+highLevelSummary = """
+<p>Write a GPU compute shader as raw SPIR-V binary that computes a parallel prefix
+sum (inclusive scan) of an array of integers. Given an input like [3, 1, 4, 1, 5],
+the output should be [3, 4, 8, 9, 14] &mdash; each element is the sum of all elements
+up to and including that position.</p>
+<p>Doing this efficiently on a GPU requires a multi-pass tree-based algorithm, not a
+simple loop. Subpasses increase the array size up to tens of thousands of elements.
+The result must match the CPU reference exactly, element by element.</p>
+"""

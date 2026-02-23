@@ -715,3 +715,13 @@ def setup():
       input_path = streaming_input.generate()
       size_mb = streaming_input.get_size_bytes() / (1024 * 1024)
       print(f"    Subpass {subpass}: {size_mb:.1f} MB cached")
+
+
+highLevelSummary = """
+<p>Find the smallest set of edges to remove from a graph so that it splits into
+two disconnected pieces. Think of it like finding the weakest point in a network
+&mdash; the fewest cables you&rsquo;d need to cut to divide it in two.</p>
+<p>Subpasses increase the graph size from small networks to very large ones.
+The AI must implement an efficient algorithm; na&iuml;ve approaches are far too
+slow on the bigger inputs.</p>
+"""

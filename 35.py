@@ -213,7 +213,7 @@ TEST_CASES = [
 GRAPH_CACHE: Dict[int, Any] = {}
 _INPUT_FILE_CACHE: Dict[int, StreamingInputFile] = {}
 LAST_DOM_VIZ: Dict[Tuple[int, str], dict] = {}
-STREAMING_THRESHOLD_EDGES = 1_000_000
+STREAMING_THRESHOLD_EDGES = 1_000
 
 
 def get_graph(subpass: int, include_edges: bool = True) -> Tuple[
@@ -499,9 +499,15 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
         grade = (0.0, f"[{case['desc']}] Invalid output format")
         _grade_cache.put_grade(grade, *cache_parts)
         return grade
+
+      t = time.time()
       valid, msg = _verify_planted_domination(
         num_vertices, dom_set, parent, extra_dom_neighbors
       )
+      verify_time = time.time() - t
+      if verify_time > 1:
+        print(f"  _verify_planted_domination time: {verify_time:.2f}s")
+
       if not valid:
         grade = (0.0, f"[{case['desc']}] {msg}")
         _grade_cache.put_grade(grade, *cache_parts)
@@ -531,7 +537,13 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
       dom_set = set(map(int, lines[1].split())) if len(lines) > 1 else set()
 
     num_vertices, edges, planted_dom, _, _, _ = get_graph(subPass)
+
+    t = time.time()
     valid, msg = verify_dominating_set(num_vertices, edges, dom_set)
+    verify_time = time.time() - t
+    if verify_time > 1:
+      print(f"  verify_dominating_set time: {verify_time:.2f}s")
+
     if not valid:
       grade = (0.0, f"[{case['desc']}] {msg}")
       _grade_cache.put_grade(grade, *cache_parts)
@@ -542,7 +554,12 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
         num_vertices, edges, dom_set, planted_dom, valid, msg
       )
 
+    t = time.time()
     greedy_size = greedy_dominating_set(num_vertices, edges)
+    verify_time = time.time() - t
+    if verify_time > 1:
+      print(f"  greedy_dominating_set time: {verify_time:.2f}s")
+
     ratio = len(dom_set) / greedy_size if greedy_size > 0 else 1.0
     score = min(1.0, 1.5 - ratio * 0.5)
 
@@ -702,12 +719,11 @@ def _generate_dom_svg(viz: dict) -> str:
 
 
 highLevelSummary = """
-Minimum Dominating Set finds smallest set where every vertex is in or adjacent to the set.
-
-**Algorithms:**
-- **Greedy**: Select vertices covering most uncovered neighbors
-- **ILP Formulation**: Exact via integer programming
-- **Approximation**: O(log n) for general graphs
+<p>Find the smallest set of nodes such that every node in the graph is either in
+the set or directly connected to a node in the set. Think of placing Wi-Fi
+routers so that every room is within range of at least one router.</p>
+<p>This is NP-hard. The test uses planted instances with a known optimal set for
+strict pass/fail grading. Subpasses increase the graph size.</p>
 """
 
 

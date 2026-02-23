@@ -744,9 +744,12 @@ def _generate_clique_svg(viz: dict) -> str:
 
 
 highLevelSummary = """
-Maximum Clique finds the largest complete subgraph in a graph.
-
-
+<p>Find the largest group of nodes in a graph where every pair is directly
+connected. Think of finding the biggest circle of friends where everyone knows
+everyone else &mdash; no strangers allowed.</p>
+<p>This is one of the hardest problems in computer science (NP-hard). The test
+uses planted instances with a known answer for strict pass/fail grading.
+Subpasses increase the graph size and density.</p>
 """
 
 

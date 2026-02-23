@@ -27,8 +27,11 @@ Fragment output:
   layout(location = 0) out vec4 outColor;
 """
 
+import json
 import os
+import subprocess
 import sys
+import tempfile
 from typing import Tuple, Optional, Dict
 from PIL import Image
 
@@ -39,6 +42,8 @@ from shader_test_utils import (
 )
 
 title = "Binary SPIR-V Fragment Shaders"
+
+TIMEOUT_SECONDS = 60
 
 # ---------------------------------------------------------------------------
 # Common binary SPIR-V description for prompts
@@ -285,11 +290,11 @@ def _get_renderer():
     return _renderer_instance
 
 
-def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
+def _grade_answer_inner(result: dict, subPass: int, aiEngineName: str) -> tuple:
     if not result:
-        return 0.0, "No result provided"
+        return 0.0, "No result provided", {"error": "no_result"}
     if "spirv_hex" not in result:
-        return 0.0, "No SPIR-V hex data provided"
+        return 0.0, "No SPIR-V hex data provided", {"error": "no_spirv_hex"}
 
     desc = SUBPASSES[subPass]["description"]
     hex_str = result["spirv_hex"]
@@ -299,40 +304,117 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
     try:
         frag_spirv = bytes.fromhex(hex_str)
     except ValueError as e:
-        return 0.0, f"[{desc}] Invalid hex string: {e}"
+        return 0.0, f"[{desc}] Invalid hex string: {e}", {"error": str(e)}
 
     # Check SPIR-V magic number
     if len(frag_spirv) < 20:
-        return 0.0, f"[{desc}] Binary too short ({len(frag_spirv)} bytes, minimum 20)"
+        return 0.0, f"[{desc}] Binary too short ({len(frag_spirv)} bytes, minimum 20)", {
+            "error": "binary_too_short"
+        }
     magic = int.from_bytes(frag_spirv[0:4], 'little')
     if magic != 0x07230203:
-        return 0.0, f"[{desc}] Invalid SPIR-V magic: 0x{magic:08X} (expected 0x07230203)"
+        return 0.0, f"[{desc}] Invalid SPIR-V magic: 0x{magic:08X} (expected 0x07230203)", {
+            "error": "bad_magic"
+        }
 
     try:
         renderer = _get_renderer()
     except Exception as e:
-        return 0.0, f"[{desc}] Failed to create renderer: {e}"
+        return 0.0, f"[{desc}] Failed to create renderer: {e}", {"error": str(e)}
 
     valid, err = validate_spirv(frag_spirv)
     if not valid:
-        return 0.0, f"[{desc}] SPIR-V validation failed: {err}"
+        return 0.0, f"[{desc}] SPIR-V validation failed: {err}", {"error": err}
 
     try:
         pixels = renderer.render(frag_spirv)
     except Exception as e:
-        return 0.0, f"[{desc}] Rendering failed: {e}"
+        return 0.0, f"[{desc}] Rendering failed: {e}", {"error": str(e)}
 
-    _OUTPUT_IMAGE_CACHE[(subPass, aiEngineName)] = _save_rendered_image(
-        45, subPass, aiEngineName, pixels
-    )
+    output_image = _save_rendered_image(45, subPass, aiEngineName, pixels)
 
     reference = load_reference(41, subPass)
     if reference is None:
         save_reference(pixels, 41, subPass)
-        return 1.0, f"[{desc}] No reference - saved current render as reference"
+        return 1.0, f"[{desc}] No reference - saved current render as reference", {
+            "output_image": output_image
+        }
 
     score, explanation = compare_images(pixels, reference, color_tolerance=2, spatial_tolerance=1)
-    return score, f"[{desc}] {explanation}"
+    return score, f"[{desc}] {explanation}", {"output_image": output_image}
+
+
+def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
+    """Run grading in an isolated subprocess to survive GPU hangs/TDRs."""
+    if not result or "spirv_hex" not in result:
+        return 0.0, "No SPIR-V hex data provided"
+
+    payload = {
+        "spirv_hex": result.get("spirv_hex", ""),
+        "subPass": subPass,
+        "aiEngineName": aiEngineName,
+    }
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        in_path = os.path.join(tmp_dir, "grade_input.json")
+        out_path = os.path.join(tmp_dir, "grade_output.json")
+        with open(in_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+
+        cmd = [sys.executable, __file__, "--grade", in_path, out_path]
+        try:
+            subprocess.run(
+                cmd,
+                check=False,
+                timeout=TIMEOUT_SECONDS + 10,
+                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
+            )
+        except subprocess.TimeoutExpired:
+            return 0.0, "GPU execution timed out or hung (subprocess killed)"
+        except Exception as e:
+            return 0.0, f"Subprocess failed: {e}"
+
+        if not os.path.exists(out_path):
+            return 0.0, "Subprocess produced no result (crash or TDR)"
+
+        try:
+            with open(out_path, "r", encoding="utf-8") as f:
+                out = json.load(f)
+            score = out.get("score", 0.0)
+            explanation = out.get("explanation", "No explanation")
+            details = out.get("details", {}) or {}
+            output_image = details.get("output_image")
+            if output_image:
+                _OUTPUT_IMAGE_CACHE[(subPass, aiEngineName)] = output_image
+            return score, explanation
+        except Exception as e:
+            return 0.0, f"Failed to read subprocess result: {e}"
+
+
+def _run_grade_subprocess(in_path: str, out_path: str) -> int:
+    try:
+        with open(in_path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        result = {"spirv_hex": payload.get("spirv_hex", "")}
+        subPass = int(payload.get("subPass", 0))
+        aiEngineName = payload.get("aiEngineName", "")
+        score, explanation, details = _grade_answer_inner(result, subPass, aiEngineName)
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump({"score": score, "explanation": explanation, "details": details}, f)
+        return 0
+    except Exception as e:
+        try:
+            with open(out_path, "w", encoding="utf-8") as f:
+                json.dump({"score": 0.0, "explanation": f"Subprocess error: {e}",
+                           "details": {"error": str(e)}}, f)
+        except Exception:
+            pass
+        return 1
+
+
+if __name__ == "__main__":
+    if len(sys.argv) >= 4 and sys.argv[1] == "--grade":
+        sys.exit(_run_grade_subprocess(sys.argv[2], sys.argv[3]))
 
 
 def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
@@ -371,13 +453,11 @@ def _save_rendered_image(test_num: int, subPass: int, aiEngineName: str, pixels)
 
 
 highLevelSummary = """
-Binary SPIR-V Fragment Shaders tests the ability to construct GPU shaders as raw SPIR-V binary data.
-
-**Key concepts:**
-- SPIR-V binary format (little-endian 32-bit words, magic number, header, instruction stream)
-- Instruction encoding: (word_count << 16) | opcode
-- Type system (void, float, vectors, pointers)
-- Decoration system (locations, bindings, offsets)
-- Same 20 rendering tasks as test 41
-- This is the hardest shader test: requires byte-level understanding of SPIR-V
+<p>Construct GPU fragment shaders as raw SPIR-V binary data &mdash; a stream of
+little-endian 32-bit words encoding every instruction, type, and decoration by
+hand. The same 20 visual effects (lighting, patterns, fractals) must be produced,
+but the AI outputs hex-encoded binary rather than text assembly.</p>
+<p>This is the most extreme shader test: every opcode, operand, and ID must be
+numerically correct at the byte level. The binary is validated, rendered on a
+sphere, and compared pixel-by-pixel against the reference images.</p>
 """

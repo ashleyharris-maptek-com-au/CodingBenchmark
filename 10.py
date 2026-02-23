@@ -650,23 +650,9 @@ def generate_2d_cutting_stock_svg(rects: List[Tuple[int, int]], board_w: int, bo
 
 
 highLevelSummary = """
-The 2D Cutting Stock Problem is a harder variant of bin packing.
-
-**Problem:** Pack rectangles into minimum number of fixed-size boards.
-
-**Key considerations:**
-- Rectangles may be rotated 90°
-- No overlapping allowed
-- Guillotine vs non-guillotine cuts
-
-**Algorithms:**
-- **Shelf algorithms**: NFDH, FFDH, BFDH - pack in horizontal shelves
-- **Guillotine**: Only edge-to-edge cuts (practical for real cutting)
-- **Maximal rectangles**: Track free spaces, best-fit placement
-- **Bottom-Left (BL)**: Place at lowest, then leftmost position
-- **Skyline**: Track top profile of placed rectangles
-
-**Complexity:** NP-hard, but good heuristics exist.
-
-The baseline uses Shelf Next Fit Decreasing Height (SNFDH).
+<p>Pack a set of rectangles into as few fixed-size boards as possible, with no
+overlapping. Rectangles may be rotated 90&deg; to fit better. Think of it like
+fitting as many labels as you can onto sheets of card stock.</p>
+<p>This 2D packing problem is NP-hard. Subpasses increase the number and variety
+of rectangles. The baseline stacks rectangles in simple horizontal rows.</p>
 """

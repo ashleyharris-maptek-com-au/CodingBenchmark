@@ -427,3 +427,14 @@ def resultToNiceReport(result, subPass, aiEngineName):
     crashed=crashed,
     crash_reason=crash_reason,
   )
+
+
+highLevelSummary = """
+<p>Write a Python autopilot to dock a spacecraft with a space station in orbit.
+Orbital mechanics are counter-intuitive &mdash; thrusting towards the target often
+moves you away because of how orbits work &mdash; so the AI must understand
+rendezvous dynamics, not just &ldquo;point and go&rdquo;.</p>
+<p>The 25 scenarios vary starting positions, sensor and thruster failures, and
+uncommanded thrust events. The AI must plan approach manoeuvres, manage fuel, and
+handle faults while achieving a gentle, aligned docking.</p>
+"""

@@ -2420,3 +2420,317 @@ def generate_threejs_docking_viz(path_points,
     """
   return html
 
+
+def generate_threejs_boid_visualization(initial_boids: List,
+                                        gpu_frames: List,
+                                        ref_frames: List,
+                                        gpu_final: List,
+                                        ref_final: List,
+                                        n_total: int,
+                                        n_shown: int,
+                                        timesteps: int,
+                                        dt: float,
+                                        pos_tol: float,
+                                        score: float,
+                                        bound_size: float) -> str:
+  """
+  Generate HTML/JS for 3D boid flocking visualization with playback controls.
+  Shows both GPU (orange) and CPU reference (cyan) boids for comparison.
+
+  Args:
+      initial_boids: [[x,y,z,vx,vy,vz], ...] initial state
+      gpu_frames: list of frames from GPU, each [[x,y,z,vx,vy,vz], ...]
+      ref_frames: list of frames from CPU reference (same length as gpu_frames)
+      gpu_final: [[x,y,z,vx,vy,vz], ...] GPU final state
+      ref_final: [[x,y,z,vx,vy,vz], ...] CPU final state
+      n_total: total boid count (before downsampling)
+      n_shown: number of boids shown in visualization
+      timesteps: total simulation steps
+      dt: timestep
+      pos_tol: position tolerance used for grading
+      score: grade score
+      bound_size: simulation bounding box size
+  """
+  viz_id = str(uuid.uuid4())[:8]
+
+  gpu_frames_json = json.dumps(gpu_frames)
+  ref_frames_json = json.dumps(ref_frames)
+  gpu_final_json = json.dumps(gpu_final)
+  ref_final_json = json.dumps(ref_final)
+  num_frames = max(len(gpu_frames), len(ref_frames))
+
+  score_color = "#22c55e" if score >= 0.8 else "#eab308" if score >= 0.3 else "#ef4444"
+
+  html = f"""
+  <div class="boid-visualization" style="margin: 15px 0;">
+    <details>
+      <summary style="cursor:pointer;padding:8px;background:#e8e8e8;border-radius:4px;font-weight:bold;color:#333;border:1px solid #ccc;">
+        &#x1f426; Boid Flocking: N={n_total} ({n_shown} shown), {timesteps} steps
+        <span style="color:{score_color};margin-left:8px;">score={score:.2f}</span>
+      </summary>
+      <div style="margin-top:10px;">
+        <div id="boid-renderer-{viz_id}" style="width:100%;height:500px;border:1px solid #ccc;background:#111;border-radius:4px;position:relative;display:flex;align-items:center;justify-content:center;color:#999;">
+          <span class="viz-placeholder">Scroll here to activate 3D view</span>
+        </div>
+        <div id="boid-controls-{viz_id}" style="display:none;margin-top:8px;padding:8px 12px;background:#f8f8f8;border:1px solid #e5e7eb;border-radius:6px;">
+          <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+            <button id="boid-play-{viz_id}" style="padding:4px 12px;background:#3b82f6;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:13px;">&#x25b6; Play</button>
+            <input id="boid-scrub-{viz_id}" type="range" min="0" max="100" value="0" style="flex:1;min-width:120px;">
+            <span id="boid-frame-{viz_id}" style="font-size:12px;color:#475569;min-width:80px;">Frame 0/{num_frames}</span>
+            <label style="font-size:12px;color:#475569;">Speed:
+              <select id="boid-speed-{viz_id}" style="font-size:12px;padding:2px 4px;">
+                <option value="0.5">0.5x</option>
+                <option value="1" selected>1x</option>
+                <option value="2">2x</option>
+                <option value="4">4x</option>
+              </select>
+            </label>
+            <label style="font-size:12px;color:#475569;">
+              <input id="boid-showcpu-{viz_id}" type="checkbox" checked style="margin-right:3px;">CPU ref
+            </label>
+            <label style="font-size:12px;color:#475569;">
+              <input id="boid-showgpu-{viz_id}" type="checkbox" checked style="margin-right:3px;">GPU
+            </label>
+            <button id="boid-reset-{viz_id}" style="padding:4px 8px;background:#e5e7eb;border:1px solid #ccc;border-radius:4px;cursor:pointer;font-size:12px;">Reset View</button>
+          </div>
+        </div>
+        <div style="margin-top:6px;font-size:11px;color:#64748b;">
+          Bound={bound_size} &middot; dt={dt} &middot; pos_tol={pos_tol:.2f} &middot; {n_shown}/{n_total} boids shown &middot;
+          <span style="color:#22d3ee;">&#x25cf; Cyan=CPU ref</span> &middot;
+          <span style="color:#f97316;">&#x25cf; Orange=GPU</span> &middot;
+          Drag to rotate &middot; Scroll to zoom &middot; Right-drag to pan
+        </div>
+      </div>
+    </details>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/three@0.132.2/build/three.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.132.2/examples/js/controls/OrbitControls.js"></script>
+  <script>
+  (function() {{
+    var vizId = '{viz_id}';
+    var gpuFrames = {gpu_frames_json};
+    var refFrames = {ref_frames_json};
+    var gpuFinal = {gpu_final_json};
+    var refFinal = {ref_final_json};
+    var boundSize = {bound_size};
+    var nShown = {n_shown};
+    var totalFrames = Math.max(gpuFrames.length, refFrames.length);
+
+    var scene, camera, renderer, controls, animationId;
+    var isActive = false;
+    var cpuMesh, gpuMesh;
+    var currentFrame = 0;
+    var playing = false;
+    var playSpeed = 1;
+    var lastPlayTime = 0;
+    var showCpu = true;
+    var showGpu = true;
+
+    function createBoidInstances(count, color) {{
+      var coneGeom = new THREE.ConeGeometry(0.3, 1.0, 6);
+      coneGeom.rotateX(Math.PI / 2);
+      var mat = new THREE.MeshPhongMaterial({{
+        color: color, flatShading: true, transparent: true, opacity: 0.8
+      }});
+      var mesh = new THREE.InstancedMesh(coneGeom, mat, count);
+      mesh.instanceMatrix.setUsage(35048);
+      return mesh;
+    }}
+
+    function setBoidPositions(mesh, boids) {{
+      var dummy = new THREE.Object3D();
+      for (var i = 0; i < boids.length; i++) {{
+        var b = boids[i];
+        dummy.position.set(b[0], b[1], b[2]);
+        var vx = b[3], vy = b[4], vz = b[5];
+        var speed = Math.sqrt(vx*vx + vy*vy + vz*vz);
+        if (speed > 0.001) {{
+          dummy.lookAt(b[0] + vx, b[1] + vy, b[2] + vz);
+        }}
+        dummy.scale.set(1, 1, 1);
+        dummy.updateMatrix();
+        mesh.setMatrixAt(i, dummy.matrix);
+      }}
+      mesh.instanceMatrix.needsUpdate = true;
+      mesh.count = boids.length;
+    }}
+
+    function getFrame(frames, idx, finalState) {{
+      if (frames.length === 0) return finalState;
+      var i = Math.min(idx, frames.length - 1);
+      return frames[i];
+    }}
+
+    function updateFrame(frameIdx) {{
+      currentFrame = Math.max(0, Math.min(frameIdx, totalFrames - 1));
+      if (cpuMesh) setBoidPositions(cpuMesh, getFrame(refFrames, currentFrame, refFinal));
+      if (gpuMesh) setBoidPositions(gpuMesh, getFrame(gpuFrames, currentFrame, gpuFinal));
+      var scrub = document.getElementById('boid-scrub-' + vizId);
+      if (scrub) scrub.value = (currentFrame / Math.max(1, totalFrames - 1) * 100).toFixed(0);
+      var label = document.getElementById('boid-frame-' + vizId);
+      if (label) label.textContent = 'Frame ' + (currentFrame + 1) + '/' + totalFrames;
+    }}
+
+    function activate() {{
+      if (isActive) return;
+      isActive = true;
+      if (typeof THREE === 'undefined') return;
+      var container = document.getElementById('boid-renderer-' + vizId);
+      if (!container) return;
+
+      var ph = container.querySelector('.viz-placeholder');
+      if (ph) ph.style.display = 'none';
+      var ctrlDiv = document.getElementById('boid-controls-' + vizId);
+      if (ctrlDiv) ctrlDiv.style.display = 'block';
+
+      scene = new THREE.Scene();
+      scene.background = new THREE.Color(0x111827);
+
+      camera = new THREE.PerspectiveCamera(60, container.clientWidth / container.clientHeight, 0.1, 500);
+      camera.position.set(boundSize * 0.8, boundSize * 0.6, boundSize * 0.8);
+      camera.lookAt(0, 0, 0);
+
+      renderer = new THREE.WebGLRenderer({{ antialias: true }});
+      renderer.setSize(container.clientWidth, container.clientHeight);
+      container.appendChild(renderer.domElement);
+
+      controls = new THREE.OrbitControls(camera, renderer.domElement);
+      controls.enableDamping = true;
+      controls.dampingFactor = 0.08;
+      controls.target.set(0, 0, 0);
+
+      scene.add(new THREE.AmbientLight(0x404060, 0.6));
+      var dl = new THREE.DirectionalLight(0xffffff, 0.8);
+      dl.position.set(boundSize, boundSize, boundSize);
+      scene.add(dl);
+      var dl2 = new THREE.DirectionalLight(0x8888ff, 0.3);
+      dl2.position.set(-boundSize, -boundSize, 0);
+      scene.add(dl2);
+
+      var half = boundSize / 2;
+      var boxGeom = new THREE.BoxGeometry(boundSize, boundSize, boundSize);
+      var boxEdges = new THREE.EdgesGeometry(boxGeom);
+      scene.add(new THREE.LineSegments(boxEdges, new THREE.LineBasicMaterial({{ color: 0x334155 }})));
+
+      var grid = new THREE.GridHelper(boundSize, 10, 0x1e293b, 0x1e293b);
+      grid.position.y = -half;
+      scene.add(grid);
+
+      var axes = new THREE.AxesHelper(half * 0.3);
+      axes.position.set(-half, -half, -half);
+      scene.add(axes);
+
+      cpuMesh = createBoidInstances(nShown, 0x22d3ee);
+      scene.add(cpuMesh);
+
+      gpuMesh = createBoidInstances(nShown, 0xf97316);
+      scene.add(gpuMesh);
+
+      updateFrame(0);
+
+      var playBtn = document.getElementById('boid-play-' + vizId);
+      var scrub = document.getElementById('boid-scrub-' + vizId);
+      var speedSel = document.getElementById('boid-speed-' + vizId);
+      var cpuCb = document.getElementById('boid-showcpu-' + vizId);
+      var gpuCb = document.getElementById('boid-showgpu-' + vizId);
+      var resetBtn = document.getElementById('boid-reset-' + vizId);
+
+      if (playBtn) playBtn.addEventListener('click', function() {{
+        playing = !playing;
+        playBtn.innerHTML = playing ? '&#x23f8; Pause' : '&#x25b6; Play';
+        if (playing) lastPlayTime = performance.now();
+      }});
+      if (scrub) scrub.addEventListener('input', function() {{
+        var f = Math.round(parseFloat(scrub.value) / 100 * (totalFrames - 1));
+        updateFrame(f);
+      }});
+      if (speedSel) speedSel.addEventListener('change', function() {{
+        playSpeed = parseFloat(speedSel.value);
+      }});
+      if (cpuCb) cpuCb.addEventListener('change', function() {{
+        showCpu = cpuCb.checked;
+        cpuMesh.visible = showCpu;
+      }});
+      if (gpuCb) gpuCb.addEventListener('change', function() {{
+        showGpu = gpuCb.checked;
+        gpuMesh.visible = showGpu;
+      }});
+      if (resetBtn) resetBtn.addEventListener('click', function() {{
+        camera.position.set(boundSize * 0.8, boundSize * 0.6, boundSize * 0.8);
+        camera.lookAt(0, 0, 0);
+        controls.target.set(0, 0, 0);
+        controls.update();
+      }});
+
+      function animate(now) {{
+        if (!isActive) return;
+        animationId = requestAnimationFrame(animate);
+        if (playing) {{
+          var elapsed = (now - lastPlayTime) / 1000;
+          var framesToAdvance = elapsed * 30 * playSpeed;
+          if (framesToAdvance >= 1) {{
+            var next = currentFrame + Math.floor(framesToAdvance);
+            lastPlayTime = now;
+            if (next >= totalFrames) {{
+              updateFrame(totalFrames - 1);
+              playing = false;
+              if (playBtn) playBtn.innerHTML = '&#x25b6; Play';
+            }} else {{
+              updateFrame(next);
+            }}
+          }}
+        }}
+        controls.update();
+        renderer.render(scene, camera);
+      }}
+      animationId = requestAnimationFrame(animate);
+    }}
+
+    function dispose() {{
+      if (!isActive) return;
+      isActive = false;
+      playing = false;
+      if (animationId) {{ cancelAnimationFrame(animationId); animationId = null; }}
+      var container = document.getElementById('boid-renderer-' + vizId);
+      if (renderer) {{
+        renderer.dispose();
+        if (renderer.domElement && renderer.domElement.parentNode)
+          renderer.domElement.parentNode.removeChild(renderer.domElement);
+        renderer = null;
+      }}
+      if (scene) {{
+        scene.traverse(function(obj) {{
+          if (obj.geometry) obj.geometry.dispose();
+          if (obj.material) {{
+            if (Array.isArray(obj.material)) obj.material.forEach(function(m) {{ m.dispose(); }});
+            else obj.material.dispose();
+          }}
+        }});
+        scene = null;
+      }}
+      camera = null; controls = null;
+      cpuMesh = null; gpuMesh = null;
+      var ctrlDiv = document.getElementById('boid-controls-' + vizId);
+      if (ctrlDiv) ctrlDiv.style.display = 'none';
+      if (container) {{
+        var ph = container.querySelector('.viz-placeholder');
+        if (ph) ph.style.display = '';
+      }}
+    }}
+
+    if (window.VizManager) {{
+      window.VizManager.register({{
+        id: vizId,
+        containerId: 'boid-renderer-' + vizId,
+        activate: activate,
+        dispose: dispose
+      }});
+    }} else {{
+      activate();
+    }}
+  }})();
+  </script>
+  """
+  return html
+

@@ -566,14 +566,11 @@ def _generate_clustering_svg(case: dict) -> str:
 
 
 highLevelSummary = """
-3D point clustering partitions spatial data into meaningful groups.
-
-**Algorithms:**
-- **K-means**: Iterative centroid optimization, O(nki) per iteration
-- **K-means++**: Smart initialization for better convergence
-- **DBSCAN**: Density-based clustering, handles arbitrary shapes
-
-**Key metrics:**
-- WCSS (Within-Cluster Sum of Squares): Lower is better
-- Silhouette score: Measures cluster separation
+<p>Given a cloud of 3D points, group them into clusters so that points in the same
+cluster are close together and points in different clusters are far apart. Think
+of sorting a jar of mixed beads by colour when all you can see is their position.</p>
+<p>The AI must decide how many clusters exist and assign every point to one.
+Subpasses increase the number of points and make the clusters harder to
+separate. Scoring is based on how well the AI&rsquo;s clusters match the true
+groupings.</p>
 """

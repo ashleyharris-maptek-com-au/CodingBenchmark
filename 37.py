@@ -482,11 +482,12 @@ def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
 
 
 highLevelSummary = """
-Directed Feedback Vertex Set asks for the minimum vertices to remove to eliminate all
-directed cycles.
-
-This test uses planted instances: a random DAG core plus a small set of cycle-breaker
-vertices that create all cycles.
+<p>Find the smallest set of nodes to remove from a directed graph so that no cycles
+remain. Think of breaking deadlocks in a dependency chain &mdash; remove as few
+tasks as possible so that the rest can be completed in a straight order.</p>
+<p>This is NP-hard. The test uses planted instances where a known small set of
+nodes creates all the cycles, enabling strict pass/fail grading. Subpasses
+increase the graph size.</p>
 """
 
 

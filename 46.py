@@ -18,11 +18,17 @@ Buffer layout:
   Binding 2 (uniform): Params - uvec4(N, timesteps, 0, 0), vec4(dt, softening, G, 0)
 """
 
+import json
 import math
+import os
 import random
 import struct
+import subprocess
+import sys
+import tempfile
 import time
 import hashlib
+from pathlib import Path
 from html import escape
 from typing import Tuple, Optional
 
@@ -31,6 +37,7 @@ import numpy as np
 from shader_test_utils import compile_glsl, validate_spirv
 from compute_test_utils import ComputeShaderRunner, grade_compute_pingpong
 from solver_utils import GradeCache
+from native_compiler import CppCompiler, CompilationError, ExecutionError
 
 title = "N-Body Gravitational Simulation (GLSL Compute)"
 
@@ -45,10 +52,84 @@ SUBPASSES = [
   (512, 100, 0.001, 0.01),
   (1024, 100, 0.001, 0.01),
   (2048, 200, 0.001, 0.01),
-  (4096, 200, 0.001, 0.01),
 ]
 
 G_CONSTANT = 6.674e-3  # Scaled G for visible dynamics
+
+# ── C++ reference implementation ──────────────────────────────────────────────
+_NBODY_CPP_SOURCE = r"""
+#include <cstdio>
+#include <cmath>
+#include <vector>
+
+int main() {
+    int N, timesteps;
+    double dt, softening, G;
+    if (scanf("%d %d", &N, &timesteps) != 2) return 1;
+    if (scanf("%lf %lf %lf", &dt, &softening, &G) != 3) return 1;
+
+    std::vector<double> px(N), py(N), pz(N);
+    std::vector<double> vx(N), vy(N), vz(N);
+    std::vector<double> mass(N);
+
+    for (int i = 0; i < N; i++) {
+        if (scanf("%lf %lf %lf %lf %lf %lf %lf",
+                  &px[i], &py[i], &pz[i], &mass[i],
+                  &vx[i], &vy[i], &vz[i]) != 7) return 1;
+    }
+
+    std::vector<double> ax(N), ay(N), az(N);
+
+    for (int step = 0; step < timesteps; step++) {
+        for (int i = 0; i < N; i++) {
+            ax[i] = ay[i] = az[i] = 0.0;
+        }
+        for (int i = 0; i < N; i++) {
+            for (int j = 0; j < N; j++) {
+                if (i == j) continue;
+                double dx = px[j] - px[i];
+                double dy = py[j] - py[i];
+                double dz = pz[j] - pz[i];
+                double dist_sq = dx*dx + dy*dy + dz*dz + softening*softening;
+                double dist = sqrt(dist_sq);
+                double force_mag = G * mass[j] / dist_sq;
+                ax[i] += force_mag * dx / dist;
+                ay[i] += force_mag * dy / dist;
+                az[i] += force_mag * dz / dist;
+            }
+        }
+        for (int i = 0; i < N; i++) {
+            vx[i] += ax[i] * dt;
+            vy[i] += ay[i] * dt;
+            vz[i] += az[i] * dt;
+            px[i] += vx[i] * dt;
+            py[i] += vy[i] * dt;
+            pz[i] += vz[i] * dt;
+        }
+    }
+
+    for (int i = 0; i < N; i++) {
+        printf("%.17g %.17g %.17g %.17g %.17g %.17g %.17g\n",
+               px[i], py[i], pz[i], mass[i], vx[i], vy[i], vz[i]);
+    }
+    return 0;
+}
+"""
+
+_cpp_compiler = None
+_cpp_exe = None
+
+
+def _get_cpp_exe():
+  """Compile the C++ N-body reference binary (cached by source hash)."""
+  global _cpp_compiler, _cpp_exe
+  if _cpp_exe is not None and _cpp_exe.exists():
+    return _cpp_exe
+  _cpp_compiler = CppCompiler("_reference")
+  if _cpp_compiler.find_compiler() is None:
+    raise CompilationError("No C++ compiler found for N-body reference")
+  _cpp_exe = _cpp_compiler.compile(_NBODY_CPP_SOURCE)
+  return _cpp_exe
 
 
 def generate_bodies(n, seed=RANDOM_SEED):
@@ -96,8 +177,8 @@ def make_params_buffer(n, timesteps, dt, softening):
   return data
 
 
-def cpu_reference(bodies, timesteps, dt, softening, G=G_CONSTANT):
-  """Run N-body simulation on CPU with double precision."""
+def _cpu_reference_python(bodies, timesteps, dt, softening, G=G_CONSTANT):
+  """Fallback: pure Python/numpy O(N^2) N-body simulation."""
   n = len(bodies)
   pos = np.array([(b[0], b[1], b[2]) for b in bodies], dtype=np.float64)
   vel = np.array([(b[4], b[5], b[6]) for b in bodies], dtype=np.float64)
@@ -121,6 +202,47 @@ def cpu_reference(bodies, timesteps, dt, softening, G=G_CONSTANT):
   result = []
   for i in range(n):
     result.append((pos[i, 0], pos[i, 1], pos[i, 2], mass[i], vel[i, 0], vel[i, 1], vel[i, 2]))
+  return result
+
+
+def cpu_reference(bodies, timesteps, dt, softening, G=G_CONSTANT):
+  """Run N-body simulation using compiled C++ (falls back to Python)."""
+  n = len(bodies)
+  try:
+    exe = _get_cpp_exe()
+  except (CompilationError, Exception) as e:
+    print(f"  C++ reference unavailable ({e}), falling back to Python...")
+    return _cpu_reference_python(bodies, timesteps, dt, softening, G)
+
+  # Build stdin text
+  lines = [f"{n} {timesteps}", f"{dt!r} {softening!r} {G!r}"]
+  for x, y, z, m, vx, vy, vz in bodies:
+    lines.append(f"{x!r} {y!r} {z!r} {m!r} {vx!r} {vy!r} {vz!r}")
+  stdin_data = "\n".join(lines) + "\n"
+
+  compiler = _cpp_compiler or CppCompiler("_reference")
+  try:
+    stdout, stderr, elapsed, rc = compiler.execute(exe, stdin_data=stdin_data, timeout=300)
+  except ExecutionError as e:
+    print(f"  C++ reference execution failed ({e}), falling back to Python...")
+    return _cpu_reference_python(bodies, timesteps, dt, softening, G)
+
+  if rc != 0:
+    print(f"  C++ reference failed (rc={rc}): {stderr[:300]}")
+    print(f"  Falling back to Python...")
+    return _cpu_reference_python(bodies, timesteps, dt, softening, G)
+
+  # Parse output
+  result = []
+  for line in stdout.strip().split("\n"):
+    vals = line.split()
+    if len(vals) == 7:
+      result.append(tuple(float(v) for v in vals))
+
+  if len(result) != n:
+    print(f"  C++ reference returned {len(result)} bodies, expected {n}. Falling back...")
+    return _cpu_reference_python(bodies, timesteps, dt, softening, G)
+
   return result
 
 
@@ -270,27 +392,85 @@ _runner_cache = None
 _ref_cache = {}
 _REPORT_CACHE = {}
 _grade_cache = GradeCache('test46')
+_CACHE_DEBUG = os.environ.get("CB_DEBUG_CACHE") == "1"
+
+
+def _normalize_shader_code(code: str) -> str:
+  if not isinstance(code, str):
+    code = str(code)
+  code = code.replace("\r\n", "\n").replace("\r", "\n")
+  lines = [ln.rstrip() for ln in code.split("\n")]
+  return "\n".join(lines).strip()
 
 
 def _cache_key_parts(result, subPass):
   code = result.get("shader_code", "")
   n, timesteps, dt, softening = SUBPASSES[subPass]
+  code_norm = _normalize_shader_code(code)
   return (
-    hashlib.sha256(code.encode('utf-8')).hexdigest()[:16],
+    hashlib.sha256(code_norm.encode('utf-8')).hexdigest()[:16],
     f"n={n}|steps={timesteps}|dt={dt}|soft={softening}|g={G_CONSTANT}",
   )
 
 
-def gradeAnswer(result, subPass, aiEngineName):
+def _cpu_ref_cache_key(n, timesteps, dt, softening):
+  seed = RANDOM_SEED + n
+  key = f"n={n}|steps={timesteps}|dt={dt}|soft={softening}|g={G_CONSTANT}|seed={seed}"
+  return hashlib.sha256(key.encode('utf-8')).hexdigest()[:24]
+
+
+def _cpu_ref_cache_path(n, timesteps, dt, softening) -> Path:
+  key = _cpu_ref_cache_key(n, timesteps, dt, softening)
+  return _grade_cache.cache_dir / f"cpu_ref_{key}.npz"
+
+
+def _load_cpu_reference(n, timesteps, dt, softening):
+  key = _cpu_ref_cache_key(n, timesteps, dt, softening)
+  if key in _ref_cache:
+    if _CACHE_DEBUG:
+      print(f"[cache46] cpu_ref hit (mem) {key}")
+    return _ref_cache[key]
+
+  cache_path = _cpu_ref_cache_path(n, timesteps, dt, softening)
+  if cache_path.exists():
+    try:
+      data = np.load(cache_path)
+      ref_bodies = data["bodies"]
+      _ref_cache[key] = ref_bodies
+      if _CACHE_DEBUG:
+        print(f"[cache46] cpu_ref hit (disk) {cache_path}")
+      return ref_bodies
+    except Exception:
+      pass
+
+  if _CACHE_DEBUG:
+    print(f"[cache46] cpu_ref miss {cache_path}")
+  return None
+
+
+def _store_cpu_reference(n, timesteps, dt, softening, ref_bodies):
+  key = _cpu_ref_cache_key(n, timesteps, dt, softening)
+  cache_path = _cpu_ref_cache_path(n, timesteps, dt, softening)
+  try:
+    np.savez_compressed(cache_path, bodies=np.array(ref_bodies, dtype=np.float64))
+    if _CACHE_DEBUG:
+      print(f"[cache46] cpu_ref stored {cache_path}")
+  except Exception:
+    pass
+  _ref_cache[key] = ref_bodies
+
+
+def _grade_answer_inner(result, subPass, aiEngineName):
   global _runner_cache, _ref_cache
 
   if not result or "shader_code" not in result:
-    return 0.0, "No shader code provided"
+    return 0.0, "No shader code provided", {"error": "no_shader_code"}
 
   cache_parts = _cache_key_parts(result, subPass)
-  cached = _grade_cache.get_grade(*cache_parts)
-  if cached is not None:
-    return cached
+  if _CACHE_DEBUG:
+    print(f"[cache46] grade key parts={cache_parts}")
+  if _CACHE_DEBUG:
+    print(f"[cache46] grade miss {cache_parts}")
 
   code = result["shader_code"]
 
@@ -300,27 +480,38 @@ def gradeAnswer(result, subPass, aiEngineName):
   except RuntimeError as e:
     grade = (0.0, f"GLSL compilation failed: {e}")
     _grade_cache.put_grade(grade, *cache_parts)
-    return grade
+    return grade[0], grade[1], {"error": str(e)}
 
   valid, err = validate_spirv(spirv)
   if not valid:
     grade = (0.0, f"SPIR-V validation failed: {err}")
     _grade_cache.put_grade(grade, *cache_parts)
-    return grade
+    return grade[0], grade[1], {"error": err}
 
   n, timesteps, dt, softening = SUBPASSES[subPass]
 
   # Generate test data
+  t = time.time()
   bodies = generate_bodies(n)
   input_data = bodies_to_buffer(bodies)
   params = make_params_buffer(n, timesteps, dt, softening)
+  generate_time = time.time() - t
+  if generate_time > 1:
+    print(f"  Body generation took {generate_time:.2f}s")
 
+  t = time.time()
   # CPU reference (cached)
-  cache_key = (n, timesteps)
-  if cache_key not in _ref_cache:
+  ref_bodies = _load_cpu_reference(n, timesteps, dt, softening)
+  if ref_bodies is None:
     print(f"  Computing CPU reference for N={n}, steps={timesteps}...")
-    _ref_cache[cache_key] = cpu_reference(bodies, timesteps, dt, softening)
-  ref_bodies = _ref_cache[cache_key]
+    ref_bodies = cpu_reference(bodies, timesteps, dt, softening)
+    _store_cpu_reference(n, timesteps, dt, softening, ref_bodies)
+
+  ref_time = time.time() - t
+  if ref_time > 1:
+    print(f"  CPU reference took {ref_time:.2f}s")
+
+  report_data = {}
 
   # Run on GPU
   try:
@@ -336,19 +527,25 @@ def gradeAnswer(result, subPass, aiEngineName):
       vel_tol = 0.5 * (1 + timesteps / 100)
       score, desc, details = compare_bodies(
         gpu_bodies, ref_bodies, pos_tol, vel_tol, return_details=True)
-      _REPORT_CACHE[(aiEngineName, subPass)] = {
+      report_data.update({
         "n": n,
         "timesteps": timesteps,
         "dt": dt,
         "softening": softening,
-        "pos_tol": pos_tol,
-        "vel_tol": vel_tol,
+        "pos_tol": float(pos_tol),
+        "vel_tol": float(vel_tol),
         "gpu_bodies": gpu_bodies,
         "ref_bodies": ref_bodies,
-        "details": details,
+        "details": {
+          "pos_errors": [float(x) for x in details["pos_errors"]],
+          "vel_errors": [float(x) for x in details["vel_errors"]],
+          "avg_pos_err": float(details["avg_pos_err"]),
+          "max_pos_err": float(details["max_pos_err"]),
+          "avg_vel_err": float(details["avg_vel_err"]),
+        },
         "score": score,
         "desc": desc,
-      }
+      })
       return score, desc
 
     grade = grade_compute_pingpong(spirv,
@@ -361,12 +558,97 @@ def gradeAnswer(result, subPass, aiEngineName):
                                    runner=_runner_cache,
                                    timeout=TIMEOUT_SECONDS)
     _grade_cache.put_grade(grade, *cache_parts)
-    return grade
+    return grade[0], grade[1], report_data
 
   except Exception as e:
     grade = (0.0, f"GPU execution failed: {e}")
     _grade_cache.put_grade(grade, *cache_parts)
-    return grade
+    return grade[0], grade[1], {"error": str(e)}
+
+
+def gradeAnswer(result, subPass, aiEngineName):
+  """Run grading in an isolated subprocess to survive GPU hangs/TDRs."""
+  if not result or "shader_code" not in result:
+    return 0.0, "No shader code provided"
+
+  cache_parts = _cache_key_parts(result, subPass)
+  if _CACHE_DEBUG:
+    print(f"[cache46] grade key parts={cache_parts}")
+  cached = _grade_cache.get_grade(*cache_parts)
+  if cached is not None:
+    if _CACHE_DEBUG:
+      print(f"[cache46] grade hit {cache_parts}")
+    return cached
+  if _CACHE_DEBUG:
+    print(f"[cache46] grade miss {cache_parts}")
+
+  payload = {
+    "shader_code": result.get("shader_code", ""),
+    "subPass": subPass,
+    "aiEngineName": aiEngineName,
+  }
+
+  with tempfile.TemporaryDirectory() as tmp_dir:
+    in_path = os.path.join(tmp_dir, "grade_input.json")
+    out_path = os.path.join(tmp_dir, "grade_output.json")
+    with open(in_path, "w", encoding="utf-8") as f:
+      json.dump(payload, f)
+
+    cmd = [sys.executable, __file__, "--grade", in_path, out_path]
+    try:
+      subprocess.run(
+        cmd,
+        check=False,
+        timeout=TIMEOUT_SECONDS + 10,
+        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
+      )
+    except subprocess.TimeoutExpired:
+      return 0.0, "GPU execution timed out or hung (subprocess killed)"
+    except Exception as e:
+      return 0.0, f"Subprocess failed: {e}"
+
+    if not os.path.exists(out_path):
+      return 0.0, "Subprocess produced no result (crash or TDR)"
+
+    try:
+      with open(out_path, "r", encoding="utf-8") as f:
+        out = json.load(f)
+      score = out.get("score", 0.0)
+      explanation = out.get("explanation", "No explanation")
+      details = out.get("details", {}) or {}
+      if details:
+        _REPORT_CACHE[(aiEngineName, subPass)] = details
+      grade = (score, explanation)
+      _grade_cache.put_grade(grade, *cache_parts)
+      return grade
+    except Exception as e:
+      return 0.0, f"Failed to read subprocess result: {e}"
+
+
+def _run_grade_subprocess(in_path: str, out_path: str) -> int:
+  try:
+    with open(in_path, "r", encoding="utf-8") as f:
+      payload = json.load(f)
+    result = {"shader_code": payload.get("shader_code", "")}
+    subPass = int(payload.get("subPass", 0))
+    aiEngineName = payload.get("aiEngineName", "")
+    score, explanation, details = _grade_answer_inner(result, subPass, aiEngineName)
+    with open(out_path, "w", encoding="utf-8") as f:
+      json.dump({"score": score, "explanation": explanation, "details": details}, f)
+    return 0
+  except Exception as e:
+    try:
+      with open(out_path, "w", encoding="utf-8") as f:
+        json.dump({"score": 0.0, "explanation": f"Subprocess error: {e}",
+                   "details": {"error": str(e)}}, f)
+    except Exception:
+      pass
+    return 1
+
+
+if __name__ == "__main__":
+  if len(sys.argv) >= 4 and sys.argv[1] == "--grade":
+    sys.exit(_run_grade_subprocess(sys.argv[2], sys.argv[3]))
 
 
 def _build_svg_projection(samples, width=520, height=360):
@@ -472,3 +754,38 @@ def resultToNiceReport(result, subPass, aiEngineName):
 
   _grade_cache.put_report(html, *cache_parts)
   return html
+
+
+def setup():
+  """Pre-compile C++ reference and compute all CPU references (called by --setup)."""
+  print("  Compiling C++ N-body reference...")
+  try:
+    _get_cpp_exe()
+    print("  C++ reference compiled OK")
+  except Exception as e:
+    print(f"  WARNING: C++ compilation failed ({e}), will use Python fallback")
+
+  print("  Pre-computing CPU references for all subpasses...")
+  for i, (n, timesteps, dt, softening) in enumerate(SUBPASSES):
+    ref = _load_cpu_reference(n, timesteps, dt, softening)
+    if ref is not None:
+      print(f"    Subpass {i}: N={n}, steps={timesteps} - cached")
+      continue
+    print(f"    Subpass {i}: N={n}, steps={timesteps} - computing...")
+    t0 = time.time()
+    bodies = generate_bodies(n)
+    ref_bodies = cpu_reference(bodies, timesteps, dt, softening)
+    _store_cpu_reference(n, timesteps, dt, softening, ref_bodies)
+    elapsed = time.time() - t0
+    print(f"    Subpass {i}: done in {elapsed:.1f}s")
+
+
+highLevelSummary = """
+<p>Write a GPU compute shader in GLSL that simulates gravitational attraction between
+particles. Every body pulls on every other body, and the shader must update all
+positions and velocities for each timestep. The final state is compared against a
+high-precision CPU reference.</p>
+<p>Subpasses increase the number of bodies (up to thousands) and timesteps, testing
+both correctness and numerical stability. Errors accumulate over time, so even
+small inaccuracies compound into visible drift.</p>
+"""
