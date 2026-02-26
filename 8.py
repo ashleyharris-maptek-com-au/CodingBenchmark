@@ -40,7 +40,7 @@ def generate_random_maze(width: int, height: int, wall_density: float, seed: int
         carve(nx, ny)
 
   # Start carving from (1, 1)
-  sys.setrecursionlimit(sys.maxsize-1)
+  sys.setrecursionlimit(1000000000)
   try:
     carve(1, 1)
   except RecursionError:
