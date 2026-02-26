@@ -33,6 +33,13 @@ from solver_utils import parse_freeform_response
 
 title = "3D Voxel Mining (C#)"
 
+tags = [
+  "csharp",
+  "freeform response",
+  "optimization",
+  "geometry",
+]
+
 TIMEOUT_SECONDS = 300
 RANDOM_SEED = 19191919
 

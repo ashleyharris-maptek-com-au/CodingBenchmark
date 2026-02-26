@@ -44,6 +44,13 @@ from shader_test_utils import (
 
 title = "Fragment Shaders (HLSL)"
 
+tags = [
+  "hlsl",
+  "structured response",
+  "shader",
+  "gpu",
+]
+
 TIMEOUT_SECONDS = 60
 
 _renderer_instance: Optional[ShaderRenderer] = None

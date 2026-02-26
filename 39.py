@@ -17,6 +17,13 @@ from native_compiler import RustCompiler, CompilationError, ExecutionError
 from solver_utils import StreamingInputFile
 
 title = "Graph Bisection (Rust)"
+
+tags = [
+  "rust",
+  "structured response",
+  "np hard",
+  "graph theory",
+]
 TIMEOUT_SECONDS = 30
 RANDOM_SEED = 39393939
 

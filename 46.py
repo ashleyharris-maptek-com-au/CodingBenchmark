@@ -41,6 +41,13 @@ from native_compiler import CppCompiler, CompilationError, ExecutionError
 
 title = "N-Body Gravitational Simulation (GLSL Compute)"
 
+tags = [
+  "glsl",
+  "structured response",
+  "gpu compute",
+  "simulation",
+]
+
 RANDOM_SEED = 46464646
 TIMEOUT_SECONDS = 60
 

@@ -13,6 +13,13 @@ from native_compiler import CSharpCompiler, CompilationError, ExecutionError, de
 
 title = "Tetris Game (C#)"
 
+tags = [
+  "csharp",
+  "structured response",
+  "game ai",
+  "algorithm design",
+]
+
 # Timeout in seconds (5 minutes)
 TIMEOUT_SECONDS = 300
 

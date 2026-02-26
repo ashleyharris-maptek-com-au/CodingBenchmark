@@ -31,6 +31,13 @@ from orbital_sim import (
 )
 
 title = "Spacecraft Orbital Docking Autopilot (Python)"
+
+tags = [
+  "python",
+  "structured response",
+  "control systems",
+  "simulation",
+]
 TIMEOUT_SECONDS = 120
 
 _HISTORY_CACHE = {}   # {(aiEngineName, subPass): history_list}

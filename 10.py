@@ -19,6 +19,13 @@ from native_compiler import CppCompiler, compile_and_run, describe_this_pc
 
 title = "2D Cutting Stock - Rectangle Packing (C++)"
 
+tags = [
+  "cpp",
+  "structured response",
+  "optimization",
+  "packing",
+]
+
 # Timeout in seconds (30 seconds)
 TIMEOUT_SECONDS = 30
 

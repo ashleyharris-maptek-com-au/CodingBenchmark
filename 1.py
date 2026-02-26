@@ -11,6 +11,14 @@ from solver_utils import StreamingInputFile, parse_freeform_response, GradeCache
 
 title = "Travelling Salesman Problem Solver (C++)"
 
+tags = [
+  "cpp",
+  "np hard",
+  "freeform response",
+  "algorithm design",
+  "optimization",
+]
+
 # Seed for reproducible city generation
 RANDOM_SEED = 42
 

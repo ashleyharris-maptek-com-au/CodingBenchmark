@@ -39,6 +39,13 @@ from autoland_sim import (
 )
 
 title = "Aircraft Autoland (Python)"
+
+tags = [
+  "python",
+  "structured response",
+  "control systems",
+  "simulation",
+]
 TIMEOUT_SECONDS = 120
 
 _HISTORY_CACHE = {}  # {(aiEngineName, subPass): history_list}

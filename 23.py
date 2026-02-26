@@ -21,6 +21,13 @@ from solver_utils import parse_freeform_response
 
 title = "Lunar Lander Game"
 
+tags = [
+  "rust",
+  "freeform response",
+  "game ai",
+  "simulation",
+]
+
 # Timeout in seconds (60 minutes)
 TIMEOUT_SECONDS = 3600
 

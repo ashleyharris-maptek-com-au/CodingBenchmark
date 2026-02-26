@@ -33,6 +33,13 @@ from compute_test_utils import ComputeShaderRunner, grade_compute
 
 title = "Hash Mining / Proof of Work (WGSL Compute)"
 
+tags = [
+  "wgsl",
+  "structured response",
+  "gpu compute",
+  "algorithm design",
+]
+
 RANDOM_SEED = 47474747
 TIMEOUT_SECONDS = 60
 

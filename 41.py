@@ -40,6 +40,13 @@ from shader_test_utils import (
 
 title = "Fragment Shaders (SPIR-V Assembly)"
 
+tags = [
+  "spirv",
+  "structured response",
+  "shader",
+  "gpu",
+]
+
 TIMEOUT_SECONDS = 60
 
 # ---------------------------------------------------------------------------

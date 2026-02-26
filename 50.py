@@ -41,6 +41,13 @@ from native_compiler import CppCompiler, CompilationError, ExecutionError
 
 title = "Boid Flocking Simulation (GLSL Compute)"
 
+tags = [
+  "glsl",
+  "structured response",
+  "gpu compute",
+  "simulation",
+]
+
 RANDOM_SEED = 50505050
 TIMEOUT_SECONDS = 60
 

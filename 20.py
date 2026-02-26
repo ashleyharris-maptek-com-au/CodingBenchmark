@@ -43,6 +43,12 @@ from solver_utils import StreamingInputFile
 
 title = "Drillhole Data Validation (Rust)"
 
+tags = [
+  "rust",
+  "structured response",
+  "algorithm design",
+]
+
 # Timeout in seconds (5 minutes)
 TIMEOUT_SECONDS = 300
 

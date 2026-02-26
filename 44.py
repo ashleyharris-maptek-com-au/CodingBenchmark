@@ -44,6 +44,13 @@ from shader_test_utils import (
 
 title = "Fragment Shaders (GLSL)"
 
+tags = [
+  "glsl",
+  "structured response",
+  "shader",
+  "gpu",
+]
+
 TIMEOUT_SECONDS = 60
 
 # ---------------------------------------------------------------------------

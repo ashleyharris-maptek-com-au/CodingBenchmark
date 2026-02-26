@@ -43,6 +43,13 @@ from solver_utils import StreamingInputFile, create_graph_input_file, GradeCache
 
 title = "Minimum Cut Problem (C++)"
 
+tags = [
+  "cpp",
+  "structured response",
+  "graph theory",
+  "algorithm design",
+]
+
 # Timeout in seconds (5 minutes)
 TIMEOUT_SECONDS = 30
 

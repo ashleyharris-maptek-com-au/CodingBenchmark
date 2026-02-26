@@ -9,6 +9,13 @@ from solver_utils import StreamingInputFile
 
 title = "Graph Layout - Edge Crossing Minimization (Rust)"
 
+tags = [
+  "rust",
+  "structured response",
+  "graph theory",
+  "optimization",
+]
+
 # Seed for reproducible graph generation
 RANDOM_SEED = 54321
 

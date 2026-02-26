@@ -20,6 +20,14 @@ from native_compiler import CSharpCompiler, compile_and_run, describe_this_pc
 
 title = "3D Bin Packing - Polyhedra in Box (C#)"
 
+tags = [
+  "csharp",
+  "structured response",
+  "optimization",
+  "packing",
+  "geometry",
+]
+
 # Timeout in seconds (5 minutes)
 TIMEOUT_SECONDS = 30
 

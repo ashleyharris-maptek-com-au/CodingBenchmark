@@ -25,6 +25,13 @@ from native_compiler import CppCompiler, CompilationError, ExecutionError,descri
 from solver_utils import StreamingInputFile
 
 title = "Graph Coloring (C++)"
+
+tags = [
+  "cpp",
+  "structured response",
+  "np hard",
+  "graph theory",
+]
 TIMEOUT_SECONDS = 30
 RANDOM_SEED = 27272727
 

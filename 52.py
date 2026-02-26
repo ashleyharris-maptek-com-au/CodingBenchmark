@@ -21,6 +21,13 @@ from car_sim import (
 )
 
 title = "Self-Driving Car Highway Autopilot (Python)"
+
+tags = [
+  "python",
+  "structured response",
+  "control systems",
+  "simulation",
+]
 TIMEOUT_SECONDS = 90
 
 _HISTORY_CACHE = {}    # {(aiEngineName, subPass): history_list}

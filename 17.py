@@ -20,6 +20,14 @@ from visualization_utils import generate_threejs_aabb_visualization
 
 title = "3D AABB Bin Packing (C#)"
 
+tags = [
+  "csharp",
+  "structured response",
+  "optimization",
+  "packing",
+  "geometry",
+]
+
 # Timeout in seconds (5 minutes)
 TIMEOUT_SECONDS = 30
 

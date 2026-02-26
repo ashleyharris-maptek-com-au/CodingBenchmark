@@ -31,6 +31,13 @@ from solver_utils import GradeCache
 
 title = "Tetrahedron Shadow Covering (Rust)"
 
+tags = [
+  "rust",
+  "structured response",
+  "geometry",
+  "optimization",
+]
+
 # Timeout in seconds (5 minutes)
 TIMEOUT_SECONDS = 30
 

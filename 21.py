@@ -50,6 +50,13 @@ from native_compiler import CppCompiler, CompilationError, ExecutionError, compi
 
 title = "N-Dimensional Snake Game (C++)"
 
+tags = [
+  "cpp",
+  "structured response",
+  "game ai",
+  "algorithm design",
+]
+
 # Timeout in seconds (5 minutes)
 TIMEOUT_SECONDS = 30
 

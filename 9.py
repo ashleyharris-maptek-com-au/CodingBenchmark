@@ -24,6 +24,13 @@ from solver_utils import GradeCache
 
 title = "1D Cutting Stock - Minimum Waste (C#)"
 
+tags = [
+  "csharp",
+  "structured response",
+  "optimization",
+  "packing",
+]
+
 TIMEOUT_SECONDS = 300
 
 RANDOM_SEED = 88888

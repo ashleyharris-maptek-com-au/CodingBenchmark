@@ -18,6 +18,13 @@ from native_compiler import CSharpCompiler, CompilationError, ExecutionError, de
 from solver_utils import StreamingInputFile
 
 title = "Feedback Vertex Set (C#)"
+
+tags = [
+  "csharp",
+  "structured response",
+  "np hard",
+  "graph theory",
+]
 TIMEOUT_SECONDS = 30
 RANDOM_SEED = 37373737
 

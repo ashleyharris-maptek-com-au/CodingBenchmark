@@ -15,6 +15,13 @@ from typing import List, Set, Tuple, Dict, Any, Iterable
 from solver_utils import StreamingInputFile
 
 title = "Exact Cover (Python)"
+
+tags = [
+  "python",
+  "structured response",
+  "np hard",
+  "constraint satisfaction",
+]
 TIMEOUT_SECONDS = 30
 RANDOM_SEED = 38383838
 

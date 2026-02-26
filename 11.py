@@ -21,6 +21,14 @@ from solver_utils import parse_freeform_response
 
 title = "2D Polygon Cutting Stock (Rust)"
 
+tags = [
+  "rust",
+  "freeform response",
+  "optimization",
+  "packing",
+  "geometry",
+]
+
 # Timeout in seconds (30 seconds for testing)
 TIMEOUT_SECONDS = 30
 

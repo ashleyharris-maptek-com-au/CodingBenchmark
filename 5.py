@@ -16,6 +16,14 @@ from native_compiler import RustCompiler, compile_and_run, describe_this_pc
 
 title = "Hamiltonian Path on Grid with Obstacles (Rust)"
 
+tags = [
+  "rust",
+  "structured response",
+  "np hard",
+  "graph theory",
+  "algorithm design",
+]
+
 # Seed for reproducibility
 RANDOM_SEED = 77777
 

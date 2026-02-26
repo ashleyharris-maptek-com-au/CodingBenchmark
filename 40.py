@@ -16,6 +16,13 @@ from native_compiler import CppCompiler, CompilationError, ExecutionError
 from solver_utils import StreamingInputFile
 
 title = "Integer Linear Programming (C++)"
+
+tags = [
+  "cpp",
+  "structured response",
+  "np hard",
+  "optimization",
+]
 TIMEOUT_SECONDS = 30
 RANDOM_SEED = 40404040
 

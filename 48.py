@@ -38,6 +38,13 @@ from compute_test_utils import ComputeShaderRunner, grade_compute_pingpong
 
 title = "2D Fluid Simulation - Lattice Boltzmann (SPIR-V ASM Compute)"
 
+tags = [
+  "spirv",
+  "structured response",
+  "gpu compute",
+  "simulation",
+]
+
 RANDOM_SEED = 48484848
 TIMEOUT_SECONDS = 60
 

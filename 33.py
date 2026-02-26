@@ -19,6 +19,13 @@ from native_compiler import CSharpCompiler, CompilationError, ExecutionError
 from solver_utils import StreamingInputFile
 
 title = "Quadratic Assignment Problem (C#)"
+
+tags = [
+  "csharp",
+  "structured response",
+  "np hard",
+  "optimization",
+]
 TIMEOUT_SECONDS = 30
 RANDOM_SEED = 33333333
 

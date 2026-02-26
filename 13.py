@@ -20,6 +20,13 @@ from solver_utils import StreamingInputFile
 
 title = "Longest Common Substring (C++)"
 
+tags = [
+  "cpp",
+  "structured response",
+  "string algorithms",
+  "algorithm design",
+]
+
 # Timeout in seconds (0.5 minutes)
 TIMEOUT_SECONDS = 300
 

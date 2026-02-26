@@ -22,6 +22,13 @@ from solver_utils import StreamingInputFile
 
 title = "CSG Union of Two Polyhedra (C++)"
 
+tags = [
+  "cpp",
+  "freeform response",
+  "geometry",
+  "algorithm design",
+]
+
 # Timeout in seconds (30 seconds for testing)
 TIMEOUT_SECONDS = 30
 

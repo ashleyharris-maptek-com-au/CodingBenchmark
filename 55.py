@@ -34,6 +34,13 @@ from typing import Dict, List, Optional, Tuple
 
 title = "Can your write a chess bot? (C++)"
 
+tags = [
+  "cpp",
+  "freeform response",
+  "game ai",
+  "algorithm design",
+]
+
 # ---------------------------------------------------------------------------
 # Move notation helpers
 # ---------------------------------------------------------------------------

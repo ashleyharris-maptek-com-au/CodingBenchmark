@@ -14,6 +14,13 @@ from native_compiler import RustCompiler, CompilationError, ExecutionError,descr
 from solver_utils import StreamingInputFile
 
 title = "Minimum Vertex Cover (Rust)"
+
+tags = [
+  "rust",
+  "structured response",
+  "np hard",
+  "graph theory",
+]
 TIMEOUT_SECONDS = 30
 RANDOM_SEED = 28282828
 

@@ -27,6 +27,13 @@ from typing import List, Tuple, Set, Optional, Dict, Any
 from solver_utils import StreamingInputFile
 
 title = "3-SAT Solver (Python)"
+
+tags = [
+  "python",
+  "structured response",
+  "np hard",
+  "constraint satisfaction",
+]
 TIMEOUT_SECONDS = 300
 RANDOM_SEED = 30303030
 

@@ -24,6 +24,13 @@ from solver_utils import StreamingInputFile
 
 title = "Minesweeper Solver (C#)"
 
+tags = [
+  "csharp",
+  "structured response",
+  "constraint satisfaction",
+  "game ai",
+]
+
 # Timeout in seconds (5 minutes)
 TIMEOUT_SECONDS = 30
 

@@ -37,6 +37,13 @@ from native_compiler import RustCompiler, CompilationError, ExecutionError
 
 title = "3D Point Clustering (Rust)"
 
+tags = [
+  "rust",
+  "structured response",
+  "algorithm design",
+  "optimization",
+]
+
 # Timeout in seconds (5 minutes)
 TIMEOUT_SECONDS = 30
 

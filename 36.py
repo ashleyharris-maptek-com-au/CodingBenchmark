@@ -20,6 +20,13 @@ from native_compiler import CppCompiler, CompilationError, ExecutionError, descr
 from solver_utils import StreamingInputFile, GradeCache
 
 title = "Maximum Independent Set (C++)"
+
+tags = [
+  "cpp",
+  "structured response",
+  "np hard",
+  "graph theory",
+]
 TIMEOUT_SECONDS = 30
 RANDOM_SEED = 36363636
 

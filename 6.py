@@ -24,6 +24,13 @@ from native_compiler import CSharpCompiler, compile_and_run, describe_this_pc
 
 title = "Orbital TSP - Space Station Route Planning (C#)"
 
+tags = [
+  "csharp",
+  "structured response",
+  "np hard",
+  "optimization",
+]
+
 # Timeout in seconds (5 minutes)
 TIMEOUT_SECONDS = 30
 

@@ -25,6 +25,13 @@ from native_compiler import CppCompiler, compile_and_run, describe_this_pc
 
 title = "Job-Shop Scheduling (C++)"
 
+tags = [
+  "cpp",
+  "structured response",
+  "np hard",
+  "optimization",
+]
+
 # Timeout in seconds (5 minutes)
 TIMEOUT_SECONDS = 30
 

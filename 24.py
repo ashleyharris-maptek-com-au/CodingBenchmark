@@ -26,6 +26,13 @@ from solver_utils import GradeCache
 
 title = "3D Lunar Lander Game (C++)"
 
+tags = [
+  "cpp",
+  "structured response",
+  "game ai",
+  "simulation",
+]
+
 # Timeout in seconds
 TIMEOUT_SECONDS = 3600
 

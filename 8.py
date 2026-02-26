@@ -8,6 +8,12 @@ from solver_utils import StreamingInputFile
 
 title = "Maze Solver (Rust)"
 
+tags = [
+  "rust",
+  "structured response",
+  "algorithm design",
+]
+
 # Timeout in seconds (30 seconds)
 TIMEOUT_SECONDS = 30
 
@@ -34,7 +40,7 @@ def generate_random_maze(width: int, height: int, wall_density: float, seed: int
         carve(nx, ny)
 
   # Start carving from (1, 1)
-  sys.setrecursionlimit(max(10000, width * height))
+  sys.setrecursionlimit(sys.maxsize-1)
   try:
     carve(1, 1)
   except RecursionError:

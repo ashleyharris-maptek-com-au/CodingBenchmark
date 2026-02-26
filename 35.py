@@ -22,6 +22,13 @@ from solver_utils import StreamingInputFile, GradeCache
 _grade_cache = GradeCache('test35')
 
 title = "Minimum Dominating Set (Rust)"
+
+tags = [
+  "rust",
+  "structured response",
+  "np hard",
+  "graph theory",
+]
 TIMEOUT_SECONDS = 30
 RANDOM_SEED = 35353535
 

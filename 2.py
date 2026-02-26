@@ -10,6 +10,13 @@ from collections import defaultdict
 
 title = "Chinese Postman Problem Solver (C#)"
 
+tags = [
+  "csharp",
+  "structured response",
+  "graph theory",
+  "optimization",
+]
+
 # Seed for reproducible graph generation
 RANDOM_SEED = 12345
 

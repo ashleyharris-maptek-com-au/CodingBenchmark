@@ -24,6 +24,14 @@ from visualization_utils import generate_threejs_tetrahedron_visualization
 
 title = "Regular Tetrahedron Packing in Polyhedra (C++)"
 
+tags = [
+  "cpp",
+  "freeform response",
+  "geometry",
+  "packing",
+  "optimization",
+]
+
 # Seed for reproducibility
 RANDOM_SEED = 99999
 

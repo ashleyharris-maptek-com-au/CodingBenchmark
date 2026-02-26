@@ -26,6 +26,13 @@ from solver_utils import StreamingInputFile, GradeCache
 _grade_cache = GradeCache('test29')
 
 title = "Maximum Clique (C#)"
+
+tags = [
+  "csharp",
+  "structured response",
+  "np hard",
+  "graph theory",
+]
 TIMEOUT_SECONDS = 300
 RANDOM_SEED = 29292929
 

@@ -18,6 +18,13 @@ from typing import List, Tuple, Dict, Any
 from solver_utils import StreamingInputFile
 
 title = "Vehicle Routing Problem (Python)"
+
+tags = [
+  "python",
+  "structured response",
+  "np hard",
+  "optimization",
+]
 TIMEOUT_SECONDS = 30
 RANDOM_SEED = 34343434
 

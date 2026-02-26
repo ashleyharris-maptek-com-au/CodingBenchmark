@@ -19,6 +19,13 @@ from solver_utils import parse_freeform_response
 
 title = "Asteroid Interception (C#)"
 
+tags = [
+  "csharp",
+  "freeform response",
+  "simulation",
+  "algorithm design",
+]
+
 # Timeout in seconds (5 minutes)
 TIMEOUT_SECONDS = 30
 

@@ -33,6 +33,13 @@ from compute_test_utils import ComputeShaderRunner, grade_compute
 
 title = "Parallel Prefix Sum (SPIR-V Binary Compute)"
 
+tags = [
+  "spirv",
+  "structured response",
+  "gpu compute",
+  "algorithm design",
+]
+
 RANDOM_SEED = 49494949
 TIMEOUT_SECONDS = 60
 

@@ -44,6 +44,13 @@ from autopilot_sim import (
 
 title = "Airliner Autopilot (Python)"
 
+tags = [
+  "python",
+  "structured response",
+  "control systems",
+  "simulation",
+]
+
 TIMEOUT_SECONDS = 120  # generous for 30 subpasses
 
 _HISTORY_CACHE = {}  # {(aiEngineName, subPass): history_list}
