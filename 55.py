@@ -11,7 +11,7 @@ notation on stdout.  The engine is compiled once and then invoked repeatedly
   Subpasses 20-29: Full games vs Stockfish at increasing ELO (100-2500).
 """
 
-from solver_utils import GradeCache
+from solver_utils import GradeCache, parse_freeform_response
 from native_compiler import CppCompiler, CompilationError, ExecutionError, describe_this_pc
 
 import chess
@@ -27,13 +27,12 @@ import tempfile
 import time
 import urllib.request
 import zipfile
+import hashlib
 from html import escape
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-title = "Can your write a chess bot in C++?"
-
-skip = True
+title = "Can your write a chess bot? (C++)"
 
 # ---------------------------------------------------------------------------
 # Move notation helpers
@@ -235,24 +234,9 @@ as referencing the wrong intrinsics or non-standard header (like 'bits/stdc++.h'
 Write complete, compilable C++ code with a main() function.
 """
 
-structure = {
-  "type": "object",
-  "properties": {
-    "reasoning": {
-      "type": "string",
-      "description": "Explain your chess engine approach (search algorithm, evaluation, etc.)"
-    },
-    "cpp_code": {
-      "type": "string",
-      "description": "Complete C++ code with main() function"
-    }
-  },
-  "required": ["reasoning", "cpp_code"],
-  "additionalProperties": False
-}
+structure = None
 
-extraGradeAnswerRuns = list(range(1, 30))
-
+extraGradeAnswerRuns = list(range(1, 40))
 
 # ---------------------------------------------------------------------------
 # Subpass definitions
@@ -296,133 +280,152 @@ TRIVIAL_POSITIONS = [
 # These are classic, well-known puzzles from public domain sources.
 PUZZLES = [
   {
-    "fen": "2bqkbn1/2pppp2/np2N3/r3P1p1/p2N2B1/5Q2/PPPPPP1P/RNB1K2R w KQq - 0 1",
-    "name": "Mate in 2 - Queen f3",
-    "solution_moves": ["Qf3a3#"],
+    "fen": "2bqkr2/2pppp2/np5b/r3PNpN/p5B1/3P1Q2/PPP2PPP/R1B2RK1 w - - 0 1",
+    "name": "Mate in 2 with knight sacrifice",
     "desc": "White to play and mate in two.",
-    "max_moves": 2,
+    "max_moves": 3,
   },
   {
     "fen": "r2qk2r/pb4pp/1n2Pb2/2B2Q2/p1p5/2P5/PP2B1PP/RN2K2R w KQkq - 0 1",
-    "name": "Mate in 1 - Back rank",
-    "solution_moves": [],
-    "desc": "White to play and mate in one with Qd7#.",
-    "max_moves": 1,
+    "name": "Mate in 3",
+    "desc": "White to play and mate in 3",
+    "max_moves": 6,
   },
   {
     "fen": "6k1/pp4p1/2p5/2bp4/8/P5Pb/1P3rrP/2BRRK2 b - - 0 1",
     "name": "Mate in 2 - Double rook",
-    "solution_moves": [],
     "desc": "Black to play and mate in two moves.",
-    "max_moves": 3,
+    "max_moves": 4,
   },
   {
     "fen": "r1b1kb1r/pppp1ppp/5q2/4n3/3KP3/2N3PN/PPP4P/R1BQ1B1R b kq - 0 1",
-    "name": "Mate in 2 - King hunt",
-    "solution_moves": [],
+    "name": "Mate in 3 - King hunt",
     "desc": "Black to play, find the forcing sequence.",
-    "max_moves": 3,
+    "max_moves": 6,
   },
   {
     "fen": "r5rk/5p1p/5R2/4B3/8/8/7P/7K w - - 0 1",
-    "name": "Mate in 2 - Rook + Bishop",
-    "solution_moves": [],
-    "desc": "White to play and mate in two.",
-    "max_moves": 3,
+    "name": "Mate in 3 - Rook + Bishop",
+    "desc": "White to play and mate in 3.",
+    "max_moves": 6,
   },
   {
     "fen": "3qr2k/pbpp2pp/1p5N/3Q2b1/2P1P3/P7/1PP2PPP/R4RK1 w - - 0 1",
     "name": "Mate in 2 - Knight sacrifice",
-    "solution_moves": ["Qd5g8+"],
     "desc": "White to play and force mate.",
-    "max_moves": 3,
+    "max_moves": 4,
   },
   {
     "fen": "r1bq2r1/b4pk1/p1pp1p2/1p2pP2/1P2P1PB/3P4/1PPQ4/2KR3R w - - 0 1",
     "name": "Mate in 2 - h file attack",
-    "solution_moves": ["Qd2h2"],
     "desc": "White to play and force mate.",
-    "max_moves": 3,
+    "max_moves": 4,
   },
   {
     "fen": "2r1nrk1/p4p1p/1p2p1pQ/nPqbRN2/8/P2B4/1BP2PPP/3R2K1 w - - 0 1",
-    "name": "Mate in 3 - Exchange sacrifice",
-    "solution_moves": ["Nf5e7+"],
-    "desc": "White to play and force mate in three.",
-    "max_moves": 5,
+    "name": "Exchange sacrifice",
+    "desc": "White to play and gain like +100 points of eval",
+    "max_moves": 8,
   },
   {
     "fen": "r1bqr3/ppp1B1kp/1b4p1/n2B4/3NQ3/2P5/PP2B1PP/R3K2R w KQ - 0 1",
-    "name": "Mate in 3 - Bishop pair",
-    "solution_moves": ["Qe4f5"],
-    "desc": "White to play and force mate.",
-    "max_moves": 5,
+    "name": "Bishop pair",
+    "desc": "White to play while Mate in 10.",
+    "max_moves": 6,
   },
   {
     "fen": "rnbk1b1r/ppqpnQ1p/4p1p1/2p1N1B1/4N3/8/PPP1PPPP/R3KB1R w KQ - 0 1",
-    "name": "Mate in 3 - Discovered check",
-    "solution_moves": [],
+    "name": "Queen sacrifice",
     "desc": "White to play and force mate.",
-    "max_moves": 5,
+    "max_moves": 6,
   },
   {
     "fen": "4Rnk1/pr3ppp/1p3q2/5NQ1/2p5/8/PP3PPP/6K1 w - - 0 1",
     "name": "Mate in 3 - Rook + Knight",
-    "solution_moves": ["Qg5g6"],
     "desc": "White to play and force mate in three.",
-    "max_moves": 5,
+    "max_moves": 6,
   },
   {
-    "fen": "3r2k1/1pp2ppp/p1pb4/8/1q1N1Q2/4P3/rPP2PPP/1K1R3R w - - 0 1",
-    "name": "Zwischenzug tactic",
-    "solution_moves": ["Nd4e6"],
+    "fen": "3r2k1/Pp3ppp/2p5/8/1q1NQ3/4P3/1PP2PP1/1K1R3R w - - 0 1",
+    "name": "White mate in 6",
     "desc": "White to play and find the intermediate move.",
-    "max_moves": 3,
+    "max_moves": 12,
   },
   {
-    "fen": "r4rk1/ppq2pp1/2p2n1p/4N1N1/3pP3/3P3P/PPP2QP1/R3R1K1 w - - 0 1",
-    "name": "Double knight attack",
-    "solution_moves": ["Ng5h7"],
+    "fen": "r4rk1/pp3pp1/2p2n2/4N1N1/3pP3/1B1P2QP/PPP3P1/R3R1K1 w - - 0 1",
+    "name": "Double knight pinned attack",
     "desc": "White to play and win material or force mate.",
-    "max_moves": 5,
+    "max_moves": 6,
   },
   {
-    "fen": "r2qk2r/ppp1bppp/2np1n2/1B2p1B1/4P1b1/2NP1N2/PPP2PPP/R2QK2R w KQkq - 0 1",
+    "fen": "r2qk2r/1pp2p2/2np1n2/pB1Np1Bp/4P3/3P1N2/PPP2PPP/R2Q1RK1 w kq - 0 1",
     "name": "Pin exploitation",
-    "solution_moves": [],
-    "desc": "Complex middlegame position - find the best continuation.",
-    "max_moves": 3,
+    "desc": "Whites up 7 points and and black is double pinned.",
+    "max_moves": 8,
   },
   {
-    "fen": "r2r2k1/pp2bppp/2p1pn2/q7/3P4/2NBPN2/PP3PPP/R2Q1RK1 w - - 0 1",
-    "name": "Positional squeeze",
-    "solution_moves": [],
-    "desc": "Find the best plan in this IQP position.",
-    "max_moves": 3,
+    "fen": "4r1k1/p1P1bppp/1n2p3/q7/3P4/2NBPN2/PP3PPP/R2Q1RK1 w - - 0 1",
+    "name": "Unsupported passed pawn",
+    "desc": "White to play and find the best plan.",
+    "max_moves": 12,
   },
 ]
 
-# Subpasses 20-29: Full games vs Stockfish at increasing ELO
+# Subpasses 20+: Full games vs Stockfish at increasing ELO
 STOCKFISH_GAMES = [
   {"elo": 100,  "time_per_move": 5,  "name": "Stockfish ELO 100 (absolute beginner)"},
   {"elo": 400,  "time_per_move": 5,  "name": "Stockfish ELO 400 (casual player)"},
   {"elo": 700,  "time_per_move": 5,  "name": "Stockfish ELO 700 (club beginner)"},
   {"elo": 1000, "time_per_move": 10, "name": "Stockfish ELO 1000 (intermediate)"},
   {"elo": 1200, "time_per_move": 10, "name": "Stockfish ELO 1200 (club player)"},
+  {"elo": 1400, "time_per_move": 10, "name": "Stockfish ELO 1400 (Author after a few drinks)"},
   {"elo": 1500, "time_per_move": 15, "name": "Stockfish ELO 1500 (strong club)"},
+  {"elo": 1600, "time_per_move": 15, "name": "Stockfish ELO 1600 (Author with his ADHD meds)"},
   {"elo": 1800, "time_per_move": 20, "name": "Stockfish ELO 1800 (expert)"},
   {"elo": 2000, "time_per_move": 30, "name": "Stockfish ELO 2000 (candidate master)"},
+  {"elo": 2100, "time_per_move": 30, "name": "Stockfish ELO 2100"},
   {"elo": 2200, "time_per_move": 45, "name": "Stockfish ELO 2200 (master)"},
+  {"elo": 2300, "time_per_move": 30, "name": "Stockfish ELO 2300"},
+  {"elo": 2400, "time_per_move": 30, "name": "Stockfish ELO 2400"},
   {"elo": 2500, "time_per_move": 60, "name": "Stockfish ELO 2500 (grandmaster)"},
+  {"elo": 2600, "time_per_move": 30, "name": "Stockfish ELO 2600"},
+  {"elo": 2700, "time_per_move": 30, "name": "Stockfish ELO 2700"},
   {"elo": 2800, "time_per_move": 60, "name": "Stockfish ELO 2800 (Magnus Carlsen)"},
   {"elo": 3000, "time_per_move": 120, "name": "Stockfish ELO 3000 (Epic chess engine)"},
   {"elo": 3190, "time_per_move": 300, "name": "Stockfish ELO 3190 (Stockfish 18 highest limitable)"},
   {"elo": 3600, "time_per_move": 900, "name": "Stockfish ELO 3600 (Stockfish 18 full power)"},
 ]
 
+subpassParamSummary = []
+for m in TRIVIAL_POSITIONS:
+  subpassParamSummary.append(f"{m['name']}")
+for m in PUZZLES:
+  subpassParamSummary.append(f"{m['name']}")
+for m in STOCKFISH_GAMES:
+  subpassParamSummary.append(f"{m['name']}")
+
 # Cache for reports
 _REPORT_CACHE: Dict[Tuple[str, int], dict] = {}
 _grade_cache = GradeCache("test_55")
+
+
+def _cache_key_parts(result: str, subPass: int) -> tuple:
+  code = result
+  if subPass < 5:
+    pos = TRIVIAL_POSITIONS[subPass]
+    case_key = f"trivial|fen={pos['fen']}|name={pos['name']}"
+  elif subPass < 20:
+    puz = PUZZLES[subPass - 5]
+    case_key = (
+      f"puzzle|fen={puz['fen']}|moves={puz['max_moves']}|name={puz['name']}"
+    )
+  else:
+    game_cfg = STOCKFISH_GAMES[subPass - 20]
+    case_key = f"game|elo={game_cfg['elo']}|t={game_cfg['time_per_move']}"
+  return (
+    hashlib.sha256(code.encode("utf-8")).hexdigest()[:16],
+    case_key,
+  )
 
 
 # ---------------------------------------------------------------------------
@@ -458,32 +461,49 @@ def _run_engine_once(exe_path: str, fen: str, timeout: float) -> Tuple[Optional[
 # ---------------------------------------------------------------------------
 
 def gradeAnswer(result, subPass, aiEngineName):
-  if not result or "cpp_code" not in result:
+  if len(result) < 10:
     return 0.0, "No C++ code provided"
 
-  code = result["cpp_code"]
+  cache_parts = _cache_key_parts(result, subPass)
+  cached = _grade_cache.get_grade(*cache_parts)
+  if cached is not None:
+    return cached
+
+  d = parse_freeform_response(result)
+  code = d["code"]
+  discussion = d["discussion"]
 
   # --- Compile ---
   compiler = CppCompiler(aiEngineName)
   if not compiler.find_compiler():
-    return 0.0, "No C++ compiler found"
+    grade = (0.0, "No C++ compiler found")
+    _grade_cache.put_grade(grade, *cache_parts)
+    return grade
 
   try:
     exe_path = str(compiler.compile(code))
   except CompilationError as e:
-    return 0.0, f"Compilation error: {str(e)[:500]}"
+    grade = (0.0, f"Compilation error: {str(e)[:500]}")
+    _grade_cache.put_grade(grade, *cache_parts)
+    return grade
 
   # --- Subpasses 0-4: trivial tactics ---
   if subPass < 5:
-    return _grade_trivial(exe_path, subPass, aiEngineName)
+    grade = _grade_trivial(exe_path, subPass, aiEngineName)
+    _grade_cache.put_grade(grade, *cache_parts)
+    return grade
 
   # --- Subpasses 5-19: puzzles ---
   elif subPass < 20:
-    return _grade_puzzle(exe_path, subPass, aiEngineName)
+    grade = _grade_puzzle(exe_path, subPass, aiEngineName)
+    _grade_cache.put_grade(grade, *cache_parts)
+    return grade
 
   # --- Subpasses 20-29: full games vs Stockfish ---
   else:
-    return _grade_stockfish_game(exe_path, subPass, aiEngineName)
+    grade = _grade_stockfish_game(exe_path, subPass, aiEngineName)
+    _grade_cache.put_grade(grade, *cache_parts)
+    return grade
 
 
 def _grade_trivial(exe_path: str, subPass: int, aiEngineName: str):
@@ -521,13 +541,17 @@ def _grade_trivial(exe_path: str, subPass: int, aiEngineName: str):
 
   # Use Stockfish to evaluate the position after the move (if available)
   sf_path = _find_stockfish()
-  sf_eval = None
+  sf_start_eval = None
+  sf_end_eval = None
   if sf_path:
     try:
       engine = chess.engine.SimpleEngine.popen_uci(sf_path)
+      startInfo = engine.analyse(board, chess.engine.Limit(time=1.0))
+      sf_start_eval = startInfo.get("score")
+
       board.push(parsed)
-      info = engine.analyse(board, chess.engine.Limit(time=1.0))
-      sf_eval = info.get("score")
+      endInfo = engine.analyse(board, chess.engine.Limit(time=1.0))
+      sf_end_eval = endInfo.get("score")
       board.pop()
       engine.quit()
     except Exception:
@@ -536,13 +560,16 @@ def _grade_trivial(exe_path: str, subPass: int, aiEngineName: str):
   _REPORT_CACHE[(aiEngineName, subPass)] = {
     "type": "trivial", "pos": pos, "board_fen": pos["fen"],
     "engine_move": move_str, "error": "", "score": score,
-    "sf_eval": str(sf_eval) if sf_eval else None,
+    "sf_start_eval": sf_start_eval,
+    "sf_end_eval": sf_end_eval,
     "moves": [(pos["fen"], move_str, True)],
   }
 
-  detail = f"[{pos['name']}] Move: {move_str}"
-  if sf_eval:
-    detail += f" (eval: {sf_eval})"
+  detail = f"[{pos['name']}]<br> Move: {move_str}"
+  if sf_start_eval:
+    detail += f"<br> (StartEval: {sf_start_eval})"
+  if sf_end_eval:
+    detail += f"<br> (EndEval: {sf_end_eval})"
   return score, detail
 
 
@@ -553,12 +580,23 @@ def _grade_puzzle(exe_path: str, subPass: int, aiEngineName: str):
   moves_played = []
   sf_path = _find_stockfish()
   sf_engine = None
+  whiteStartScore = None
+
+  def scoreToString(score):
+    if score.is_mate():
+      return "M" + str(score.moves)
+    return score
 
   if sf_path:
     try:
       sf_engine = chess.engine.SimpleEngine.popen_uci(sf_path)
+      startInfo = sf_engine.analyse(board, chess.engine.Limit(time=1.0))
+      whiteStartScore = startInfo.get("score").white()
     except Exception:
       sf_engine = None
+
+  
+  playerColour = chess.WHITE if puz["fen"].split()[1] == "w" else chess.BLACK
 
   score = 0.0
   detail = ""
@@ -603,11 +641,30 @@ def _grade_puzzle(exe_path: str, subPass: int, aiEngineName: str):
       score = 1.0
       detail = f"[{puz['name']}] Checkmate found!"
     elif correct_moves > 0:
-      score = correct_moves / max(1, (total_half_moves + 1) // 2)
-      score = min(score, 0.9)  # Cap at 0.9 unless checkmate
-      if not detail:
-        detail = f"[{puz['name']}] {correct_moves} correct moves, no mate"
+      endInfo = sf_engine.analyse(board, chess.engine.Limit(time=1.0))
+      whiteEndScore = endInfo.get("score").white()
+
+      if playerColour == chess.WHITE:
+        detail = f"Puzzle start was {scoreToString(whiteStartScore)}<br>, end was {scoreToString(whiteEndScore)}"
+        if whiteEndScore > whiteStartScore:
+          score = 1.0
+        if whiteEndScore.is_mate() and whiteEndScore.mate() > 0 or whiteEndScore.score() > 0:
+          detail += " Made position worse but still winning."
+          score = 0.2
+        else:
+          score = 0.0
+      else:
+        detail = f"Puzzle start was {scoreToString(whiteStartScore)}<br>, end was {scoreToString(whiteEndScore)}"
+        if whiteEndScore < whiteStartScore:
+          score = 1.0
+        if whiteEndScore.is_mate() and whiteEndScore.mate() < 0 or whiteEndScore.score() < 0:
+          detail += " Made position worse but still winning."
+          score = 0.2
+        else:
+          score = 0.0
+
     else:
+      score = 0
       if not detail:
         detail = f"[{puz['name']}] No correct moves"
 
@@ -790,17 +847,58 @@ def _build_report_html(report, board_states, moves, score, error):
   last_idx = len(board_states) - 1
   score_pct = f"{score:.0%}"
 
+  def peiceToUnicode(piece):
+    if piece == "p": return "♟"
+    if piece == "P": return "♙"
+    if piece == "k": return "♚"
+    if piece == "K": return "♔"
+    if piece == "Q": return "♕"
+    if piece == "q": return "♛"
+    if piece == "B": return "♗"
+    if piece == "b": return "♝"
+    if piece == "N": return "♘"
+    if piece == "n": return "♞"
+    if piece == "R": return "♖"
+    if piece == "r": return "♜"
+    return ""
+
   # Build HTML with JS using plain string concat to avoid brace issues
   parts = []
   parts.append("<div style='margin:10px 0;padding:14px;border:1px solid #1f2937;")
-  parts.append("            border-radius:8px;background:#0f172a;'>")
+  parts.append("            border-radius:8px;background:#0f172a;height:380px;width:800px;'>")
+  parts.append(f"  <div id='{uid}_board' style='width:360px;height:360px;margin:8px 0;float:left'></div>")
   parts.append(f"  <div style='font-weight:600;color:#e2e8f0;font-size:14px;margin-bottom:2px;'>")
   parts.append(f"    {title_text}</div>")
   parts.append(f"  <div style='font-size:12px;color:#64748b;margin-bottom:10px;'>")
   parts.append(f"    {len(moves)} moves &middot;")
   parts.append(f"    <span style='color:{sc};font-weight:700;'>{status} ({score_pct})</span></div>")
-  parts.append(f"  {error_html}")
-  parts.append(f"  <div id='{uid}_board' style='width:360px;height:360px;margin:8px 0;'></div>")
+  parts.append(f"  {error_html}<br>")
+  parts.append(f"FEN:<input type='text' id='fen' value='" + report.get("board_fen", chess.STARTING_FEN) + "'><br>")
+
+  parts.append("<table style='padding-left:10px;width:300px'><tr><td style='border:0px'><ol>")
+  tableSize = 10 if len(moves) < 30 else moves //3 + 1
+  for counter,move in enumerate(moves):
+   try:
+    m = move[1]
+    m = peiceToUnicode(m[0]) + m[1:]
+
+    if m[3] == 'x':
+      m = m[0:3] + '↠' + m[4:]
+    else:
+      m = m[0:3] + "→" + m[3:]
+
+    if "/" in m:
+      m = m[:-1] + peiceToUnicode(m[-1])
+
+    parts.append(f"<li>{m}</li>")
+   except:
+    parts.append(f"<li>{move[1]}</li>")
+
+   if counter % tableSize == tableSize-1:
+    parts.append("</ol></td> <td style='border:0px'><ol start='{}'>".format(counter+1))
+
+  parts.append("</ol></td></tr></table>")
+
   parts.append(f"  <div style='display:flex;align-items:center;gap:8px;margin-top:6px;'>")
   parts.append(f"    <button onclick='{uid}_go(0)' style='{_BTN_STYLE}'>&#x23EE;</button>")
   parts.append(f"    <button onclick='{uid}_step(-1)' style='{_BTN_STYLE}'>&larr;</button>")
@@ -812,6 +910,8 @@ def _build_report_html(report, board_states, moves, score, error):
   parts.append(f"           style='flex:1;accent-color:#3b82f6;'/>")
   parts.append(f"    <span id='{uid}_lbl' style='font-size:11px;color:#94a3b8;min-width:80px;'>Start</span>")
   parts.append(f"  </div>")
+
+  parts.append("<span style='clear:both'></span>")
 
   # JavaScript - use a separate string to keep braces clean
   js = """
@@ -857,6 +957,14 @@ def _build_report_html(report, board_states, moves, score, error):
 
 
 def resultToNiceReport(result, subPass, aiEngineName):
+  if not result:
+    return "<div style='color:#94a3b8;'>No result provided</div>"
+
+  cache_parts = _cache_key_parts(result, subPass)
+  cached = _grade_cache.get_report(*cache_parts)
+  if cached is not None:
+    return cached
+
   report = _REPORT_CACHE.get((aiEngineName, subPass))
   if not report:
     return "<div style='color:#94a3b8;'>No visualization data captured</div>"
@@ -890,16 +998,23 @@ def resultToNiceReport(result, subPass, aiEngineName):
       "label": label,
     })
 
-  htmlHeader = "FEN:<input type='text' id='fen' value='" + initial_fen + "'><br>"
 
   if subPass == 0:
-    if "cpp_code" in result:
-      code = result["cpp_code"]
+    htmlHeader = ""
+    d = parse_freeform_response(result)
+    code = d["code"]
+    discussion = d["discussion"]
+    if discussion:
+      htmlHeader += f"<details><summary>View Reasoning and Discussion ({len(discussion)} chars)</summary><pre>{discussion}</pre></details><br>"
+    if code:
       code_escaped = code.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
       htmlHeader += f"<details><summary>View Code ({len(code)} chars)</summary><pre>{code_escaped}</pre></details><br>"
+  else:
+    htmlHeader = ""
 
-
-  return htmlHeader + _build_report_html(report, board_states, moves, score, error)
+  html = htmlHeader + _build_report_html(report, board_states, moves, score, error)
+  _grade_cache.put_report(html, *cache_parts)
+  return html
 
 def setup():
   _find_stockfish()

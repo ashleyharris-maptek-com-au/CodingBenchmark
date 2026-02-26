@@ -8,6 +8,7 @@ don't fit in memory.
 """
 
 import os
+import re
 import shutil
 import sys
 import time
@@ -30,6 +31,78 @@ STREAMING_CACHE_DIR = Path(tempfile.gettempdir()) / "codingbenchmark_streaming_c
 
 # Directory for cached grade/report results
 GRADE_CACHE_DIR = Path(tempfile.gettempdir()) / "codingbenchmark_grade_cache"
+
+
+def _strip_comment_prefix(line: str) -> str:
+  stripped = line.lstrip()
+  if stripped.startswith("///"):
+    stripped = stripped[3:]
+  elif stripped.startswith("//"):
+    stripped = stripped[2:]
+  elif stripped.startswith("#"):
+    stripped = stripped[1:]
+  return stripped.lstrip()
+
+
+def _split_leading_comment(text: str) -> tuple:
+  """Return (comment, remainder) if a leading comment block exists."""
+  block_match = re.match(r"\s*/\*([\s\S]*?)\*/", text)
+  if block_match:
+    comment = block_match.group(1).strip()
+    remainder = text[block_match.end():].lstrip()
+
+    return comment, remainder
+
+  lines = text.splitlines()
+  comment_lines = []
+  idx = 0
+  while idx < len(lines):
+    line = lines[idx]
+    if not line.strip() and not comment_lines:
+      idx += 1
+      continue
+    stripped = line.lstrip()
+    if stripped.startswith("//") or stripped.startswith("#"):
+      if stripped.startswith("#include") or stripped.startswith("#if"):
+        break
+      comment_lines.append(stripped)
+      idx += 1
+      continue
+    break
+
+  if comment_lines:
+    comment = "\n".join(_strip_comment_prefix(l) for l in comment_lines).strip()
+    remainder = "\n".join(lines[idx:]).lstrip()
+    return comment, remainder
+
+  return None, text
+
+
+def _extract_leading_comment(text: str) -> str:
+  comment, _ = _split_leading_comment(text)
+  return comment or ""
+
+
+def parse_freeform_response(response_text: str) -> dict:
+  """Parse a free-text LLM response into discussion + code."""
+  if not response_text:
+    return {"discussion": "", "code": ""}
+
+  text = response_text.strip()
+  fence_re = re.compile(r"```(?:[a-zA-Z0-9_+-]*)\n([\s\S]*?)```", re.MULTILINE)
+  match = fence_re.search(text)
+  if match:
+    discussion = text[:match.start()].strip()
+    code = match.group(1).strip("\n")
+    if not discussion:
+      discussion = _extract_leading_comment(code)
+    return {"discussion": discussion, "code": code}
+
+  discussion, code = _split_leading_comment(text)
+  if discussion is None:
+    discussion = ""
+    code = text
+  return {"discussion": discussion, "code": code.strip("\n")}
 
 
 class GradeCache:

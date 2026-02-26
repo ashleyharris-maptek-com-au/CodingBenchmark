@@ -42,7 +42,7 @@ from shader_test_utils import (
     image_pair_html
 )
 
-title = "HLSL Fragment Shaders"
+title = "Fragment Shaders (HLSL)"
 
 TIMEOUT_SECONDS = 60
 

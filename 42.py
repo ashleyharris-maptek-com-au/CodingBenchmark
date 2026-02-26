@@ -53,7 +53,7 @@ from shader_test_utils import (
     get_reference_path, image_pair_html
 )
 
-title = "SPIR-V Assembly Geometry Shaders"
+title = "Geometry Shaders (SPIR-V Assembly)"
 
 TIMEOUT_SECONDS = 60
 

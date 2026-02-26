@@ -15,6 +15,7 @@ from pathlib import Path
 
 # Import our native compiler helper
 from native_compiler import CSharpCompiler, CompilationError, ExecutionError, describe_this_pc
+from solver_utils import parse_freeform_response
 
 title = "Asteroid Interception (C#)"
 
@@ -594,23 +595,18 @@ Write complete, compilable C# code with a static void Main method.
 # List of subpasses to grade the single answer against all difficulty levels
 extraGradeAnswerRuns = list(range(len(TEST_CASES)))
 
-structure = {
-  "type": "object",
-  "properties": {
-    "reasoning": {
-      "type":
-      "string",
-      "description":
-      "Explain your algorithm approach and how it adapts to different interception complexities"
-    },
-    "csharp_code": {
-      "type": "string",
-      "description": "Complete C# code with Main method that handles all scales"
-    }
-  },
-  "required": ["reasoning", "csharp_code"],
-  "additionalProperties": False
-}
+structure = None
+
+
+def _extract_freeform(result):
+  if isinstance(result, dict):
+    discussion = result.get("reasoning") or result.get("discussion") or ""
+    code = result.get("csharp_code") or result.get("code") or ""
+    return discussion, code, ""
+  if isinstance(result, str) and result.strip() == "__content_violation__":
+    return "", "", "Content violation"
+  parsed = parse_freeform_response(result or "")
+  return parsed.get("discussion", ""), parsed.get("code", ""), ""
 
 
 def parse_burns(output: str) -> List[Tuple[float, float, float, float]]:
@@ -895,14 +891,17 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
   if not result:
     return 0.0, "No result provided"
 
-  if "csharp_code" not in result:
+  discussion, code, parse_error = _extract_freeform(result)
+  if parse_error:
+    return 0.0, parse_error
+  if not code:
     return 0.0, "No C# code provided"
 
   case = TEST_CASES[subPass]
   description = case["description"]
   sim, input_data = get_scenario(subPass)
 
-  code = result["csharp_code"]
+  code = code
 
   # Run solver
   stdout, error, exec_time = run_solver(code, input_data, aiEngineName)
@@ -955,16 +954,16 @@ def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
   case = TEST_CASES[subPass]
   html = f"<h4>Asteroid Interception - {case['description']}</h4>"
 
+  discussion, code, _ = _extract_freeform(result)
+
   # Show reasoning summary
-  if "reasoning" in result and subPass == 0:
-    reasoning = result['reasoning'][:500] + ('...'
-                                             if len(result.get('reasoning', '')) > 500 else '')
+  if discussion and subPass == 0:
+    reasoning = discussion[:500] + ('...' if len(discussion) > 500 else '')
     reasoning_escaped = reasoning.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     html += f"<p><strong>Strategy:</strong> {reasoning_escaped}</p>"
 
   # Show code in collapsible
-  if "csharp_code" in result and subPass == 0:
-    code = result["csharp_code"]
+  if code and subPass == 0:
     code_escaped = code.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     html += f"<details><summary>View C# Code ({len(code)} chars)</summary><pre>{code_escaped}</pre></details>"
 

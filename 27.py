@@ -494,7 +494,7 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
         if len(colors) == case["vertices"] and all(0 <= c < case["colors"] for c in colors):
           return 1.0, f"[{case['desc']}] Coloring produced in {exec_time:.2f}s (verification skipped)"
         else:
-          return 0.2, f"[{case['desc']}] Invalid output format"
+          return 0.0, f"[{case['desc']}] Invalid output format"
       else:
         num_vertices, edges, num_colors = get_graph(subPass)
         valid, msg = verify_coloring(num_vertices, edges, colors, num_colors)
@@ -525,12 +525,12 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
     if valid:
       return 1.0, f"[{case['desc']}] Valid coloring in {exec_time:.2f}s"
     else:
-      return 0.2, f"[{case['desc']}] {msg}"
+      return 0.0, f"[{case['desc']}] {msg}"
 
   except subprocess.TimeoutExpired:
-    return 0.1, f"[{case['desc']}] Timeout"
+    return 0.0, f"[{case['desc']}] Timeout"
   except ExecutionError as e:
-    return 0.1, f"[{case['desc']}] {str(e)[:100]}"
+    return 0.0, f"[{case['desc']}] {str(e)[:100]}"
   except Exception as e:
     return 0.0, f"[{case['desc']}] Error: {str(e)[:100]}"
 

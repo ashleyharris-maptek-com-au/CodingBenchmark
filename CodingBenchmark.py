@@ -44,8 +44,13 @@ class TSPBenchmarkRunner(BenchmarkRunner):
 
 if __name__ == "__main__":
   # Register placebo data provider for "Human with tools" baseline
-  set_placebo_data_provider(["naive", "naive-optimised", "best-published", "random", "human"],
-                            get_placebo_response)
+  set_placebo_data_provider([
+    {"name": "naive", "description": "Simple, obvious approach (~20 lines). No optimisation. Times out on large inputs."},
+    {"name": "naive-optimised", "description": "Same algorithm as naive, but hyper-optimised (parallel, SIMD, small types)."},
+    {"name": "best-published", "description": "References a published paper/algorithm."},
+    {"name": "random", "description": "Lets just guess."},
+    {"name": "human", "description": "A professional human software engineer spent ~1hr trying to solve it."},
+  ], get_placebo_response)
 
   runner = TSPBenchmarkRunner()
   run_benchmark_main(runner, __file__)

@@ -17,7 +17,7 @@ import time
 from typing import List, Tuple, Set, Optional, Dict
 
 from native_compiler import CppCompiler, compile_and_run, describe_this_pc
-from solver_utils import StreamingInputFile
+from solver_utils import StreamingInputFile, parse_freeform_response
 
 # Import visualization utilities
 from visualization_utils import generate_threejs_tetrahedron_visualization
@@ -152,21 +152,18 @@ Write complete, compilable C++ code with a main() function.
 # List of subpasses to grade the single answer against all difficulty levels
 extraGradeAnswerRuns = list(range(len(CONTAINER_CONFIGS)))
 
-structure = {
-  "type": "object",
-  "properties": {
-    "reasoning": {
-      "type": "string",
-      "description": "Explain your packing strategy and how it adapts to different container sizes"
-    },
-    "cpp_code": {
-      "type": "string",
-      "description": "Complete C++ code with main() that handles all scales"
-    }
-  },
-  "required": ["reasoning", "cpp_code"],
-  "additionalProperties": False
-}
+structure = None
+
+
+def _extract_freeform(result):
+  if isinstance(result, dict):
+    discussion = result.get("reasoning") or result.get("discussion") or ""
+    code = result.get("cpp_code") or result.get("code") or ""
+    return discussion, code, ""
+  if isinstance(result, str) and result.strip() == "__content_violation__":
+    return "", "", "Content violation"
+  parsed = parse_freeform_response(result or "")
+  return parsed.get("discussion", ""), parsed.get("code", ""), ""
 
 
 def get_tetrahedron_vertices(center: Tuple, rotation: Tuple, edge: float) -> List[Tuple]:
@@ -426,13 +423,16 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
   if not result:
     return 0.0, "No result provided"
 
-  if "cpp_code" not in result:
+  discussion, code, parse_error = _extract_freeform(result)
+  if parse_error:
+    return 0.0, parse_error
+  if not code:
     return 0.0, "No C++ code provided"
 
   global lastPlacements
   name, container_vertices = CONTAINERS_CACHE[subPass]
   _, _, expected_min = CONTAINER_CONFIGS[subPass]
-  code = result["cpp_code"]
+  code = code
 
   # Execute solver
   placements, error, exec_time = execute_solver(code, container_vertices, TETRA_EDGE)
@@ -491,14 +491,13 @@ def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
 
   html = f"<h4>Tetrahedron Packing - {name} ({len(vertices)} vertices)</h4>"
 
+  discussion, code, _ = _extract_freeform(result)
   if subPass == 0:
-    if "reasoning" in result:
-      reasoning = result['reasoning'][:500] + ('...'
-                                               if len(result.get('reasoning', '')) > 500 else '')
+    if discussion:
+      reasoning = discussion[:500] + ('...' if len(discussion) > 500 else '')
       html += f"<p><strong>Strategy:</strong> {reasoning}</p>"
 
-    if "cpp_code" in result:
-      code = result["cpp_code"]
+    if code:
       code_escaped = code.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
       html += f"<details><summary>View Code ({len(code)} chars)</summary><pre>{code_escaped}</pre></details>"
 

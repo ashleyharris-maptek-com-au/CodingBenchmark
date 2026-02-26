@@ -3,18 +3,19 @@ import random
 import sys
 import os
 import time
+import hashlib
 from pathlib import Path
 
 from native_compiler import CppCompiler, compile_and_run, describe_this_pc
-from solver_utils import StreamingInputFile
+from solver_utils import StreamingInputFile, parse_freeform_response, GradeCache
 
 title = "Travelling Salesman Problem Solver (C++)"
 
 # Seed for reproducible city generation
 RANDOM_SEED = 42
 
-# Timeout in seconds (30 seconds)
-TIMEOUT_SECONDS = 30
+# Timeout in seconds (300 seconds)
+TIMEOUT_SECONDS = 300
 
 # City counts for each subpass
 CITY_COUNTS = [
@@ -22,6 +23,10 @@ CITY_COUNTS = [
   1_000_000, 5_000_000, 10_000_000, 50_000_000, 100_000_000
 ]
 
+subpassParamSummary = []
+
+for n in CITY_COUNTS:
+  subpassParamSummary.append(f"{n} Cities")
 
 # Pre-generate cities for each subpass (deterministic)
 def generate_cities(n: int, seed: int = RANDOM_SEED) -> list:
@@ -91,21 +96,18 @@ Include adaptive logic that chooses different strategies based on N.
 # List of subpasses to grade the single answer against all difficulty levels
 extraGradeAnswerRuns = list(range(1, len(CITY_COUNTS)))
 
-structure = {
-  "type": "object",
-  "properties": {
-    "reasoning": {
-      "type": "string",
-      "description": "Explain your approach and how it adapts to different problem sizes"
-    },
-    "cpp_code": {
-      "type": "string",
-      "description": "Complete C++ code with main() that handles all scales"
-    }
-  },
-  "required": ["reasoning", "cpp_code"],
-  "additionalProperties": False
-}
+structure = None
+
+
+def _extract_freeform(result):
+  if isinstance(result, dict):
+    discussion = result.get("reasoning") or result.get("discussion") or ""
+    code = result.get("cpp_code") or result.get("code") or ""
+    return discussion, code, ""
+  if isinstance(result, str) and result.strip() == "__content_violation__":
+    return "", "", "Content violation"
+  parsed = parse_freeform_response(result or "")
+  return parsed.get("discussion", ""), parsed.get("code", ""), ""
 
 
 def calculate_route_distance(cities: list, route: list) -> float:
@@ -199,7 +201,7 @@ def find_edge_crossing(cities: list,
                        seed: int = RANDOM_SEED):
   n = len(route)
   if n < 4:
-    return None
+    return []
 
   def endpoints(edge_idx: int):
     a_i = route[edge_idx]
@@ -207,6 +209,7 @@ def find_edge_crossing(cities: list,
     return cities[a_i], cities[b_i], a_i, b_i
 
   if n <= full_check_n:
+    crossings = []
     for i in range(n):
       a, b, a_i, b_i = endpoints(i)
       for j in range(i + 1, n):
@@ -216,13 +219,14 @@ def find_edge_crossing(cities: list,
           continue
         c, d, c_i, d_i = endpoints(j)
         if _segments_intersect(a, b, c, d):
-          return (i, j, (a_i, b_i), (c_i, d_i))
-    return None
+          crossings.append((i, j, (a_i, b_i), (c_i, d_i)))
+    return crossings
 
   k = min(sample_edges, n)
   rng = random.Random(seed + n)
   edge_indices = rng.sample(range(n), k)
 
+  crossings = []
   for ii in range(k):
     i = edge_indices[ii]
     a, b, a_i, b_i = endpoints(i)
@@ -233,8 +237,8 @@ def find_edge_crossing(cities: list,
         continue
       c, d, c_i, d_i = endpoints(j)
       if _segments_intersect(a, b, c, d):
-        return (i, j, (a_i, b_i), (c_i, d_i))
-  return None
+        crossings.append((i, j, (a_i, b_i), (c_i, d_i)))
+  return crossings
 
 
 def get_baseline_distance(cities: list) -> float:
@@ -300,6 +304,14 @@ def get_baseline_distance(cities: list) -> float:
 
 STREAMING_THRESHOLD_CITIES = 100_000
 _INPUT_FILE_CACHE = {}
+_grade_cache = GradeCache("test_1")
+
+
+def _cache_key_parts(code: str, subPass: int) -> tuple:
+  n = CITY_COUNTS[subPass]
+  code_hash = hashlib.sha256(code.encode("utf-8")).hexdigest()[:16]
+  seed_key = f"seed={RANDOM_SEED + n}"
+  return (code_hash, f"n={n}", seed_key)
 
 
 def format_input(cities: list) -> str:
@@ -369,8 +381,16 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
   if not result:
     return 0.0, "No result provided"
 
-  if "cpp_code" not in result:
+  discussion, code, parse_error = _extract_freeform(result)
+  if parse_error:
+    return 0.0, parse_error
+  if not code:
     return 0.0, "No C++ code provided"
+
+  cache_parts = _cache_key_parts(code, subPass)
+  cached = _grade_cache.get_grade(*cache_parts)
+  if cached is not None:
+    return cached
 
   global CITIES_CACHE
   global lastRoute
@@ -380,7 +400,7 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
     CITIES_CACHE[subPass] = generate_cities(n)
 
   cities = CITIES_CACHE[subPass]
-  code = result["cpp_code"]
+  code = code
 
   if _should_use_streaming(subPass):
     streaming_input = _get_streaming_input(subPass)
@@ -411,10 +431,11 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
 
   lastRoute = route
 
-  crossing = find_edge_crossing(cities, route)
-  if crossing:
-    i, j, e1, e2 = crossing
-    return 0.0, f"[{n} cities] Route has edge crossing between edges {i}({e1[0]}→{e1[1]}) and {j}({e2[0]}→{e2[1]})"
+  crossings = find_edge_crossing(cities, route)
+
+  if len(crossings) > 1:
+    return 0.0, f"[{n} cities] Route has {len(crossings)} edge crossings. Optimal solution must have 0"
+
 
   # Calculate distances
   route_distance = calculate_route_distance(cities, route)
@@ -441,7 +462,14 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
                  f"Ratio: {ratio:.2f}x, "
                  f"Time: {exec_time:.1f}s - {quality}")
 
-  return score, explanation
+  if crossings:
+    i, j, e1, e2 = crossings[0]
+    explanation += f", [{n} cities] Route has edge crossing between edges {i}({e1[0]}→{e1[1]}) and {j}({e2[0]}→{e2[1]})"
+    score /= 2
+
+  result_tuple = (score, explanation)
+  _grade_cache.put_grade(result_tuple, *cache_parts)
+  return result_tuple
 
 
 def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
@@ -451,13 +479,17 @@ def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
 
   html = f"<h4>TSP Solver - {n} Cities</h4>"
 
+  discussion, code, _ = _extract_freeform(result)
+  if code:
+    cache_parts = _cache_key_parts(code, subPass)
+    cached = _grade_cache.get_report(*cache_parts)
+    if cached is not None:
+      return cached
   if subPass == 0:
-    if "reasoning" in result:
-      html += f"<p><strong>Approach:</strong> {result['reasoning'][:500]}{'...' if len(result.get('reasoning', '')) > 500 else ''}</p>"
+    if discussion:
+      html += f"<p><strong>Approach:</strong> {discussion[:500]}{'...' if len(discussion) > 500 else ''}</p>"
 
-    if "cpp_code" in result:
-      code = result["cpp_code"]
-      # Escape HTML
+    if code:
       code_escaped = code.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
       html += f"<details><summary>View Code ({len(code)} chars)</summary><pre>{code_escaped}</pre></details>"
 
@@ -481,6 +513,8 @@ def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
   else:
     html += "<p style='color:red'>Could not render route: No valid route generated</p>"
 
+  if code:
+    _grade_cache.put_report(html, *cache_parts)
   return html
 
 
@@ -533,7 +567,7 @@ def generate_route_svg(cities: list, route: list, city_count: int) -> str:
   svg_html = f'''
   <div style="margin: 10px 0; width: 100%">
     <h5>Route Visualization ({city_count} cities)</h5>
-    <svg width="100%" style="border: 1px solid #ccc; background: white;" viewBox="0 0 {width} {height}">
+    <svg width="100%" style="border: 1px solid #ccc; background: white; min-width: 400px; min-height: 400px;" viewBox="0 0 {width} {height}">
       <path d="M {path_data}" stroke="#333" stroke-width="1.5" fill="none" opacity="0.7"/>
       {city_circles}
     </svg>

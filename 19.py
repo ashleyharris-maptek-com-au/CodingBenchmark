@@ -29,6 +29,7 @@ from typing import List, Tuple, Set, Dict, Optional
 from pathlib import Path
 
 from native_compiler import CSharpCompiler, CompilationError, ExecutionError, describe_this_pc
+from solver_utils import parse_freeform_response
 
 title = "3D Voxel Mining (C#)"
 
@@ -264,21 +265,18 @@ Include adaptive logic that chooses different strategies based on problem scale.
 # List of subpasses to grade the single answer against all difficulty levels
 extraGradeAnswerRuns = list(range(len(TEST_CASES)))
 
-structure = {
-  "type": "object",
-  "properties": {
-    "reasoning": {
-      "type": "string",
-      "description": "Explain your mining strategy: how you decide what to dig, where to dump, and route planning"
-    },
-    "csharp_code": {
-      "type": "string",
-      "description": "Complete C# code with Main method that reads voxel data and outputs mining operations"
-    }
-  },
-  "required": ["reasoning", "csharp_code"],
-  "additionalProperties": False
-}
+structure = None
+
+
+def _extract_freeform(result):
+  if isinstance(result, dict):
+    discussion = result.get("reasoning") or result.get("discussion") or ""
+    code = result.get("csharp_code") or result.get("code") or ""
+    return discussion, code, ""
+  if isinstance(result, str) and result.strip() == "__content_violation__":
+    return "", "", "Content violation"
+  parsed = parse_freeform_response(result or "")
+  return parsed.get("discussion", ""), parsed.get("code", ""), ""
 
 
 def execute_solver_binary(code: str, input_bytes: bytes, engine_name: str,
@@ -525,7 +523,11 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
 
   if not result:
     return 0.0, "No result provided"
-  if "csharp_code" not in result:
+
+  discussion, code, parse_error = _extract_freeform(result)
+  if parse_error:
+    return 0.0, parse_error
+  if not code:
     return 0.0, "No C# code provided"
 
   case = TEST_CASES[subPass]
@@ -541,7 +543,7 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
   input_bytes = format_input_bytes(voxels, xdim, ydim, zdim)
   theoretical_max = compute_total_ore_value(voxels, xdim, ydim, zdim)
 
-  code = result["csharp_code"]
+  code = code
 
   # Execute solver
   stdout, error, exec_time, success = execute_solver_binary(code, input_bytes, aiEngineName)
@@ -831,8 +833,9 @@ def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
   case = TEST_CASES[subPass]
   html = f"<h4>3D Voxel Mining - {case['desc']}</h4>"
 
-  if "reasoning" in result and subPass == 0:
-    r = result['reasoning'][:400] + ('...' if len(result.get('reasoning', '')) > 400 else '')
+  discussion, code, _ = _extract_freeform(result)
+  if discussion and subPass == 0:
+    r = discussion[:400] + ('...' if len(discussion) > 400 else '')
     html += f"<p><strong>Strategy:</strong> {r.replace('<', '&lt;').replace('>', '&gt;')}</p>"
 
   # Add visualization if we have grade results
@@ -846,9 +849,9 @@ def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
     except Exception as e:
       html += f"<p style='color:orange'>Visualization error: {str(e)}</p>"
 
-  if "csharp_code" in result and subPass == 0:
-    code = result["csharp_code"].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    html += f"<details><summary>View C# Code ({len(result['csharp_code'])} chars)</summary><pre>{code}</pre></details>"
+  if code and subPass == 0:
+    code_escaped = code.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    html += f"<details><summary>View C# Code ({len(code)} chars)</summary><pre>{code_escaped}</pre></details>"
 
   return html
 

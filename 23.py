@@ -17,6 +17,7 @@ from pathlib import Path
 
 # Import our native compiler helper
 from native_compiler import RustCompiler, CompilationError, ExecutionError, describe_this_pc
+from solver_utils import parse_freeform_response
 
 title = "Lunar Lander Game"
 
@@ -508,23 +509,18 @@ Write complete, compilable Rust code with a main function. Assume only the stand
 # List of subpasses to grade the single answer against all difficulty levels
 extraGradeAnswerRuns = list(range(len(TEST_CASES)))
 
-structure = {
-  "type": "object",
-  "properties": {
-    "reasoning": {
-      "type":
-      "string",
-      "description":
-      "Explain your algorithm approach and how it adapts to different landing complexities"
-    },
-    "rust_code": {
-      "type": "string",
-      "description": "Complete Rust code with main function that handles all scales"
-    }
-  },
-  "required": ["reasoning", "rust_code"],
-  "additionalProperties": False
-}
+structure = None
+
+
+def _extract_freeform(result):
+  if isinstance(result, dict):
+    discussion = result.get("reasoning") or result.get("discussion") or ""
+    code = result.get("rust_code") or result.get("code") or ""
+    return discussion, code, ""
+  if isinstance(result, str) and result.strip() == "__content_violation__":
+    return "", "", "Content violation"
+  parsed = parse_freeform_response(result or "")
+  return parsed.get("discussion", ""), parsed.get("code", ""), ""
 
 
 def run_lander_simulation(code: str, case: dict, subpass: int,
@@ -769,7 +765,10 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
   if not result:
     return 0.0, "No result provided"
 
-  if "rust_code" not in result:
+  discussion, code, parse_error = _extract_freeform(result)
+  if parse_error:
+    return 0.0, parse_error
+  if not code:
     return 0.0, "No Rust code provided"
 
   case = TEST_CASES[subPass]
@@ -781,7 +780,7 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
     print(f"Generating the world took {getWorldTime:.2f}s for subpass {subPass}")
   max_distance = math.sqrt(world.width**2 + world.height**2)
 
-  code = result["rust_code"]
+  code = code
 
   # Run simulation
   landed, distance, end_reason, exec_time = run_lander_simulation(code, case, subPass, aiEngineName)
@@ -807,12 +806,13 @@ def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
     return "<p style='color:red'>No result provided</p>"
   case = TEST_CASES[subPass]
   html = f"<h4>Lunar Lander - {case['description']}</h4>"
-  if "reasoning" in result:
-    r = result['reasoning'][:400] + ('...' if len(result.get('reasoning', '')) > 400 else '')
+  discussion, code, _ = _extract_freeform(result)
+  if discussion:
+    r = discussion[:400] + ('...' if len(discussion) > 400 else '')
     html += f"<p><strong>Approach:</strong> {r.replace('<', '&lt;').replace('>', '&gt;')}</p>"
-  if "rust_code" in result:
-    code = result["rust_code"].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    html += f"<details><summary>View Rust Code ({len(result['rust_code'])} chars)</summary><pre>{code}</pre></details>"
+  if code:
+    code_escaped = code.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    html += f"<details><summary>View Rust Code ({len(code)} chars)</summary><pre>{code_escaped}</pre></details>"
   stats = LAST_LANDER_STATS.get((subPass, aiEngineName))
   if stats:
     tick_rate = stats["ticks"] / stats["sim_time"] if stats["sim_time"] > 0 else 0

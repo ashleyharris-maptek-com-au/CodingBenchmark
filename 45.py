@@ -41,7 +41,7 @@ from shader_test_utils import (
     image_pair_html
 )
 
-title = "Binary SPIR-V Fragment Shaders"
+title = "Fragment Shaders (SPIRV)"
 
 TIMEOUT_SECONDS = 60
 

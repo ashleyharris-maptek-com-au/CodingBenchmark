@@ -17,6 +17,7 @@ import random
 from typing import List, Tuple, Dict
 
 from native_compiler import CppCompiler, compile_and_run, describe_this_pc
+from solver_utils import parse_freeform_response
 from solver_utils import StreamingInputFile
 
 title = "CSG Union of Two Polyhedra (C++)"
@@ -236,6 +237,20 @@ def make_subdivided_box(cx, cy, cz, sx, sy, sz, subdivisions) -> Dict:
 MESHES_CACHE = {}
 
 
+def _get_mesh_data(subPass: int) -> Dict:
+  """Return cached mesh data for a subpass, generating it if missing."""
+  if subPass in MESHES_CACHE:
+    return MESHES_CACHE[subPass]
+  config = TEST_CONFIGS[subPass]
+  data = {
+    "name": config["name"],
+    "mesh_a": config["mesh_a"](),
+    "mesh_b": config["mesh_b"](),
+  }
+  MESHES_CACHE[subPass] = data
+  return data
+
+
 def format_mesh_for_prompt(mesh: Dict, name: str) -> str:
   """Format mesh as Python dict literal."""
   v = mesh["vertices"]
@@ -299,23 +314,18 @@ Write complete, compilable C++ code with a main() function.
 # List of subpasses to grade the single answer against all difficulty levels
 extraGradeAnswerRuns = list(range(len(TEST_CONFIGS)))
 
-structure = {
-  "type": "object",
-  "properties": {
-    "reasoning": {
-      "type":
-      "string",
-      "description":
-      "Explain your CSG algorithm approach and how it adapts to different mesh complexities"
-    },
-    "cpp_code": {
-      "type": "string",
-      "description": "Complete C++ code with main() that handles all scales"
-    }
-  },
-  "required": ["reasoning", "cpp_code"],
-  "additionalProperties": False
-}
+structure = None
+
+
+def _extract_freeform(result):
+  if isinstance(result, dict):
+    discussion = result.get("reasoning") or result.get("discussion") or ""
+    code = result.get("cpp_code") or result.get("code") or ""
+    return discussion, code, ""
+  if isinstance(result, str) and result.strip() == "__content_violation__":
+    return "", "", "Content violation"
+  parsed = parse_freeform_response(result or "")
+  return parsed.get("discussion", ""), parsed.get("code", ""), ""
 
 
 def compute_volume(mesh: Dict) -> float:
@@ -872,21 +882,17 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
   if not result:
     return 0.0, "No result provided"
 
-  if "cpp_code" not in result:
+  discussion, code, parse_error = _extract_freeform(result)
+  if parse_error:
+    return 0.0, parse_error
+  if not code:
     return 0.0, "No C++ code provided"
 
-  config = TEST_CONFIGS[subPass]
-  MESHES_CACHE[subPass] = {
-    "name": config["name"],
-    "mesh_a": config["mesh_a"](),
-    "mesh_b": config["mesh_b"](),
-  }
-
-  data = MESHES_CACHE[subPass]
+  data = _get_mesh_data(subPass)
   mesh_a = data["mesh_a"]
   mesh_b = data["mesh_b"]
   name = data["name"]
-  code = result["cpp_code"]
+  code = code
 
   # Execute solver
   result_mesh, error, exec_time = execute_solver(code, mesh_a, mesh_b, subPass, aiEngineName)
@@ -988,20 +994,21 @@ def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
   if not result:
     return "<p style='color:red'>No result provided</p>"
 
-  data = MESHES_CACHE[subPass]
+  try:
+    data = _get_mesh_data(subPass)
+  except Exception as e:
+    return f"<p style='color:red'>Failed to load mesh data: {str(e)[:200]}</p>"
   name = data["name"]
 
   html = f"<h4>CSG Union - {name}</h4>"
 
+  discussion, code, _ = _extract_freeform(result)
   if subPass == 0:
-
-    if "reasoning" in result:
-      reasoning = result['reasoning'][:500] + ('...'
-                                               if len(result.get('reasoning', '')) > 500 else '')
+    if discussion:
+      reasoning = discussion[:500] + ('...' if len(discussion) > 500 else '')
       html += f"<p><strong>Approach:</strong> {reasoning}</p>"
 
-    if "cpp_code" in result:
-      code = result["cpp_code"]
+    if code:
       code_escaped = code.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
       html += f"<details><summary>View Code ({len(code)} chars)</summary><pre>{code_escaped}</pre></details>"
 

@@ -26,6 +26,7 @@ import subprocess
 import sys
 import os
 import time
+import hashlib
 from typing import List, Tuple, Set, Dict, Any, Optional
 from pathlib import Path
 from collections import deque
@@ -38,7 +39,7 @@ except Exception:
 
 # Import our native compiler helper
 from native_compiler import CppCompiler, CompilationError, ExecutionError, describe_this_pc
-from solver_utils import StreamingInputFile, create_graph_input_file
+from solver_utils import StreamingInputFile, create_graph_input_file, GradeCache
 
 title = "Minimum Cut Problem (C++)"
 
@@ -47,6 +48,17 @@ TIMEOUT_SECONDS = 30
 
 # Seed for reproducibility
 RANDOM_SEED = 18181818
+
+_grade_cache = GradeCache("test18")
+
+
+def _cache_key_parts(result: dict, subPass: int) -> tuple:
+  case = TEST_CASES[subPass]
+  code = result.get("cpp_code", "")
+  return (
+    hashlib.sha256(code.encode("utf-8")).hexdigest()[:16],
+    f"n={case['num_nodes']}|m={case['num_edges']}|cut={case['cut_size']}|seed={case['seed']}",
+  )
 
 
 def generate_connected_graph(num_nodes: int, num_edges: int, seed: int) -> List[Tuple[int, int]]:
@@ -580,6 +592,11 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
   if "cpp_code" not in result:
     return 0.0, "No C++ code provided"
 
+  cache_parts = _cache_key_parts(result, subPass)
+  cached = _grade_cache.get_grade(*cache_parts)
+  if cached is not None:
+    return cached
+
   case = TEST_CASES[subPass]
   num_nodes = case["num_nodes"]
   known_cut = case["known_cut"]
@@ -612,12 +629,16 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
                                                            input_data=input_data)
 
   if not success:
-    return 0.0, f"[{description}] {error}", stdout
+    grade = (0.0, f"[{description}] {error}")
+    _grade_cache.put_grade(grade, *cache_parts)
+    return grade
 
   # Parse output
   cut_edges, parse_error = parse_output(stdout)
   if parse_error and not cut_edges:
-    return 0.0, f"[{description}] {parse_error}", stdout
+    grade = (0.0, f"[{description}] {parse_error}")
+    _grade_cache.put_grade(grade, *cache_parts)
+    return grade
 
   # Verify cut (skip full verification for very large streaming cases)
   if use_streaming and case["num_edges"] > 10_000_000:
@@ -630,7 +651,9 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
     is_valid, verify_msg = verify_cut_edges(num_nodes, edges, cut_edges)
 
   if not is_valid:
-    return 0.0, f"[{description}] Invalid cut: {verify_msg}", stdout
+    grade = (0.0, f"[{description}] Invalid cut: {verify_msg}")
+    _grade_cache.put_grade(grade, *cache_parts)
+    return grade
 
   # Score based on cut size
   cut_size = len(cut_edges)
@@ -646,19 +669,16 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
     score = 0.6
     quality = f"acceptable ({ratio:.1f}x optimal)"
   else:
-    score = 0.4
-    quality = f"valid but suboptimal ({ratio:.1f}x optimal)"
+    score = 0.0
+    quality = f"Suboptimal ({ratio:.1f}x optimal)"
 
   explanation = (f"[{description}] Cut size: {cut_size}, "
                  f"Known min: {known_cut}, "
                  f"Time: {exec_time:.2f}s - {quality}")
 
-  if subPass == 0:
-    html = output_example_html(score, explanation, result, subPass)
-  else:
-    html = f"<pre>{stdout}</pre>"
-
-  return score, explanation, html
+  grade = (score, explanation)
+  _grade_cache.put_grade(grade, *cache_parts)
+  return grade
 
 
 def output_example_html(score: float, explanation: str, result: dict, subPass: int) -> str:
@@ -704,6 +724,28 @@ def output_summary_html(results: list) -> str:
         <p><strong>Subpasses Completed:</strong> {len(results)}</p>
     </div>
     """
+
+
+def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
+  """Generate cached HTML report."""
+  if not result:
+    return "<p style='color:red'>No result provided</p>"
+
+  cache_parts = _cache_key_parts(result, subPass)
+  cached = _grade_cache.get_report(*cache_parts)
+  if cached is not None:
+    return cached
+
+  case = TEST_CASES[subPass]
+  cached_grade = _grade_cache.get_grade(*cache_parts)
+  if cached_grade is not None:
+    score, explanation = cached_grade
+  else:
+    score, explanation = 0.0, f"[{case['description']}] Not graded yet"
+
+  html = output_example_html(score, explanation, result, subPass)
+  _grade_cache.put_report(html, *cache_parts)
+  return html
 
 
 def setup():

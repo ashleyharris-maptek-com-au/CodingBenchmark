@@ -610,7 +610,7 @@ class CppCompiler(NativeCompiler):
     exe_path = self._get_cached_exe_path(source_hash)
 
     # Create temp source file
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.cpp', delete=False) as f:
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.cpp', delete=False,encoding='utf-8') as f:
       f.write(source_code)
       src_path = f.name
 

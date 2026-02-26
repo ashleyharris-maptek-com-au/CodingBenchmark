@@ -587,14 +587,14 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
   # Score based on coverage
   if coverage >= 0.95:
     coverage_score = 1.0
-  elif coverage >= 0.8:
+  elif coverage >= 0.9:
     coverage_score = 0.85
-  elif coverage >= 0.6:
+  elif coverage >= 0.8:
     coverage_score = 0.7
-  elif coverage >= 0.3:
+  elif coverage >= 0.7:
     coverage_score = 0.5
   else:
-    coverage_score = 0.3
+    coverage_score = 0.0
 
   quality = f"{coverage*100:.0f}% coverage with {count} tetrahedrons"
 

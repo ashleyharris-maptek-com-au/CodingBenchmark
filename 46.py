@@ -696,6 +696,9 @@ def resultToNiceReport(result, subPass, aiEngineName):
   if not report:
     return ""
 
+  if "n" not in report:
+    return ""
+
   n = report["n"]
   details = report["details"]
   pos_errors = details["pos_errors"]
