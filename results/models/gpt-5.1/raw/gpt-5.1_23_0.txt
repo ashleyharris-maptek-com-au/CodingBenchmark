@@ -1,1 +1,353 @@
-{'reasoning': 'Below is a simple but robust real-time controller with an async-style architecture using threads. It:\n\n- Uses one thread to read stdin continuously and push parsed state updates into a lock-free-ish shared slot.\n- Uses the main thread as the control loop, polling the latest state and writing commands at a fixed high rate (~50 Hz), independent of input timing.\n- Keeps parsing of the (possibly huge) map minimal and streaming-friendly, without storing multi-GB maps.\n- Uses a simple heuristic controller: first stabilize attitude (angle≈0, pointing up), then control vertical speed and roughly home toward the target pad. It’s not optimal, but it’s safe-ish and cheap.\n\nAlgorithm outline:\n1. Read initial scalar parameters and coordinates.\n2. Read map rows line by line until EOF or until a blank line after the map. We don’t store gigantic maps; instead we:\n   - Store width and height.\n   - Discard row content after counting rows, except for detecting start/target if needed (the numeric start/target are already given).\n3. Spawn an input thread:\n   - It uses a `BufRead` loop, parsing each state update (x y vx vy angle angular_vel fuel_remaining) into a `State`.\n   - Stores the latest state into `Arc<Mutex<Option<State>>>` and updates an `AtomicU64` timestamp for last-update time.\n4. Main control loop (in main thread):\n   - Runs at ~50 Hz using `std::thread::sleep`.\n   - Each iteration, reads the latest state; if none seen yet, output neutral (0 thrust, 0 turn).\n   - If input appears stalled for >0.3 s, still keep sending safe commands (reduce thrust, aim upright) to avoid engine cut for lack of output.\n5. Control law:\n   - Desired angle: mostly 0 (point up). Add small horizontal correction if far from target: if x < target_x, tilt right slightly (negative angle in our convention because positive angular velocity is clockwise and angle=0 is up), else tilt left.\n   - Use PD control on angle to compute turn command in [-1, 1].\n   - Compute desired vertical speed based on altitude: when high above target, allow faster descent; when close, require slower descent (<2 m/s). Use simple schedule: v_descent = -min(1.0 + altitude/20.0, 8.0) but capped to safe levels near ground.\n   - Use a proportional controller on (vy - v_desired) to choose thrust. Also account roughly for gravity by adding g/ max_thrust.\n   - Clamp thrust to [0,1], and if low on fuel, bias toward saving fuel (we lightly reduce commanded thrust when fuel_remaining < some threshold).\n\nSafety / simplicity motives:\n- Avoid complicated path planning or terrain reasoning; just go mostly straight down over target.\n- Always send commands at high rate, independent of input timing.\n- Avoid allocations inside tight loops.\n\nThis should compile on stable Rust 1.92 (edition 2024) with only std, and adhere to the I/O protocol.\n', 'rust_code': 'use std::cmp::min;\nuse std::f64::consts::PI;\nuse std::io::{self, Read, Write, BufRead, BufReader};\nuse std::sync::{Arc, Mutex};\nuse std::sync::atomic::{AtomicU64, Ordering};\nuse std::thread;\nuse std::time::{Duration, Instant};\n\n#[derive(Clone, Copy, Debug, Default)]\nstruct State {\n    x: f64,\n    y: f64,\n    vx: f64,\n    vy: f64,\n    angle: f64,\n    angular_vel: f64,\n    fuel_remaining: f64,\n}\n\nfn main() {\n    // Use stdin in blocking mode, but put reader on separate thread.\n    let stdin = io::stdin();\n    let mut first_reader = BufReader::new(stdin.lock());\n\n    // Read initial scalar parameters.\n    let (width, height, gravity, max_thrust, fuel) = {\n        let mut line = String::new();\n        // Read until we have at least 5 numbers.\n        let mut nums: Vec<f64> = Vec::new();\n        while nums.len() < 5 {\n            line.clear();\n            if first_reader.read_line(&mut line).unwrap_or(0) == 0 {\n                // Unexpected EOF\n                return;\n            }\n            for tok in line.split_whitespace() {\n                if let Ok(v) = tok.parse::<f64>() {\n                    nums.push(v);\n                    if nums.len() == 5 { break; }\n                }\n            }\n        }\n        (nums[0] as usize, nums[1] as usize, nums[2], nums[3], nums[4])\n    };\n\n    let (start_x, start_y, target_x, target_y) = {\n        let mut line = String::new();\n        let mut nums: Vec<f64> = Vec::new();\n        while nums.len() < 4 {\n            line.clear();\n            if first_reader.read_line(&mut line).unwrap_or(0) == 0 {\n                return;\n            }\n            for tok in line.split_whitespace() {\n                if let Ok(v) = tok.parse::<f64>() {\n                    nums.push(v);\n                    if nums.len() == 4 { break; }\n                }\n            }\n        }\n        (nums[0], nums[1], nums[2], nums[3])\n    };\n\n    // Read map rows, but avoid storing large maps. Just advance the reader over `height` lines.\n    {\n        let mut row = String::new();\n        for _ in 0..height {\n            row.clear();\n            let n = first_reader.read_line(&mut row).unwrap_or(0);\n            if n == 0 { break; }\n            // We ignore the content to save memory.\n        }\n    }\n\n    // At this point, `first_reader` is positioned at the beginning of the continuous state updates.\n    // We now create a dedicated thread to keep reading from stdin.\n\n    let shared_state = Arc::new(Mutex::new(None::<State>));\n    let last_update_ns = Arc::new(AtomicU64::new(0));\n\n    let shared_state_reader = Arc::clone(&shared_state);\n    let last_update_reader = Arc::clone(&last_update_ns);\n\n    // We need to move the remaining underlying reader into the thread. Extract inner reader.\n    // Unfortunately, BufReader doesn\'t expose into_inner without ownership; we own it now.\n    let stdin_thread = thread::spawn(move || {\n        let mut buf_reader = first_reader; // move into thread\n        let mut line = String::new();\n        loop {\n            line.clear();\n            let n = match buf_reader.read_line(&mut line) {\n                Ok(v) => v,\n                Err(_) => break,\n            };\n            if n == 0 {\n                break; // EOF\n            }\n            // Expect: x y vx vy angle angular_vel fuel_remaining\n            let mut vals: [f64; 7] = [0.0; 7];\n            let mut count = 0;\n            for tok in line.split_whitespace() {\n                if let Ok(v) = tok.parse::<f64>() {\n                    if count < 7 {\n                        vals[count] = v;\n                        count += 1;\n                    }\n                }\n            }\n            if count >= 7 {\n                let st = State {\n                    x: vals[0],\n                    y: vals[1],\n                    vx: vals[2],\n                    vy: vals[3],\n                    angle: vals[4],\n                    angular_vel: vals[5],\n                    fuel_remaining: vals[6],\n                };\n                if let Ok(mut slot) = shared_state_reader.lock() {\n                    *slot = Some(st);\n                }\n                let now = Instant::now();\n                let ns = now.elapsed().as_nanos() as u64; // monotonic-ish relative value\n                last_update_reader.store(ns, Ordering::Relaxed);\n            }\n        }\n        // Input ended; we leave the shared state as-is.\n    });\n\n    // Control loop in main thread.\n    let mut out = io::BufWriter::new(io::stdout());\n\n    let control_hz = 50.0; // 50 Hz\n    let control_dt = Duration::from_micros((1_000_000.0 / control_hz) as u64);\n\n    // Precompute some simple margins.\n    let target_x = target_x;\n    let target_y = target_y;\n    let g = gravity;\n\n    // Time reference for last_update_ns: we used Instant::now().elapsed(), which is weird; instead,\n    // we can just treat last_update_ns as increasing and compare deltas; here we reset baseline.\n    let start_instant = Instant::now();\n    last_update_ns.store(0, Ordering::Relaxed);\n\n    // Simple helper to get pseudo-now in ns relative to start.\n    let mut now_ns = || -> u64 {\n        let d = start_instant.elapsed();\n        (d.as_secs() as u64) * 1_000_000_000u64 + (d.subsec_nanos() as u64)\n    };\n\n    loop {\n        let loop_start = Instant::now();\n\n        let state_opt = {\n            if let Ok(guard) = shared_state.lock() {\n                *guard\n            } else {\n                None\n            }\n        };\n\n        let mut thrust = 0.0f64;\n        let mut turn = 0.0f64;\n\n        if let Some(s) = state_opt {\n            // Basic guidance.\n            // Horizontal control: small tilt towards target.\n            let dx = target_x - s.x;\n            let dy = target_y - s.y;\n\n            // Desired angle is near 0 (up). Introduce small tilt to move horizontally.\n            let mut desired_angle = 0.0f64;\n            let horiz_dist = dx;\n\n            if horiz_dist.abs() > 1.0 {\n                // Tilt proportionally but cap small.\n                let max_tilt = 0.2; // rad ~ 11 degrees\n                let k_tilt = 0.002; // rad per meter\n                let tilt = (horiz_dist * -k_tilt).clamp(-max_tilt, max_tilt);\n                desired_angle = tilt;\n            }\n\n            // PD control for angle.\n            let angle_err = wrap_angle(desired_angle - s.angle);\n            let k_p_ang = 2.0;\n            let k_d_ang = 0.5;\n            let ang_cmd = k_p_ang * angle_err - k_d_ang * s.angular_vel;\n            // Turn is radians/sec normalized to [-1,1]; assume max turn rate = 1 rad/s.\n            turn = ang_cmd.clamp(-1.0, 1.0);\n\n            // Vertical control.\n            // Altitude relative to target: higher y is downward.\n            let altitude = dy * -1.0; // positive if above target\n\n            // Desired vertical speed (vy): positive is downward.\n            // When high, allow faster descent; near ground, require very slow.\n            let desired_vy = if altitude > 50.0 {\n                // Up high: moderate descent.\n                3.0 // m/s downward\n            } else if altitude > 10.0 {\n                2.0\n            } else if altitude > 3.0 {\n                1.0\n            } else {\n                0.5 // very gentle near pad\n            };\n\n            let vy_err = s.vy - desired_vy;\n            // Approximate required thrust to counter gravity + correct velocity.\n            let k_v = 0.5; // tuning\n            let needed_acc = -vy_err * k_v + g; // upward acceleration (in world y negative) we want.\n            let base = needed_acc / max_thrust; // thrust fraction\n\n            thrust = base.clamp(0.0, 1.0);\n\n            // Slight fuel conservation: if low fuel, reduce thrust a bit.\n            if s.fuel_remaining < 3.0 {\n                thrust *= 0.9;\n            }\n\n            // If we are very close to ground but descending too fast, burn hard.\n            if altitude < 5.0 && s.vy > 2.0 {\n                thrust = 1.0;\n            }\n\n            // Additional safety: if we are way above target and falling fast, burn harder.\n            if altitude > 50.0 && s.vy > 10.0 {\n                thrust = (thrust + 0.5).clamp(0.0, 1.0);\n            }\n        } else {\n            // No state yet: keep neutral, maybe tiny thrust to avoid free-fall if sim starts later.\n            thrust = 0.0;\n            turn = 0.0;\n        }\n\n        // Check input stall; if no updates for too long, still send safe-ish commands.\n        let now = now_ns();\n        let last = last_update_ns.load(Ordering::Relaxed);\n        if last != 0 && now.saturating_sub(last) > 300_000_000 { // 0.3 s\n            // Reduce thrust to avoid wasting fuel, keep attitude command.\n            thrust = thrust.min(0.5);\n        }\n\n        // Output command.\n        // Use limited precision to reduce output size; but we must flush quickly.\n        // Format: "thrust turn\\n"\n        // Safety: clamp again to [0,1] and [-1,1].\n        let thrust_c = thrust.clamp(0.0, 1.0);\n        let turn_c = turn.clamp(-1.0, 1.0);\n\n        // Write without allocations where possible.\n        // We\'ll use write! macros; BufWriter should handle efficiency.\n        let _ = writeln!(out, "{:.4} {:.4}", thrust_c, turn_c);\n        let _ = out.flush();\n\n        // Sleep to maintain control frequency.\n        let elapsed = loop_start.elapsed();\n        if elapsed < control_dt {\n            thread::sleep(control_dt - elapsed);\n        }\n    }\n\n    // stdin_thread will run until EOF; main loop doesn\'t join.\n}\n\nfn wrap_angle(a: f64) -> f64 {\n    // Wrap to [-pi, pi]\n    let mut x = a;\n    while x > PI {\n        x -= 2.0 * PI;\n    }\n    while x < -PI {\n        x += 2.0 * PI;\n    }\n    x\n}\n'}
+```rust
+// Simple real-time Lunar Lander controller.
+// Strategy:
+// - Parse initial map quickly, then stream state lines.
+// - Use a dedicated stdin-reading thread that parses each state update
+//   and stores the latest state in an atomic slot.
+// - Main thread runs a fixed 50 Hz control loop (20+ Hz required),
+//   reading the latest state and outputting commands.
+//
+// Controller logic (very simple, robust-ish):
+// - While high above target: keep roughly over target X, manage vertical speed.
+// - Near ground: aim almost straight up and reduce vertical velocity.
+// - Use PID-like proportional control on angle and vertical speed.
+// This is NOT optimal but should be safe and stable in many cases.
+
+use std::f64::consts::PI;
+use std::io::{self, Read};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
+use std::thread;
+use std::time::{Duration, Instant};
+
+// Shared state from reader to controller
+#[derive(Clone, Copy, Debug)]
+struct LanderState {
+    x: f64,
+    y: f64,
+    vx: f64,
+    vy: f64,
+    angle: f64,
+    angular_vel: f64,
+    fuel_remaining: f64,
+    valid: bool,
+}
+
+fn main() {
+    // Read initial configuration and map in a blocking way once.
+    // We must be careful to not slurp arbitrary GB maps into memory.
+    // However, we *must* read all map rows, but can immediately discard them
+    // after reading each line, since we only use target coordinates.
+    let mut input = String::new();
+    let mut stdin = io::stdin();
+
+    // Read the first two lines fully (sizes + start/target)
+    // To simplify, read line-by-line using read_line.
+    use std::io::BufRead;
+    let mut reader = io::BufReader::new(stdin);
+
+    let mut line = String::new();
+
+    // Line 1: width height gravity max_thrust fuel
+    line.clear();
+    if reader.read_line(&mut line).unwrap_or(0) == 0 {
+        return;
+    }
+    let mut it = line.split_whitespace();
+    let width: usize = it.next().unwrap_or("0").parse().unwrap_or(0);
+    let height: usize = it.next().unwrap_or("0").parse().unwrap_or(0);
+    let gravity: f64 = it.next().unwrap_or("0").parse().unwrap_or(0.0);
+    let max_thrust: f64 = it.next().unwrap_or("0").parse().unwrap_or(0.0);
+    let _fuel_total: f64 = it.next().unwrap_or("0").parse().unwrap_or(0.0);
+
+    // Line 2: start_x start_y target_x target_y
+    line.clear();
+    if reader.read_line(&mut line).unwrap_or(0) == 0 {
+        return;
+    }
+    let mut it = line.split_whitespace();
+    let _start_x: f64 = it.next().unwrap_or("0").parse().unwrap_or(0.0);
+    let _start_y: f64 = it.next().unwrap_or("0").parse().unwrap_or(0.0);
+    let target_x: f64 = it.next().unwrap_or("0").parse().unwrap_or(0.0);
+    let target_y: f64 = it.next().unwrap_or("0").parse().unwrap_or(0.0);
+
+    // Read map rows and discard (to avoid huge memory usage).
+    // Map rows: each is a line of characters.
+    for _ in 0..height {
+        line.clear();
+        if reader.read_line(&mut line).unwrap_or(0) == 0 {
+            break;
+        }
+        // We could parse obstacles here if needed; for now we only
+        // ensure we drain the input for the map.
+    }
+
+    // At this point, 'reader' is positioned at the start of the
+    // continuous state updates.
+
+    // Shared state between reader thread and control loop
+    let state = Arc::new(Mutex::new(LanderState {
+        x: 0.0,
+        y: 0.0,
+        vx: 0.0,
+        vy: 0.0,
+        angle: 0.0,
+        angular_vel: 0.0,
+        fuel_remaining: 0.0,
+        valid: false,
+    }));
+    let running = Arc::new(AtomicBool::new(true));
+
+    // Spawn reader thread: constantly parse numbers from stdin.
+    // We re-use the existing BufRead 'reader' by moving it into the thread.
+    let state_reader = Arc::clone(&state);
+    let running_reader = Arc::clone(&running);
+
+    // NOTE: We must move 'reader' into the thread; to do that, we need to
+    // reconstruct from stdin again, as we can’t move 'reader' easily
+    // after partial use. To keep things simple, we now switch to raw
+    // Read for the remaining data, since we've consumed the text map.
+    // We'll parse whitespace-separated floats from here on.
+
+    // Extract the underlying stdin handle again
+    // SAFETY: We create a new reader from stdin; previously 'reader'
+    // was only used for initial lines & map.
+    let mut raw_stdin = io::stdin();
+
+    thread::spawn(move || {
+        // We'll read into a buffer and parse floats with a minimal tokenizer.
+        // To keep it straightforward and robust, use a small internal buffer
+        // and accumulate into a string, then split_whitespace.
+        let mut buf = [0u8; 8192];
+        let mut leftover = String::new();
+
+        // We expect updates in blocks of 7 floats: x y vx vy angle angular_vel fuel_remaining
+        loop {
+            if !running_reader.load(Ordering::Relaxed) {
+                break;
+            }
+
+            let n = match raw_stdin.read(&mut buf) {
+                Ok(0) => break, // EOF
+                Ok(n) => n,
+                Err(_) => break,
+            };
+
+            leftover.push_str(std::str::from_utf8(&buf[..n]).unwrap_or(""));
+
+            // Try to parse as many complete states as possible
+            let mut parts = leftover.split_whitespace().peekable();
+            let mut consumed = 0usize;
+            let mut count = 0usize;
+
+            while let (Some(_), Some(_), Some(_), Some(_), Some(_), Some(_), Some(_)) = (
+                parts.peek(),
+                { parts.nth(0) },
+                parts.nth(0),
+                parts.nth(0),
+                parts.nth(0),
+                parts.nth(0),
+                parts.nth(0),
+            ) {
+                // The peek consumes one; nth(0) consumes one each time.
+                // But this is messy to track consumed bytes, so instead
+                // we'll re-implement a simpler parser below.
+                count += 1;
+                break;
+            }
+
+            // The above attempt is cumbersome. Instead, implement a more direct tokenizer:
+            // Re-split leftover and try to parse chunks of 7 tokens, but retain unused tail.
+
+            let tokens: Vec<&str> = leftover.split_whitespace().collect();
+            let num_states = tokens.len() / 7;
+            if num_states == 0 {
+                continue;
+            }
+
+            for i in 0..num_states {
+                let base = i * 7;
+                let parse = |s: &str| s.parse::<f64>().unwrap_or(0.0);
+                let sx = parse(tokens[base]);
+                let sy = parse(tokens[base + 1]);
+                let svx = parse(tokens[base + 2]);
+                let svy = parse(tokens[base + 3]);
+                let sangle = parse(tokens[base + 4]);
+                let sangvel = parse(tokens[base + 5]);
+                let sfuel = parse(tokens[base + 6]);
+
+                {
+                    let mut st = state_reader.lock().unwrap();
+                    st.x = sx;
+                    st.y = sy;
+                    st.vx = svx;
+                    st.vy = svy;
+                    st.angle = sangle;
+                    st.angular_vel = sangvel;
+                    st.fuel_remaining = sfuel;
+                    st.valid = true;
+                }
+            }
+
+            // Rebuild leftover from any unused tokens (tail)
+            let tail_start = num_states * 7;
+            if tail_start < tokens.len() {
+                let mut new_leftover = String::new();
+                for i in tail_start..tokens.len() {
+                    new_leftover.push_str(tokens[i]);
+                    new_leftover.push(' ');
+                }
+                leftover = new_leftover;
+            } else {
+                leftover.clear();
+            }
+        }
+    });
+
+    // Controller loop at ~50 Hz
+    let mut stdout = io::BufWriter::new(io::stdout());
+    let tick = Duration::from_millis(20); // 50 Hz
+    let mut last = Instant::now();
+
+    loop {
+        if !running.load(Ordering::Relaxed) {
+            break;
+        }
+
+        // Busy-wait / sleep hybrid to maintain timing
+        let now = Instant::now();
+        if let Some(remaining) = tick.checked_sub(now.duration_since(last)) {
+            // Sleep for most of the remaining duration
+            if remaining > Duration::from_micros(200) {
+                thread::sleep(remaining - Duration::from_micros(200));
+            }
+            // Brief spin to get closer to exact tick (optional)
+            while last + tick > Instant::now() {}
+        }
+        last = Instant::now();
+
+        // Read latest state
+        let st = {
+            let st_guard = state.lock().unwrap();
+            *st_guard
+        };
+
+        if !st.valid {
+            // No state yet; send zero commands to be safe
+            use std::io::Write;
+            writeln!(stdout, "0 0").unwrap();
+            stdout.flush().unwrap();
+            continue;
+        }
+
+        // Basic controller
+
+        // Height above target (y increases downward)
+        let height = st.y - target_y;
+
+        // Desired horizontal position: target_x
+        let dx = target_x - st.x;
+
+        // Angle: 0 is up, positive is clockwise. We want angle ~0 for vertical thrust.
+        // We'll use small tilts to correct x when high, but get upright when close.
+        let distance_to_target = (dx * dx + height * height).sqrt();
+
+        // Vertical velocity limits become more strict near ground
+        let safe_vy_far = 20.0;
+        let safe_vy_near = 2.0;
+
+        // We define a "near" threshold
+        let near_threshold = 20.0;
+        let vy_limit = if height > near_threshold {
+            safe_vy_far
+        } else {
+            safe_vy_near
+        };
+
+        // Compute desired angle (tilt) to move horizontally toward target when high
+        let mut desired_angle = 0.0;
+        if height > 5.0 {
+            // Proportional control to move over the target
+            let kx = 0.02; // horizontal correction factor
+            let vx_target = kx * dx; // desired horizontal velocity
+            let kvx = 0.2;
+            let vx_error = vx_target - st.vx;
+
+            // Map vx_error to angle: small tilt, limited
+            let angle_for_vx = -vx_error * kvx; // negative error => tilt left, etc.
+            let max_tilt = 20.0_f64.to_radians();
+            desired_angle = angle_for_vx.clamp(-max_tilt, max_tilt);
+        } else {
+            // Very close: stay upright
+            desired_angle = 0.0;
+        }
+
+        // Angle control: proportional on angle error
+        let mut angle_error = desired_angle - st.angle;
+        // Normalize angle error to [-pi, pi] to avoid weird wrap behaviors
+        while angle_error > PI {
+            angle_error -= 2.0 * PI;
+        }
+        while angle_error < -PI {
+            angle_error += 2.0 * PI;
+        }
+        let k_angle = 1.5; // rad/s per rad
+        let desired_turn_rate = k_angle * angle_error;
+        let turn = desired_turn_rate.clamp(-1.0, 1.0);
+
+        // Vertical speed control:
+        // We want vy small (negative upward, positive downward, but spec says + is downward).
+        // Gravity is +g, thrust is opposite angle; but we approximate thrust as vertical
+        // component only (we always keep angle small).
+        let mut desired_vy = 0.0;
+        if height > 5.0 {
+            // When high, allow some downward speed proportional to height
+            let max_down_speed = 10.0;
+            desired_vy = (height * 0.1).clamp(0.0, max_down_speed);
+        } else {
+            // Near ground: very small downward speed
+            desired_vy = 0.5;
+        }
+
+        let vy_error = desired_vy - st.vy;
+        let kvy = 0.1;
+        // Base thrust fraction to counter gravity: thrust = g / max_thrust
+        let hover_thrust = if max_thrust > 0.0 {
+            gravity / max_thrust
+        } else {
+            0.0
+        };
+
+        // PD-like control on vertical speed
+        let thrust_correction = kvy * vy_error;
+        let mut thrust = (hover_thrust + thrust_correction).clamp(0.0, 1.0);
+
+        // Extra safety: if near ground and falling too fast, max thrust
+        if height <= near_threshold && st.vy > vy_limit {
+            thrust = 1.0;
+        }
+
+        // If almost landed: height small and vy small, cut thrust
+        if height <= 1.0 && st.vy <= safe_vy_near && st.vy >= -safe_vy_near {
+            thrust = 0.0;
+        }
+
+        // If out of fuel, no thrust
+        if st.fuel_remaining <= 0.0 {
+            thrust = 0.0;
+        }
+
+        // Simple fuel conservation: if high and slow, allow more free-fall
+        if height > 50.0 && st.vy < safe_vy_far * 0.5 {
+            thrust *= 0.5;
+        }
+
+        // Output commands
+        use std::io::Write;
+        writeln!(stdout, "{} {}", thrust, turn).unwrap();
+        stdout.flush().unwrap();
+    }
+}
+```

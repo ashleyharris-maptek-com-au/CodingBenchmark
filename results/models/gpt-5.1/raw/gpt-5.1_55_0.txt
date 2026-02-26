@@ -1,0 +1,1017 @@
+```cpp
+#include <bits/stdc++.h>
+using namespace std;
+
+/*
+ Simple chess engine:
+ - Board with bitboards
+ - Move generation (legal moves)
+ - Alpha-beta search with iterative deepening
+ - Time control via global deadline
+ - Outputs move in "disambiguated algebraic" as specified in prompt
+   (piece letter + from + [x]to [+ /# etc]), with some simplifications:
+   - We always include source square and destination square.
+   - We add 'x' for captures.
+   - We emit promotions like /Q.
+   - We handle ep and castling notation.
+   - Check/checkmate indication is approximate (post-move search with depth 1).
+ This is not a full-strength engine but should find reasonable moves within a few seconds.
+*/
+
+using U64 = unsigned long long;
+
+// Time control
+chrono::steady_clock::time_point g_startTime;
+double g_timeLimitSeconds = 5.0;
+atomic<bool> g_timeUp(false);
+
+// Side
+enum Color { WHITE = 0, BLACK = 1 };
+
+// Piece type
+enum PieceType { EMPTY=0, PAWN, KNIGHT, BISHOP, ROOK, QUEEN, KING };
+
+// Board representation
+struct Board {
+    // Bitboards indexed by [color][pieceType]
+    U64 bb[2][7];
+    Color sideToMove;
+    bool whiteCastleK, whiteCastleQ, blackCastleK, blackCastleQ;
+    int enPassantSq; // -1 if none, 0..63 otherwise
+    int halfmoveClock;
+    int fullmoveNumber;
+
+    // Piece array for fast lookup (0..63)
+    // positive for white, negative for black, magnitude piece type
+    int pieces[64];
+
+    U64 occWhite, occBlack, occAll;
+
+    Board() {
+        memset(bb, 0, sizeof(bb));
+        memset(pieces, 0, sizeof(pieces));
+        sideToMove = WHITE;
+        whiteCastleK = whiteCastleQ = blackCastleK = blackCastleQ = false;
+        enPassantSq = -1;
+        halfmoveClock = 0;
+        fullmoveNumber = 1;
+        occWhite = occBlack = occAll = 0ULL;
+    }
+};
+
+inline int sqIndex(int file, int rank) { // file 0..7 (a..h), rank 0..7 (1..8)
+    return rank*8 + file;
+}
+inline int fileOf(int sq){ return sq & 7; }
+inline int rankOf(int sq){ return sq >> 3; }
+inline U64 bit(int sq){ return 1ULL << sq; }
+
+// Move representation
+// bits: from(0-5), to(6-11), promo(12-15), flags(16..)
+// promo: 0-none,1-N,2-B,3-R,4-Q
+enum MoveFlags {
+    MF_NONE       = 0,
+    MF_CAPTURE    = 1<<0,
+    MF_ENPASSANT  = 1<<1,
+    MF_CASTLE     = 1<<2,
+    MF_DOUBLEPUSH = 1<<3,
+    MF_PROMOTION  = 1<<4,
+};
+using Move = uint32_t;
+
+inline Move makeMove(int from, int to, int promo, int flags) {
+    return (Move)(from | (to<<6) | (promo<<12) | (flags<<16));
+}
+inline int  mFrom(Move m){ return (m & 0x3F); }
+inline int  mTo(Move m){ return (m>>6) & 0x3F; }
+inline int  mPromo(Move m){ return (m>>12) & 0xF; }
+inline int  mFlags(Move m){ return (m>>16); }
+
+// Zobrist (for transposition)
+struct TTEntry {
+    U64 key;
+    int depth;
+    int score;
+    Move bestMove;
+    uint8_t flag; // 0=exact,1=alpha,2=beta
+    TTEntry():key(0),depth(-1000),score(0),bestMove(0),flag(0){}
+};
+static const int TT_SIZE = 1<<20; // ~1M entries
+vector<TTEntry> TT;
+U64 zobPiece[2][7][64];
+U64 zobSide;
+U64 zobCastle[16];
+U64 zobEP[64];
+
+U64 g_zobKey=0;
+
+void initZobrist() {
+    mt19937_64 rng(20250226);
+    for(int c=0;c<2;c++)
+        for(int p=0;p<7;p++)
+            for(int s=0;s<64;s++)
+                zobPiece[c][p][s]=rng();
+    zobSide = rng();
+    for(int i=0;i<16;i++) zobCastle[i]=rng();
+    for(int i=0;i<64;i++) zobEP[i]=rng();
+    TT.assign(TT_SIZE, TTEntry());
+}
+
+U64 computeZobKey(const Board& b){
+    U64 k=0;
+    for(int sq=0;sq<64;sq++){
+        int pc=b.pieces[sq];
+        if(pc){
+            int c = pc>0?WHITE:BLACK;
+            int pt = abs(pc);
+            k ^= zobPiece[c][pt][sq];
+        }
+    }
+    int cst=0;
+    if(b.whiteCastleK) cst|=1;
+    if(b.whiteCastleQ) cst|=2;
+    if(b.blackCastleK) cst|=4;
+    if(b.blackCastleQ) cst|=8;
+    k ^= zobCastle[cst];
+    if(b.enPassantSq!=-1) k ^= zobEP[b.enPassantSq];
+    if(b.sideToMove==BLACK) k ^= zobSide;
+    return k;
+}
+
+void updateOcc(Board& b){
+    b.occWhite=b.occBlack=0;
+    for(int sq=0;sq<64;sq++){
+        int pc=b.pieces[sq];
+        if(pc>0) b.occWhite |= bit(sq);
+        else if(pc<0) b.occBlack |= bit(sq);
+    }
+    b.occAll = b.occWhite | b.occBlack;
+}
+
+// FEN parsing
+bool parseFEN(const string& fen, Board& b){
+    b = Board();
+    stringstream ss(fen);
+    string boardPart, stm, castling, ep;
+    ss>>boardPart>>stm>>castling>>ep>>b.halfmoveClock>>b.fullmoveNumber;
+    // Board
+    int sq = 56; // a8
+    for(char c: boardPart){
+        if(c=='/'){ sq-=16; continue; }
+        if(isdigit((unsigned char)c)){
+            sq += c-'0';
+        } else {
+            int pt=0; Color col=WHITE;
+            if(c=='p'){pt=PAWN;col=BLACK;}
+            else if(c=='P'){pt=PAWN;col=WHITE;}
+            else if(c=='n'){pt=KNIGHT;col=BLACK;}
+            else if(c=='N'){pt=KNIGHT;col=WHITE;}
+            else if(c=='b'){pt=BISHOP;col=BLACK;}
+            else if(c=='B'){pt=BISHOP;col=WHITE;}
+            else if(c=='r'){pt=ROOK;col=BLACK;}
+            else if(c=='R'){pt=ROOK;col=WHITE;}
+            else if(c=='q'){pt=QUEEN;col=BLACK;}
+            else if(c=='Q'){pt=QUEEN;col=WHITE;}
+            else if(c=='k'){pt=KING;col=BLACK;}
+            else if(c=='K'){pt=KING;col=WHITE;}
+            else return false;
+            b.pieces[sq] = (col==WHITE?pt:-pt);
+            b.bb[col][pt] |= bit(sq);
+            sq++;
+        }
+    }
+    b.sideToMove = (stm=="w"?WHITE:BLACK);
+    b.whiteCastleK = castling.find('K')!=string::npos;
+    b.whiteCastleQ = castling.find('Q')!=string::npos;
+    b.blackCastleK = castling.find('k')!=string::npos;
+    b.blackCastleQ = castling.find('q')!=string::npos;
+    if(ep=="-") b.enPassantSq=-1;
+    else{
+        int file = ep[0]-'a';
+        int rank = ep[1]-'1';
+        b.enPassantSq = sqIndex(file,rank);
+    }
+    updateOcc(b);
+    g_zobKey = computeZobKey(b);
+    return true;
+}
+
+// attack masks
+U64 knightAtt[64];
+U64 kingAtt[64];
+U64 pawnAtt[2][64];
+U64 pawnPush[2][64];
+U64 fileMask[8];
+U64 rankMask[8];
+
+void initMasks(){
+    for(int i=0;i<64;i++){
+        int f=fileOf(i), r=rankOf(i);
+        // knight
+        U64 m=0;
+        int df[8]={1,2,2,1,-1,-2,-2,-1};
+        int dr[8]={2,1,-1,-2,-2,-1,1,2};
+        for(int k=0;k<8;k++){
+            int nf=f+df[k], nr=r+dr[k];
+            if(nf>=0&&nf<8&&nr>=0&&nr<8) m|=bit(sqIndex(nf,nr));
+        }
+        knightAtt[i]=m;
+        // king
+        m=0;
+        for(int df2=-1;df2<=1;df2++)
+            for(int dr2=-1;dr2<=1;dr2++){
+                if(!df2 && !dr2) continue;
+                int nf=f+df2, nr=r+dr2;
+                if(nf>=0&&nf<8&&nr>=0&&nr<8) m|=bit(sqIndex(nf,nr));
+            }
+        kingAtt[i]=m;
+        // pawn attacks/pushes
+        // white
+        pawnAtt[WHITE][i]=0;
+        if(r<7){
+            if(f>0) pawnAtt[WHITE][i]|=bit(sqIndex(f-1,r+1));
+            if(f<7) pawnAtt[WHITE][i]|=bit(sqIndex(f+1,r+1));
+        }
+        pawnPush[WHITE][i]= (r<7)? bit(sqIndex(f,r+1)) : 0;
+        // black
+        pawnAtt[BLACK][i]=0;
+        if(r>0){
+            if(f>0) pawnAtt[BLACK][i]|=bit(sqIndex(f-1,r-1));
+            if(f<7) pawnAtt[BLACK][i]|=bit(sqIndex(f+1,r-1));
+        }
+        pawnPush[BLACK][i]= (r>0)? bit(sqIndex(f,r-1)) : 0;
+    }
+    for(int f=0;f<8;f++){
+        fileMask[f]=0;
+        for(int r=0;r<8;r++) fileMask[f]|=bit(sqIndex(f,r));
+    }
+    for(int r=0;r<8;r++){
+        rankMask[r]=0;
+        for(int f=0;f<8;f++) rankMask[r]|=bit(sqIndex(f,r));
+    }
+}
+
+// sliding attacks
+U64 slideRay(int sq, int df, int dr, U64 occ){
+    U64 m=0;
+    int f=fileOf(sq), r=rankOf(sq);
+    while(true){
+        f+=df; r+=dr;
+        if(f<0||f>7||r<0||r>7) break;
+        int nsq = sqIndex(f,r);
+        m |= bit(nsq);
+        if(occ & bit(nsq)) break;
+    }
+    return m;
+}
+U64 bishopAttacks(int sq, U64 occ){
+    return slideRay(sq,1,1,occ)|slideRay(sq,1,-1,occ)|
+           slideRay(sq,-1,1,occ)|slideRay(sq,-1,-1,occ);
+}
+U64 rookAttacks(int sq, U64 occ){
+    return slideRay(sq,1,0,occ)|slideRay(sq,-1,0,occ)|
+           slideRay(sq,0,1,occ)|slideRay(sq,0,-1,occ);
+}
+U64 queenAttacks(int sq, U64 occ){
+    return bishopAttacks(sq,occ)|rookAttacks(sq,occ);
+}
+
+// side attacks
+U64 attacksFromSq(const Board& b, int sq, Color side, int pt){
+    U64 occ=b.occAll;
+    switch(pt){
+        case PAWN: return pawnAtt[side][sq];
+        case KNIGHT: return knightAtt[sq];
+        case BISHOP: return bishopAttacks(sq,occ);
+        case ROOK: return rookAttacks(sq,occ);
+        case QUEEN: return queenAttacks(sq,occ);
+        case KING: return kingAtt[sq];
+        default: return 0;
+    }
+}
+
+U64 attackedBy(const Board& b, Color side){
+    U64 res=0;
+    U64 occ=b.occAll;
+    U64 pawns=b.bb[side][PAWN];
+    while(pawns){
+        int sq = __builtin_ctzll(pawns);
+        pawns &= pawns-1;
+        res |= pawnAtt[side][sq];
+    }
+    U64 knights=b.bb[side][KNIGHT];
+    while(knights){
+        int sq=__builtin_ctzll(knights);
+        knights&=knights-1;
+        res|=knightAtt[sq];
+    }
+    U64 bishops=b.bb[side][BISHOP];
+    while(bishops){
+        int sq=__builtin_ctzll(bishops);
+        bishops&=bishops-1;
+        res|=bishopAttacks(sq,occ);
+    }
+    U64 rooks=b.bb[side][ROOK];
+    while(rooks){
+        int sq=__builtin_ctzll(rooks);
+        rooks&=rooks-1;
+        res|=rookAttacks(sq,occ);
+    }
+    U64 queens=b.bb[side][QUEEN];
+    while(queens){
+        int sq=__builtin_ctzll(queens);
+        queens&=queens-1;
+        res|=queenAttacks(sq,occ);
+    }
+    U64 king=b.bb[side][KING];
+    if(king){
+        int sq=__builtin_ctzll(king);
+        res|=kingAtt[sq];
+    }
+    return res;
+}
+
+bool inCheck(const Board& b, Color side){
+    U64 kingBB = b.bb[side][KING];
+    if(!kingBB) return false;
+    int ks = __builtin_ctzll(kingBB);
+    Color opp = (side==WHITE?BLACK:WHITE);
+    U64 att = attackedBy(b,opp);
+    return (att & bit(ks))!=0;
+}
+
+// Make/unmake move (limited, no history of zobrist needed for this task; we recompute key local)
+struct Undo {
+    int captured;
+    int epSq;
+    bool wK,wQ,bK,bQ;
+    int halfmove;
+    int fullmove;
+};
+
+void doMove(Board& b, Move m, Undo& u){
+    u.captured = 0;
+    u.epSq = b.enPassantSq;
+    u.wK=b.whiteCastleK; u.wQ=b.whiteCastleQ;
+    u.bK=b.blackCastleK; u.bQ=b.blackCastleQ;
+    u.halfmove=b.halfmoveClock;
+    u.fullmove=b.fullmoveNumber;
+
+    int from=mFrom(m), to=mTo(m);
+    int fl = mFlags(m);
+    int promo = mPromo(m);
+
+    int pc = b.pieces[from];
+    int pt = abs(pc);
+    Color side = (pc>0?WHITE:BLACK);
+    Color opp = (Color)(1-side);
+
+    b.enPassantSq=-1;
+    b.halfmoveClock++;
+    if(side==BLACK) b.fullmoveNumber++;
+
+    // capture
+    if(fl & MF_CAPTURE){
+        if(fl & MF_ENPASSANT){
+            int capSq = to + (side==WHITE?-8:8);
+            u.captured = b.pieces[capSq];
+            b.bb[opp][PAWN] &= ~bit(capSq);
+            b.pieces[capSq]=0;
+        }else{
+            u.captured = b.pieces[to];
+            int cpt = abs(u.captured);
+            b.bb[opp][cpt] &= ~bit(to);
+            b.pieces[to]=0;
+        }
+        b.halfmoveClock=0;
+    }
+
+    // move piece
+    b.bb[side][pt] &= ~bit(from);
+    b.pieces[from]=0;
+
+    int newPt = pt;
+    if(fl & MF_PROMOTION){
+        // promo code: 1-N,2-B,3-R,4-Q
+        if(promo==1) newPt=KNIGHT;
+        else if(promo==2) newPt=BISHOP;
+        else if(promo==3) newPt=ROOK;
+        else if(promo==4) newPt=QUEEN;
+    }
+
+    b.bb[side][newPt] |= bit(to);
+    b.pieces[to] = (side==WHITE?newPt:-newPt);
+
+    // pawn move specifics
+    if(pt==PAWN){
+        b.halfmoveClock=0;
+        int rFrom = rankOf(from);
+        int rTo = rankOf(to);
+        if(abs(rTo-rFrom)==2){
+            b.enPassantSq = from + (side==WHITE?8:-8);
+        }
+    }
+
+    // castling
+    if(fl & MF_CASTLE){
+        if(side==WHITE){
+            if(to==sqIndex(6,0)){ // g1
+                // rook h1->f1
+                int rf= sqIndex(7,0), rt=sqIndex(5,0);
+                b.bb[WHITE][ROOK] &= ~bit(rf);
+                b.bb[WHITE][ROOK] |= bit(rt);
+                b.pieces[rf]=0; b.pieces[rt]=ROOK;
+            }else if(to==sqIndex(2,0)){ // c1
+                int rf=sqIndex(0,0), rt=sqIndex(3,0);
+                b.bb[WHITE][ROOK] &= ~bit(rf);
+                b.bb[WHITE][ROOK] |= bit(rt);
+                b.pieces[rf]=0;b.pieces[rt]=ROOK;
+            }
+        }else{
+            if(to==sqIndex(6,7)){ // g8
+                int rf=sqIndex(7,7), rt=sqIndex(5,7);
+                b.bb[BLACK][ROOK] &= ~bit(rf);
+                b.bb[BLACK][ROOK] |= bit(rt);
+                b.pieces[rf]=0;b.pieces[rt]=-ROOK;
+            }else if(to==sqIndex(2,7)){ // c8
+                int rf=sqIndex(0,7), rt=sqIndex(3,7);
+                b.bb[BLACK][ROOK] &= ~bit(rf);
+                b.bb[BLACK][ROOK] |= bit(rt);
+                b.pieces[rf]=0;b.pieces[rt]=-ROOK;
+            }
+        }
+    }
+
+    // update castling rights if king or rook moved/captured
+    if(pt==KING){
+        if(side==WHITE){ b.whiteCastleK=b.whiteCastleQ=false; }
+        else { b.blackCastleK=b.blackCastleQ=false; }
+    }
+    if(pt==ROOK){
+        if(from==sqIndex(0,0)) b.whiteCastleQ=false;
+        else if(from==sqIndex(7,0)) b.whiteCastleK=false;
+        else if(from==sqIndex(0,7)) b.blackCastleQ=false;
+        else if(from==sqIndex(7,7)) b.blackCastleK=false;
+    }
+    if(u.captured){
+        if(u.captured==ROOK){
+            if(to==sqIndex(0,0)) b.whiteCastleQ=false;
+            else if(to==sqIndex(7,0)) b.whiteCastleK=false;
+        }else if(u.captured==-ROOK){
+            if(to==sqIndex(0,7)) b.blackCastleQ=false;
+            else if(to==sqIndex(7,7)) b.blackCastleK=false;
+        }
+    }
+
+    updateOcc(b);
+    b.sideToMove = opp;
+}
+
+void undoMove(Board& b, Move m, const Undo& u){
+    int from=mFrom(m), to=mTo(m);
+    int fl=mFlags(m);
+    int promo=mPromo(m);
+    Color opp = b.sideToMove;
+    Color side = (Color)(1-opp);
+
+    int pc = b.pieces[to];
+    int pt = abs(pc);
+    int origPt = pt;
+    if(fl & MF_PROMOTION){
+        origPt = PAWN;
+    }
+
+    // restore sideToMove etc.
+    b.sideToMove = side;
+    b.enPassantSq = u.epSq;
+    b.whiteCastleK=u.wK; b.whiteCastleQ=u.wQ;
+    b.blackCastleK=u.bK; b.blackCastleQ=u.bQ;
+    b.halfmoveClock=u.halfmove;
+    b.fullmoveNumber=u.fullmove;
+
+    // remove piece from 'to'
+    b.bb[side][pt] &= ~bit(to);
+    b.pieces[to]=0;
+
+    // restore rook for castling
+    if(fl & MF_CASTLE){
+        if(side==WHITE){
+            if(to==sqIndex(6,0)){ // g1
+                int rf=sqIndex(7,0), rt=sqIndex(5,0);
+                b.bb[WHITE][ROOK] &= ~bit(rt);
+                b.bb[WHITE][ROOK] |= bit(rf);
+                b.pieces[rt]=0; b.pieces[rf]=ROOK;
+            }else if(to==sqIndex(2,0)){ // c1
+                int rf=sqIndex(0,0), rt=sqIndex(3,0);
+                b.bb[WHITE][ROOK] &= ~bit(rt);
+                b.bb[WHITE][ROOK] |= bit(rf);
+                b.pieces[rt]=0; b.pieces[rf]=ROOK;
+            }
+        }else{
+            if(to==sqIndex(6,7)){ // g8
+                int rf=sqIndex(7,7), rt=sqIndex(5,7);
+                b.bb[BLACK][ROOK] &= ~bit(rt);
+                b.bb[BLACK][ROOK] |= bit(rf);
+                b.pieces[rt]=0; b.pieces[rf]=-ROOK;
+            }else if(to==sqIndex(2,7)){ // c8
+                int rf=sqIndex(0,7), rt=sqIndex(3,7);
+                b.bb[BLACK][ROOK] &= ~bit(rt);
+                b.bb[BLACK][ROOK] |= bit(rf);
+                b.pieces[rt]=0; b.pieces[rf]=-ROOK;
+            }
+        }
+    }
+
+    // restore from square
+    b.bb[side][origPt] |= bit(from);
+    b.pieces[from] = (side==WHITE?origPt:-origPt);
+
+    // restore capture
+    if(u.captured){
+        if(fl & MF_ENPASSANT){
+            int capSq = to + (side==WHITE?-8:8);
+            int cpt=abs(u.captured);
+            b.bb[(u.captured>0?WHITE:BLACK)][cpt] |= bit(capSq);
+            b.pieces[capSq]=u.captured;
+        }else{
+            int cpt=abs(u.captured);
+            b.bb[(u.captured>0?WHITE:BLACK)][cpt] |= bit(to);
+            b.pieces[to]=u.captured;
+        }
+    }
+
+    updateOcc(b);
+}
+
+// Move generation (psuedo-legal), then filter by legality
+vector<Move> genPseudoLegal(const Board& b){
+    vector<Move> moves;
+    Color side=b.sideToMove;
+    Color opp=(Color)(1-side);
+    U64 ownOcc = (side==WHITE?b.occWhite:b.occBlack);
+    U64 oppOcc = (side==WHITE?b.occBlack:b.occWhite);
+    U64 allOcc = b.occAll;
+
+    int dir = (side==WHITE?1:-1);
+    int startRank = (side==WHITE?1:6);
+    int promotionRank = (side==WHITE?6:1);
+    int lastRank = (side==WHITE?7:0);
+
+    // pawns
+    U64 pawns = b.bb[side][PAWN];
+    while(pawns){
+        int sq = __builtin_ctzll(pawns);
+        pawns &= pawns-1;
+        int f=fileOf(sq), r=rankOf(sq);
+
+        // single push
+        int nr=r+dir;
+        if(nr>=0 && nr<8){
+            int to = sqIndex(f,nr);
+            if(!(allOcc & bit(to))){
+                if(r==promotionRank){
+                    // promotions
+                    moves.push_back(makeMove(sq,to,4,MF_PROMOTION)); // Q
+                    moves.push_back(makeMove(sq,to,3,MF_PROMOTION)); // R
+                    moves.push_back(makeMove(sq,to,2,MF_PROMOTION)); // B
+                    moves.push_back(makeMove(sq,to,1,MF_PROMOTION)); // N
+                }else{
+                    int flags=0;
+                    if(r==startRank){
+                        int nr2=r+2*dir;
+                        int to2=sqIndex(f,nr2);
+                        if(!(allOcc & bit(to2))){
+                            flags|=MF_DOUBLEPUSH;
+                            moves.push_back(makeMove(sq,to2,0,flags));
+                            flags=0;
+                        }
+                    }
+                    moves.push_back(makeMove(sq,to,0,0));
+                }
+            }
+        }
+        // captures
+        for(int df=-1;df<=1;df+=2){
+            int nf=f+df;
+            if(nf<0||nf>7) continue;
+            int nr2=r+dir;
+            if(nr2<0||nr2>7) continue;
+            int to = sqIndex(nf,nr2);
+            if(oppOcc & bit(to)){
+                if(r==promotionRank){
+                    moves.push_back(makeMove(sq,to,4,MF_CAPTURE|MF_PROMOTION));
+                    moves.push_back(makeMove(sq,to,3,MF_CAPTURE|MF_PROMOTION));
+                    moves.push_back(makeMove(sq,to,2,MF_CAPTURE|MF_PROMOTION));
+                    moves.push_back(makeMove(sq,to,1,MF_CAPTURE|MF_PROMOTION));
+                }else{
+                    moves.push_back(makeMove(sq,to,0,MF_CAPTURE));
+                }
+            }
+        }
+        // en passant
+        if(b.enPassantSq!=-1){
+            int ep = b.enPassantSq;
+            if(rankOf(ep)==r+dir && abs(fileOf(ep)-f)==1){
+                int flags = MF_CAPTURE|MF_ENPASSANT;
+                moves.push_back(makeMove(sq,ep,0,flags));
+            }
+        }
+    }
+
+    // knights
+    U64 knights = b.bb[side][KNIGHT];
+    while(knights){
+        int sq=__builtin_ctzll(knights);
+        knights&=knights-1;
+        U64 att = knightAtt[sq] & ~ownOcc;
+        while(att){
+            int to=__builtin_ctzll(att);
+            att&=att-1;
+            int flags=0;
+            if(oppOcc & bit(to)) flags|=MF_CAPTURE;
+            moves.push_back(makeMove(sq,to,0,flags));
+        }
+    }
+
+    // bishops
+    U64 bishops = b.bb[side][BISHOP];
+    while(bishops){
+        int sq=__builtin_ctzll(bishops);
+        bishops&=bishops-1;
+        U64 att = bishopAttacks(sq,allOcc) & ~ownOcc;
+        while(att){
+            int to=__builtin_ctzll(att);
+            att&=att-1;
+            int flags=0;
+            if(oppOcc & bit(to)) flags|=MF_CAPTURE;
+            moves.push_back(makeMove(sq,to,0,flags));
+        }
+    }
+
+    // rooks
+    U64 rooks = b.bb[side][ROOK];
+    while(rooks){
+        int sq=__builtin_ctzll(rooks);
+        rooks&=rooks-1;
+        U64 att = rookAttacks(sq,allOcc) & ~ownOcc;
+        while(att){
+            int to=__builtin_ctzll(att);
+            att&=att-1;
+            int flags=0;
+            if(oppOcc & bit(to)) flags|=MF_CAPTURE;
+            moves.push_back(makeMove(sq,to,0,flags));
+        }
+    }
+
+    // queens
+    U64 queens = b.bb[side][QUEEN];
+    while(queens){
+        int sq=__builtin_ctzll(queens);
+        queens&=queens-1;
+        U64 att = queenAttacks(sq,allOcc) & ~ownOcc;
+        while(att){
+            int to=__builtin_ctzll(att);
+            att&=att-1;
+            int flags=0;
+            if(oppOcc & bit(to)) flags|=MF_CAPTURE;
+            moves.push_back(makeMove(sq,to,0,flags));
+        }
+    }
+
+    // king
+    U64 king = b.bb[side][KING];
+    if(king){
+        int sq=__builtin_ctzll(king);
+        U64 att = kingAtt[sq] & ~ownOcc;
+        while(att){
+            int to=__builtin_ctzll(att);
+            att&=att-1;
+            int flags=0;
+            if(oppOcc & bit(to)) flags|=MF_CAPTURE;
+            moves.push_back(makeMove(sq,to,0,flags));
+        }
+
+        // castling
+        if(side==WHITE){
+            if(b.whiteCastleK){
+                // e1g1: squares f1,g1 must be empty and not under attack
+                if(!(allOcc & (bit(sqIndex(5,0))|bit(sqIndex(6,0))))){
+                    if(!inCheck(b,WHITE)){
+                        Board tmp=b; Undo u;
+                        Move m1=makeMove(sq,sqIndex(5,0),0,0);
+                        doMove(tmp,m1,u);
+                        if(!inCheck(tmp,WHITE)){
+                            undoMove(tmp,m1,u);
+                            Move m2=makeMove(sq,sqIndex(6,0),0,MF_CASTLE);
+                            doMove(tmp,m2,u);
+                            if(!inCheck(tmp,WHITE)){
+                                moves.push_back(m2);
+                            }
+                        }
+                    }
+                }
+            }
+            if(b.whiteCastleQ){
+                if(!(allOcc & (bit(sqIndex(1,0))|bit(sqIndex(2,0))|bit(sqIndex(3,0))))){
+                    if(!inCheck(b,WHITE)){
+                        Board tmp=b; Undo u;
+                        Move m1=makeMove(sq,sqIndex(3,0),0,0);
+                        doMove(tmp,m1,u);
+                        if(!inCheck(tmp,WHITE)){
+                            undoMove(tmp,m1,u);
+                            Move m2=makeMove(sq,sqIndex(2,0),0,MF_CASTLE);
+                            doMove(tmp,m2,u);
+                            if(!inCheck(tmp,WHITE)){
+                                moves.push_back(m2);
+                            }
+                        }
+                    }
+                }
+            }
+        }else{
+            if(b.blackCastleK){
+                if(!(allOcc & (bit(sqIndex(5,7))|bit(sqIndex(6,7))))){
+                    if(!inCheck(b,BLACK)){
+                        Board tmp=b; Undo u;
+                        Move m1=makeMove(sq,sqIndex(5,7),0,0);
+                        doMove(tmp,m1,u);
+                        if(!inCheck(tmp,BLACK)){
+                            undoMove(tmp,m1,u);
+                            Move m2=makeMove(sq,sqIndex(6,7),0,MF_CASTLE);
+                            doMove(tmp,m2,u);
+                            if(!inCheck(tmp,BLACK)){
+                                moves.push_back(m2);
+                            }
+                        }
+                    }
+                }
+            }
+            if(b.blackCastleQ){
+                if(!(allOcc & (bit(sqIndex(1,7))|bit(sqIndex(2,7))|bit(sqIndex(3,7))))){
+                    if(!inCheck(b,BLACK)){
+                        Board tmp=b; Undo u;
+                        Move m1=makeMove(sq,sqIndex(3,7),0,0);
+                        doMove(tmp,m1,u);
+                        if(!inCheck(tmp,BLACK)){
+                            undoMove(tmp,m1,u);
+                            Move m2=makeMove(sq,sqIndex(2,7),0,MF_CASTLE);
+                            doMove(tmp,m2,u);
+                            if(!inCheck(tmp,BLACK)){
+                                moves.push_back(m2);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    return moves;
+}
+
+vector<Move> genLegal(Board& b){
+    vector<Move> ps = genPseudoLegal(b);
+    vector<Move> res;
+    for(Move m: ps){
+        Undo u;
+        doMove(b,m,u);
+        if(!inCheck(b,(Color)(1-b.sideToMove))) res.push_back(m);
+        undoMove(b,m,u);
+    }
+    return res;
+}
+
+// Evaluation (simple material + piece-square)
+const int pieceVal[7]={0,100,320,330,500,900,20000};
+
+int evalMaterial(const Board& b){
+    int score=0;
+    for(int sq=0;sq<64;sq++){
+        int pc=b.pieces[sq];
+        if(pc>0) score += pieceVal[pc];
+        else if(pc<0) score -= pieceVal[-pc];
+    }
+    return (b.sideToMove==WHITE?score:-score); // side-to-move perspective
+}
+
+// Quiescence
+int qsearch(Board& b, int alpha, int beta){
+    if(g_timeUp.load()) return evalMaterial(b);
+    int stand = evalMaterial(b);
+    if(stand>=beta) return beta;
+    if(stand>alpha) alpha=stand;
+
+    vector<Move> moves = genLegal(b);
+    for(Move m: moves){
+        if(!(mFlags(m)&MF_CAPTURE) && !(mFlags(m)&MF_PROMOTION)) continue;
+        Undo u;
+        doMove(b,m,u);
+        int score = -qsearch(b,-beta,-alpha);
+        undoMove(b,m,u);
+        if(score>=beta) return beta;
+        if(score>alpha) alpha=score;
+    }
+    return alpha;
+}
+
+// Alpha-beta with iterative deepening
+int nodes=0;
+
+int alphabeta(Board& b, int depth, int alpha, int beta){
+    if(g_timeUp.load()) return evalMaterial(b);
+    if(depth==0) return qsearch(b,alpha,beta);
+
+    vector<Move> moves = genLegal(b);
+    if(moves.empty()){
+        if(inCheck(b,b.sideToMove)) return -100000 + (5-depth);
+        else return 0;
+    }
+
+    // simple move ordering: captures first
+    sort(moves.begin(),moves.end(),[](Move a, Move b){
+        return (mFlags(a)&MF_CAPTURE) > (mFlags(b)&MF_CAPTURE);
+    });
+
+    int bestScore=-1000000;
+    for(Move m: moves){
+        Undo u;
+        doMove(b,m,u);
+        int score = -alphabeta(b,depth-1,-beta,-alpha);
+        undoMove(b,m,u);
+        if(g_timeUp.load()) return bestScore== -1000000 ? evalMaterial(b) : bestScore;
+        if(score>bestScore) bestScore=score;
+        if(score>alpha) alpha=score;
+        if(alpha>=beta) break;
+    }
+    return bestScore;
+}
+
+Move findBestMove(Board& b){
+    g_startTime = chrono::steady_clock::now();
+    g_timeUp.store(false);
+    Move bestMove=0;
+    int bestScore=-1000000;
+
+    for(int depth=1;depth<=6;depth++){
+        auto now = chrono::steady_clock::now();
+        double elapsed = chrono::duration<double>(now-g_startTime).count();
+        if(elapsed>g_timeLimitSeconds*0.9){
+            g_timeUp.store(true);
+            break;
+        }
+
+        vector<Move> moves = genLegal(b);
+        if(moves.empty()) break;
+
+        sort(moves.begin(),moves.end(),[](Move a, Move b){
+            return (mFlags(a)&MF_CAPTURE) > (mFlags(b)&MF_CAPTURE);
+        });
+
+        int localBestScore=-1000000;
+        Move localBestMove=0;
+        for(Move m: moves){
+            Undo u;
+            doMove(b,m,u);
+            int score = -alphabeta(b,depth-1,-1000000,1000000);
+            undoMove(b,m,u);
+            if(g_timeUp.load()) break;
+            if(score>localBestScore){
+                localBestScore=score;
+                localBestMove=m;
+            }
+        }
+        if(!g_timeUp.load() && localBestMove){
+            bestMove=localBestMove;
+            bestScore=localBestScore;
+        }
+        if(g_timeUp.load()) break;
+    }
+
+    if(!bestMove){
+        vector<Move> moves = genLegal(b);
+        if(!moves.empty()) bestMove=moves[0];
+    }
+    return bestMove;
+}
+
+// Convert move to required notation
+string squareToStr(int sq){
+    string s;
+    s.push_back('a'+fileOf(sq));
+    s.push_back('1'+rankOf(sq));
+    return s;
+}
+
+bool leavesOpponentInCheckmate(Board& b, Move m){
+    Undo u;
+    doMove(b,m,u);
+    Color opp = b.sideToMove;
+    vector<Move> oppMoves = genLegal(b);
+    bool mate = oppMoves.empty() && inCheck(b,opp);
+    undoMove(b,m,u);
+    return mate;
+}
+bool leavesOpponentInCheck(Board& b, Move m){
+    Undo u;
+    doMove(b,m,u);
+    Color opp = b.sideToMove;
+    bool chk = inCheck(b,opp);
+    undoMove(b,m,u);
+    return chk;
+}
+
+char pieceLetterFromPiece(int pc){
+    int pt = abs(pc);
+    if(pt==PAWN) return 'p';
+    if(pt==KNIGHT) return 'N';
+    if(pt==BISHOP) return 'B';
+    if(pt==ROOK) return 'R';
+    if(pt==QUEEN) return 'Q';
+    if(pt==KING) return 'K';
+    return '?';
+}
+
+string moveToNotation(Board& b, Move m){
+    int from=mFrom(m), to=mTo(m);
+    int fl=mFlags(m);
+    int promo=mPromo(m);
+
+    // castling
+    int pc = b.pieces[from];
+    int pt = abs(pc);
+    if((fl & MF_CASTLE) && pt==KING){
+        // decide side by from/to
+        if(fileOf(to)==6) return "O-O";
+        else return "O-O-O";
+    }
+
+    string s;
+    s.push_back(pieceLetterFromPiece(pc));
+    s += squareToStr(from);
+    if(fl & MF_CAPTURE){
+        if(fl & MF_ENPASSANT){
+            s += "x";
+            s += squareToStr(to);
+            s += "ep";
+        }else{
+            s += "x";
+            s += squareToStr(to);
+        }
+    }else{
+        s += squareToStr(to);
+    }
+
+    if(fl & MF_PROMOTION){
+        s += "/";
+        char p='Q';
+        if(promo==1)p='N';
+        else if(promo==2)p='B';
+        else if(promo==3)p='R';
+        else if(promo==4)p='Q';
+        s.push_back(p);
+    }
+
+    if(leavesOpponentInCheckmate(b,m)) s.push_back('#');
+    else if(leavesOpponentInCheck(b,m)) s.push_back('+');
+
+    return s;
+}
+
+int main(){
+    ios::sync_with_stdio(false);
+    cin.tie(nullptr);
+
+    initMasks();
+    initZobrist();
+
+    double timeout;
+    if(!(cin>>timeout)) return 0;
+    g_timeLimitSeconds = max(1.0, timeout);
+    string fenRest;
+    getline(cin, fenRest); // end of line
+    string fen;
+    getline(cin, fen);
+    if(fen.empty()){
+        // maybe the FEN was on same line (unlikely per problem, but safe)
+        fen = fenRest;
+    }
+
+    Board b;
+    if(!parseFEN(fen,b)){
+        // fallback: output any legal-looking move (e2e4 style)
+        cout<<"pe2e4\n";
+        return 0;
+    }
+
+    Move best = findBestMove(b);
+    if(!best){
+        // no legal moves (checkmate or stalemate), output something legal-ish: resign analog
+        cout<<"O-O\n";
+        return 0;
+    }
+
+    string out = moveToNotation(b,best);
+    cout<<out<<"\n";
+    return 0;
+}
+```
