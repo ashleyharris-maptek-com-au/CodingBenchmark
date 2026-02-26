@@ -1,0 +1,261 @@
+```rust
+use std::io::{self, BufRead, Write, BufWriter};
+use std::mem::MaybeUninit;
+use std::f64::consts::PI;
+
+// Constants
+const MAX_STOCK_VERTICES: usize = 10_000; // Allow very complex stock polygons
+const MAX_PIECE_VERTICES: usize = 5000;
+const MIN_STOCK_AREA: f64 = 1e-8;
+const EPSILON: f64 = 1e-9;
+const PI2: f64 = PI * 2.0;
+
+// Feature flags for optimization
+const ENABLE_SIMD: bool = true;
+const ENABLE_AVX: bool = ENABLE_SIMD && cfg!(target_arch = "x86_64");
+
+// --- Data Structures ---
+
+#[derive(Clone, Copy)]
+struct Vec2 {
+    x: f64,
+    y: f64,
+}
+
+impl Vec2 {
+    fn new(x: f64, y: f64) -> Self { Self { x, y } }
+    
+    // Basic geometric ops optimized for f64
+    fn dot(&self, other: Vec2) -> f64 { self.x * other.x + self.y * other.y }
+    fn cross(&self, other: Vec2) -> f64 { self.x * other.y - self.y * other.x }
+    fn rotate(&self, angle: f64) -> Vec2 {
+        let c = angle.cos();
+        let s = angle.sin();
+        Vec2::new(self.x * c - self.y * s, self.x * s + self.y * c)
+    }
+    fn add(&self, other: Vec2) -> Vec2 { Vec2::new(self.x + other.x, self.y + other.y) }
+    fn sub(&self, other: Vec2) -> Vec2 { Vec2::new(self.x - other.x, self.y - other.y) }
+    fn mul(&self, scalar: f64) -> Vec2 { Vec2::new(self.x * scalar, self.y * scalar) }
+}
+
+// --- Input Parsing ---
+
+fn parse_input<R: BufRead>(reader: R) -> Vec<Vec<Vec2>>> {
+    let mut lines = reader.lines();
+    
+    // Parse Stock Polygon
+    let stock_line = lines.next().unwrap().unwrap();
+    let stock_v: Vec<usize> = stock_line.split_whitespace()
+        .map(|s| s.parse().unwrap())
+        .collect();
+    let sv = stock_v[0];
+    let sv_lines: Vec<String> = (0..sv).map(|_| lines.next().unwrap().unwrap()).collect();
+    let stock_poly: Vec<Vec2> = sv_lines.iter().flat_map(|l| {
+        let parts: Vec<f64> = l.split_whitespace().map(|s| s.parse().unwrap()).collect();
+        Some((parts[0], parts[1]))
+    }).map(|(x, y)| Vec2::new(x, y))
+      .collect();
+    let stock_center = centroid(&stock_poly);
+
+    // Parse Pieces
+    let piece_line = lines.next().unwrap().unwrap();
+    let np: usize = piece_line.split_whitespace().nth(1).unwrap().parse().unwrap();
+    
+    let mut pieces: Vec<Vec<Vec2>>> = Vec::with_capacity(np);
+    
+    for _ in 0..np {
+        let pv_line = lines.next().unwrap().unwrap();
+        let pv: usize = pv_line.split_whitespace().nth(0).unwrap().parse().unwrap();
+        let mut piece_poly: Vec<Vec2> = Vec::with_capacity(pv);
+        for _ in 0..pv {
+            let line = lines.next().unwrap().unwrap();
+            let parts: Vec<f64> = line.split_whitespace().map(|s| s.parse().unwrap()).collect();
+            piece_poly.push(Vec2::new(parts[0], parts[1]));
+        }
+        pieces.push(piece_poly);
+    }
+
+    // We need to output for each piece which stock it goes to.
+    // For simplicity in this robust prototype, we map pieces to stocks.
+    // We'll create a vector of pieces. 
+    // The problem expects an index per piece. We will store the stock index per piece in the logic.
+    
+    pieces
+}
+
+fn centroid(poly: &[Vec2]) -> Vec2 {
+    if poly.is_empty() { return Vec2::new(0.0, 0.0); }
+    let mut c = Vec2::new(0.0, 0.0);
+    let n = poly.len();
+    for p in poly {
+        c = c.add(*p);
+    }
+    c.mul(1.0 / n as f64)
+}
+
+// --- Physics / Geometry Engine ---
+
+// Utility to rotate points
+fn rotate_points(points: &[Vec2], angle: f64, center: Vec2) -> Vec<Vec2> {
+    let c = angle.cos();
+    let s = angle.sin();
+    points.iter().map(|p| {
+        let dx = p.x - center.x;
+        let dy = p.y - center.y;
+        let rx = dx * c - dy * s;
+        let ry = dx * s + dy * c;
+        Vec2::new(rx + center.x, ry + center.y)
+    }).collect()
+}
+
+fn normalize_angle(angle: f64) -> f64 {
+    let mut a = angle % PI2;
+    if a < 0.0 { a += PI2; }
+    a
+}
+
+fn find_best_rotation_and_center(piece: &[Vec2], stock: &[Vec2], stock_center: Vec2) -> Option<(Vec2, f64)> {
+    // 1. Find orientation that maximizes "inward projection" to reduce volume needed.
+    //    Simplified: We try to align piece centroid roughly with stock centroid to ensure center stays in stock.
+    let piece_center = centroid(piece);
+    let dx = stock_center.x - piece_center.x;
+    let dy = stock_center.y - piece_center.y;
+    let base_angle = (-dy).atan2(dx); // Angle to stock center
+
+    // 2. Iterate rotations. Optimization: Only check rotations that keep the piece inside a "bounding box" check
+    //    or simply check a set of discrete angles (e.g., every 45 degrees is usually fine for optimal packing if not strictly constrained by shape).
+    //    However, to be rigorous, we scan -90 to +90 deg.
+    const NUM_ROTATIONS: usize = 13; // -90, -45, -22.5, 0, ..., 90
+    let mut best_val = -f64::INFINITY;
+    let mut best_state: Option<(Vec2, f64)> = None;
+
+    let mut angles = [0.0f64; NUM_ROTATIONS];
+    let step = PI / 2.0 / (NUM_ROTATIONS - 1) as f64;
+    for i in 0..NUM_ROTATIONS {
+        angles[i] = base_angle - PI/2.0 + i as f64 * step;
+    }
+
+    for angle in angles {
+        let rotated_poly = rotate_points(piece, angle, piece_center);
+        
+        // Distance from center to furthest vertex
+        let furthest_dist = rotated_poly.iter().map(|p| {
+            let d = p.sub(stock_center);
+            d.dot(d).sqrt()
+        }).fold(0.0, f64::max);
+
+        // Heuristic: The closer the furthest vertex is to center, the more likely to fit in a complex polygon
+        // or at least not lose significant area.
+        let val = -furthest_dist; 
+
+        if val > best_val {
+            best_val = val;
+            best_state = Some((Vec2::new(0.0, 0.0), angle)); // Initial placement offset
+        }
+    }
+
+    best_state
+}
+
+fn is_point_in_polygon(point: Vec2, poly: &[Vec2]) -> bool {
+    // Ray casting
+    let mut inside = false;
+    let n = poly.len();
+    let mut j = n - 1;
+    
+    for i in 0..n {
+        let pi = poly[i];
+        let pj = poly[j];
+        
+        if ((pi.y > point.y) != (pj.y > point.y)) &&
+           (point.x < (pj.x - pi.x) * (point.y - pi.y) / (pj.y - pi.y + 1e-12) + pi.x) {
+            inside = !inside;
+        }
+        j = i;
+    }
+    inside
+}
+
+fn is_poly_in_stock(rotated_piece: &[Vec2], stock_poly: &[Vec2]) -> bool {
+    // 1. Check if all piece vertices are inside the stock
+    for p in rotated_piece {
+        if !is_point_in_polygon(*p, stock_poly) {
+            return false;
+        }
+    }
+    
+    // 2. The stock poly is convex? If yes, this is sufficient.
+    // 3. Check for holes or non-trivial cases where piece vertices are inside but piece "spills" out.
+    //    This is a non-trivial point-in-polygon check for the shape itself.
+    //    Simple approach: Check if center of piece is in stock. If all vertices are in, and centroid is in, 
+    //    it's very likely valid for convex stock.
+    //    Let's do a more robust check: Oriented Area test or just assume convex stock for "Complex Polygon" problem
+    //    or simplified packing implies convex.
+    
+    // Robust check for arbitrary polygon (Piece Poly) inside Stock Poly.
+    // We check if the convex hull of the piece is inside.
+    // Or simpler: Check if all edges of the piece are on the "same side" relative to stock edges?
+    // Let's implement standard Point-in-Polygon for each vertex (done).
+    // If Stock is convex, that's sufficient.
+    
+    let pc = centroid(rotated_piece);
+    if is_point_in_polygon(pc, stock_poly) {
+        return true;
+    }
+    false
+}
+
+// --- Solver ---
+
+fn solve() {
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let mut out = BufWriter::new(stdout.lock());
+    
+    let pieces = parse_input(stdin.lock());
+    let stock_poly = parse_input(stdin.lock()).pop().unwrap_or_default(); // Should be single stock
+    
+    let stock_center = centroid(&stock_poly);
+    
+    let stock_area = polygon_area(&stock_poly);
+    if stock_area < MIN_STOCK_AREA {
+        writeln!(out, "0").unwrap();
+        return;
+    }
+
+    let mut results = Vec::with_capacity(pieces.len());
+    
+    for (idx, piece) in pieces.iter().enumerate() {
+        // Find best placement
+        let placement = find_best_rotation_and_center(piece, &stock_poly, stock_center);
+        
+        if let Some((offset, angle)) = placement {
+            results.push((0, offset, angle)); // Stock 0
+        } else {
+            // Fallback: If strict fit fails, try -PI/2 offset (to the left) - this rarely works but handles edge cases
+            results.push((0, Vec2::new(-stock_center.x, -stock_center.y), angle));
+        }
+    }
+
+    writeln!(out, "1").unwrap();
+    for (stock_idx, (pos_x, pos_y, angle)) in results {
+        writeln!(out, "{} {:.10} {:.10}", stock_idx, pos_x, angle).unwrap();
+    }
+}
+
+fn polygon_area(poly: &[Vec2]) -> f64 {
+    let n = poly.len();
+    if n < 3 { return 0.0; }
+    let mut area = 0.0;
+    for i in 0..n {
+        let j = (i + 1) % n;
+        area += poly[i].x * poly[j].y;
+        area -= poly[j].x * poly[i].y;
+    }
+    area.abs() / 2.0
+}
+
+fn main() {
+    solve();
+}
+```
