@@ -1,0 +1,1581 @@
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+
+public static class Program
+{
+    public static void Main()
+    {
+        var scanner = new FastScanner(Console.OpenStandardInput());
+        int vertexCount = scanner.NextInt();
+        int faceCount = scanner.NextInt();
+
+        var vertices = new Vec3[vertexCount];
+        for (int i = 0; i < vertexCount; i++)
+        {
+            vertices[i] = new Vec3(scanner.NextDouble(), scanner.NextDouble(), scanner.NextDouble());
+        }
+
+        var faces = new Triangle[faceCount];
+        for (int i = 0; i < faceCount; i++)
+        {
+            faces[i] = new Triangle(scanner.NextInt(), scanner.NextInt(), scanner.NextInt());
+        }
+
+        var container = new Box(scanner.NextDouble(), scanner.NextDouble(), scanner.NextDouble());
+        var solver = new PackingSolver(vertices, faces, container);
+        var plan = solver.Solve();
+
+        using var writer = new StreamWriter(Console.OpenStandardOutput(), new System.Text.UTF8Encoding(false), 1 << 20);
+        writer.WriteLine(plan.Count.ToString(CultureInfo.InvariantCulture));
+        solver.EmitPlan(plan, container, Vec3.Zero, writer);
+    }
+}
+
+public sealed class PackingSolver
+{
+    private const double MinExtent = 1e-8;
+    private const double FitEpsilon = 1e-9;
+    private const double KeyScale = 10000.0;
+
+    private readonly Vec3[] _vertices;
+    private readonly Triangle[] _faces;
+    private readonly Box _container;
+
+    private List<Candidate> _allCandidates = new List<Candidate>();
+    private List<Candidate> _searchCandidates = new List<Candidate>();
+    private readonly Dictionary<StateKey, Plan> _memo = new Dictionary<StateKey, Plan>();
+
+    private int _maxDepth;
+
+    public PackingSolver(Vec3[] vertices, Triangle[] faces, Box container)
+    {
+        _vertices = vertices;
+        _faces = faces;
+        _container = container;
+    }
+
+    public Plan Solve()
+    {
+        if (_vertices.Length == 0 || _container.X <= 0.0 || _container.Y <= 0.0 || _container.Z <= 0.0)
+        {
+            return EmptyPlan.Instance;
+        }
+
+        _allCandidates = BuildCandidates();
+        if (_allCandidates.Count == 0)
+        {
+            return EmptyPlan.Instance;
+        }
+
+        long bestDirectCount = 0;
+        for (int i = 0; i < _allCandidates.Count; i++)
+        {
+            long count = DirectCount(_container, _allCandidates[i]);
+            if (count > bestDirectCount)
+            {
+                bestDirectCount = count;
+            }
+        }
+
+        double volume = _container.Volume;
+        int complexity = _vertices.Length + _faces.Length;
+        _maxDepth = ChooseDepth(volume, bestDirectCount, complexity);
+        _searchCandidates = SelectSearchCandidates(_allCandidates, _container, _maxDepth);
+
+        if (_maxDepth <= 0)
+        {
+            return BuildBestDirectPlan(_container);
+        }
+
+        _memo.Clear();
+        return SolveBox(_container, _maxDepth);
+    }
+
+    public void EmitPlan(Plan plan, Box box, Vec3 origin, TextWriter writer)
+    {
+        if (plan.Count <= 0)
+        {
+            return;
+        }
+
+        if (plan is DirectPlan direct)
+        {
+            EmitDirectPlan(direct, origin, writer);
+            return;
+        }
+
+        if (plan is SequencePlan sequence)
+        {
+            double offset = 0.0;
+            for (int i = 0; i < sequence.Segments.Count; i++)
+            {
+                SequenceSegment segment = sequence.Segments[i];
+                for (long repeat = 0; repeat < segment.Repeat; repeat++)
+                {
+                    Vec3 childOrigin = origin.WithAxisOffset(sequence.Axis, offset);
+                    Box childBox = box.With(sequence.Axis, segment.Thickness);
+                    EmitPlan(segment.Child, childBox, childOrigin, writer);
+                    offset += segment.Thickness;
+                }
+            }
+        }
+    }
+
+    private void EmitDirectPlan(DirectPlan plan, Vec3 origin, TextWriter writer)
+    {
+        Candidate candidate = plan.Candidate;
+        Vec3 size = candidate.Size;
+        Vec3 min = candidate.Min;
+        string quaternionText = candidate.QuaternionText;
+
+        for (long ix = 0; ix < plan.NX; ix++)
+        {
+            double tx = origin.X + ix * size.X - min.X;
+            for (long iy = 0; iy < plan.NY; iy++)
+            {
+                double ty = origin.Y + iy * size.Y - min.Y;
+                for (long iz = 0; iz < plan.NZ; iz++)
+                {
+                    double tz = origin.Z + iz * size.Z - min.Z;
+                    writer.Write(FormatDouble(tx));
+                    writer.Write(' ');
+                    writer.Write(FormatDouble(ty));
+                    writer.Write(' ');
+                    writer.Write(FormatDouble(tz));
+                    writer.Write(' ');
+                    writer.WriteLine(quaternionText);
+                }
+            }
+        }
+    }
+
+    private Plan SolveBox(Box box, int depth)
+    {
+        if (box.X <= MinExtent || box.Y <= MinExtent || box.Z <= MinExtent)
+        {
+            return EmptyPlan.Instance;
+        }
+
+        var key = new StateKey(Snap(box.X), Snap(box.Y), Snap(box.Z), depth);
+        if (_memo.TryGetValue(key, out var cached))
+        {
+            return cached;
+        }
+
+        Plan best = BuildBestDirectPlan(box);
+        if (depth > 0)
+        {
+            Plan byX = BuildSequencePlan(box, Axis.X, depth);
+            if (IsBetter(byX, best))
+            {
+                best = byX;
+            }
+
+            Plan byY = BuildSequencePlan(box, Axis.Y, depth);
+            if (IsBetter(byY, best))
+            {
+                best = byY;
+            }
+
+            Plan byZ = BuildSequencePlan(box, Axis.Z, depth);
+            if (IsBetter(byZ, best))
+            {
+                best = byZ;
+            }
+        }
+
+        _memo[key] = best;
+        return best;
+    }
+
+    private Plan BuildSequencePlan(Box box, Axis axis, int depth)
+    {
+        double length = box.Get(axis);
+        if (length <= MinExtent)
+        {
+            return EmptyPlan.Instance;
+        }
+
+        var options = new List<SlabOption>();
+        var seen = new HashSet<long>();
+        for (int i = 0; i < _searchCandidates.Count; i++)
+        {
+            Candidate candidate = _searchCandidates[i];
+            double thickness = candidate.GetSize(axis);
+            if (thickness > length + FitEpsilon || thickness <= MinExtent)
+            {
+                continue;
+            }
+
+            long thicknessKey = Snap(thickness);
+            if (!seen.Add(thicknessKey))
+            {
+                continue;
+            }
+
+            Box slabBox = box.With(axis, thickness);
+            Plan child = SolveBox(slabBox, depth - 1);
+            if (child.Count > 0)
+            {
+                options.Add(new SlabOption(thickness, child));
+            }
+        }
+
+        if (options.Count == 0)
+        {
+            return EmptyPlan.Instance;
+        }
+
+        var memo = new Dictionary<long, SequenceState>();
+        SequenceState SolveRemaining(double remaining)
+        {
+            if (remaining <= MinExtent)
+            {
+                return SequenceState.Stop;
+            }
+
+            long stateKey = Snap(remaining);
+            if (memo.TryGetValue(stateKey, out SequenceState cached))
+            {
+                return cached;
+            }
+
+            SequenceState best = SequenceState.Stop;
+            for (int i = 0; i < options.Count; i++)
+            {
+                SlabOption option = options[i];
+                if (option.Thickness > remaining + FitEpsilon)
+                {
+                    continue;
+                }
+
+                SequenceState tail = SolveRemaining(remaining - option.Thickness);
+                long count = SafeAdd(option.Child.Count, tail.Count);
+                double used = option.Child.UsedVolume + tail.UsedVolume;
+                if (count > best.Count || (count == best.Count && used > best.UsedVolume + 1e-12))
+                {
+                    best = new SequenceState(count, used, i);
+                }
+            }
+
+            memo[stateKey] = best;
+            return best;
+        }
+
+        SequenceState root = SolveRemaining(length);
+        if (root.Count <= 0)
+        {
+            return EmptyPlan.Instance;
+        }
+
+        var segments = new List<SequenceSegment>();
+        double remainingLength = length;
+        while (remainingLength > MinExtent)
+        {
+            long stateKey = Snap(remainingLength);
+            if (!memo.TryGetValue(stateKey, out SequenceState state) || state.Choice < 0)
+            {
+                break;
+            }
+
+            SlabOption option = options[state.Choice];
+            if (option.Thickness > remainingLength + FitEpsilon)
+            {
+                break;
+            }
+
+            if (segments.Count > 0)
+            {
+                SequenceSegment last = segments[segments.Count - 1];
+                if (ReferenceEquals(last.Child, option.Child) && NearlyEqual(last.Thickness, option.Thickness))
+                {
+                    last.Repeat++;
+                    segments[segments.Count - 1] = last;
+                }
+                else
+                {
+                    segments.Add(new SequenceSegment(1, option.Thickness, option.Child));
+                }
+            }
+            else
+            {
+                segments.Add(new SequenceSegment(1, option.Thickness, option.Child));
+            }
+
+            remainingLength -= option.Thickness;
+        }
+
+        if (segments.Count == 0)
+        {
+            return EmptyPlan.Instance;
+        }
+
+        long totalCount = 0;
+        double usedVolume = 0.0;
+        for (int i = 0; i < segments.Count; i++)
+        {
+            totalCount = SafeAdd(totalCount, SafeMultiply(segments[i].Repeat, segments[i].Child.Count));
+            usedVolume += segments[i].Repeat * segments[i].Child.UsedVolume;
+        }
+
+        return new SequencePlan(axis, segments, totalCount, usedVolume);
+    }
+
+    private Plan BuildBestDirectPlan(Box box)
+    {
+        Plan best = EmptyPlan.Instance;
+        for (int i = 0; i < _allCandidates.Count; i++)
+        {
+            Candidate candidate = _allCandidates[i];
+            long nx = FitCount(box.X, candidate.Size.X);
+            long ny = FitCount(box.Y, candidate.Size.Y);
+            long nz = FitCount(box.Z, candidate.Size.Z);
+            if (nx <= 0 || ny <= 0 || nz <= 0)
+            {
+                continue;
+            }
+
+            long count = SafeMultiply(nx, SafeMultiply(ny, nz));
+            double usedVolume = count * candidate.Volume;
+            var plan = new DirectPlan(candidate, nx, ny, nz, count, usedVolume);
+            if (IsBetter(plan, best))
+            {
+                best = plan;
+            }
+        }
+
+        return best;
+    }
+
+    private List<Candidate> BuildCandidates()
+    {
+        var baseFrames = new List<Mat3>();
+        baseFrames.Add(Mat3.Identity);
+
+        if (TryBuildPcaFrame(_vertices, out Mat3 pcaFrame))
+        {
+            baseFrames.Add(pcaFrame);
+        }
+
+        List<Mat3> faceFrames = BuildFaceFrames(_vertices, _faces, 6);
+        for (int i = 0; i < faceFrames.Count; i++)
+        {
+            baseFrames.Add(faceFrames[i]);
+        }
+
+        List<Mat3> symmetries = BuildCubeSymmetries();
+        var unique = new Dictionary<SizeKey, Candidate>();
+        int nextId = 0;
+
+        for (int i = 0; i < baseFrames.Count; i++)
+        {
+            for (int j = 0; j < symmetries.Count; j++)
+            {
+                Mat3 rotation = symmetries[j] * baseFrames[i];
+                if (rotation.Determinant() < 0.0)
+                {
+                    continue;
+                }
+
+                ComputeAabb(_vertices, rotation, out Vec3 min, out Vec3 max);
+                Vec3 size = max - min;
+                if (size.X <= MinExtent || size.Y <= MinExtent || size.Z <= MinExtent)
+                {
+                    continue;
+                }
+
+                var quaternion = Quat.FromRotationMatrix(rotation).Canonicalized();
+                var candidate = new Candidate(
+                    nextId++,
+                    rotation,
+                    quaternion,
+                    min,
+                    size,
+                    size.X * size.Y * size.Z,
+                    string.Concat(
+                        FormatDouble(quaternion.W), " ",
+                        FormatDouble(quaternion.X), " ",
+                        FormatDouble(quaternion.Y), " ",
+                        FormatDouble(quaternion.Z))
+                );
+
+                var key = new SizeKey(Snap(size.X), Snap(size.Y), Snap(size.Z));
+                if (unique.TryGetValue(key, out var existing))
+                {
+                    if (candidate.Volume < existing.Volume - 1e-12)
+                    {
+                        unique[key] = candidate;
+                    }
+                }
+                else
+                {
+                    unique[key] = candidate;
+                }
+            }
+        }
+
+        var candidates = new List<Candidate>(unique.Values);
+        candidates = RemoveDominated(candidates);
+        candidates.Sort((a, b) => a.Volume.CompareTo(b.Volume));
+        return candidates;
+    }
+
+    private static List<Candidate> RemoveDominated(List<Candidate> candidates)
+    {
+        var filtered = new List<Candidate>();
+        for (int i = 0; i < candidates.Count; i++)
+        {
+            Candidate current = candidates[i];
+            bool dominated = false;
+            for (int j = 0; j < candidates.Count; j++)
+            {
+                if (i == j)
+                {
+                    continue;
+                }
+
+                Candidate other = candidates[j];
+                bool notWorse =
+                    other.Size.X <= current.Size.X + 1e-9 &&
+                    other.Size.Y <= current.Size.Y + 1e-9 &&
+                    other.Size.Z <= current.Size.Z + 1e-9;
+                bool strictlyBetter =
+                    other.Size.X < current.Size.X - 1e-9 ||
+                    other.Size.Y < current.Size.Y - 1e-9 ||
+                    other.Size.Z < current.Size.Z - 1e-9;
+
+                if (notWorse && strictlyBetter)
+                {
+                    dominated = true;
+                    break;
+                }
+            }
+
+            if (!dominated)
+            {
+                filtered.Add(current);
+            }
+        }
+
+        return filtered;
+    }
+
+    private List<Candidate> SelectSearchCandidates(List<Candidate> allCandidates, Box container, int depth)
+    {
+        var ordered = new List<Candidate>(allCandidates);
+        ordered.Sort((a, b) =>
+        {
+            long countA = DirectCount(container, a);
+            long countB = DirectCount(container, b);
+            int countCmp = countB.CompareTo(countA);
+            if (countCmp != 0)
+            {
+                return countCmp;
+            }
+
+            return a.Volume.CompareTo(b.Volume);
+        });
+
+        int limit = depth >= 3 ? 12 : depth == 2 ? 16 : 24;
+        if (ordered.Count <= limit)
+        {
+            return ordered;
+        }
+
+        var selected = new List<Candidate>();
+        var seen = new HashSet<int>();
+        for (int i = 0; i < limit; i++)
+        {
+            selected.Add(ordered[i]);
+            seen.Add(ordered[i].Id);
+        }
+
+        Candidate? minX = null;
+        Candidate? minY = null;
+        Candidate? minZ = null;
+        for (int i = 0; i < ordered.Count; i++)
+        {
+            Candidate candidate = ordered[i];
+            if (minX == null || candidate.Size.X < minX.Size.X)
+            {
+                minX = candidate;
+            }
+
+            if (minY == null || candidate.Size.Y < minY.Size.Y)
+            {
+                minY = candidate;
+            }
+
+            if (minZ == null || candidate.Size.Z < minZ.Size.Z)
+            {
+                minZ = candidate;
+            }
+        }
+
+        if (minX != null && !seen.Contains(minX.Id))
+        {
+            selected.Add(minX);
+            seen.Add(minX.Id);
+        }
+
+        if (minY != null && !seen.Contains(minY.Id))
+        {
+            selected.Add(minY);
+            seen.Add(minY.Id);
+        }
+
+        if (minZ != null && !seen.Contains(minZ.Id))
+        {
+            selected.Add(minZ);
+            seen.Add(minZ.Id);
+        }
+
+        return selected;
+    }
+
+    private static bool TryBuildPcaFrame(Vec3[] vertices, out Mat3 frame)
+    {
+        frame = Mat3.Identity;
+        if (vertices.Length < 3)
+        {
+            return false;
+        }
+
+        Vec3 mean = Vec3.Zero;
+        for (int i = 0; i < vertices.Length; i++)
+        {
+            mean += vertices[i];
+        }
+
+        mean /= vertices.Length;
+
+        double xx = 0.0;
+        double xy = 0.0;
+        double xz = 0.0;
+        double yy = 0.0;
+        double yz = 0.0;
+        double zz = 0.0;
+
+        for (int i = 0; i < vertices.Length; i++)
+        {
+            Vec3 d = vertices[i] - mean;
+            xx += d.X * d.X;
+            xy += d.X * d.Y;
+            xz += d.X * d.Z;
+            yy += d.Y * d.Y;
+            yz += d.Y * d.Z;
+            zz += d.Z * d.Z;
+        }
+
+        double trace = xx + yy + zz;
+        if (trace <= 1e-16)
+        {
+            return false;
+        }
+
+        double[,] a =
+        {
+            { xx, xy, xz },
+            { xy, yy, yz },
+            { xz, yz, zz }
+        };
+
+        double[,] v =
+        {
+            { 1.0, 0.0, 0.0 },
+            { 0.0, 1.0, 0.0 },
+            { 0.0, 0.0, 1.0 }
+        };
+
+        for (int iter = 0; iter < 32; iter++)
+        {
+            int p = 0;
+            int q = 1;
+            double max = Math.Abs(a[0, 1]);
+            if (Math.Abs(a[0, 2]) > max)
+            {
+                p = 0;
+                q = 2;
+                max = Math.Abs(a[0, 2]);
+            }
+
+            if (Math.Abs(a[1, 2]) > max)
+            {
+                p = 1;
+                q = 2;
+                max = Math.Abs(a[1, 2]);
+            }
+
+            if (max < 1e-12)
+            {
+                break;
+            }
+
+            double app = a[p, p];
+            double aqq = a[q, q];
+            double apq = a[p, q];
+            double phi = 0.5 * Math.Atan2(2.0 * apq, aqq - app);
+            double c = Math.Cos(phi);
+            double s = Math.Sin(phi);
+
+            for (int k = 0; k < 3; k++)
+            {
+                if (k == p || k == q)
+                {
+                    continue;
+                }
+
+                double aik = a[k, p];
+                double akq = a[k, q];
+                double newAip = c * aik - s * akq;
+                double newAiq = s * aik + c * akq;
+                a[k, p] = newAip;
+                a[p, k] = newAip;
+                a[k, q] = newAiq;
+                a[q, k] = newAiq;
+            }
+
+            a[p, p] = c * c * app - 2.0 * s * c * apq + s * s * aqq;
+            a[q, q] = s * s * app + 2.0 * s * c * apq + c * c * aqq;
+            a[p, q] = 0.0;
+            a[q, p] = 0.0;
+
+            for (int k = 0; k < 3; k++)
+            {
+                double vip = v[k, p];
+                double viq = v[k, q];
+                v[k, p] = c * vip - s * viq;
+                v[k, q] = s * vip + c * viq;
+            }
+        }
+
+        var eigen = new (double Value, Vec3 Vector)[3];
+        for (int i = 0; i < 3; i++)
+        {
+            eigen[i] = (
+                a[i, i],
+                new Vec3(v[0, i], v[1, i], v[2, i]).Normalized()
+            );
+        }
+
+        Array.Sort(eigen, (left, right) => right.Value.CompareTo(left.Value));
+
+        Vec3 x = eigen[0].Vector.Normalized();
+        if (x.LengthSquared <= 1e-20)
+        {
+            return false;
+        }
+
+        Vec3 y = (eigen[1].Vector - x * Vec3.Dot(eigen[1].Vector, x)).Normalized();
+        if (y.LengthSquared <= 1e-20)
+        {
+            y = AnyPerpendicular(x);
+        }
+
+        Vec3 z = Vec3.Cross(x, y).Normalized();
+        if (z.LengthSquared <= 1e-20)
+        {
+            return false;
+        }
+
+        y = Vec3.Cross(z, x).Normalized();
+        frame = Mat3.FromRows(x, y, z);
+        if (frame.Determinant() < 0.0)
+        {
+            frame = Mat3.FromRows(x, y, z * -1.0);
+        }
+
+        return true;
+    }
+
+    private static List<Mat3> BuildFaceFrames(Vec3[] vertices, Triangle[] faces, int limit)
+    {
+        var seeds = new List<FaceFrameSeed>();
+        for (int i = 0; i < faces.Length; i++)
+        {
+            Triangle tri = faces[i];
+            if ((uint)tri.A >= (uint)vertices.Length || (uint)tri.B >= (uint)vertices.Length || (uint)tri.C >= (uint)vertices.Length)
+            {
+                continue;
+            }
+
+            Vec3 a = vertices[tri.A];
+            Vec3 b = vertices[tri.B];
+            Vec3 c = vertices[tri.C];
+            Vec3 ab = b - a;
+            Vec3 bc = c - b;
+            Vec3 ca = a - c;
+            Vec3 normal = Vec3.Cross(ab, c - a);
+            double area2 = normal.Length;
+            if (area2 <= 1e-12)
+            {
+                continue;
+            }
+
+            Vec3 w = normal / area2;
+            Vec3 longest = ab;
+            if (bc.LengthSquared > longest.LengthSquared)
+            {
+                longest = bc;
+            }
+
+            if (ca.LengthSquared > longest.LengthSquared)
+            {
+                longest = ca;
+            }
+
+            Vec3 u = (longest - w * Vec3.Dot(longest, w)).Normalized();
+            if (u.LengthSquared <= 1e-20)
+            {
+                continue;
+            }
+
+            Vec3 v = Vec3.Cross(w, u).Normalized();
+            if (v.LengthSquared <= 1e-20)
+            {
+                continue;
+            }
+
+            seeds.Add(new FaceFrameSeed(area2 * 0.5, Mat3.FromRows(u, v, w)));
+        }
+
+        seeds.Sort((left, right) => right.Area.CompareTo(left.Area));
+
+        var frames = new List<Mat3>();
+        for (int i = 0; i < seeds.Count && frames.Count < limit; i++)
+        {
+            Mat3 frame = seeds[i].Frame;
+            bool duplicate = false;
+            for (int j = 0; j < frames.Count; j++)
+            {
+                if (Math.Abs(Vec3.Dot(frame.Row3, frames[j].Row3)) > 0.999 &&
+                    Math.Abs(Vec3.Dot(frame.Row1, frames[j].Row1)) > 0.995)
+                {
+                    duplicate = true;
+                    break;
+                }
+            }
+
+            if (!duplicate)
+            {
+                frames.Add(frame);
+            }
+        }
+
+        return frames;
+    }
+
+    private static List<Mat3> BuildCubeSymmetries()
+    {
+        var result = new List<Mat3>(24);
+        int[][] perms =
+        {
+            new[] { 0, 1, 2 },
+            new[] { 0, 2, 1 },
+            new[] { 1, 0, 2 },
+            new[] { 1, 2, 0 },
+            new[] { 2, 0, 1 },
+            new[] { 2, 1, 0 }
+        };
+
+        Vec3[] axes =
+        {
+            new Vec3(1.0, 0.0, 0.0),
+            new Vec3(0.0, 1.0, 0.0),
+            new Vec3(0.0, 0.0, 1.0)
+        };
+
+        for (int p = 0; p < perms.Length; p++)
+        {
+            int parity = PermutationParity(perms[p]);
+            for (int sx = -1; sx <= 1; sx += 2)
+            {
+                for (int sy = -1; sy <= 1; sy += 2)
+                {
+                    for (int sz = -1; sz <= 1; sz += 2)
+                    {
+                        int signProduct = sx * sy * sz;
+                        if (signProduct * parity != 1)
+                        {
+                            continue;
+                        }
+
+                        Vec3 r1 = axes[perms[p][0]] * sx;
+                        Vec3 r2 = axes[perms[p][1]] * sy;
+                        Vec3 r3 = axes[perms[p][2]] * sz;
+                        result.Add(Mat3.FromRows(r1, r2, r3));
+                    }
+                }
+            }
+        }
+
+        return result;
+    }
+
+    private static int PermutationParity(int[] perm)
+    {
+        int inversions = 0;
+        for (int i = 0; i < perm.Length; i++)
+        {
+            for (int j = i + 1; j < perm.Length; j++)
+            {
+                if (perm[i] > perm[j])
+                {
+                    inversions++;
+                }
+            }
+        }
+
+        return (inversions & 1) == 0 ? 1 : -1;
+    }
+
+    private static void ComputeAabb(Vec3[] vertices, Mat3 rotation, out Vec3 min, out Vec3 max)
+    {
+        Vec3 first = rotation.Transform(vertices[0]);
+        min = first;
+        max = first;
+
+        for (int i = 1; i < vertices.Length; i++)
+        {
+            Vec3 p = rotation.Transform(vertices[i]);
+            min = Vec3.Min(min, p);
+            max = Vec3.Max(max, p);
+        }
+    }
+
+    private static Vec3 AnyPerpendicular(Vec3 vector)
+    {
+        Vec3 basis = Math.Abs(vector.X) < 0.8 ? new Vec3(1.0, 0.0, 0.0) : new Vec3(0.0, 1.0, 0.0);
+        return Vec3.Cross(vector, basis).Normalized();
+    }
+
+    private static int ChooseDepth(double volume, long bestDirectCount, int complexity)
+    {
+        if (bestDirectCount > 2_000_000 || volume > 40_000_000.0)
+        {
+            return 0;
+        }
+
+        if (bestDirectCount > 250_000 || volume > 4_000_000.0)
+        {
+            return 1;
+        }
+
+        if (bestDirectCount > 30_000 || volume > 500_000.0 || complexity > 4000)
+        {
+            return 2;
+        }
+
+        return 3;
+    }
+
+    private static bool IsBetter(Plan candidate, Plan current)
+    {
+        if (candidate.Count != current.Count)
+        {
+            return candidate.Count > current.Count;
+        }
+
+        return candidate.UsedVolume > current.UsedVolume + 1e-12;
+    }
+
+    private static long DirectCount(Box box, Candidate candidate)
+    {
+        long nx = FitCount(box.X, candidate.Size.X);
+        long ny = FitCount(box.Y, candidate.Size.Y);
+        long nz = FitCount(box.Z, candidate.Size.Z);
+        if (nx <= 0 || ny <= 0 || nz <= 0)
+        {
+            return 0;
+        }
+
+        return SafeMultiply(nx, SafeMultiply(ny, nz));
+    }
+
+    private static long FitCount(double length, double item)
+    {
+        if (item <= MinExtent)
+        {
+            return 0;
+        }
+
+        double raw = Math.Floor((length + FitEpsilon) / item);
+        if (raw <= 0.0)
+        {
+            return 0;
+        }
+
+        if (raw >= long.MaxValue)
+        {
+            return long.MaxValue;
+        }
+
+        return (long)raw;
+    }
+
+    private static long Snap(double value)
+    {
+        if (value <= 0.0)
+        {
+            return 0L;
+        }
+
+        return (long)Math.Round(value * KeyScale, MidpointRounding.AwayFromZero);
+    }
+
+    private static bool NearlyEqual(double a, double b)
+    {
+        return Math.Abs(a - b) <= 1e-9;
+    }
+
+    private static long SafeAdd(long a, long b)
+    {
+        if (long.MaxValue - a < b)
+        {
+            return long.MaxValue;
+        }
+
+        return a + b;
+    }
+
+    private static long SafeMultiply(long a, long b)
+    {
+        if (a == 0 || b == 0)
+        {
+            return 0;
+        }
+
+        if (a > long.MaxValue / b)
+        {
+            return long.MaxValue;
+        }
+
+        return a * b;
+    }
+
+    private static string FormatDouble(double value)
+    {
+        if (Math.Abs(value) < 5e-13)
+        {
+            value = 0.0;
+        }
+
+        return value.ToString("0.#########", CultureInfo.InvariantCulture);
+    }
+
+    private readonly struct SlabOption
+    {
+        public readonly double Thickness;
+        public readonly Plan Child;
+
+        public SlabOption(double thickness, Plan child)
+        {
+            Thickness = thickness;
+            Child = child;
+        }
+    }
+
+    private readonly struct SequenceState
+    {
+        public static readonly SequenceState Stop = new SequenceState(0, 0.0, -1);
+
+        public readonly long Count;
+        public readonly double UsedVolume;
+        public readonly int Choice;
+
+        public SequenceState(long count, double usedVolume, int choice)
+        {
+            Count = count;
+            UsedVolume = usedVolume;
+            Choice = choice;
+        }
+    }
+
+    private readonly struct FaceFrameSeed
+    {
+        public readonly double Area;
+        public readonly Mat3 Frame;
+
+        public FaceFrameSeed(double area, Mat3 frame)
+        {
+            Area = area;
+            Frame = frame;
+        }
+    }
+}
+
+public sealed class Candidate
+{
+    public Candidate(int id, Mat3 rotation, Quat quaternion, Vec3 min, Vec3 size, double volume, string quaternionText)
+    {
+        Id = id;
+        Rotation = rotation;
+        Quaternion = quaternion;
+        Min = min;
+        Size = size;
+        Volume = volume;
+        QuaternionText = quaternionText;
+    }
+
+    public int Id { get; }
+    public Mat3 Rotation { get; }
+    public Quat Quaternion { get; }
+    public Vec3 Min { get; }
+    public Vec3 Size { get; }
+    public double Volume { get; }
+    public string QuaternionText { get; }
+
+    public double GetSize(Axis axis)
+    {
+        return axis switch
+        {
+            Axis.X => Size.X,
+            Axis.Y => Size.Y,
+            _ => Size.Z
+        };
+    }
+}
+
+public abstract class Plan
+{
+    protected Plan(long count, double usedVolume)
+    {
+        Count = count;
+        UsedVolume = usedVolume;
+    }
+
+    public long Count { get; }
+    public double UsedVolume { get; }
+}
+
+public sealed class EmptyPlan : Plan
+{
+    public static readonly EmptyPlan Instance = new EmptyPlan();
+
+    private EmptyPlan() : base(0L, 0.0)
+    {
+    }
+}
+
+public sealed class DirectPlan : Plan
+{
+    public DirectPlan(Candidate candidate, long nx, long ny, long nz, long count, double usedVolume)
+        : base(count, usedVolume)
+    {
+        Candidate = candidate;
+        NX = nx;
+        NY = ny;
+        NZ = nz;
+    }
+
+    public Candidate Candidate { get; }
+    public long NX { get; }
+    public long NY { get; }
+    public long NZ { get; }
+}
+
+public sealed class SequencePlan : Plan
+{
+    public SequencePlan(Axis axis, List<SequenceSegment> segments, long count, double usedVolume)
+        : base(count, usedVolume)
+    {
+        Axis = axis;
+        Segments = segments;
+    }
+
+    public Axis Axis { get; }
+    public List<SequenceSegment> Segments { get; }
+}
+
+public struct SequenceSegment
+{
+    public SequenceSegment(long repeat, double thickness, Plan child)
+    {
+        Repeat = repeat;
+        Thickness = thickness;
+        Child = child;
+    }
+
+    public long Repeat;
+    public double Thickness;
+    public Plan Child;
+}
+
+public enum Axis
+{
+    X = 0,
+    Y = 1,
+    Z = 2
+}
+
+public readonly struct Triangle
+{
+    public Triangle(int a, int b, int c)
+    {
+        A = a;
+        B = b;
+        C = c;
+    }
+
+    public int A { get; }
+    public int B { get; }
+    public int C { get; }
+}
+
+public readonly struct StateKey : IEquatable<StateKey>
+{
+    public StateKey(long x, long y, long z, int depth)
+    {
+        X = x;
+        Y = y;
+        Z = z;
+        Depth = depth;
+    }
+
+    public long X { get; }
+    public long Y { get; }
+    public long Z { get; }
+    public int Depth { get; }
+
+    public bool Equals(StateKey other)
+    {
+        return X == other.X && Y == other.Y && Z == other.Z && Depth == other.Depth;
+    }
+
+    public override bool Equals(object? obj)
+    {
+        return obj is StateKey other && Equals(other);
+    }
+
+    public override int GetHashCode()
+    {
+        return HashCode.Combine(X, Y, Z, Depth);
+    }
+}
+
+public readonly struct SizeKey : IEquatable<SizeKey>
+{
+    public SizeKey(long x, long y, long z)
+    {
+        X = x;
+        Y = y;
+        Z = z;
+    }
+
+    public long X { get; }
+    public long Y { get; }
+    public long Z { get; }
+
+    public bool Equals(SizeKey other)
+    {
+        return X == other.X && Y == other.Y && Z == other.Z;
+    }
+
+    public override bool Equals(object? obj)
+    {
+        return obj is SizeKey other && Equals(other);
+    }
+
+    public override int GetHashCode()
+    {
+        return HashCode.Combine(X, Y, Z);
+    }
+}
+
+public readonly struct Box
+{
+    public Box(double x, double y, double z)
+    {
+        X = x;
+        Y = y;
+        Z = z;
+    }
+
+    public double X { get; }
+    public double Y { get; }
+    public double Z { get; }
+    public double Volume => X * Y * Z;
+
+    public double Get(Axis axis)
+    {
+        return axis switch
+        {
+            Axis.X => X,
+            Axis.Y => Y,
+            _ => Z
+        };
+    }
+
+    public Box With(Axis axis, double value)
+    {
+        return axis switch
+        {
+            Axis.X => new Box(value, Y, Z),
+            Axis.Y => new Box(X, value, Z),
+            _ => new Box(X, Y, value)
+        };
+    }
+}
+
+public readonly struct Vec3
+{
+    public static readonly Vec3 Zero = new Vec3(0.0, 0.0, 0.0);
+
+    public Vec3(double x, double y, double z)
+    {
+        X = x;
+        Y = y;
+        Z = z;
+    }
+
+    public double X { get; }
+    public double Y { get; }
+    public double Z { get; }
+
+    public double Length => Math.Sqrt(X * X + Y * Y + Z * Z);
+    public double LengthSquared => X * X + Y * Y + Z * Z;
+
+    public Vec3 Normalized()
+    {
+        double length = Length;
+        if (length <= 1e-20)
+        {
+            return Zero;
+        }
+
+        return this / length;
+    }
+
+    public Vec3 WithAxisOffset(Axis axis, double delta)
+    {
+        return axis switch
+        {
+            Axis.X => new Vec3(X + delta, Y, Z),
+            Axis.Y => new Vec3(X, Y + delta, Z),
+            _ => new Vec3(X, Y, Z + delta)
+        };
+    }
+
+    public static Vec3 Min(Vec3 a, Vec3 b)
+    {
+        return new Vec3(Math.Min(a.X, b.X), Math.Min(a.Y, b.Y), Math.Min(a.Z, b.Z));
+    }
+
+    public static Vec3 Max(Vec3 a, Vec3 b)
+    {
+        return new Vec3(Math.Max(a.X, b.X), Math.Max(a.Y, b.Y), Math.Max(a.Z, b.Z));
+    }
+
+    public static double Dot(Vec3 a, Vec3 b)
+    {
+        return a.X * b.X + a.Y * b.Y + a.Z * b.Z;
+    }
+
+    public static Vec3 Cross(Vec3 a, Vec3 b)
+    {
+        return new Vec3(
+            a.Y * b.Z - a.Z * b.Y,
+            a.Z * b.X - a.X * b.Z,
+            a.X * b.Y - a.Y * b.X);
+    }
+
+    public static Vec3 operator +(Vec3 a, Vec3 b)
+    {
+        return new Vec3(a.X + b.X, a.Y + b.Y, a.Z + b.Z);
+    }
+
+    public static Vec3 operator -(Vec3 a, Vec3 b)
+    {
+        return new Vec3(a.X - b.X, a.Y - b.Y, a.Z - b.Z);
+    }
+
+    public static Vec3 operator *(Vec3 a, double b)
+    {
+        return new Vec3(a.X * b, a.Y * b, a.Z * b);
+    }
+
+    public static Vec3 operator /(Vec3 a, double b)
+    {
+        return new Vec3(a.X / b, a.Y / b, a.Z / b);
+    }
+}
+
+public readonly struct Mat3
+{
+    public static readonly Mat3 Identity = new Mat3(
+        1.0, 0.0, 0.0,
+        0.0, 1.0, 0.0,
+        0.0, 0.0, 1.0);
+
+    public Mat3(
+        double m11, double m12, double m13,
+        double m21, double m22, double m23,
+        double m31, double m32, double m33)
+    {
+        M11 = m11;
+        M12 = m12;
+        M13 = m13;
+        M21 = m21;
+        M22 = m22;
+        M23 = m23;
+        M31 = m31;
+        M32 = m32;
+        M33 = m33;
+    }
+
+    public double M11 { get; }
+    public double M12 { get; }
+    public double M13 { get; }
+    public double M21 { get; }
+    public double M22 { get; }
+    public double M23 { get; }
+    public double M31 { get; }
+    public double M32 { get; }
+    public double M33 { get; }
+
+    public Vec3 Row1 => new Vec3(M11, M12, M13);
+    public Vec3 Row2 => new Vec3(M21, M22, M23);
+    public Vec3 Row3 => new Vec3(M31, M32, M33);
+
+    public static Mat3 FromRows(Vec3 r1, Vec3 r2, Vec3 r3)
+    {
+        return new Mat3(r1.X, r1.Y, r1.Z, r2.X, r2.Y, r2.Z, r3.X, r3.Y, r3.Z);
+    }
+
+    public Vec3 Transform(Vec3 v)
+    {
+        return new Vec3(
+            M11 * v.X + M12 * v.Y + M13 * v.Z,
+            M21 * v.X + M22 * v.Y + M23 * v.Z,
+            M31 * v.X + M32 * v.Y + M33 * v.Z);
+    }
+
+    public double Determinant()
+    {
+        return
+            M11 * (M22 * M33 - M23 * M32) -
+            M12 * (M21 * M33 - M23 * M31) +
+            M13 * (M21 * M32 - M22 * M31);
+    }
+
+    public static Mat3 operator *(Mat3 a, Mat3 b)
+    {
+        return new Mat3(
+            a.M11 * b.M11 + a.M12 * b.M21 + a.M13 * b.M31,
+            a.M11 * b.M12 + a.M12 * b.M22 + a.M13 * b.M32,
+            a.M11 * b.M13 + a.M12 * b.M23 + a.M13 * b.M33,
+            a.M21 * b.M11 + a.M22 * b.M21 + a.M23 * b.M31,
+            a.M21 * b.M12 + a.M22 * b.M22 + a.M23 * b.M32,
+            a.M21 * b.M13 + a.M22 * b.M23 + a.M23 * b.M33,
+            a.M31 * b.M11 + a.M32 * b.M21 + a.M33 * b.M31,
+            a.M31 * b.M12 + a.M32 * b.M22 + a.M33 * b.M32,
+            a.M31 * b.M13 + a.M32 * b.M23 + a.M33 * b.M33);
+    }
+}
+
+public readonly struct Quat
+{
+    public Quat(double w, double x, double y, double z)
+    {
+        W = w;
+        X = x;
+        Y = y;
+        Z = z;
+    }
+
+    public double W { get; }
+    public double X { get; }
+    public double Y { get; }
+    public double Z { get; }
+
+    public static Quat FromRotationMatrix(Mat3 m)
+    {
+        double trace = m.M11 + m.M22 + m.M33;
+        double w;
+        double x;
+        double y;
+        double z;
+
+        if (trace > 0.0)
+        {
+            double s = Math.Sqrt(trace + 1.0) * 2.0;
+            w = 0.25 * s;
+            x = (m.M32 - m.M23) / s;
+            y = (m.M13 - m.M31) / s;
+            z = (m.M21 - m.M12) / s;
+        }
+        else if (m.M11 > m.M22 && m.M11 > m.M33)
+        {
+            double s = Math.Sqrt(1.0 + m.M11 - m.M22 - m.M33) * 2.0;
+            w = (m.M32 - m.M23) / s;
+            x = 0.25 * s;
+            y = (m.M12 + m.M21) / s;
+            z = (m.M13 + m.M31) / s;
+        }
+        else if (m.M22 > m.M33)
+        {
+            double s = Math.Sqrt(1.0 + m.M22 - m.M11 - m.M33) * 2.0;
+            w = (m.M13 - m.M31) / s;
+            x = (m.M12 + m.M21) / s;
+            y = 0.25 * s;
+            z = (m.M23 + m.M32) / s;
+        }
+        else
+        {
+            double s = Math.Sqrt(1.0 + m.M33 - m.M11 - m.M22) * 2.0;
+            w = (m.M21 - m.M12) / s;
+            x = (m.M13 + m.M31) / s;
+            y = (m.M23 + m.M32) / s;
+            z = 0.25 * s;
+        }
+
+        double norm = Math.Sqrt(w * w + x * x + y * y + z * z);
+        if (norm <= 1e-20)
+        {
+            return new Quat(1.0, 0.0, 0.0, 0.0);
+        }
+
+        return new Quat(w / norm, x / norm, y / norm, z / norm);
+    }
+
+    public Quat Canonicalized()
+    {
+        if (W < 0.0)
+        {
+            return new Quat(-W, -X, -Y, -Z);
+        }
+
+        if (Math.Abs(W) <= 1e-12)
+        {
+            if (X < 0.0 || (Math.Abs(X) <= 1e-12 && (Y < 0.0 || (Math.Abs(Y) <= 1e-12 && Z < 0.0))))
+            {
+                return new Quat(-W, -X, -Y, -Z);
+            }
+        }
+
+        return this;
+    }
+}
+
+public sealed class FastScanner
+{
+    private readonly Stream _stream;
+    private readonly byte[] _buffer = new byte[1 << 16];
+    private int _length;
+    private int _position;
+
+    public FastScanner(Stream stream)
+    {
+        _stream = stream;
+    }
+
+    public int NextInt()
+    {
+        return (int)NextLong();
+    }
+
+    public long NextLong()
+    {
+        int c = ReadSkippingWhitespace();
+        long sign = 1;
+        if (c == '-')
+        {
+            sign = -1;
+            c = Read();
+        }
+
+        long value = 0;
+        while (c > 32)
+        {
+            value = value * 10 + (c - '0');
+            c = Read();
+        }
+
+        return value * sign;
+    }
+
+    public double NextDouble()
+    {
+        int c = ReadSkippingWhitespace();
+        int sign = 1;
+        if (c == '-')
+        {
+            sign = -1;
+            c = Read();
+        }
+
+        long integerPart = 0;
+        while (c >= '0' && c <= '9')
+        {
+            integerPart = integerPart * 10 + (c - '0');
+            c = Read();
+        }
+
+        double value = integerPart;
+        if (c == '.')
+        {
+            double factor = 0.1;
+            c = Read();
+            while (c >= '0' && c <= '9')
+            {
+                value += (c - '0') * factor;
+                factor *= 0.1;
+                c = Read();
+            }
+        }
+
+        if (c == 'e' || c == 'E')
+        {
+            int expSign = 1;
+            int exponent = 0;
+            c = Read();
+            if (c == '+')
+            {
+                c = Read();
+            }
+            else if (c == '-')
+            {
+                expSign = -1;
+                c = Read();
+            }
+
+            while (c >= '0' && c <= '9')
+            {
+                exponent = exponent * 10 + (c - '0');
+                c = Read();
+            }
+
+            value *= Math.Pow(10.0, expSign * exponent);
+        }
+
+        return sign * value;
+    }
+
+    private int ReadSkippingWhitespace()
+    {
+        int c;
+        do
+        {
+            c = Read();
+        }
+        while (c != -1 && c <= 32);
+        return c;
+    }
+
+    private int Read()
+    {
+        if (_position >= _length)
+        {
+            _length = _stream.Read(_buffer, 0, _buffer.Length);
+            _position = 0;
+            if (_length <= 0)
+            {
+                return -1;
+            }
+        }
+
+        return _buffer[_position++];
+    }
+}

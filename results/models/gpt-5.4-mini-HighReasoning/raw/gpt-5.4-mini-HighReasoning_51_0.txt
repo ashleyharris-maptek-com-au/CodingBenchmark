@@ -1,0 +1,698 @@
+from math import atan2, cos, exp, isfinite, pi, radians, sin
+from statistics import median
+
+
+_MEM = {
+    "prev_alt": None,
+    "prev_ias": None,
+    "prev_hdg": None,
+    "prev_roll": 0.0,
+    "prev_pitch": 0.0,
+    "prev_vs": 0.0,
+    "trim": 0.0,
+    "gear": 1,
+    "flaps": 0.0,
+    "speedbrake": 0.0,
+    "healthy": {},
+    "i_alt": 0.0,
+    "i_spd": 0.0,
+    "i_hdg": 0.0,
+    "i_roll": 0.0,
+    "i_pitch": 0.0,
+    "i_yaw": 0.0,
+}
+
+
+def _get(state, key, default=0.0):
+    v = state.get(key, default)
+    return default if v is None else v
+
+
+def _clamp(x, lo, hi):
+    return lo if x < lo else hi if x > hi else x
+
+
+def _wrap360(a):
+    return a % 360.0
+
+
+def _ang_diff(a, b):
+    return ((a - b + 180.0) % 360.0) - 180.0
+
+
+def _finite(x):
+    return isinstance(x, (int, float)) and isfinite(x)
+
+
+def _sigmoid(x):
+    return 1.0 / (1.0 + exp(-x))
+
+
+def _update_health(group, idx, residual, threshold):
+    health = _MEM["healthy"].setdefault(group, [1.0, 1.0, 1.0])
+    score = 1.0 if residual <= threshold else 0.4 if residual <= threshold * 2.0 else 0.08
+    health[idx] = _clamp(0.97 * health[idx] + 0.03 * score, 0.05, 1.0)
+    return health[idx]
+
+
+def _fuse_triplet(group, values, valids=None, prev=None, threshold=1.0):
+    items = []
+    if valids is None:
+        valids = [True, True, True]
+    for i, v in enumerate(values):
+        if not _finite(v):
+            continue
+        w = 1.0 if valids[i] else 0.7
+        w *= _MEM["healthy"].setdefault(group, [1.0, 1.0, 1.0])[i]
+        if prev is not None:
+            dprev = abs(v - prev)
+            if dprev > threshold * 6.0:
+                w *= 0.15
+            elif dprev > threshold * 3.0:
+                w *= 0.45
+        items.append((i, float(v), w))
+    if not items:
+        return prev if prev is not None else 0.0
+    med = median([v for _, v, _ in items])
+    refined = []
+    for i, v, w in items:
+        residual = abs(v - med)
+        _update_health(group, i, residual, threshold)
+        if residual > threshold * 6.0:
+            w *= 0.08
+        elif residual > threshold * 3.0:
+            w *= 0.25
+        elif residual > threshold:
+            w *= 0.65
+        refined.append((v, w))
+    sw = sum(w for _, w in refined)
+    fused = sum(v * w for v, w in refined) / sw if sw > 1e-9 else med
+    if prev is not None:
+        fused = 0.75 * fused + 0.25 * prev
+    return fused
+
+
+def _pick_altitude(state, dt):
+    prev_alt = _MEM["prev_alt"]
+    prev_vs = _MEM["prev_vs"]
+    pred = prev_alt if prev_alt is not None else None
+    if pred is not None:
+        pred = pred + prev_vs * dt / 60.0
+
+    baro = _fuse_triplet(
+        "baro_alt",
+        [
+            _get(state, "baro_alt_1_ft"),
+            _get(state, "baro_alt_2_ft"),
+            _get(state, "baro_alt_3_ft"),
+        ],
+        [
+            bool(_get(state, "baro_alt_1_valid", True)),
+            bool(_get(state, "baro_alt_2_valid", True)),
+            bool(_get(state, "baro_alt_3_valid", True)),
+        ],
+        prev=prev_alt,
+        threshold=40.0,
+    )
+    radar = _fuse_triplet(
+        "radar_alt",
+        [
+            _get(state, "radar_alt_1_ft"),
+            _get(state, "radar_alt_2_ft"),
+            _get(state, "radar_alt_3_ft"),
+        ],
+        [
+            bool(_get(state, "radar_alt_1_valid", True)),
+            bool(_get(state, "radar_alt_2_valid", True)),
+            bool(_get(state, "radar_alt_3_valid", True)),
+        ],
+        prev=None,
+        threshold=10.0,
+    )
+    gps = _fuse_triplet(
+        "gps_alt",
+        [
+            _get(state, "gps_1_alt_ft"),
+            _get(state, "gps_2_alt_ft"),
+            _get(state, "gps_3_alt_ft"),
+        ],
+        [
+            bool(_get(state, "gps_1_valid", True)),
+            bool(_get(state, "gps_2_valid", True)),
+            bool(_get(state, "gps_3_valid", True)),
+        ],
+        prev=prev_alt,
+        threshold=60.0,
+    )
+    adc = _fuse_triplet(
+        "adc_pressure_alt",
+        [
+            _get(state, "adc_1_pressure_alt_ft"),
+            _get(state, "adc_2_pressure_alt_ft"),
+            _get(state, "adc_3_pressure_alt_ft"),
+        ],
+        [
+            bool(_get(state, "adc_1_valid", True)),
+            bool(_get(state, "adc_2_valid", True)),
+            bool(_get(state, "adc_3_valid", True)),
+        ],
+        prev=baro,
+        threshold=50.0,
+    )
+
+    sources = []
+    # Baro is primary at normal altitude.
+    sources.append((baro, 1.0))
+    # Radar dominates in the flare / low level.
+    radar_w = 0.0
+    if _finite(radar):
+        radar_w = _clamp(2.0 - radar / 4000.0, 0.0, 1.6)
+        if radar < 1500.0:
+            radar_w *= 1.6
+    sources.append((radar, radar_w))
+    # GPS is useful as a sanity check, but not primary for altitude control.
+    gps_w = 0.25 + 0.35 * _clamp((baro - 5000.0) / 25000.0, 0.0, 1.0)
+    sources.append((gps, gps_w))
+    sources.append((adc, 0.7))
+
+    if pred is not None:
+        weighted = []
+        for val, w in sources:
+            if not _finite(val):
+                continue
+            resid = abs(val - pred)
+            w *= exp(-resid / 1800.0)
+            weighted.append((val, w))
+        if weighted:
+            sw = sum(w for _, w in weighted)
+            alt = sum(v * w for v, w in weighted) / sw
+        else:
+            alt = baro
+    else:
+        weighted = [(v, w) for v, w in sources if _finite(v)]
+        sw = sum(w for _, w in weighted)
+        alt = sum(v * w for v, w in weighted) / sw if sw > 1e-9 else baro
+
+    if _finite(radar):
+        # If radar strongly disagrees with the baro/GPS pair at low level, trust radar more.
+        low_level = radar < 3000.0
+        if low_level:
+            pair = [baro, gps, adc]
+            pair = [x for x in pair if _finite(x)]
+            if pair:
+                pair_med = median(pair)
+                if abs(radar - pair_med) > 180.0 and abs(baro - gps) < 250.0:
+                    alt = 0.75 * radar + 0.25 * pair_med
+
+    return alt, baro, radar, gps, adc
+
+
+def _fuse_ias(state, prev_ias=None):
+    ias = _fuse_triplet(
+        "ias",
+        [
+            _get(state, "ias_1_kt"),
+            _get(state, "ias_2_kt"),
+            _get(state, "ias_3_kt"),
+        ],
+        [
+            bool(_get(state, "ias_1_valid", True)),
+            bool(_get(state, "ias_2_valid", True)),
+            bool(_get(state, "ias_3_valid", True)),
+        ],
+        prev=prev_ias,
+        threshold=8.0,
+    )
+    gs = _fuse_triplet(
+        "gs",
+        [
+            _get(state, "gps_1_gs_kt"),
+            _get(state, "gps_2_gs_kt"),
+            _get(state, "gps_3_gs_kt"),
+        ],
+        [
+            bool(_get(state, "gps_1_valid", True)),
+            bool(_get(state, "gps_2_valid", True)),
+            bool(_get(state, "gps_3_valid", True)),
+        ],
+        prev=None,
+        threshold=10.0,
+    )
+    tas = _fuse_triplet(
+        "tas",
+        [
+            _get(state, "tas_1_kt"),
+            _get(state, "tas_2_kt"),
+            _get(state, "tas_3_kt"),
+        ],
+        [True, True, True],
+        prev=None,
+        threshold=12.0,
+    )
+    machs = [
+        _get(state, "mach_1", 0.0),
+        _get(state, "mach_2", 0.0),
+        _get(state, "mach_3", 0.0),
+    ]
+    machs = [m for m in machs if _finite(m) and m > 0.0]
+    mach = median(machs) if machs else 0.0
+
+    # Reject an IAS sensor if it is wildly inconsistent with the group and the air data package.
+    candidates = []
+    for v in [ias]:
+        if _finite(v):
+            candidates.append((v, 1.0))
+    if _finite(gs):
+        candidates.append((gs, 0.35))
+    if _finite(tas):
+        candidates.append((tas, 0.25))
+    if candidates:
+        sw = sum(w for _, w in candidates)
+        fused = sum(v * w for v, w in candidates) / sw
+    else:
+        fused = ias
+
+    # IAS should normally be the control speed; use GS/TAS only to catch obvious failures.
+    if _finite(gs) and _finite(tas):
+        sane = _clamp((gs + 0.35 * tas) / 1.35, 0.0, 1000.0)
+        if abs(ias - sane) > 40.0:
+            fused = 0.55 * sane + 0.45 * ias
+
+    if mach > 0.78 and _finite(tas):
+        # At higher Mach, TAS helps keep the speed target smooth.
+        fused = 0.7 * fused + 0.3 * _clamp(tas / 1.7, 0.0, 1000.0)
+
+    return fused, ias, gs, tas, mach
+
+
+def _fuse_attitude(state):
+    pitch = _fuse_triplet(
+        "pitch",
+        [
+            _get(state, "irs_1_pitch_deg"),
+            _get(state, "irs_2_pitch_deg"),
+            _get(state, "irs_3_pitch_deg"),
+        ],
+        [
+            bool(_get(state, "irs_1_valid", True)),
+            bool(_get(state, "irs_2_valid", True)),
+            bool(_get(state, "irs_3_valid", True)),
+        ],
+        prev=_MEM["prev_pitch"],
+        threshold=2.0,
+    )
+    roll = _fuse_triplet(
+        "roll",
+        [
+            _get(state, "irs_1_roll_deg"),
+            _get(state, "irs_2_roll_deg"),
+            _get(state, "irs_3_roll_deg"),
+        ],
+        [
+            bool(_get(state, "irs_1_valid", True)),
+            bool(_get(state, "irs_2_valid", True)),
+            bool(_get(state, "irs_3_valid", True)),
+        ],
+        prev=_MEM["prev_roll"],
+        threshold=2.0,
+    )
+    hdg_candidates = [
+        _get(state, "irs_1_heading_deg"),
+        _get(state, "irs_2_heading_deg"),
+        _get(state, "irs_3_heading_deg"),
+        _get(state, "magnetic_heading_deg"),
+    ]
+    hdg_candidates = [h for h in hdg_candidates if _finite(h)]
+    if hdg_candidates:
+        x = sum(cos(radians(h)) for h in hdg_candidates)
+        y = sum(sin(radians(h)) for h in hdg_candidates)
+        hdg = _wrap360((atan2(y, x) * 180.0 / pi))
+    else:
+        hdg = _MEM["prev_hdg"] if _MEM["prev_hdg"] is not None else 0.0
+
+    track_candidates = [
+        _get(state, "irs_1_track_deg"),
+        _get(state, "irs_2_track_deg"),
+        _get(state, "irs_3_track_deg"),
+        _get(state, "track_deg"),
+    ]
+    track_candidates = [t for t in track_candidates if _finite(t)]
+    if track_candidates:
+        x = sum(cos(radians(t)) for t in track_candidates)
+        y = sum(sin(radians(t)) for t in track_candidates)
+        track = _wrap360((atan2(y, x) * 180.0 / pi))
+    else:
+        track = hdg
+
+    return pitch, roll, hdg, track
+
+
+def _fuse_rates(state):
+    pitch_rate = _fuse_triplet(
+        "pitch_rate",
+        [
+            _get(state, "gyro_1_pitch_rate_dps"),
+            _get(state, "gyro_2_pitch_rate_dps"),
+            _get(state, "gyro_3_pitch_rate_dps"),
+        ],
+        [
+            bool(_get(state, "gyro_1_valid", True)),
+            bool(_get(state, "gyro_2_valid", True)),
+            bool(_get(state, "gyro_3_valid", True)),
+        ],
+        prev=0.0,
+        threshold=1.5,
+    )
+    roll_rate = _fuse_triplet(
+        "roll_rate",
+        [
+            _get(state, "gyro_1_roll_rate_dps"),
+            _get(state, "gyro_2_roll_rate_dps"),
+            _get(state, "gyro_3_roll_rate_dps"),
+        ],
+        [
+            bool(_get(state, "gyro_1_valid", True)),
+            bool(_get(state, "gyro_2_valid", True)),
+            bool(_get(state, "gyro_3_valid", True)),
+        ],
+        prev=0.0,
+        threshold=1.5,
+    )
+    yaw_rate = _fuse_triplet(
+        "yaw_rate",
+        [
+            _get(state, "gyro_1_yaw_rate_dps"),
+            _get(state, "gyro_2_yaw_rate_dps"),
+            _get(state, "gyro_3_yaw_rate_dps"),
+        ],
+        [
+            bool(_get(state, "gyro_1_valid", True)),
+            bool(_get(state, "gyro_2_valid", True)),
+            bool(_get(state, "gyro_3_valid", True)),
+        ],
+        prev=0.0,
+        threshold=1.5,
+    )
+    return pitch_rate, roll_rate, yaw_rate
+
+
+def _fuse_aoa(state):
+    aoa = _fuse_triplet(
+        "aoa",
+        [
+            _get(state, "aoa_1_deg"),
+            _get(state, "aoa_2_deg"),
+            _get(state, "aoa_3_deg"),
+        ],
+        [
+            bool(_get(state, "aoa_1_valid", True)),
+            bool(_get(state, "aoa_2_valid", True)),
+            bool(_get(state, "aoa_3_valid", True)),
+        ],
+        prev=None,
+        threshold=2.0,
+    )
+    return aoa
+
+
+def _engine_health(state, idx):
+    running = bool(_get(state, f"engine_{idx}_running", True))
+    fire = bool(_get(state, f"engine_{idx}_fire", False))
+    n1 = _get(state, f"engine_{idx}_n1_pct", 0.0)
+    n2 = _get(state, f"engine_{idx}_n2_pct", 0.0)
+    thrust = _get(state, f"engine_{idx}_thrust_pct", 0.0)
+    vib = _get(state, f"engine_{idx}_vibration", 0.0)
+    egt = _get(state, f"engine_{idx}_egt_c", 0.0)
+    oilp = _get(state, f"engine_{idx}_oil_press_psi", 0.0)
+    score = 1.0
+    if not running:
+        score *= 0.2
+    if fire:
+        score *= 0.0
+    if n1 < 10.0 and thrust < 5.0:
+        score *= 0.35
+    if oilp < 5.0:
+        score *= 0.6
+    if vib > 5.0:
+        score *= 0.6
+    if egt > 900.0:
+        score *= 0.8
+    return _clamp(score, 0.0, 1.0), thrust, n1, n2, running, fire
+
+
+def autopilot_step(state: dict, dt: float) -> dict:
+    if dt is None or not _finite(dt) or dt <= 0.0:
+        dt = _get(state, "dt", 0.05)
+    dt = max(0.01, float(dt))
+
+    alt, baro_alt, radar_alt, gps_alt, adc_alt = _pick_altitude(state, dt)
+    ias, ias_raw, gs, tas, mach = _fuse_ias(state, _MEM["prev_ias"])
+    pitch, roll, hdg, track = _fuse_attitude(state)
+    pitch_rate, roll_rate, yaw_rate = _fuse_rates(state)
+    aoa = _fuse_aoa(state)
+
+    target_alt = _get(state, "target_alt_ft", alt)
+    target_hdg = _wrap360(_get(state, "target_hdg_deg", hdg))
+    target_ias = _get(state, "target_ias_kt", ias)
+    target_vs = _get(state, "target_vs_fpm", 0.0)
+
+    ap_engaged = bool(_get(state, "ap_engaged", True))
+    at_engaged = bool(_get(state, "at_engaged", True))
+
+    alt_err = target_alt - alt
+    spd_err = target_ias - ias
+    hdg_err = _ang_diff(target_hdg, hdg)
+    trk_err = _ang_diff(target_hdg, track)
+
+    radar_agl = radar_alt if _finite(radar_alt) else max(0.0, alt - 50.0)
+    on_ground = any(
+        bool(_get(state, k, False))
+        for k in ("weight_on_wheels_left", "weight_on_wheels_nose", "weight_on_wheels_right")
+    )
+
+    eng1 = _engine_health(state, 1)
+    eng2 = _engine_health(state, 2)
+    e1_health, e1_thrust, e1_n1, e1_n2, e1_run, e1_fire = eng1
+    e2_health, e2_thrust, e2_n1, e2_n2, e2_run, e2_fire = eng2
+    thrust_diff = e2_thrust - e1_thrust
+
+    # Phase / energy management.
+    if radar_agl < 80.0 or on_ground:
+        phase = "ground"
+    elif radar_agl < 1500.0 and target_alt > alt:
+        phase = "takeoff_climb"
+    elif alt_err > 800.0:
+        phase = "climb"
+    elif alt_err < -800.0:
+        phase = "descent"
+    else:
+        phase = "capture"
+
+    # Vertical path: altitude capture blended with explicit VS target.
+    alt_capture_vs = _clamp(alt_err * 1.8, -2500.0, 2500.0)
+    if abs(alt_err) < 300.0:
+        alt_capture_vs = _clamp(alt_err * 0.9, -800.0, 800.0)
+    desired_vs = 0.55 * target_vs + 0.45 * alt_capture_vs
+    if phase == "ground":
+        desired_vs = 0.0
+    elif phase == "takeoff_climb":
+        desired_vs = max(desired_vs, 1200.0)
+    elif phase == "climb":
+        desired_vs = max(desired_vs, 800.0)
+    elif phase == "descent":
+        desired_vs = min(desired_vs, -700.0)
+
+    # Speed protection: prioritize IAS if near stall or overspeed.
+    if _finite(aoa) and aoa > 12.5:
+        desired_vs = min(desired_vs, 0.0)
+    if ias < target_ias - 15.0:
+        desired_vs = min(desired_vs, _clamp((ias - target_ias) * 80.0, -3000.0, 0.0))
+    if ias > target_ias + 25.0:
+        desired_vs = max(desired_vs, -_clamp((ias - target_ias) * 55.0, 0.0, 2500.0))
+
+    # Pitch command from desired vertical speed and energy state.
+    pitch_cmd = _clamp(desired_vs / 250.0, -12.0, 18.0)
+    if _finite(aoa):
+        # Mild alpha protection; heavy alpha protection is handled by speed capture below.
+        pitch_cmd -= _clamp((aoa - 10.0) * 0.7, 0.0, 6.0)
+    if ias < target_ias - 20.0:
+        pitch_cmd -= _clamp((target_ias - ias) * 0.05, 0.0, 7.0)
+    if ias > target_ias + 20.0:
+        pitch_cmd -= _clamp((ias - target_ias) * 0.02, 0.0, 6.0)
+    if mach > 0.80:
+        pitch_cmd -= _clamp((mach - 0.80) * 60.0, 0.0, 5.0)
+
+    # Roll command from heading capture with bank limiting for low speed / high drag.
+    bank_limit = 30.0
+    if ias < 180.0:
+        bank_limit = 20.0
+    if ias < 140.0:
+        bank_limit = 15.0
+    if radar_agl < 300.0:
+        bank_limit = min(bank_limit, 18.0)
+    if phase in ("descent", "capture") and abs(alt_err) < 600.0:
+        bank_limit = min(bank_limit, 22.0)
+    desired_bank = _clamp(hdg_err * 0.75 + trk_err * 0.15, -bank_limit, bank_limit)
+
+    # Control laws.
+    _MEM["i_pitch"] = _clamp(_MEM["i_pitch"] + (pitch_cmd - pitch) * dt, -15.0, 15.0)
+    _MEM["i_roll"] = _clamp(_MEM["i_roll"] + (desired_bank - roll) * dt, -20.0, 20.0)
+    _MEM["i_hdg"] = _clamp(_MEM["i_hdg"] + hdg_err * dt, -100.0, 100.0)
+    _MEM["i_alt"] = _clamp(_MEM["i_alt"] + alt_err * dt, -5000.0, 5000.0)
+    _MEM["i_spd"] = _clamp(_MEM["i_spd"] + spd_err * dt, -200.0, 200.0)
+    _MEM["i_yaw"] = _clamp(_MEM["i_yaw"] + _ang_diff(track, hdg) * dt, -50.0, 50.0)
+
+    elevator_cmd = (
+        0.12 * (pitch_cmd - pitch)
+        - 0.06 * pitch_rate
+        + 0.015 * _MEM["i_pitch"]
+    )
+    # Keep trim as the long-term baseline so elevator stays centered.
+    _MEM["trim"] = _clamp(
+        _MEM["trim"] + _clamp(0.02 * elevator_cmd - 0.0015 * pitch_rate, -0.01, 0.01),
+        -1.0,
+        1.0,
+    )
+    elevator = _clamp(elevator_cmd - 0.15 * _MEM["trim"], -1.0, 1.0)
+
+    roll_cmd = (
+        0.06 * (desired_bank - roll)
+        - 0.03 * roll_rate
+        + 0.004 * _MEM["i_roll"]
+    )
+    aileron = _clamp(roll_cmd, -1.0, 1.0)
+
+    # Rudder keeps yaw coordinated and handles engine asymmetry.
+    yaw_coord = -0.02 * yaw_rate + 0.01 * roll_cmd
+    thrust_bias = _clamp(thrust_diff / 100.0, -0.6, 0.6)
+    rudder = _clamp(yaw_coord + 0.25 * thrust_bias + 0.004 * _MEM["i_yaw"], -1.0, 1.0)
+    if e1_health < 0.3 and e2_health > 0.6:
+        rudder = _clamp(rudder + 0.25, -1.0, 1.0)
+    elif e2_health < 0.3 and e1_health > 0.6:
+        rudder = _clamp(rudder - 0.25, -1.0, 1.0)
+
+    # Autothrust: speed hold with phase-dependent feed-forward and engine-out handling.
+    drag_bias = 0.0
+    drag_bias += 0.12 if _get(state, "gear_handle_down", False) else 0.0
+    drag_bias += 0.10 if _MEM["gear"] else 0.0
+    flaps_pos = float(_MEM["flaps"])
+    drag_bias += _clamp(flaps_pos / 50.0, 0.0, 0.8) * 0.18
+    drag_bias += _clamp(_get(state, "speedbrake_handle", 0.0), 0.0, 1.0) * 0.22
+    if phase == "ground":
+        throttle_base = 0.20
+    elif phase == "takeoff_climb":
+        throttle_base = 0.96
+    elif phase == "climb":
+        throttle_base = 0.80
+    elif phase == "descent":
+        throttle_base = 0.28
+    else:
+        throttle_base = 0.55
+
+    throttle_base += 0.010 * spd_err
+    throttle_base += 0.00010 * abs(desired_vs)
+    throttle_base += drag_bias
+    if ias < target_ias - 12.0:
+        throttle_base += 0.10
+    if ias > target_ias + 18.0:
+        throttle_base -= 0.08
+    if mach > 0.80:
+        throttle_base -= 0.10
+    throttle_base = _clamp(throttle_base, 0.0, 1.0)
+
+    # Engine-out / fire logic.
+    if e1_fire:
+        th1 = 0.0
+        th2 = 1.0 if at_engaged else throttle_base
+    elif e2_fire:
+        th2 = 0.0
+        th1 = 1.0 if at_engaged else throttle_base
+    elif e1_health < 0.25 and e2_health > 0.5:
+        th1 = 0.0
+        th2 = _clamp(throttle_base + 0.20, 0.0, 1.0)
+    elif e2_health < 0.25 and e1_health > 0.5:
+        th2 = 0.0
+        th1 = _clamp(throttle_base + 0.20, 0.0, 1.0)
+    else:
+        asym = _clamp(thrust_diff / 200.0, -0.12, 0.12)
+        th1 = _clamp(throttle_base - asym, 0.0, 1.0)
+        th2 = _clamp(throttle_base + asym, 0.0, 1.0)
+
+    if not at_engaged:
+        th1 = _clamp(_get(state, "throttle_1_pos", th1), 0.0, 1.0)
+        th2 = _clamp(_get(state, "throttle_2_pos", th2), 0.0, 1.0)
+
+    # Speedbrake and configuration.
+    speedbrake = 0.0
+    if ias > target_ias + 22.0 and alt > 300.0:
+        speedbrake = _clamp((ias - target_ias - 22.0) / 28.0, 0.0, 1.0)
+    elif phase == "descent" and alt_err < -1200.0 and ias > target_ias + 8.0:
+        speedbrake = 0.35
+    if _finite(aoa) and aoa > 14.0:
+        speedbrake = 0.0
+
+    # Gear and flap logic with hysteresis.
+    gear = int(_MEM["gear"])
+    if radar_agl < 35.0 or on_ground:
+        gear = 1
+    elif radar_agl > 1200.0 and ias > 150.0 and target_alt > 1000.0:
+        gear = 0
+    elif radar_agl < 900.0 and (phase in ("takeoff_climb", "descent") or alt_err < 0.0):
+        gear = 1
+    elif radar_agl > 1600.0 and phase in ("climb", "capture") and ias > 170.0:
+        gear = 0
+    _MEM["gear"] = gear
+
+    if gear == 1:
+        if radar_agl < 250.0 and ias < 145.0:
+            flaps = 40.0
+        elif radar_agl < 700.0 and ias < 160.0:
+            flaps = 30.0
+        elif radar_agl < 1500.0 and ias < 180.0:
+            flaps = 15.0
+        elif radar_agl < 3000.0 and ias < 210.0:
+            flaps = 5.0
+        else:
+            flaps = 0.0
+    else:
+        if phase == "takeoff_climb" and radar_agl < 1500.0:
+            flaps = 15.0
+        elif phase == "descent" and radar_agl < 2500.0 and ias < 200.0:
+            flaps = 5.0
+        else:
+            flaps = 0.0
+    _MEM["flaps"] = flaps
+    _MEM["speedbrake"] = speedbrake
+
+    # Strong flare / near-stall protections.
+    if radar_agl < 50.0 and not on_ground:
+        elevator = _clamp(elevator + 0.12, -1.0, 1.0)
+        throttle_base = max(throttle_base, 0.35)
+    if _finite(aoa) and aoa > 15.5:
+        elevator = _clamp(elevator - 0.15, -1.0, 1.0)
+        th1 = max(th1, 0.75)
+        th2 = max(th2, 0.75)
+    if ias < max(110.0, target_ias - 35.0):
+        elevator = _clamp(elevator - 0.20, -1.0, 1.0)
+        th1 = max(th1, 0.85)
+        th2 = max(th2, 0.85)
+
+    # Preserve persistent estimates.
+    _MEM["prev_alt"] = alt
+    _MEM["prev_ias"] = ias
+    _MEM["prev_hdg"] = hdg
+    _MEM["prev_roll"] = roll
+    _MEM["prev_pitch"] = pitch
+    _MEM["prev_vs"] = _get(state, "vertical_speed_fpm", _MEM["prev_vs"])
+
+    return {
+        "elevator": float(_clamp(elevator, -1.0, 1.0)),
+        "aileron": float(_clamp(aileron, -1.0, 1.0)),
+        "rudder": float(_clamp(rudder, -1.0, 1.0)),
+        "throttle_1": float(_clamp(th1, 0.0, 1.0)),
+        "throttle_2": float(_clamp(th2, 0.0, 1.0)),
+        "elevator_trim": float(_clamp(_MEM["trim"], -1.0, 1.0)),
+        "flaps": float(_clamp(flaps, 0.0, 40.0)),
+        "speedbrake": float(_clamp(speedbrake, 0.0, 1.0)),
+        "gear": int(gear),
+    }

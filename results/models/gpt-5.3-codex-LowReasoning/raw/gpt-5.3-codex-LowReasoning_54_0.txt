@@ -1,0 +1,271 @@
+from math import isfinite
+
+# Persistent state across calls (reset by harness between scenarios/retries)
+_AP = {
+    "initialized": False,
+    "go_around": False,
+    "ga_latched": False,
+    "flare": False,
+    "prev_ra": None,
+    "integrators": {"gs": 0.0, "loc": 0.0, "spd": 0.0},
+    "filters": {"gs": 0.0, "loc": 0.0, "ias": 140.0, "vs": -700.0, "hdg_err": 0.0},
+    "wow_seen": False,
+}
+
+
+def _clamp(x, lo, hi):
+    return lo if x < lo else hi if x > hi else x
+
+
+def _med(vals, default=0.0):
+    vals = [v for v in vals if v is not None and isfinite(v)]
+    if not vals:
+        return default
+    vals = sorted(vals)
+    n = len(vals)
+    m = n // 2
+    return vals[m] if n % 2 else 0.5 * (vals[m - 1] + vals[m])
+
+
+def _vote3(state, stem, suffix, valid_suffix="_valid", default=0.0):
+    vals = []
+    for i in (1, 2, 3):
+        vk = f"{stem}_{i}{valid_suffix}"
+        xk = f"{stem}_{i}{suffix}"
+        if bool(state.get(vk, False)):
+            v = state.get(xk)
+            if isinstance(v, (int, float)) and isfinite(v):
+                vals.append(float(v))
+    if len(vals) >= 2:
+        return _med(vals, default)
+    if len(vals) == 1:
+        return vals[0]
+    return default
+
+
+def _mean2(a, b, default=0.0):
+    ok_a = isinstance(a, (int, float)) and isfinite(a)
+    ok_b = isinstance(b, (int, float)) and isfinite(b)
+    if ok_a and ok_b:
+        return 0.5 * (a + b)
+    if ok_a:
+        return float(a)
+    if ok_b:
+        return float(b)
+    return default
+
+
+def _lp(prev, new, alpha):
+    return prev + alpha * (new - prev)
+
+
+def _ang_err(target, current):
+    e = (target - current + 180.0) % 360.0 - 180.0
+    return e
+
+
+def autopilot_step(state: dict, dt: float) -> dict:
+    global _AP
+
+    if dt <= 0.0:
+        dt = 0.02
+    dt = _clamp(dt, 0.01, 0.2)
+
+    # --- Robust sensor fusion ---
+    ra = state.get("radio_alt_ft")
+    if not isinstance(ra, (int, float)) or not isfinite(ra):
+        ra = _vote3(state, "baro_alt", "_ft", default=300.0)
+    else:
+        ra = float(ra)
+
+    gs_dot = _vote3(state, "glideslope", "_dots", default=state.get("target_gs_dots", 0.0) or 0.0)
+    loc_dot = _vote3(state, "localizer", "_dots", default=state.get("target_loc_dots", 0.0) or 0.0)
+
+    ias = _vote3(state, "ias", "_kt", default=state.get("target_ias_kt", 140.0) or 140.0)
+    if not isfinite(ias) or ias < 40:
+        ias = _mean2(state.get("groundspeed_kt"), state.get("irs_1_gs_kt"), default=140.0)
+
+    vs = _vote3(state, "irs", "_vs_fpm", default=-700.0)
+    hdg = _vote3(state, "irs", "_heading_deg", default=state.get("target_hdg_deg", 0.0) or 0.0)
+    target_hdg = float(state.get("target_hdg_deg", hdg) or hdg)
+    hdg_err = _ang_err(target_hdg, hdg)
+
+    vref = state.get("target_vref_kt")
+    if not isinstance(vref, (int, float)) or not isfinite(vref):
+        vref = 137.0
+    else:
+        vref = float(vref)
+
+    on_ground = bool(state.get("on_ground", False) or state.get("weight_on_wheels", False))
+
+    # Filters to handle flicker/turbulence
+    a = _clamp(dt * 2.5, 0.05, 0.45)
+    _AP["filters"]["gs"] = _lp(_AP["filters"]["gs"], gs_dot, a)
+    _AP["filters"]["loc"] = _lp(_AP["filters"]["loc"], loc_dot, a)
+    _AP["filters"]["ias"] = _lp(_AP["filters"]["ias"], ias, a)
+    _AP["filters"]["vs"] = _lp(_AP["filters"]["vs"], vs, a)
+    _AP["filters"]["hdg_err"] = _lp(_AP["filters"]["hdg_err"], hdg_err, _clamp(dt * 3.0, 0.08, 0.55))
+
+    gs_dot_f = _AP["filters"]["gs"]
+    loc_dot_f = _AP["filters"]["loc"]
+    ias_f = _AP["filters"]["ias"]
+    vs_f = _AP["filters"]["vs"]
+    hdg_err_f = _AP["filters"]["hdg_err"]
+
+    # Derived kinematics
+    prev_ra = _AP["prev_ra"]
+    if prev_ra is None:
+        ra_rate_fpm = vs_f
+    else:
+        ra_rate_fpm = (ra - prev_ra) * 60.0 / dt
+    _AP["prev_ra"] = ra
+
+    # Phase targets
+    approach_speed = max(vref + 5.0, float(state.get("target_ias_kt", vref + 5.0) or (vref + 5.0)))
+    if ra < 80:
+        speed_tgt = vref + 2.0
+    elif ra < 200:
+        speed_tgt = vref + 4.0
+    else:
+        speed_tgt = approach_speed
+
+    # --- Go-around logic (unstable approach gates) ---
+    unstable = False
+    if not on_ground and 80 < ra < 900:
+        if abs(loc_dot_f) > 2.2 or abs(gs_dot_f) > 2.0:
+            unstable = True
+        if ias_f > vref + 28 or ias_f < max(vref - 15, 105):
+            unstable = True
+        if ra < 300 and vs_f < -1400:
+            unstable = True
+    if not on_ground and ra < 120 and abs(loc_dot_f) > 2.8:
+        unstable = True
+
+    if unstable and not _AP["ga_latched"] and ra > 40:
+        _AP["go_around"] = True
+        _AP["ga_latched"] = True
+
+    # End go-around after climb established (sim restarts soon after)
+    if _AP["go_around"] and ra > 1500:
+        _AP["go_around"] = False
+
+    # --- Ground rollout ---
+    if on_ground:
+        _AP["wow_seen"] = True
+        gs = float(state.get("groundspeed_kt", ias_f) or ias_f)
+        rev = 1.0 if gs > 75 else 0.55 if gs > 50 else 0.0
+        brake = 1.0 if gs > 90 else 0.8 if gs > 60 else 0.5 if gs > 30 else 0.2
+        return {
+            "elevator": 0.15,
+            "aileron": _clamp(-0.06 * loc_dot_f, -0.35, 0.35),
+            "rudder": _clamp(0.02 * hdg_err_f - 0.10 * loc_dot_f, -0.5, 0.5),
+            "throttle_1": 0.0,
+            "throttle_2": 0.0,
+            "elevator_trim": 0.0,
+            "flaps": 30,
+            "gear": 1.0,
+            "speedbrake": 1.0,
+            "spoiler": 1.0,
+            "autobrake": brake,
+            "reverse_1": rev,
+            "reverse_2": rev,
+        }
+
+    # --- Go-around command ---
+    if _AP["go_around"]:
+        pitch_cmd = 0.36 if ra < 500 else 0.30
+        return {
+            "elevator": pitch_cmd,
+            "aileron": _clamp(-0.07 * loc_dot_f, -0.45, 0.45),
+            "rudder": _clamp(-0.12 * loc_dot_f + 0.02 * hdg_err_f, -0.55, 0.55),
+            "throttle_1": 1.0,
+            "throttle_2": 1.0,
+            "elevator_trim": 0.20,
+            "flaps": 15,
+            "gear": 1.0 if ra < 200 else 0.0,
+            "speedbrake": 0.0,
+            "spoiler": 0.0,
+            "autobrake": 0.0,
+            "reverse_1": 0.0,
+            "reverse_2": 0.0,
+        }
+
+    # --- Normal approach / flare control ---
+    # Integrators with anti-windup
+    _AP["integrators"]["gs"] = _clamp(_AP["integrators"]["gs"] + gs_dot_f * dt, -2.0, 2.0)
+    _AP["integrators"]["loc"] = _clamp(_AP["integrators"]["loc"] + loc_dot_f * dt, -2.0, 2.0)
+    _AP["integrators"]["spd"] = _clamp(_AP["integrators"]["spd"] + (speed_tgt - ias_f) * dt, -25.0, 25.0)
+
+    # Capture flare
+    if ra < 55:
+        _AP["flare"] = True
+    if ra > 120:
+        _AP["flare"] = False
+
+    # Lateral: localizer + heading damping
+    aileron = _clamp(-0.11 * loc_dot_f - 0.0015 * hdg_err_f - 0.015 * _AP["integrators"]["loc"], -0.85, 0.85)
+    rudder = _clamp(-0.18 * loc_dot_f + 0.003 * hdg_err_f, -0.75, 0.75)
+
+    # Vertical: use GS + VS damping + flare law
+    if _AP["flare"]:
+        target_sink = -120.0 if ra < 20 else -220.0
+        sink_err = target_sink - ra_rate_fpm
+        elevator = _clamp(0.18 + 0.00075 * sink_err, -0.10, 0.58)
+        throttle_base = 0.10 if ra < 20 else 0.14
+    else:
+        # Positive gs_dot means above path; command down.
+        elevator = _clamp(-0.15 * gs_dot_f - 0.00022 * (vs_f + 700.0) - 0.03 * _AP["integrators"]["gs"], -0.75, 0.75)
+        throttle_base = 0.48
+
+    # Speed/thrust loop with simple engine-out handling
+    spd_err = speed_tgt - ias_f
+    throttle_cmd = throttle_base + 0.0125 * spd_err + 0.0018 * _AP["integrators"]["spd"]
+    throttle_cmd = _clamp(throttle_cmd, 0.0, 1.0)
+
+    eng1_run = bool(state.get("engine_1_running", True)) and not bool(state.get("engine_1_fire", False))
+    eng2_run = bool(state.get("engine_2_running", True)) and not bool(state.get("engine_2_fire", False))
+
+    if eng1_run and eng2_run:
+        t1 = t2 = throttle_cmd
+    elif eng1_run and not eng2_run:
+        t1, t2 = _clamp(throttle_cmd + 0.18, 0.0, 1.0), 0.0
+        rudder += 0.12
+    elif eng2_run and not eng1_run:
+        t1, t2 = 0.0, _clamp(throttle_cmd + 0.18, 0.0, 1.0)
+        rudder -= 0.12
+    else:
+        # Dual engine out glide: best effort pitch for ~vref+10
+        t1 = t2 = 0.0
+        elevator = _clamp(elevator + 0.07 + 0.01 * _clamp((vref + 10) - ias_f, -20, 20), -0.8, 0.8)
+
+    # Configuration schedule
+    if ra > 1800:
+        flaps = 5
+        gear = 0.0
+    elif ra > 900:
+        flaps = 15
+        gear = 1.0
+    elif ra > 300:
+        flaps = 25
+        gear = 1.0
+    else:
+        flaps = 30
+        gear = 1.0
+
+    speedbrake = 0.0
+
+    return {
+        "elevator": elevator,
+        "aileron": aileron,
+        "rudder": _clamp(rudder, -1.0, 1.0),
+        "throttle_1": _clamp(t1, 0.0, 1.0),
+        "throttle_2": _clamp(t2, 0.0, 1.0),
+        "elevator_trim": _clamp(0.12 * elevator, -0.35, 0.35),
+        "flaps": flaps,
+        "gear": gear,
+        "speedbrake": speedbrake,
+        "spoiler": 0.0,
+        "autobrake": 0.0,
+        "reverse_1": 0.0,
+        "reverse_2": 0.0,
+    }

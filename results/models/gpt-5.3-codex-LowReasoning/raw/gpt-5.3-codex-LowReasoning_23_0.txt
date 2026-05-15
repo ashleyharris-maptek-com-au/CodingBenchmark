@@ -1,0 +1,281 @@
+use std::f64::consts::PI;
+use std::io::{self, BufRead, BufReader, BufWriter, Write};
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant};
+
+#[derive(Clone, Copy, Debug)]
+struct State {
+    x: f64,
+    y: f64,
+    vx: f64,
+    vy: f64,
+    angle: f64,
+    angular_vel: f64,
+    fuel: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Command {
+    thrust: f64,
+    turn: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Config {
+    gravity: f64,
+    max_thrust: f64,
+    target_x: f64,
+    target_y: f64,
+}
+
+fn clamp(v: f64, lo: f64, hi: f64) -> f64 {
+    if v < lo {
+        lo
+    } else if v > hi {
+        hi
+    } else {
+        v
+    }
+}
+
+fn wrap_angle(mut a: f64) -> f64 {
+    while a > PI {
+        a -= 2.0 * PI;
+    }
+    while a < -PI {
+        a += 2.0 * PI;
+    }
+    a
+}
+
+fn read_initial<R: BufRead>(reader: &mut R) -> io::Result<Config> {
+    let mut first = String::new();
+    let mut second = String::new();
+
+    if reader.read_line(&mut first)? == 0 {
+        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "missing first header line"));
+    }
+    if reader.read_line(&mut second)? == 0 {
+        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "missing second header line"));
+    }
+
+    let v1: Vec<f64> = first
+        .split_whitespace()
+        .filter_map(|s| s.parse::<f64>().ok())
+        .collect();
+    let v2: Vec<f64> = second
+        .split_whitespace()
+        .filter_map(|s| s.parse::<f64>().ok())
+        .collect();
+
+    if v1.len() < 5 || v2.len() < 4 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid initial numeric header",
+        ));
+    }
+
+    let width = v1[0].max(0.0) as usize;
+    let height = v1[1].max(0.0) as usize;
+    let gravity = v1[2];
+    let max_thrust = v1[3];
+
+    let target_x = v2[2];
+    let target_y = v2[3];
+
+    // Stream and discard map rows to stay memory-efficient for large maps.
+    let mut row = String::new();
+    for _ in 0..height {
+        row.clear();
+        if reader.read_line(&mut row)? == 0 {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "missing map row"));
+        }
+        if row.trim().is_empty() {
+            continue;
+        }
+        let _ = width;
+    }
+
+    Ok(Config {
+        gravity,
+        max_thrust,
+        target_x,
+        target_y,
+    })
+}
+
+fn parse_state_line(line: &str) -> Option<State> {
+    let nums: Vec<f64> = line
+        .split_whitespace()
+        .filter_map(|s| s.parse::<f64>().ok())
+        .collect();
+    if nums.len() < 7 {
+        return None;
+    }
+    Some(State {
+        x: nums[0],
+        y: nums[1],
+        vx: nums[2],
+        vy: nums[3],
+        angle: nums[4],
+        angular_vel: nums[5],
+        fuel: nums[6],
+    })
+}
+
+fn controller(cfg: &Config, s: State) -> Command {
+    let dx = cfg.target_x - s.x;
+    let dy = cfg.target_y - s.y;
+
+    // Phase switching by altitude error to prioritize horizontal alignment earlier.
+    let near_ground = dy.abs() < 18.0;
+
+    // Desired horizontal speed profile: faster far away, near zero on approach.
+    let vx_des = if dx.abs() > 30.0 {
+        clamp(dx * 0.10, -8.0, 8.0)
+    } else {
+        clamp(dx * 0.06, -2.0, 2.0)
+    };
+
+    // Desired vertical speed (downward positive): descend gently near target.
+    let vy_des = if near_ground {
+        0.4
+    } else if dy > 60.0 {
+        4.0
+    } else if dy > 20.0 {
+        2.0
+    } else {
+        1.0
+    };
+
+    let ex = vx_des - s.vx;
+    let ey = vy_des - s.vy;
+
+    // Convert speed errors into desired accelerations.
+    let ax_cmd = clamp(0.9 * ex, -cfg.max_thrust * 0.8, cfg.max_thrust * 0.8);
+    let ay_cmd = clamp(1.2 * ey, -cfg.max_thrust * 0.8, cfg.max_thrust * 0.8);
+
+    // Net acceleration needed from thrust vector in world frame.
+    // y positive downward, so upward acceleration is negative y.
+    let tx = ax_cmd;
+    let ty = ay_cmd - cfg.gravity;
+
+    // Thrust direction when angle=0 is up => vector (0, -1).
+    let thrust_mag = (tx * tx + ty * ty).sqrt();
+
+    let mut angle_des = if thrust_mag > 1e-6 {
+        // Unit vector mapping: (sin(a), -cos(a)).
+        // So a = atan2(x, -y).
+        tx.atan2(-ty)
+    } else {
+        0.0
+    };
+
+    // Keep conservative tilt near ground to reduce touchdown risk.
+    if near_ground {
+        angle_des = clamp(angle_des, -0.35, 0.35);
+    } else {
+        angle_des = clamp(angle_des, -0.9, 0.9);
+    }
+
+    let angle_err = wrap_angle(angle_des - s.angle);
+    let turn = clamp(2.8 * angle_err - 0.9 * s.angular_vel, -1.0, 1.0);
+
+    // Project commanded thrust onto current orientation for stable throttle control.
+    let ux = s.angle.sin();
+    let uy = -s.angle.cos();
+    let along = tx * ux + ty * uy;
+
+    let mut thrust = if cfg.max_thrust > 1e-9 {
+        along / cfg.max_thrust
+    } else {
+        0.0
+    };
+
+    // Safety boost if descending too fast.
+    if s.vy > 6.0 {
+        thrust = thrust.max(0.85);
+    }
+    if near_ground && s.vy > 2.0 {
+        thrust = thrust.max(0.92);
+    }
+
+    if s.fuel <= 0.02 {
+        thrust = 0.0;
+    }
+
+    Command {
+        thrust: clamp(thrust, 0.0, 1.0),
+        turn,
+    }
+}
+
+fn main() -> io::Result<()> {
+    let stdin = io::stdin();
+    let mut reader = BufReader::new(stdin.lock());
+    let cfg = read_initial(&mut reader)?;
+
+    let (tx_state, rx_state) = mpsc::channel::<State>();
+
+    // Reader thread: continuously parse state lines.
+    let reader_handle = thread::spawn(move || {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {
+                    if let Some(s) = parse_state_line(&line) {
+                        if tx_state.send(s).is_err() {
+                            break;
+                        }
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let stdout = io::stdout();
+    let mut out = BufWriter::new(stdout.lock());
+
+    // Default safe command while waiting for first state.
+    let mut latest = State {
+        x: cfg.target_x,
+        y: cfg.target_y,
+        vx: 0.0,
+        vy: 0.0,
+        angle: 0.0,
+        angular_vel: 0.0,
+        fuel: 0.0,
+    };
+
+    let tick = Duration::from_millis(50); // 20 Hz minimum output
+    let mut next = Instant::now();
+
+    loop {
+        while let Ok(s) = rx_state.try_recv() {
+            latest = s;
+        }
+
+        let cmd = controller(&cfg, latest);
+        writeln!(out, "{:.3} {:.3}", cmd.thrust, cmd.turn)?;
+        out.flush()?;
+
+        next += tick;
+        let now = Instant::now();
+        if next > now {
+            thread::sleep(next - now);
+        } else {
+            next = now;
+        }
+
+        if reader_handle.is_finished() {
+            // Keep outputting a tiny bit after EOF is unnecessary; exit cleanly.
+            break;
+        }
+    }
+
+    Ok(())
+}

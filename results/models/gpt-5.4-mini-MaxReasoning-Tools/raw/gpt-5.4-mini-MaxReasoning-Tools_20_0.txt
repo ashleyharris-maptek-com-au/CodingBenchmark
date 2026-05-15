@@ -1,0 +1,383 @@
+use std::io::{self, BufRead, Write};
+
+#[derive(Clone)]
+struct SampleRow {
+    depth: f64,
+    orig_idx: usize,
+    values: Vec<Option<f64>>,
+}
+
+#[derive(Clone)]
+struct Candidate {
+    hole_id: String,
+    hole_seq: usize,
+    sample_idx: usize,
+    prop_idx: usize,
+    confidence: f64,
+    raw_score: f64,
+}
+
+fn parse_usize_token(tok: Option<&str>) -> Option<usize> {
+    let s = tok?.trim_start_matches('\u{feff}');
+    s.parse::<usize>().ok()
+}
+
+fn parse_f64_token(tok: Option<&str>) -> Option<f64> {
+    let s = tok?.trim_start_matches('\u{feff}');
+    if s.eq_ignore_ascii_case("na")
+        || s.eq_ignore_ascii_case("n/a")
+        || s.eq_ignore_ascii_case("null")
+        || s.eq_ignore_ascii_case("nan")
+        || s == "."
+    {
+        return None;
+    }
+    let v = s.parse::<f64>().ok()?;
+    if v.is_finite() {
+        Some(v)
+    } else {
+        None
+    }
+}
+
+fn read_nonempty_line<R: BufRead>(reader: &mut R, buf: &mut String) -> io::Result<bool> {
+    loop {
+        buf.clear();
+        let n = reader.read_line(buf)?;
+        if n == 0 {
+            return Ok(false);
+        }
+        if !buf.trim().is_empty() {
+            return Ok(true);
+        }
+    }
+}
+
+fn median_sorted(values: &[f64]) -> f64 {
+    let n = values.len();
+    if n == 0 {
+        0.0
+    } else if n & 1 == 1 {
+        values[n / 2]
+    } else {
+        (values[n / 2 - 1] + values[n / 2]) * 0.5
+    }
+}
+
+fn robust_median_mad(values: &mut Vec<f64>, scratch: &mut Vec<f64>) -> (f64, f64) {
+    values.sort_unstable_by(|a, b| a.total_cmp(b));
+    let med = median_sorted(values);
+
+    scratch.clear();
+    scratch.reserve(values.len());
+    for &v in values.iter() {
+        scratch.push((v - med).abs());
+    }
+    scratch.sort_unstable_by(|a, b| a.total_cmp(b));
+    let mad = median_sorted(scratch);
+    (med, (mad * 1.4826).max(1e-9))
+}
+
+fn median_scale(diffs: &mut Vec<f64>) -> f64 {
+    if diffs.is_empty() {
+        return 1e-9;
+    }
+    diffs.sort_unstable_by(|a, b| a.total_cmp(b));
+    median_sorted(diffs).max(1e-9)
+}
+
+fn score_to_confidence(score: f64) -> f64 {
+    if !score.is_finite() || score <= 0.0 {
+        0.0
+    } else {
+        1.0 - (-score * 0.5).exp()
+    }
+}
+
+fn analyze_hole(
+    hole_id: String,
+    hole_seq: usize,
+    samples: Vec<SampleRow>,
+    num_properties: usize,
+    candidates: &mut Vec<Candidate>,
+) {
+    let n = samples.len();
+    if n == 0 || num_properties == 0 {
+        return;
+    }
+
+    // Sort by depth so the neighborhood logic follows the borehole trace.
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_unstable_by(|&a, &b| {
+        samples[a]
+            .depth
+            .total_cmp(&samples[b].depth)
+            .then_with(|| samples[a].orig_idx.cmp(&samples[b].orig_idx))
+    });
+
+    let depths_sorted: Vec<f64> = order.iter().map(|&i| samples[i].depth).collect();
+    let orig_idx_sorted: Vec<usize> = order.iter().map(|&i| samples[i].orig_idx).collect();
+
+    let window_radius = if n <= 8 {
+        n.saturating_sub(1)
+    } else if n <= 32 {
+        4.min(n - 1)
+    } else if n <= 128 {
+        3.min(n - 1)
+    } else {
+        2.min(n - 1)
+    };
+
+    let threshold = if n <= 8 {
+        2.8
+    } else if n <= 32 {
+        3.0
+    } else if n <= 128 {
+        3.0
+    } else {
+        3.0
+    };
+
+    let mut values_sorted = vec![None; n];
+    let mut prev_valid = vec![None; n];
+    let mut next_valid = vec![None; n];
+    let mut window_vals = Vec::with_capacity(window_radius * 2 + 2);
+    let mut scratch = Vec::with_capacity(window_radius * 2 + 2);
+
+    for prop_idx in 0..num_properties {
+        // Materialize one property column in depth order.
+        for (dst, &src) in values_sorted.iter_mut().zip(order.iter()) {
+            *dst = samples[src].values[prop_idx];
+        }
+
+        let valid_count = values_sorted.iter().filter(|v| v.is_some()).count();
+        if valid_count == 0 {
+            continue;
+        }
+
+        prev_valid.fill(None);
+        next_valid.fill(None);
+
+        let mut last_valid: Option<usize> = None;
+        let mut adj_diffs: Vec<f64> = Vec::new();
+        for i in 0..n {
+            prev_valid[i] = last_valid;
+            if let Some(v) = values_sorted[i] {
+                if let Some(prev_i) = last_valid {
+                    // Prefer adjacent-in-depth changes for the fallback scale.
+                    if i == prev_i + 1 {
+                        if let Some(prev_v) = values_sorted[prev_i] {
+                            adj_diffs.push((v - prev_v).abs());
+                        }
+                    }
+                }
+                last_valid = Some(i);
+            }
+        }
+
+        let mut next: Option<usize> = None;
+        for i in (0..n).rev() {
+            next_valid[i] = next;
+            if values_sorted[i].is_some() {
+                next = Some(i);
+            }
+        }
+
+        let mut fallback_diffs: Vec<f64> = Vec::new();
+        let adj_scale = if adj_diffs.len() >= 2 {
+            median_scale(&mut adj_diffs)
+        } else {
+            let mut last: Option<usize> = None;
+            for i in 0..n {
+                if let Some(v) = values_sorted[i] {
+                    if let Some(prev_i) = last {
+                        if let Some(prev_v) = values_sorted[prev_i] {
+                            fallback_diffs.push((v - prev_v).abs());
+                        }
+                    }
+                    last = Some(i);
+                }
+            }
+            median_scale(&mut fallback_diffs)
+        };
+
+        for si in 0..n {
+            let Some(x) = values_sorted[si] else {
+                // Missing values are only flagged when there is enough surrounding context.
+                if valid_count >= 3 && prev_valid[si].is_some() && next_valid[si].is_some() {
+                    candidates.push(Candidate {
+                        hole_id: hole_id.clone(),
+                        hole_seq,
+                        sample_idx: orig_idx_sorted[si],
+                        prop_idx,
+                        confidence: score_to_confidence(4.0),
+                        raw_score: 4.0,
+                    });
+                }
+                continue;
+            };
+
+            if valid_count < 3 {
+                continue;
+            }
+
+            let mut best = 0.0;
+
+            // Windowed robust score.
+            window_vals.clear();
+            let start = si.saturating_sub(window_radius);
+            let end = (si + window_radius).min(n - 1);
+            for j in start..=end {
+                if j == si {
+                    continue;
+                }
+                if let Some(v) = values_sorted[j] {
+                    window_vals.push(v);
+                }
+            }
+
+            if window_vals.len() >= 2 {
+                let (med, local_scale) = robust_median_mad(&mut window_vals, &mut scratch);
+                let scale = local_scale.max(1e-9);
+                let z = (x - med).abs() / scale;
+                if z > best {
+                    best = z;
+                }
+            } else if window_vals.len() == 1 {
+                let z = (x - window_vals[0]).abs() / adj_scale.max(1e-9);
+                if z > best {
+                    best = z;
+                }
+            }
+
+            // Interpolated expected value from the nearest valid samples on either side.
+            if let Some(li) = prev_valid[si] {
+                if let Some(ri) = next_valid[si] {
+                    let lv = values_sorted[li].unwrap();
+                    let rv = values_sorted[ri].unwrap();
+                    let ld = depths_sorted[li];
+                    let rd = depths_sorted[ri];
+                    let pred = if (rd - ld).abs() > 1e-12 {
+                        lv + (depths_sorted[si] - ld) * (rv - lv) / (rd - ld)
+                    } else {
+                        0.5 * (lv + rv)
+                    };
+                    let z = (x - pred).abs() / adj_scale.max(1e-9);
+                    if z > best {
+                        best = z;
+                    }
+                } else {
+                    let z = (x - values_sorted[li].unwrap()).abs() / adj_scale.max(1e-9);
+                    if z > best {
+                        best = z;
+                    }
+                }
+            } else if let Some(ri) = next_valid[si] {
+                let z = (x - values_sorted[ri].unwrap()).abs() / adj_scale.max(1e-9);
+                if z > best {
+                    best = z;
+                }
+            }
+
+            if best >= threshold {
+                candidates.push(Candidate {
+                    hole_id: hole_id.clone(),
+                    hole_seq,
+                    sample_idx: orig_idx_sorted[si],
+                    prop_idx,
+                    confidence: score_to_confidence(best),
+                    raw_score: best,
+                });
+            }
+        }
+    }
+}
+
+fn main() -> io::Result<()> {
+    let stdin = io::stdin();
+    let mut reader = stdin.lock();
+    let mut buf = String::new();
+
+    if !read_nonempty_line(&mut reader, &mut buf)? {
+        return Ok(());
+    }
+    let mut header_it = buf.split_whitespace();
+    let num_holes = parse_usize_token(header_it.next()).unwrap_or(0);
+    let num_properties = parse_usize_token(header_it.next()).unwrap_or(0);
+
+    if !read_nonempty_line(&mut reader, &mut buf)? {
+        println!("0");
+        return Ok(());
+    }
+    let mut property_names: Vec<String> = buf
+        .split_whitespace()
+        .take(num_properties)
+        .map(|s| s.to_string())
+        .collect();
+    while property_names.len() < num_properties {
+        property_names.push(format!("prop{}", property_names.len() + 1));
+    }
+
+    let mut candidates: Vec<Candidate> = Vec::new();
+
+    for hole_seq in 0..num_holes {
+        if !read_nonempty_line(&mut reader, &mut buf)? {
+            break;
+        }
+        let mut meta_it = buf.split_whitespace();
+        let hole_id = meta_it
+            .next()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("hole{}", hole_seq + 1));
+
+        // The geometry fields are parsed for robustness; local depth-order analysis is the
+        // primary scoring strategy and remains stable even when the borehole count is large.
+        for _ in 0..7 {
+            let _ = meta_it.next();
+        }
+        let num_samples = parse_usize_token(meta_it.next()).unwrap_or(0);
+
+        let mut samples: Vec<SampleRow> = Vec::with_capacity(num_samples);
+        for sample_idx in 0..num_samples {
+            if !read_nonempty_line(&mut reader, &mut buf)? {
+                break;
+            }
+            let mut it = buf.split_whitespace();
+            let depth = parse_f64_token(it.next()).unwrap_or(sample_idx as f64);
+            let mut values = Vec::with_capacity(num_properties);
+            for _ in 0..num_properties {
+                values.push(parse_f64_token(it.next()));
+            }
+            samples.push(SampleRow {
+                depth,
+                orig_idx: sample_idx,
+                values,
+            });
+        }
+
+        analyze_hole(hole_id, hole_seq, samples, num_properties, &mut candidates);
+    }
+
+    candidates.sort_unstable_by(|a, b| {
+        b.confidence
+            .total_cmp(&a.confidence)
+            .then_with(|| b.raw_score.total_cmp(&a.raw_score))
+            .then_with(|| a.hole_seq.cmp(&b.hole_seq))
+            .then_with(|| a.sample_idx.cmp(&b.sample_idx))
+            .then_with(|| a.prop_idx.cmp(&b.prop_idx))
+    });
+
+    let stdout = io::stdout();
+    let mut out = io::BufWriter::new(stdout.lock());
+    writeln!(out, "{}", candidates.len())?;
+    for c in candidates {
+        let prop_name = &property_names[c.prop_idx];
+        writeln!(
+            out,
+            "{} {} {} {:.6}",
+            c.hole_id, c.sample_idx, prop_name, c.confidence
+        )?;
+    }
+    out.flush()?;
+    Ok(())
+}

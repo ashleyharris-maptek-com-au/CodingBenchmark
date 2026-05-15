@@ -883,6 +883,15 @@ def _grade_stockfish_game(exe_path: str, subPass: int, aiEngineName: str):
   elif outcome.winner == chess.BLACK:
     score = 0.0
     detail = f"[{game_cfg['name']}] LOSS ({outcome.termination.name})"
+
+    try:
+      if not os.path.exists("results/chessElo.json"):
+        json.dump({}, open("results/chessElo.json", "w"))
+      elo = json.load(open("results/chessElo.json"))
+      elo[aiEngineName] = target_elo - 50
+      json.dump(elo, open("results/chessElo.json", "w"))
+    except Exception:
+      pass
   else:
     # Draw
     score = 0.4
@@ -999,7 +1008,9 @@ def _build_report_html(report, board_states, moves, score, error):
       parts.append(f"<li>{m}</li>")
     except:
       parts.append(f"<li>{move[1]}</li>")
-
+    if counter > 30:
+      parts.append("<li>...</li>")
+      break
     if counter % tableSize == tableSize - 1:
       parts.append("</ol></td> <td style='border:0px'><ol start='{}'>".format(counter + 1))
 

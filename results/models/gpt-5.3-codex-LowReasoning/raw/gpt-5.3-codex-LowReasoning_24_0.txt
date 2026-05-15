@@ -1,0 +1,312 @@
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <limits>
+#include <mutex>
+#include <sstream>
+#include <string>
+#include <thread>
+#include <vector>
+
+struct Terrain {
+    int width = 0;
+    int depth = 0;
+    int height = 0;
+    std::vector<uint16_t> a; // ground top
+    std::vector<uint16_t> b; // floating bottom
+    std::vector<uint16_t> c; // floating top
+    std::atomic<bool> ready{false};
+
+    inline bool inBounds(int x, int y) const {
+        return x >= 0 && x < width && y >= 0 && y < depth;
+    }
+
+    inline size_t idx(int x, int y) const {
+        return static_cast<size_t>(x) * static_cast<size_t>(depth) + static_cast<size_t>(y);
+    }
+
+    bool isSolid(double x, double y, double z) const {
+        int xi = static_cast<int>(std::floor(x));
+        int yi = static_cast<int>(std::floor(y));
+        if (!inBounds(xi, yi)) return true;
+        if (z < 0.0 || z >= static_cast<double>(height)) return true;
+        size_t i = idx(xi, yi);
+        uint16_t aa = a[i];
+        uint16_t bb = b[i];
+        uint16_t cc = c[i];
+        if (z < static_cast<double>(aa)) return true;
+        if (z >= static_cast<double>(bb) && z < static_cast<double>(cc)) return true;
+        return false;
+    }
+
+    double clearanceAbove(double x, double y, double z) const {
+        int xi = static_cast<int>(std::floor(x));
+        int yi = static_cast<int>(std::floor(y));
+        if (!inBounds(xi, yi)) return -1.0;
+        size_t i = idx(xi, yi);
+        double aa = static_cast<double>(a[i]);
+        double bb = static_cast<double>(b[i]);
+        double cc = static_cast<double>(c[i]);
+
+        if (z < aa) return -1.0;
+        if (z >= bb && z < cc) return -1.0;
+
+        if (z < bb) {
+            if (bb == cc) return std::numeric_limits<double>::infinity();
+            return bb - z;
+        }
+        return std::numeric_limits<double>::infinity();
+    }
+};
+
+struct State {
+    double x = 0, y = 0, z = 0;
+    double vx = 0, vy = 0, vz = 0;
+    double pitch = 0, yaw = 0, roll = 0;
+    double pitch_rate = 0, yaw_rate = 0, roll_rate = 0;
+    double fuel = 0;
+    bool valid = false;
+};
+
+static double clampd(double v, double lo, double hi) {
+    return std::max(lo, std::min(hi, v));
+}
+
+static double norm3(double x, double y, double z) {
+    return std::sqrt(x * x + y * y + z * z);
+}
+
+static double wrapPi(double a) {
+    constexpr double PI = 3.14159265358979323846;
+    while (a > PI) a -= 2.0 * PI;
+    while (a < -PI) a += 2.0 * PI;
+    return a;
+}
+
+int main() {
+    std::ios::sync_with_stdio(false);
+    std::cin.tie(nullptr);
+
+    double width_d, depth_d, height_d, gravity, max_thrust, fuel0;
+    if (!(std::cin >> width_d >> depth_d >> height_d >> gravity >> max_thrust >> fuel0)) {
+        return 0;
+    }
+
+    Terrain terrain;
+    terrain.width = static_cast<int>(std::llround(width_d));
+    terrain.depth = static_cast<int>(std::llround(depth_d));
+    terrain.height = static_cast<int>(std::llround(height_d));
+
+    double sx, sy, sz, tx, ty, tz;
+    if (!(std::cin >> sx >> sy >> sz >> tx >> ty >> tz)) {
+        return 0;
+    }
+
+    std::string dummy;
+    std::getline(std::cin, dummy);
+
+    std::string terrainPath;
+    std::getline(std::cin, terrainPath);
+    if (terrainPath.empty()) {
+        return 0;
+    }
+
+    std::string stateWord;
+    if (!(std::cin >> stateWord)) {
+        return 0;
+    }
+
+    const size_t n = static_cast<size_t>(terrain.width) * static_cast<size_t>(terrain.depth);
+    terrain.a.resize(n);
+    terrain.b.resize(n);
+    terrain.c.resize(n);
+
+    std::mutex terrainMutex;
+    std::thread terrainThread([&]() {
+        std::ifstream fin(terrainPath, std::ios::binary);
+        if (!fin) {
+            terrain.ready.store(true, std::memory_order_release);
+            return;
+        }
+
+        constexpr size_t CHUNK = 1 << 20;
+        std::vector<char> buf(CHUNK);
+
+        size_t totalVals = n * 3;
+        size_t valsRead = 0;
+        size_t cell = 0;
+        int slot = 0;
+
+        while (valsRead < totalVals && fin) {
+            fin.read(buf.data(), static_cast<std::streamsize>(buf.size()));
+            std::streamsize got = fin.gcount();
+            if (got <= 0) break;
+
+            size_t i = 0;
+            while (i + 1 < static_cast<size_t>(got) && valsRead < totalVals) {
+                uint16_t v = static_cast<uint16_t>(static_cast<unsigned char>(buf[i])) |
+                             static_cast<uint16_t>(static_cast<unsigned char>(buf[i + 1]) << 8);
+                i += 2;
+
+                if (cell < n) {
+                    if (slot == 0) terrain.a[cell] = v;
+                    else if (slot == 1) terrain.b[cell] = v;
+                    else terrain.c[cell] = v;
+                }
+
+                ++valsRead;
+                ++slot;
+                if (slot == 3) {
+                    slot = 0;
+                    ++cell;
+                }
+            }
+        }
+
+        terrain.ready.store(true, std::memory_order_release);
+    });
+
+    constexpr double dt = 0.1;
+    constexpr double PI = 3.14159265358979323846;
+
+    auto controlStep = [&](const State& s) {
+        // Guidance target: velocity command toward pad with scale-aware gains.
+        double dx = tx - s.x;
+        double dy = ty - s.y;
+        double dz = tz - s.z;
+        double horizDist = std::sqrt(dx * dx + dy * dy);
+
+        double landingRadius = std::max(5.0, std::min(static_cast<double>(terrain.width), static_cast<double>(terrain.depth)) * 0.02);
+
+        double vxy_lim_far = 40.0;
+        double vxy_lim_near = 3.0;
+        double mix = clampd(horizDist / std::max(landingRadius * 8.0, 20.0), 0.0, 1.0);
+        double vxy_lim = vxy_lim_near + (vxy_lim_far - vxy_lim_near) * mix;
+
+        double kPos = 0.08;
+        double vx_cmd = clampd(kPos * dx, -vxy_lim, vxy_lim);
+        double vy_cmd = clampd(kPos * dy, -vxy_lim, vxy_lim);
+
+        double kVel = 0.35;
+        double ax_cmd = kVel * (vx_cmd - s.vx);
+        double ay_cmd = kVel * (vy_cmd - s.vy);
+
+        // Vertical profile: descend faster when far, slow near ground and near target.
+        double desiredVz;
+        if (horizDist > landingRadius * 4.0) desiredVz = -8.0;
+        else if (horizDist > landingRadius * 1.5) desiredVz = -4.0;
+        else desiredVz = -1.2;
+
+        if (dz < 20.0) desiredVz = std::max(desiredVz, -1.0);
+        if (dz < 8.0) desiredVz = std::max(desiredVz, -0.6);
+
+        double az_cmd = 0.9 * (desiredVz - s.vz);
+
+        // If terrain known, keep safer clearance from possible overhang/ground in current column.
+        if (terrain.ready.load(std::memory_order_acquire)) {
+            double clr = terrain.clearanceAbove(s.x, s.y, s.z);
+            if (clr >= 0.0 && clr < 6.0) {
+                az_cmd = std::max(az_cmd, 2.0);
+            }
+        }
+
+        // Required total acceleration vector.
+        double req_ax = ax_cmd;
+        double req_ay = ay_cmd;
+        double req_az = gravity + az_cmd;
+
+        double req_norm = norm3(req_ax, req_ay, req_az);
+        double thrust = clampd(req_norm / std::max(max_thrust, 1e-6), 0.0, 1.0);
+
+        // Desired thrust direction in world frame.
+        double ux = 0.0, uy = 0.0, uz = 1.0;
+        if (req_norm > 1e-9) {
+            ux = req_ax / req_norm;
+            uy = req_ay / req_norm;
+            uz = req_az / req_norm;
+        }
+
+        // Convert desired direction to pitch/yaw for model where
+        // up_world = (-sin(pitch)*cos(yaw), -sin(pitch)*sin(yaw), cos(pitch)).
+        double pitch_des = std::acos(clampd(uz, -1.0, 1.0));
+        if (pitch_des > PI * 0.5) pitch_des = PI * 0.5;
+
+        double yaw_des = s.yaw;
+        double hxy = std::sqrt(ux * ux + uy * uy);
+        if (hxy > 1e-6) {
+            yaw_des = std::atan2(-uy, -ux);
+        }
+
+        // Keep tilt moderate near touchdown.
+        if (dz < 10.0 || horizDist < landingRadius * 1.5) {
+            pitch_des = std::min(pitch_des, 0.35);
+        }
+
+        // PD angular controller to command angular acceleration units.
+        double kp_ang = 2.2;
+        double kd_ang = 0.9;
+
+        double pitch_err = wrapPi(pitch_des - s.pitch);
+        double yaw_err = wrapPi(yaw_des - s.yaw);
+
+        double pitch_cmd = clampd(kp_ang * pitch_err - kd_ang * s.pitch_rate, -1.0, 1.0);
+        double yaw_cmd = clampd(kp_ang * yaw_err - kd_ang * s.yaw_rate, -1.0, 1.0);
+
+        // Roll is cosmetic: damp it to zero.
+        double roll_cmd = clampd(-1.8 * s.roll - 0.8 * s.roll_rate, -1.0, 1.0);
+
+        // If very low fuel, prioritize upright low-thrust controlled descent.
+        if (s.fuel < fuel0 * 0.08) {
+            pitch_des = 0.0;
+            pitch_err = wrapPi(pitch_des - s.pitch);
+            pitch_cmd = clampd(2.0 * pitch_err - 0.8 * s.pitch_rate, -1.0, 1.0);
+            yaw_cmd = clampd(-0.4 * s.yaw_rate, -1.0, 1.0);
+            thrust = std::min(thrust, 0.75);
+        }
+
+        // Final touchdown regime.
+        if (horizDist < landingRadius && dz < 6.0) {
+            double speed = norm3(s.vx, s.vy, s.vz);
+            if (speed < 3.5) {
+                pitch_des = 0.0;
+                pitch_err = wrapPi(pitch_des - s.pitch);
+                pitch_cmd = clampd(2.4 * pitch_err - 1.0 * s.pitch_rate, -1.0, 1.0);
+                yaw_cmd = clampd(-0.6 * s.yaw_rate, -1.0, 1.0);
+                double az_touch = 1.3 * (-0.4 - s.vz);
+                thrust = clampd((gravity + az_touch) / std::max(max_thrust, 1e-6), 0.0, 1.0);
+            }
+        }
+
+        return std::array<double, 4>{thrust, pitch_cmd, yaw_cmd, roll_cmd};
+    };
+
+    std::cout.setf(std::ios::fixed);
+    std::cout << std::setprecision(6);
+
+    State s;
+    while (true) {
+        if (!(std::cin >> s.x >> s.y >> s.z
+                     >> s.vx >> s.vy >> s.vz
+                     >> s.pitch >> s.yaw >> s.roll
+                     >> s.pitch_rate >> s.yaw_rate >> s.roll_rate
+                     >> s.fuel)) {
+            break;
+        }
+
+        auto out = controlStep(s);
+        std::cout << out[0] << ' ' << out[1] << ' ' << out[2] << ' ' << out[3] << '\n';
+        std::cout.flush();
+    }
+
+    if (terrainThread.joinable()) {
+        terrainThread.join();
+    }
+
+    return 0;
+}
