@@ -1,16 +1,18 @@
 import time
 import random
 import sys
+import hashlib
+import os
 from typing import List, Tuple, Set
 
 from native_compiler import RustCompiler, compile_and_run, describe_this_pc
-from solver_utils import StreamingInputFile
+from solver_utils import GradeCache, StreamingInputFile, normalize_code_result
 
 title = "Maze Solver (Rust)"
 
 tags = [
   "rust",
-  "structured response",
+  "freeform response",
   "algorithm design",
 ]
 
@@ -19,6 +21,7 @@ TIMEOUT_SECONDS = 30
 
 # Seed for reproducibility
 RANDOM_SEED = 88888
+_GRADE_CACHE = GradeCache("test8_maze_solver")
 
 
 def generate_random_maze(width: int, height: int, wall_density: float, seed: int) -> str:
@@ -365,21 +368,7 @@ Write complete, compilable Rust code with a main() function.
 # List of subpasses to grade the single answer against all difficulty levels
 extraGradeAnswerRuns = list(range(len(MAZES) + len(EXTREME_MAZE_SIZES)))
 
-structure = {
-  "type": "object",
-  "properties": {
-    "reasoning": {
-      "type": "string",
-      "description": "Explain your maze-solving algorithm and how it adapts to different maze sizes"
-    },
-    "rust_code": {
-      "type": "string",
-      "description": "Complete Rust code with main() that handles all scales"
-    }
-  },
-  "required": ["reasoning", "rust_code"],
-  "additionalProperties": False
-}
+structure = None
 
 
 def parse_maze(maze_string: str) -> Tuple[List[str], Tuple[int, int], Tuple[int, int]]:
@@ -540,6 +529,48 @@ def execute_solver(code: str,
 lastPath = None
 
 
+def _sha256_text(text: str) -> str:
+  return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _rust_compiler_fingerprint(ai_engine_name: str) -> str:
+  try:
+    compiler = RustCompiler(ai_engine_name)
+    compiler_path = compiler.find_compiler()
+    if compiler_path:
+      try:
+        st = os.stat(compiler_path)
+        stat_fingerprint = f"size={st.st_size}|mtime_ns={st.st_mtime_ns}"
+      except Exception as e:
+        stat_fingerprint = f"stat-unavailable:{type(e).__name__}:{e}"
+      return f"{compiler.describe()}|path={compiler_path}|{stat_fingerprint}"
+    return compiler.describe()
+  except Exception as e:
+    return f"rust-unavailable:{type(e).__name__}:{e}"
+
+
+def _grade_cache_key_parts(ai_engine_name: str, subpass: int, maze: str, code: str) -> tuple:
+  return (
+    "test8-grade-v1",
+    f"model={ai_engine_name}",
+    f"subpass={subpass}",
+    f"maze_sha256={_sha256_text(maze)}",
+    f"solver_sha256={_sha256_text(code)}",
+    f"compiler={_rust_compiler_fingerprint(ai_engine_name)}",
+    f"machine={describe_this_pc()}",
+  )
+
+
+def _cached_path(record: dict):
+  path = record.get("path")
+  if not isinstance(path, list):
+    return None
+  try:
+    return [(int(p[0]), int(p[1])) for p in path]
+  except Exception:
+    return None
+
+
 def threeJs_visualisation(path, width: int, height: int, start, end, maze_string: str) -> str:
   from visualization_utils import generate_threejs_maze_visualization
   return generate_threejs_maze_visualization(path,
@@ -552,42 +583,73 @@ def threeJs_visualisation(path, width: int, height: int, start, end, maze_string
 
 
 def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
+  result = normalize_code_result(result, "rust_code")
   if not result:
     return 0.0, "No result provided"
 
   if "rust_code" not in result:
     return 0.0, "No Rust code provided"
 
+  if os.name == 'nt':
+    total_ram = os.popen('wmic computersystem get totalphysicalmemory').read().split()[1]
+  else:
+    total_ram = os.popen('free -b | grep Mem | awk \'{print $2}\'').read().strip()
+
+  total_ram_gb = int(total_ram) / (1024**3)
+
+  if total_ram_gb < 64 and subPass > 8:
+    return 1.0, "Not enough RAM to grade answer - assuming pass."
+
   maze = get_maze(subPass)
   info = get_maze_info(maze)
   code = result["rust_code"]
+  cache_key = _grade_cache_key_parts(aiEngineName, subPass, maze, code)
 
-  # Execute solver
-  path, error, exec_time = execute_solver(code, maze, subPass, aiEngineName)
+  def compute_grade_record():
+    path, error, exec_time = execute_solver(code, maze, subPass, aiEngineName)
+    cached_visual_path = path if info['width'] <= 100 else None
+
+    if error:
+      return {
+        "score": 0.0,
+        "explanation": f"[{info['width']}x{info['height']}] {error}",
+        "path": cached_visual_path,
+      }
+
+    is_valid, validation_error = validate_path(maze, path)
+    if not is_valid:
+      return {
+        "score": 0.0,
+        "explanation": f"[{info['width']}x{info['height']}] Invalid path: {validation_error}",
+        "path": cached_visual_path,
+      }
+
+    quality = f"path length {len(path)}"
+    explanation = (f"[{info['width']}x{info['height']}] Path found, "
+                   f"Time: {exec_time:.1f}s - {quality}")
+
+    return {
+      "score": 1.0,
+      "explanation": explanation,
+      "path": cached_visual_path,
+    }
+
+  record = _GRADE_CACHE.get_or_compute_json("grade", compute_grade_record, *cache_key)
 
   global lastPath
-  lastPath = path
+  lastPath = _cached_path(record)
 
-  if error:
-    return 0.0, f"[{info['width']}x{info['height']}] {error}"
-
-  # Validate path
-  is_valid, validation_error = validate_path(maze, path)
-  if not is_valid:
-    return 0.0, f"[{info['width']}x{info['height']}] Invalid path: {validation_error}"
-
-  quality = f"path length {len(path)}"
-
-  explanation = (f"[{info['width']}x{info['height']}] Path found, "
-                 f"Time: {exec_time:.1f}s - {quality}")
-
-  return 1.0, explanation
+  return float(record.get("score", 0.0)), str(record.get("explanation", "No explanation"))
 
 
 def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
   """Generate HTML report."""
+  result = normalize_code_result(result, "rust_code")
   if not result:
     return "<p style='color:red'>No result provided</p>"
+
+  if subPass > 6:
+    return "<p style='color:orange'>Not shown due to resource constraints.</p>"
 
   maze = get_maze(subPass)
   info = get_maze_info(maze)

@@ -11,14 +11,14 @@ import random
 import subprocess
 import time
 from typing import List, Tuple, Optional, Dict, Any
-from native_compiler import RustCompiler, CompilationError, ExecutionError,describe_this_pc
-from solver_utils import StreamingInputFile
+from native_compiler import RustCompiler, CompilationError, ExecutionError, describe_this_pc
+from solver_utils import StreamingInputFile, normalize_code_result
 
 title = "Subset Sum (Rust)"
 
 tags = [
   "rust",
-  "structured response",
+  "freeform response",
   "np hard",
   "algorithm design",
 ]
@@ -26,8 +26,7 @@ TIMEOUT_SECONDS = 300
 RANDOM_SEED = 31313131
 
 
-def generate_subset_sum(n: int, max_val: int,
-                        seed: int) -> Tuple[List[int], int, List[int]]:
+def generate_subset_sum(n: int, max_val: int, seed: int) -> Tuple[List[int], int, List[int]]:
   """Generate subset sum instance with a known solution."""
   rng = random.Random(seed)
   nums = [rng.randint(1, max_val) for _ in range(n)]
@@ -138,9 +137,8 @@ STREAMING_THRESHOLD_N = 100_000
 def get_instance(subpass: int) -> Tuple[List[int], int, List[int]]:
   if subpass not in INSTANCE_CACHE:
     case = TEST_CASES[subpass]
-    nums, target, solution_indices = generate_subset_sum(
-      case["n"], case["max_val"], RANDOM_SEED + subpass
-    )
+    nums, target, solution_indices = generate_subset_sum(case["n"], case["max_val"],
+                                                         RANDOM_SEED + subpass)
     INSTANCE_CACHE[subpass] = (nums, target, solution_indices)
   return INSTANCE_CACHE[subpass]
 
@@ -242,23 +240,7 @@ Write complete, compilable Rust code with a main() function.
 
 extraGradeAnswerRuns = list(range(len(TEST_CASES)))
 
-structure = {
-  "type": "object",
-  "properties": {
-    "reasoning": {
-      "type":
-      "string",
-      "description":
-      "Explain your algorithm approach and how it adapts to different subset sum complexities"
-    },
-    "rust_code": {
-      "type": "string",
-      "description": "Complete Rust code with main function that handles all scales"
-    }
-  },
-  "required": ["reasoning", "rust_code"],
-  "additionalProperties": False
-}
+structure = None
 
 
 def verify_subset(nums: List[int], target: int, indices: List[int]) -> Tuple[bool, str]:
@@ -280,6 +262,7 @@ def verify_subset(nums: List[int], target: int, indices: List[int]) -> Tuple[boo
 
 
 def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
+  result = normalize_code_result(result, "rust_code")
   if not result or "rust_code" not in result:
     return 0.0, "No Rust code provided"
 
@@ -357,9 +340,8 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
       valid, msg = verify_subset(nums, target, indices)
 
       if case["n"] <= 200 and not use_streaming:
-        LAST_SUBSET_VIZ[(subPass, aiEngineName)] = _build_subset_viz(
-          nums, target, solution_indices, indices, valid, msg
-        )
+        LAST_SUBSET_VIZ[(subPass, aiEngineName)] = _build_subset_viz(nums, target, solution_indices,
+                                                                     indices, valid, msg)
 
       if valid:
         return 1.0, f"[{case['desc']}] Valid subset of {len(indices)} elements, {exec_time:.2f}s"
@@ -375,14 +357,15 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
 
 
 def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
+  result = normalize_code_result(result, "rust_code")
   if not result:
     return "<p style='color:red'>No result provided</p>"
   case = TEST_CASES[subPass]
   html = f"<h4>Subset Sum - {case['desc']}</h4>"
-  if "reasoning" in result and subPass ==0:
+  if "reasoning" in result and subPass == 0:
     r = result['reasoning'][:400] + ('...' if len(result.get('reasoning', '')) > 400 else '')
     html += f"<p><strong>Approach:</strong> {r.replace('<', '&lt;').replace('>', '&gt;')}</p>"
-  if "rust_code" in result and subPass ==0:
+  if "rust_code" in result and subPass == 0:
     code = result["rust_code"].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     html += f"<details><summary>View Rust Code ({len(result['rust_code'])} chars)</summary><pre>{code}</pre></details>"
   viz = LAST_SUBSET_VIZ.get((subPass, aiEngineName))
@@ -434,14 +417,12 @@ def _generate_subset_viz_html(viz: dict) -> str:
   chips = []
   for item in items:
     fill = color_map[item["status"]][0]
-    chips.append(
-      "<div style='display:flex;flex-direction:column;align-items:center;gap:2px;"
-      "padding:6px 4px;border-radius:6px;background:#0f172a;border:1px solid #1f2937;'>"
-      f"<div style='font-size:11px;color:#e2e8f0'>{item['value']}</div>"
-      f"<div style='font-size:9px;color:#94a3b8'>#{item['index']}</div>"
-      f"<div style='width:14px;height:14px;border-radius:50%;background:{fill};'></div>"
-      "</div>"
-    )
+    chips.append("<div style='display:flex;flex-direction:column;align-items:center;gap:2px;"
+                 "padding:6px 4px;border-radius:6px;background:#0f172a;border:1px solid #1f2937;'>"
+                 f"<div style='font-size:11px;color:#e2e8f0'>{item['value']}</div>"
+                 f"<div style='font-size:9px;color:#94a3b8'>#{item['index']}</div>"
+                 f"<div style='width:14px;height:14px;border-radius:50%;background:{fill};'></div>"
+                 "</div>")
 
   legend_items = []
   for key in ("tp", "fp", "fn", "tn"):
@@ -450,43 +431,33 @@ def _generate_subset_viz_html(viz: dict) -> str:
       "<div style='display:flex;align-items:center;gap:6px;'>"
       f"<span style='width:12px;height:12px;border-radius:3px;background:{color};display:inline-block;'></span>"
       f"<span style='color:#cbd5f5;font-size:11px;'>{label}</span>"
-      "</div>"
-    )
+      "</div>")
 
   status = "VALID" if viz["valid"] else "INVALID"
   status_color = "#22c55e" if viz["valid"] else "#f97316"
-  header = (
-    f"<div style='color:#e2e8f0;font-size:13px;margin-bottom:6px;'>"
-    f"<strong>Subset Visualization</strong> &mdash; "
-    f"<span style='color:{status_color};'>{status}</span> "
-    f"(target={viz['target']}, chosen_sum={viz['chosen_sum']})</div>"
-  )
+  header = (f"<div style='color:#e2e8f0;font-size:13px;margin-bottom:6px;'>"
+            f"<strong>Subset Visualization</strong> &mdash; "
+            f"<span style='color:{status_color};'>{status}</span> "
+            f"(target={viz['target']}, chosen_sum={viz['chosen_sum']})</div>")
   if viz.get("message"):
-    header += (
-      f"<div style='color:#94a3b8;font-size:11px;margin-bottom:6px;'>"
-      f"{viz['message']}</div>"
-    )
+    header += (f"<div style='color:#94a3b8;font-size:11px;margin-bottom:6px;'>"
+               f"{viz['message']}</div>")
 
   more_note = ""
   if total > max_items:
-    more_note = (
-      f"<div style='color:#94a3b8;font-size:11px;margin-top:6px;'>"
-      f"Showing first {max_items} of {total} numbers.</div>"
-    )
+    more_note = (f"<div style='color:#94a3b8;font-size:11px;margin-top:6px;'>"
+                 f"Showing first {max_items} of {total} numbers.</div>")
 
   return (
     "<div style='margin:12px 0;padding:10px;border:1px solid #1f2937;"
     "border-radius:8px;background:#0b1120;'>"
     f"{header}"
-    "<div style='display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px;'>"
-    + "".join(legend_items) +
+    "<div style='display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px;'>" + "".join(legend_items) +
     "</div>"
     "<div style='display:grid;grid-template-columns:repeat(auto-fill, minmax(70px, 1fr));gap:6px;'>"
-    + "".join(chips) +
-    "</div>"
+    + "".join(chips) + "</div>"
     f"{more_note}"
-    "</div>"
-  )
+    "</div>")
 
 
 highLevelSummary = """

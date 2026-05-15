@@ -13,6 +13,7 @@ import math
 import traceback
 
 from visualization_utils import generate_threejs_car_path
+from solver_utils import normalize_code_result
 
 from car_sim import (
   make_car_truth, CarSensorModel, CarSimRunner, RoadModel, Obstacle,
@@ -24,7 +25,7 @@ title = "Self-Driving Car Highway Autopilot (Python)"
 
 tags = [
   "python",
-  "structured response",
+  "freeform response",
   "control systems",
   "simulation",
 ]
@@ -487,21 +488,7 @@ Your single autopilot function must handle ALL scenarios.
 
 extraGradeAnswerRuns = list(range(1, len(SCENARIOS)))
 
-structure = {
-  "type": "object",
-  "properties": {
-    "reasoning": {
-      "type": "string",
-      "description": "Explain your autopilot design"
-    },
-    "python_code": {
-      "type": "string",
-      "description": "Complete Python code defining autopilot_step(state, dt)"
-    }
-  },
-  "required": ["reasoning", "python_code"],
-  "additionalProperties": False
-}
+structure = None
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Grading
@@ -557,6 +544,7 @@ def _setup_scenario(idx):
 
 
 def gradeAnswer(result, subPass, aiEngineName):
+  result = normalize_code_result(result, "python_code")
   if not result or 'python_code' not in result:
     return 0.0, 'No Python code provided'
 
@@ -647,6 +635,7 @@ def _run_crosswind(runner, autopilot_fn):
 # Visualization for HTML report
 # ──────────────────────────────────────────────────────────────────────────────
 def resultToNiceReport(result, subPass, aiEngineName):
+  result = normalize_code_result(result, "python_code")
   sc_idx = subPass
   if sc_idx >= len(SCENARIOS):
     return ''

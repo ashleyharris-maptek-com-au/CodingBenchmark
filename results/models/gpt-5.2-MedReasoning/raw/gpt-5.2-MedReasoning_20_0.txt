@@ -1,0 +1,386 @@
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap};
+use std::hash::{BuildHasherDefault, Hasher};
+use std::io::{self, Read};
+
+// A small, fast hasher for integer-ish keys (not cryptographically secure).
+#[derive(Default)]
+struct FastHasher(u64);
+impl Hasher for FastHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        // Simple xor-mix; good enough for hash map bucketing in this task.
+        let mut h = self.0 ^ 0x9E37_79B9_7F4A_7C15u64;
+        for &b in bytes {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100_0000_01B3u64);
+            h ^= h >> 32;
+        }
+        self.0 = h;
+    }
+    fn write_u64(&mut self, i: u64) {
+        let mut h = self.0 ^ i.wrapping_add(0x9E37_79B9_7F4A_7C15u64);
+        h ^= h >> 33;
+        h = h.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+        h ^= h >> 33;
+        h = h.wrapping_mul(0xC4CE_B9FE_1A85_EC53);
+        h ^= h >> 33;
+        self.0 = h;
+    }
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+type FastBuildHasher = BuildHasherDefault<FastHasher>;
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct CellKey(u64);
+
+fn pack_cell(cx: i32, cy: i32, cz: i32) -> CellKey {
+    // Pack 3 signed 21-bit coords into 63 bits (with bias).
+    // Bias ensures stable packing for negative coordinates.
+    const BIAS: i64 = 1 << 20; // fits i32 comfortably
+    let bx = (cx as i64 + BIAS) as u64 & ((1u64 << 21) - 1);
+    let by = (cy as i64 + BIAS) as u64 & ((1u64 << 21) - 1);
+    let bz = (cz as i64 + BIAS) as u64 & ((1u64 << 21) - 1);
+    CellKey((bx << 42) | (by << 21) | bz)
+}
+
+fn is_finite_f32(v: f32) -> bool {
+    v.is_finite()
+}
+
+fn median_sorted(values: &mut [f32]) -> f32 {
+    let n = values.len();
+    if n == 0 {
+        return f32::NAN;
+    }
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+    if n % 2 == 1 {
+        values[n / 2]
+    } else {
+        0.5 * (values[n / 2 - 1] + values[n / 2])
+    }
+}
+
+fn robust_z_score(value: f32, neighbor_values: &mut Vec<f32>) -> Option<f32> {
+    // Returns robust z-score using median and MAD.
+    if neighbor_values.len() < 5 || !value.is_finite() {
+        return None;
+    }
+    let med = median_sorted(neighbor_values.as_mut_slice());
+    if !med.is_finite() {
+        return None;
+    }
+    // MAD
+    let mut devs: Vec<f32> = neighbor_values.iter().map(|&x| (x - med).abs()).collect();
+    let mad = median_sorted(devs.as_mut_slice());
+    let scale = (mad * 1.4826).max(1e-6);
+    Some(((value - med).abs()) / scale)
+}
+
+#[derive(Clone)]
+struct Point {
+    hole_id: usize,
+    sample_idx: usize,
+    x: f32,
+    y: f32,
+    z: f32,
+}
+
+#[derive(Clone)]
+struct Suspect {
+    conf: f32,
+    hole_id: usize,
+    sample_idx: usize,
+    prop_idx: usize,
+}
+
+// For a min-heap of suspects by confidence.
+#[derive(Clone)]
+struct HeapItem(Suspect);
+impl PartialEq for HeapItem {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.conf == other.0.conf
+    }
+}
+impl Eq for HeapItem {}
+impl PartialOrd for HeapItem {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        // Reverse ordering for min-heap behavior in BinaryHeap (which is a max-heap).
+        other.0.conf.partial_cmp(&self.0.conf)
+    }
+}
+impl Ord for HeapItem {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.partial_cmp(other).unwrap_or(Ordering::Equal)
+    }
+}
+
+fn main() {
+    // ----- Read & tokenize input -----
+    let mut input = String::new();
+    io::stdin().read_to_string(&mut input).unwrap();
+    let mut it = input.split_whitespace();
+
+    let num_holes: usize = match it.next() {
+        Some(s) => s.parse().unwrap_or(0),
+        None => return,
+    };
+    let num_props: usize = match it.next() {
+        Some(s) => s.parse().unwrap_or(0),
+        None => return,
+    };
+    if num_holes == 0 || num_props == 0 {
+        println!("0");
+        return;
+    }
+
+    let mut prop_names: Vec<String> = Vec::with_capacity(num_props);
+    for _ in 0..num_props {
+        if let Some(p) = it.next() {
+            prop_names.push(p.to_string());
+        } else {
+            println!("0");
+            return;
+        }
+    }
+
+    let mut hole_name_to_idx: HashMap<String, usize, FastBuildHasher> =
+        HashMap::with_capacity_and_hasher(num_holes * 2 + 1, Default::default());
+    let mut hole_names: Vec<String> = Vec::with_capacity(num_holes);
+
+    let mut points: Vec<Point> = Vec::new();
+    let mut props: Vec<f32> = Vec::new(); // flat: N * num_props
+
+    let mut minx = f32::INFINITY;
+    let mut miny = f32::INFINITY;
+    let mut minz = f32::INFINITY;
+    let mut maxx = f32::NEG_INFINITY;
+    let mut maxy = f32::NEG_INFINITY;
+    let mut maxz = f32::NEG_INFINITY;
+
+    // ----- Parse holes -----
+    for _ in 0..num_holes {
+        let hole_id = match it.next() {
+            Some(s) => s.to_string(),
+            None => break,
+        };
+
+        let parse_f64 = |s: Option<&str>| -> f64 { s.and_then(|v| v.parse().ok()).unwrap_or(0.0) };
+        let sx = parse_f64(it.next());
+        let sy = parse_f64(it.next());
+        let sz = parse_f64(it.next());
+        let dx = parse_f64(it.next());
+        let dy = parse_f64(it.next());
+        let dz = parse_f64(it.next());
+        let _length = parse_f64(it.next());
+        let nsamples: usize = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+
+        let hole_idx = *hole_name_to_idx.entry(hole_id.clone()).or_insert_with(|| {
+            let idx = hole_names.len();
+            hole_names.push(hole_id);
+            idx
+        });
+
+        let dlen = (dx * dx + dy * dy + dz * dz).sqrt();
+        let (nx, ny, nz) = if dlen > 0.0 {
+            (dx / dlen, dy / dlen, dz / dlen)
+        } else {
+            (0.0, 0.0, 1.0)
+        };
+
+        for sample_idx in 0..nsamples {
+            let depth = it.next().and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
+            let x = (sx + nx * depth) as f32;
+            let y = (sy + ny * depth) as f32;
+            let z = (sz + nz * depth) as f32;
+
+            minx = minx.min(x);
+            miny = miny.min(y);
+            minz = minz.min(z);
+            maxx = maxx.max(x);
+            maxy = maxy.max(y);
+            maxz = maxz.max(z);
+
+            points.push(Point {
+                hole_id: hole_idx,
+                sample_idx,
+                x,
+                y,
+                z,
+            });
+
+            // read num_props values (missing/invalid => NaN)
+            for _ in 0..num_props {
+                let v = match it.next() {
+                    Some(s) => s.parse::<f32>().unwrap_or(f32::NAN),
+                    None => f32::NAN,
+                };
+                props.push(v);
+            }
+        }
+    }
+
+    let n = points.len();
+    if n == 0 {
+        println!("0");
+        return;
+    }
+
+    // ----- Adaptive spatial hashing parameters -----
+    let dx = (maxx - minx) as f64;
+    let dy = (maxy - miny) as f64;
+    let dz = (maxz - minz) as f64;
+    let diag = (dx * dx + dy * dy + dz * dz).sqrt().max(1e-6);
+    let target_neighbors = if n < 20_000 { 64.0 } else { 32.0 };
+    let mut radius = (diag * (target_neighbors / n as f64).cbrt()) * 1.2;
+    // Clamp to avoid pathological radius for tiny/degenerate extents.
+    radius = radius.clamp(diag / 1000.0, diag / 10.0);
+    if !radius.is_finite() || radius <= 0.0 {
+        radius = 1.0;
+    }
+    let radius2 = (radius as f32) * (radius as f32);
+    let cell_size = radius as f32;
+
+    // ----- Build grid (cell -> point indices) -----
+    let mut grid: HashMap<CellKey, Vec<usize>, FastBuildHasher> =
+        HashMap::with_capacity_and_hasher((n / 4).max(1024), Default::default());
+
+    for (i, p) in points.iter().enumerate() {
+        let cx = ((p.x - minx) / cell_size).floor() as i32;
+        let cy = ((p.y - miny) / cell_size).floor() as i32;
+        let cz = ((p.z - minz) / cell_size).floor() as i32;
+        grid.entry(pack_cell(cx, cy, cz)).or_default().push(i);
+    }
+
+    // Strategy switches for very large datasets:
+    // - Reduce maximum neighbors examined per point
+    // - Limit output to top results
+    let max_neighbors: usize = if n < 200_000 { 96 } else { 48 };
+    let min_neighbors: usize = if n < 5_000 { 3 } else { 5 };
+    let max_output: usize = if n < 200_000 { 20_000 } else { 10_000 };
+    let z_threshold: f32 = if n < 50_000 { 6.0 } else { 7.0 };
+
+    // ----- Outlier detection -----
+    let mut heap: BinaryHeap<HeapItem> = BinaryHeap::with_capacity(max_output + 1);
+    let mut neighbor_idx: Vec<usize> = Vec::with_capacity(max_neighbors * 2);
+    let mut neighbor_vals: Vec<f32> = Vec::with_capacity(max_neighbors);
+
+    for i in 0..n {
+        let p = &points[i];
+        let cx0 = ((p.x - minx) / cell_size).floor() as i32;
+        let cy0 = ((p.y - miny) / cell_size).floor() as i32;
+        let cz0 = ((p.z - minz) / cell_size).floor() as i32;
+
+        neighbor_idx.clear();
+
+        // Expand search radius in cell space if sparse.
+        let mut found = 0usize;
+        for expand in 1..=2 {
+            for dzc in -expand..=expand {
+                for dyc in -expand..=expand {
+                    for dxc in -expand..=expand {
+                        let key = pack_cell(cx0 + dxc, cy0 + dyc, cz0 + dzc);
+                        if let Some(list) = grid.get(&key) {
+                            for &j in list {
+                                if j == i {
+                                    continue;
+                                }
+                                let q = &points[j];
+                                let dx = p.x - q.x;
+                                let dy = p.y - q.y;
+                                let dz = p.z - q.z;
+                                let d2 = dx * dx + dy * dy + dz * dz;
+                                if d2 <= radius2 {
+                                    neighbor_idx.push(j);
+                                    found += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if found >= min_neighbors {
+                break;
+            }
+        }
+
+        if neighbor_idx.len() < min_neighbors {
+            continue;
+        }
+
+        // Keep only up to max_neighbors nearest among the collected (simple partial selection).
+        if neighbor_idx.len() > max_neighbors {
+            // Compute distances; then nth_element-like via sort on small vectors.
+            let mut tmp: Vec<(f32, usize)> = neighbor_idx
+                .iter()
+                .map(|&j| {
+                    let q = &points[j];
+                    let dx = p.x - q.x;
+                    let dy = p.y - q.y;
+                    let dz = p.z - q.z;
+                    (dx * dx + dy * dy + dz * dz, j)
+                })
+                .collect();
+            tmp.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
+            neighbor_idx.clear();
+            neighbor_idx.extend(tmp.iter().take(max_neighbors).map(|&(_, j)| j));
+        }
+
+        // For each property, compute robust z-score vs neighbors.
+        let base = i * num_props;
+        for prop_idx in 0..num_props {
+            let v = props[base + prop_idx];
+            if !is_finite_f32(v) {
+                continue;
+            }
+            neighbor_vals.clear();
+            for &j in &neighbor_idx {
+                let nv = props[j * num_props + prop_idx];
+                if is_finite_f32(nv) {
+                    neighbor_vals.push(nv);
+                }
+            }
+            if neighbor_vals.len() < min_neighbors {
+                continue;
+            }
+            let z = match robust_z_score(v, &mut neighbor_vals) {
+                Some(z) => z,
+                None => continue,
+            };
+            if z < z_threshold {
+                continue;
+            }
+            // Confidence in [0,1), saturating with z
+            let conf = 1.0 - (-0.35 * (z - z_threshold)).exp();
+            let suspect = Suspect {
+                conf,
+                hole_id: p.hole_id,
+                sample_idx: p.sample_idx,
+                prop_idx,
+            };
+            if heap.len() < max_output {
+                heap.push(HeapItem(suspect));
+            } else if let Some(top) = heap.peek().cloned() {
+                // heap is min-heap via reversed ordering: peek() gives smallest conf
+                if suspect.conf > top.0.conf {
+                    heap.pop();
+                    heap.push(HeapItem(suspect));
+                }
+            }
+        }
+    }
+
+    // ----- Emit results sorted by confidence desc -----
+    let mut suspects: Vec<Suspect> = heap.into_iter().map(|h| h.0).collect();
+    suspects.sort_by(|a, b| b.conf.partial_cmp(&a.conf).unwrap_or(Ordering::Equal));
+
+    println!("{}", suspects.len());
+    for s in suspects {
+        let hole = &hole_names[s.hole_id];
+        let prop = &prop_names[s.prop_idx];
+        // sample_idx is 0-based internally; output as 0-based (explicitly stable).
+        println!("{} {} {} {:.6}", hole, s.sample_idx, prop, s.conf);
+    }
+}

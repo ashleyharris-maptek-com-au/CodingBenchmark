@@ -13,6 +13,7 @@ import math
 import traceback
 
 from visualization_utils import generate_threejs_docking_viz
+from solver_utils import normalize_code_result
 
 from orbital_sim import (
   make_dock_truth,
@@ -34,14 +35,14 @@ title = "Spacecraft Orbital Docking Autopilot (Python)"
 
 tags = [
   "python",
-  "structured response",
+  "freeform response",
   "control systems",
   "simulation",
 ]
 TIMEOUT_SECONDS = 120
 
-_HISTORY_CACHE = {}   # {(aiEngineName, subPass): history_list}
-_OUTCOME_CACHE = {}   # {(aiEngineName, subPass): (docked, crashed, crash_reason)}
+_HISTORY_CACHE = {}  # {(aiEngineName, subPass): history_list}
+_OUTCOME_CACHE = {}  # {(aiEngineName, subPass): (docked, crashed, crash_reason)}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -326,21 +327,7 @@ Persistence: module-level variables persist across calls within a scenario.
 
 extraGradeAnswerRuns = list(range(1, len(SCENARIOS)))
 
-structure = {
-  "type": "object",
-  "properties": {
-    "reasoning": {
-      "type": "string",
-      "description": "Explain your docking autopilot design"
-    },
-    "python_code": {
-      "type": "string",
-      "description": "Complete Python code defining autopilot_step(state, dt)"
-    }
-  },
-  "required": ["reasoning", "python_code"],
-  "additionalProperties": False
-}
+structure = None
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -369,6 +356,7 @@ def _setup_scenario(idx):
 
 
 def gradeAnswer(result, subPass, aiEngineName):
+  result = normalize_code_result(result, "python_code")
   if not result or 'python_code' not in result:
     return 0.0, 'No Python code provided'
 
@@ -388,7 +376,7 @@ def gradeAnswer(result, subPass, aiEngineName):
 
   sc = SCENARIOS[sc_idx]
   runner, _ = _setup_scenario(sc_idx)
-  steps = sc.get('steps', 3600)
+  steps = sc.get('steps', 3600) * 10
   print(f'  Scenario {sc_idx}: {sc["name"]}')
 
   try:
@@ -401,8 +389,7 @@ def gradeAnswer(result, subPass, aiEngineName):
 
   # Cache for visualization
   _HISTORY_CACHE[(aiEngineName, sc_idx)] = runner.history
-  _OUTCOME_CACHE[(aiEngineName, sc_idx)] = (
-    runner.docked, runner.crashed, runner.crash_reason)
+  _OUTCOME_CACHE[(aiEngineName, sc_idx)] = (runner.docked, runner.crashed, runner.crash_reason)
 
   return score, f'[{sc["name"]}] {details}'
 
@@ -411,6 +398,7 @@ def gradeAnswer(result, subPass, aiEngineName):
 # Visualization for HTML report
 # ──────────────────────────────────────────────────────────────────────────────
 def resultToNiceReport(result, subPass, aiEngineName):
+  result = normalize_code_result(result, "python_code")
   sc_idx = subPass
   if sc_idx >= len(SCENARIOS):
     return ''
@@ -419,14 +407,10 @@ def resultToNiceReport(result, subPass, aiEngineName):
   if not history:
     return ''
   # Extract LVLH relative positions [x_rad, y_along, z_cross]
-  path = [
-    [round(h['rel_pos'][0], 2),
-     round(h['rel_pos'][1], 2),
-     round(h['rel_pos'][2], 2)]
-    for h in history
-  ]
-  docked, crashed, crash_reason = _OUTCOME_CACHE.get(
-    (aiEngineName, sc_idx), (False, False, ''))
+  path = [[round(h['rel_pos'][0], 2),
+           round(h['rel_pos'][1], 2),
+           round(h['rel_pos'][2], 2)] for h in history]
+  docked, crashed, crash_reason = _OUTCOME_CACHE.get((aiEngineName, sc_idx), (False, False, ''))
   return generate_threejs_docking_viz(
     path,
     scenario_name=sc['name'],

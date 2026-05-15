@@ -1,0 +1,257 @@
+from math import sqrt, copysign
+
+# Persistent controller state
+_STATE = {
+    'init': False,
+    'fused_pos': [0.0, -200.0, 0.0],
+    'fused_vel': [0.0, 0.0, 0.0],
+    'last_cmd': [0.0, 0.0, 0.0],
+    'int_err': [0.0, 0.0, 0.0],
+    'range_ema': None,
+    'cam_bias': [0.0, 0.0, 0.0],
+}
+
+
+def _clamp(v, lo, hi):
+    return lo if v < lo else hi if v > hi else v
+
+
+def _safe_avg(vals):
+    return sum(vals) / len(vals) if vals else None
+
+
+def _get_axis_measurements(state, prefix, axis):
+    pos = state.get(f"{prefix}_rel_pos_{axis}_m", 0.0)
+    vel = state.get(f"{prefix}_rel_vel_{axis}_ms", 0.0)
+    p_ok = bool(state.get(f"{prefix}_rel_{axis}_valid", False))
+    v_ok = bool(state.get(f"{prefix}_relv_{axis}_valid", False))
+    return pos if p_ok else None, vel if v_ok else None
+
+
+def _fuse_rel(state, prev_pos, prev_vel, dt):
+    fused_pos = [0.0, 0.0, 0.0]
+    fused_vel = [0.0, 0.0, 0.0]
+    axes = ['x', 'y', 'z']
+
+    for i, a in enumerate(axes):
+        r_p, r_v = _get_axis_measurements(state, 'radar', a)
+        l_p, l_v = _get_axis_measurements(state, 'lidar', a)
+
+        p_vals = []
+        v_vals = []
+        if r_p is not None:
+            p_vals.append(r_p)
+        if l_p is not None:
+            p_vals.append(l_p)
+        if r_v is not None:
+            v_vals.append(r_v)
+        if l_v is not None:
+            v_vals.append(l_v)
+
+        p_meas = _safe_avg(p_vals)
+        v_meas = _safe_avg(v_vals)
+
+        p_pred = prev_pos[i] + prev_vel[i] * dt
+        v_pred = prev_vel[i]
+
+        if p_meas is None and v_meas is None:
+            fused_pos[i] = p_pred
+            fused_vel[i] = v_pred
+            continue
+
+        # Trust velocity a bit more than position for noisy far-range geometry
+        if v_meas is None:
+            fused_vel[i] = v_pred
+        else:
+            fused_vel[i] = 0.35 * v_pred + 0.65 * v_meas
+
+        if p_meas is None:
+            fused_pos[i] = p_pred
+        else:
+            fused_pos[i] = 0.25 * p_pred + 0.75 * p_meas
+
+        # Consistency correction: if position implies very different rate, blend gently
+        implied_v = (fused_pos[i] - prev_pos[i]) / max(dt, 1e-3)
+        fused_vel[i] = 0.8 * fused_vel[i] + 0.2 * implied_v
+
+    return fused_pos, fused_vel
+
+
+def autopilot_step(state: dict, dt: float) -> dict:
+    global _STATE
+
+    dt = max(0.02, min(float(dt), 2.0))
+
+    if not _STATE['init']:
+        _STATE['init'] = True
+        # Initialize from any valid relative sensors
+        p, v = _fuse_rel(state, _STATE['fused_pos'], _STATE['fused_vel'], dt)
+        _STATE['fused_pos'] = p
+        _STATE['fused_vel'] = v
+
+    # Fuse relative state with dropout handling
+    pos, vel = _fuse_rel(state, _STATE['fused_pos'], _STATE['fused_vel'], dt)
+
+    # Scalar range fusion (rangefinders + derived norm)
+    rf = []
+    for i in (1, 2, 3):
+        if state.get(f'range_{i}_valid', False):
+            rf.append(float(state.get(f'range_{i}_m', 0.0)))
+
+    cam_active = bool(state.get('dock_camera_active', False))
+    cam_range = float(state.get('dock_camera_range_m', 0.0)) if cam_active else None
+
+    derived_range = sqrt(pos[0]*pos[0] + pos[1]*pos[1] + pos[2]*pos[2])
+    r_meas = _safe_avg(rf)
+    if r_meas is None:
+        r_meas = cam_range if (cam_range is not None and cam_range > 0.0) else derived_range
+    else:
+        if cam_range is not None and cam_range > 0.0:
+            r_meas = 0.7 * r_meas + 0.3 * cam_range
+
+    if _STATE['range_ema'] is None:
+        _STATE['range_ema'] = r_meas
+    else:
+        _STATE['range_ema'] = 0.85 * _STATE['range_ema'] + 0.15 * r_meas
+    rng = max(0.0, _STATE['range_ema'])
+
+    rel_speed = sqrt(vel[0]*vel[0] + vel[1]*vel[1] + vel[2]*vel[2])
+
+    fuel_pct = float(state.get('fuel_remaining_pct', 100.0))
+    fuel_kg = float(state.get('fuel_remaining_kg', 500.0))
+    low_fuel = (fuel_pct < 15.0) or (fuel_kg < 60.0)
+
+    # Phase-based guidance with orbital-aware along-track behavior
+    if rng > 200.0:
+        phase = 'far'
+        target_speed = min(2.0, 0.06 * rng)
+    elif rng > 50.0:
+        phase = 'medium'
+        target_speed = min(0.8, 0.03 * rng)
+    elif rng > 10.0:
+        phase = 'close'
+        target_speed = min(0.25, 0.02 * rng)
+    else:
+        phase = 'final'
+        target_speed = 0.08
+
+    if low_fuel:
+        target_speed *= 0.8
+
+    # Desired closing direction toward origin
+    if rng > 1e-6:
+        ux, uy, uz = (-pos[0]/rng, -pos[1]/rng, -pos[2]/rng)
+    else:
+        ux, uy, uz = (0.0, 0.0, 0.0)
+
+    # Primary velocity target (toward dock)
+    vtx = ux * target_speed
+    vty = uy * target_speed
+    vtz = uz * target_speed
+
+    # Orbital mechanics shaping for along-track (y):
+    # If behind (y < 0) and far, use slight retrograde bias to lower orbit/catch up.
+    y = pos[1]
+    vy = vel[1]
+    if phase == 'far':
+        if y < -80.0:
+            vty += -0.35
+        elif y > 80.0:
+            vty += 0.25
+    elif phase == 'medium':
+        if y < -30.0:
+            vty += -0.12
+        elif y > 30.0:
+            vty += 0.10
+
+    # Keep cross-track and radial rates conservative
+    vtx = _clamp(vtx, -0.6, 0.6)
+    vty = _clamp(vty, -1.2, 1.2)
+    vtz = _clamp(vtz, -0.6, 0.6)
+
+    # Velocity control (PI-like with small integral to reject uncommanded thrust)
+    evx = vtx - vel[0]
+    evy = vty - vy
+    evz = vtz - vel[2]
+
+    ki = 0.015 if phase in ('close', 'final') else 0.008
+    _STATE['int_err'][0] = _clamp(_STATE['int_err'][0] + evx * dt, -5.0, 5.0)
+    _STATE['int_err'][1] = _clamp(_STATE['int_err'][1] + evy * dt, -5.0, 5.0)
+    _STATE['int_err'][2] = _clamp(_STATE['int_err'][2] + evz * dt, -5.0, 5.0)
+
+    kp = 0.9 if phase == 'far' else 1.0 if phase == 'medium' else 1.25
+
+    tx = kp * evx + ki * _STATE['int_err'][0]
+    ty = kp * evy + ki * _STATE['int_err'][1]
+    tz = kp * evz + ki * _STATE['int_err'][2]
+
+    # Soft position damping near dock to avoid oscillation
+    if phase in ('close', 'final'):
+        tx += _clamp(-0.02 * pos[0], -0.25, 0.25)
+        ty += _clamp(-0.02 * pos[1], -0.25, 0.25)
+        tz += _clamp(-0.02 * pos[2], -0.25, 0.25)
+
+    # Emergency braking when closing too fast
+    closing_speed = -(pos[0]*vel[0] + pos[1]*vel[1] + pos[2]*vel[2]) / max(rng, 1e-3)
+    max_close = 2.5 if phase == 'far' else 1.0 if phase == 'medium' else 0.35 if phase == 'close' else 0.12
+    if closing_speed > max_close:
+        b = min(1.0, (closing_speed - max_close) / max(0.1, max_close))
+        tx -= ux * b
+        ty -= uy * b
+        tz -= uz * b
+
+    # Deadband at docking capture
+    if rng < 2.0 and rel_speed < 0.3:
+        tx *= 0.2
+        ty *= 0.2
+        tz *= 0.2
+
+    # Fuel-aware thrust scaling
+    thrust_cap = 1.0
+    if low_fuel:
+        thrust_cap = 0.65 if rng > 20.0 else 0.45
+
+    tx = _clamp(tx, -thrust_cap, thrust_cap)
+    ty = _clamp(ty, -thrust_cap, thrust_cap)
+    tz = _clamp(tz, -thrust_cap, thrust_cap)
+
+    # Slew-rate limit to prevent chatter under flickering sensors
+    max_step = 0.35 if phase in ('far', 'medium') else 0.2
+    ltx, lty, ltz = _STATE['last_cmd']
+    tx = _clamp(tx, ltx - max_step, ltx + max_step)
+    ty = _clamp(ty, lty - max_step, lty + max_step)
+    tz = _clamp(tz, ltz - max_step, ltz + max_step)
+    _STATE['last_cmd'] = [tx, ty, tz]
+
+    # Attitude rates: keep near zero, damp gyro if valid
+    def gyro_axis(name):
+        vals = []
+        for i in (1, 2, 3):
+            if state.get(f'gyro_{i}_{name}_valid', False):
+                vals.append(float(state.get(f'gyro_{i}_{name}_dps', 0.0)))
+        return _safe_avg(vals)
+
+    roll_dps = gyro_axis('roll')
+    pitch_dps = gyro_axis('pitch')
+    yaw_dps = gyro_axis('yaw')
+
+    d2r = 0.017453292519943295
+    rr = -0.15 * (roll_dps * d2r) if roll_dps is not None else 0.0
+    rp = -0.15 * (pitch_dps * d2r) if pitch_dps is not None else 0.0
+    ry = -0.15 * (yaw_dps * d2r) if yaw_dps is not None else 0.0
+
+    rr = _clamp(rr, -0.035, 0.035)
+    rp = _clamp(rp, -0.035, 0.035)
+    ry = _clamp(ry, -0.035, 0.035)
+
+    _STATE['fused_pos'] = pos
+    _STATE['fused_vel'] = vel
+
+    return {
+        'thrust_x': float(tx),
+        'thrust_y': float(ty),
+        'thrust_z': float(tz),
+        'att_rate_roll': float(rr),
+        'att_rate_pitch': float(rp),
+        'att_rate_yaw': float(ry),
+    }

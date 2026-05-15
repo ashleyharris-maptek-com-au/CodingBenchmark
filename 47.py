@@ -30,12 +30,13 @@ import numpy as np
 
 from shader_test_utils import compile_wgsl
 from compute_test_utils import ComputeShaderRunner, grade_compute
+from solver_utils import normalize_code_result
 
 title = "Hash Mining / Proof of Work (WGSL Compute)"
 
 tags = [
   "wgsl",
-  "structured response",
+  "freeform response",
   "gpu compute",
   "algorithm design",
 ]
@@ -230,21 +231,7 @@ The shader must implement the exact hash function described above.
 
 extraGradeAnswerRuns = list(range(1, len(SUBPASSES)))
 
-structure = {
-  "type": "object",
-  "properties": {
-    "reasoning": {
-      "type": "string",
-      "description": "Explain your approach to the hash mining compute shader"
-    },
-    "shader_code": {
-      "type": "string",
-      "description": "Complete WGSL compute shader source code"
-    }
-  },
-  "required": ["reasoning", "shader_code"],
-  "additionalProperties": False
-}
+structure = None
 
 _runner_cache = None
 _base_data = None
@@ -253,6 +240,7 @@ _REPORT_CACHE = {}
 
 
 def _grade_answer_inner(result, subPass, aiEngineName):
+  result = normalize_code_result(result, "shader_code")
   global _runner_cache, _base_data, _ref_cache
 
   if not result or "shader_code" not in result:
@@ -367,6 +355,7 @@ def _grade_answer_inner(result, subPass, aiEngineName):
 
 def gradeAnswer(result, subPass, aiEngineName):
   """Run grading in an isolated subprocess to survive GPU hangs/TDRs."""
+  result = normalize_code_result(result, "shader_code")
   if not result or "shader_code" not in result:
     return 0.0, "No shader code provided"
 
@@ -436,6 +425,7 @@ if __name__ == "__main__":
 
 
 def resultToNiceReport(result, subPass, aiEngineName):
+  result = normalize_code_result(result, "shader_code")
   report = _REPORT_CACHE.get((aiEngineName, subPass), {})
   difficulty = report.get("difficulty")
   range_size = report.get("range_size")

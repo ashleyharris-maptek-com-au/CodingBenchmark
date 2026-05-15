@@ -1,0 +1,590 @@
+use std::io::{self, BufRead, BufReader, Write};
+use std::thread;
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::{Duration, Instant};
+
+const TARGET_FREQUENCY_HZ: f64 = 20.0;
+const TIME_STEP: Duration = Duration::from_secs_f64(1.0 / TARGET_FREQUENCY_HZ); // Time step in seconds
+
+// --- PID Controller ---
+struct PIDController {
+    kp: f64,
+    ki: f64,
+    kd: f64,
+    previous_error: f64,
+    integral: f64,
+    last_time: Instant,
+    output_limits: (f64, f64), // Min and max output for the controller
+}
+
+impl PIDController {
+    fn new(kp: f64, ki: f64, kd: f64, output_limits: (f64, f64)) -> Self {
+        PIDController {
+            kp,
+            ki,
+            kd,
+            previous_error: 0.0,
+            integral: 0.0,
+            last_time: Instant::now(),
+            output_limits,
+        }
+    }
+
+    fn update(&mut self, setpoint: f64, process_variable: f64) -> f64 {
+        let now = Instant::now();
+        let dt = (now - self.last_time).as_secs_f64();
+        self.last_time = now;
+
+        if dt <= 0.0 {
+            // If dt is zero or negative, only P and D terms might be calculable, or return a default.
+            // For simplicity, let's return a PD-like output if dt is negligible.
+            let error = setpoint - process_variable;
+            return self.clamp_output(self.kp * error + self.kd * (error - self.previous_error) / 0.0001); // Use a tiny dt to avoid division by zero
+        }
+
+        let error = setpoint - process_variable;
+        self.integral += error * dt;
+        
+        // Simple anti-windup: do not integrate if output is saturated.
+        // This is a basic form. More advanced methods exist.
+        let p_term = self.kp * error;
+        let d_term = self.kd * (error - self.previous_error) / dt;
+        let tentative_output = p_term + self.ki * self.integral + d_term;
+
+        let clamped_tentative_output = self.clamp_output(tentative_output);
+
+        // If the tentative output was saturated, and the error is pushing it further into saturation,
+        // do not update the integral.
+        if (tentative_output > self.output_limits.1 && error > 0.0) || (tentative_output < self.output_limits.0 && error < 0.0) {
+            // Integral term not updated to prevent windup
+        } else {
+            self.integral = self.integral.max(self.output_limits.0 / self.ki).min(self.output_limits.1 / self.ki); // Basic integral clamping
+        }
+
+
+        self.previous_error = error;
+        clamped_tentative_output
+    }
+
+    fn clamp_output(&self, output: f64) -> f64 {
+        output.max(self.output_limits.0).min(self.output_limits.1)
+    }
+
+    fn reset(&mut self) {
+        self.integral = 0.0;
+        self.previous_error = 0.0;
+        self.last_time = Instant::now();
+    }
+}
+
+// --- Game Configuration and State ---
+struct GameConfig {
+    width: f64,
+    height: f64,
+    gravity: f64,
+    max_thrust: f64,
+    max_fuel: f64,
+    start_x: f64,
+    start_y: f64,
+    target_x: f64,
+    target_y: f64,
+    map: Vec<Vec<char>>,
+}
+
+struct ShipState {
+    x: f64,
+    y: f64,
+    vx: f64,
+    vy: f64,
+    angle: f64, // Radians, 0 is up, positive is clockwise
+    angular_vel: f64,
+    fuel_remaining: f64,
+}
+
+// --- Parsing Functions ---
+fn parse_config(line: String) -> Option<GameConfig> {
+    let mut parts = line.split_whitespace();
+    if let (Ok(width), Ok(height), Ok(gravity), Ok(max_thrust), Ok(max_fuel), Ok(start_x), Ok(start_y), Ok(target_x), Ok(target_y)) = (
+        parts.next()?.parse::<f64>(),
+        parts.next()?.parse::<f64>(),
+        parts.next()?.parse::<f64>(),
+        parts.next()?.parse::<f64>(),
+        parts.next()?.parse::<f64>(),
+        parts.next()?.parse::<f64>(),
+        parts.next()?.parse::<f64>(),
+        parts.next()?.parse::<f64>(),
+        parts.next()?.parse::<f64>(),
+    ) {
+        Some(GameConfig {
+            width,
+            height,
+            gravity,
+            max_thrust,
+            max_fuel,
+            start_x,
+            start_y,
+            target_x,
+            target_y,
+            map: Vec::new(), // Map will be populated later
+        })
+    } else {
+        None
+    }
+}
+
+fn parse_state(line: String) -> Option<ShipState> {
+    let mut parts = line.split_whitespace();
+    if let (Ok(x), Ok(y), Ok(vx), Ok(vy), Ok(angle), Ok(angular_vel), Ok(fuel_remaining)) = (
+        parts.next()?.parse::<f64>(),
+        parts.next()?.parse::<f64>(),
+        parts.next()?.parse::<f64>(),
+        parts.next()?.parse::<f64>(),
+        parts.next()?.parse::<f64>(),
+        parts.next()?.parse::<f64>(),
+        parts.next()?.parse::<f64>(),
+    ) {
+        Some(ShipState {
+            x,
+            y,
+            vx,
+            vy,
+            angle,
+            angular_vel,
+            fuel_remaining,
+        })
+    } else {
+        None
+    }
+}
+
+// --- Lander Controller ---
+struct LanderController {
+    config: GameConfig,
+    vertical_pid: PIDController,
+    angle_pid: PIDController,
+    // For trajectory prediction and obstacle checking:
+    // We'll simulate physics step-by-step to predict future positions.
+}
+
+impl LanderController {
+    fn new(config: GameConfig) -> Self {
+        // PID Tuning: These values are crucial and would typically require extensive tuning.
+        // For vertical control: Aiming to reduce vertical velocity to 0.
+        let vertical_pid = PIDController::new(
+            2.0,  // kp: Proportional gain
+            0.5,  // ki: Integral gain
+            1.0,  // kd: Derivative gain
+            (0.0, 1.0), // Output limits for thrust (0.0 to 1.0)
+        );
+
+        // For angle control: Aiming to face the target position.
+        let angle_pid = PIDController::new(
+            1.5,  // kp
+            0.1,  // ki
+            0.5,  // kd
+            (-1.0, 1.0), // Output limits for turn (-1.0 to 1.0)
+        );
+
+        LanderController {
+            config,
+            vertical_pid,
+            angle_pid,
+        }
+    }
+
+    // Calculates thrust and turn commands based on current state and map information.
+    fn decide_controls(&mut self, state: &ShipState) -> (f64, f64) {
+        let mut thrust = 0.0;
+        let mut turn = 0.0;
+
+        // --- Target Calculation ---
+        let target_dx = self.config.target_x - state.x;
+        let target_dy = self.config.target_y - state.y; // y increases downwards
+
+        // Angle to target (radians, 0 is up, positive clockwise)
+        let angle_to_target = target_dy.atan2(target_dx);
+
+        // --- Angle Control ---
+        // Use PID to face the target.
+        turn = self.angle_pid.update(angle_to_target, state.angle);
+
+        // --- Thrust Control ---
+        const SAFE_LANDING_SPEED: f64 = 2.0; // m/s
+
+        // Determine target vertical velocity based on altitude.
+        let mut target_vy_setpoint = 0.0;
+        if (self.config.target_y - state.y).abs() < 10.0 { // If close to target altitude
+            target_vy_setpoint = 0.0; // Aim for zero vertical velocity for final touchdown
+        } else {
+            target_vy_setpoint = SAFE_LANDING_SPEED; // Aim to reach landing speed
+        }
+
+        // Calculate PID output for vertical velocity control.
+        // PID output maps to thrust magnitude [0, 1].
+        thrust = self.vertical_pid.update(target_vy_setpoint, state.vy);
+
+        // --- Fuel Management ---
+        let fuel_needed_this_step = thrust * self.config.max_thrust * TIME_STEP.as_secs_f64();
+        if state.fuel_remaining < fuel_needed_this_step {
+            thrust = 0.0; // Not enough fuel, cut thrust.
+        }
+
+        // --- Basic Obstacle and Landing Zone Checks ---
+        // This is a simplified check. A real implementation would need more sophisticated trajectory prediction.
+        let mut safe_to_proceed = true;
+        let mut best_turn_adjustment = turn; // Start with the PID-suggested turn
+
+        // Predict trajectory for the next few steps to check for collisions.
+        // We'll simulate a few steps forward.
+        const PREDICTION_STEPS: usize = 5; // Predict for next 5 steps (approx 250ms)
+        let mut current_sim_state = ShipState {
+            x: state.x,
+            y: state.y,
+            vx: state.vx,
+            vy: state.vy,
+            angle: state.angle,
+            angular_vel: state.angular_vel,
+            fuel_remaining: state.fuel_remaining, // Note: Fuel is not simulated in prediction for simplicity
+        };
+
+        // Temporary state for simulation to avoid affecting real state
+        let mut sim_thrust = thrust;
+        let mut sim_turn = turn;
+        
+        // If angle is not facing the target, prioritize turning and potentially reduce thrust.
+        let desired_angle_for_landing = angle_to_target;
+        const ANGLE_TOLERANCE_FOR_THRUST: f64 = std::f64::consts::PI / 180.0 * 15.0; // 15 degrees tolerance
+        let angle_diff_from_target = (state.angle - desired_angle_for_landing).abs();
+        
+        let facing_target_direction = angle_diff_from_target < ANGLE_TOLERANCE_FOR_THRUST;
+
+        // If not facing target, we might need to adjust thrust to a minimum or zero
+        // to prioritize turning.
+        if !facing_target_direction {
+            sim_thrust = 0.0; // Reduce thrust to prioritize turning
+            best_turn_adjustment = self.angle_pid.update(desired_angle_for_landing, state.angle);
+        } else {
+            // If facing target, use the calculated thrust.
+            sim_thrust = thrust;
+            best_turn_adjustment = turn; // Use PID-suggested turn
+        }
+        
+        // Basic check if trajectory is going towards target and away from obstacles
+        // This prediction is very basic and assumes controls remain constant.
+        for _ in 0..PREDICTION_STEPS {
+            // Simulate one physics step
+            let (next_state, physics_safe) = self.simulate_step(&current_sim_state, sim_thrust, best_turn_adjustment);
+            if !physics_safe {
+                safe_to_proceed = false; // Physics simulation failed (e.g., invalid state)
+                break;
+            }
+            current_sim_state = next_state;
+
+            // Check grid cell at predicted position
+            if let Some((grid_x, grid_y)) = self.coords_to_grid(current_sim_state.x, current_sim_state.y) {
+                if grid_y >= self.config.map.len() || grid_x >= self.config.map[grid_y].len() {
+                    // Out of map bounds during prediction
+                    safe_to_proceed = false;
+                    break;
+                }
+                let map_char = self.config.map[grid_y][grid_x];
+
+                if map_char == '#' {
+                    // Collision with obstacle detected in prediction!
+                    safe_to_proceed = false;
+                    // Try to steer away. A simple heuristic: turn left.
+                    // More advanced: check if turning right is better.
+                    best_turn_adjustment = -0.5; // Turn left to try and avoid obstacle
+                    // Recalculate thrust based on new turn and state.
+                    // This is a reactive step and could be recursive or iterative.
+                    // For simplicity, we'll just adjust turn and hope for the best in the next cycle.
+                    // We might need to apply a small thrust to move away.
+                    if state.vy > 0.0 { sim_thrust = 0.1; } // Gentle thrust down to get off obstacle if falling
+                    break; // Stop prediction, re-evaluate controls in main loop
+                }
+                
+                // Check if predicted position is on landing zone
+                if map_char == 'T' || map_char == 'L' {
+                    // We are predicted to land on the target/zone. Good.
+                    // Ensure final vertical velocity is low.
+                    if current_sim_state.vy.abs() > SAFE_LANDING_SPEED * 1.5 { // If predicted speed is too high for landing zone
+                        safe_to_proceed = false; // Not safe to land with this speed.
+                        // Try to reduce thrust and rely on PID for velocity control.
+                        sim_thrust = (sim_thrust * 0.5).max(0.0); // Reduce thrust to slow down.
+                        break;
+                    }
+                }
+            } else {
+                // Predicted position is outside map bounds.
+                safe_to_proceed = false;
+                break;
+            }
+        }
+
+        // --- Final Control Decision ---
+        if safe_to_proceed {
+            // If prediction is safe, use calculated thrust and turn.
+            thrust = sim_thrust;
+            turn = best_turn_adjustment;
+        } else {
+            // If prediction indicated danger, we've already tried to adjust 'best_turn_adjustment' and 'sim_thrust'.
+            // Use these adjusted values.
+            thrust = sim_thrust;
+            turn = best_turn_adjustment;
+
+            // If we detected an obstacle, try to give a small thrust to move away,
+            // but prioritize turning away.
+            if !facing_target_direction && turn < 0.0 { // If we had to turn left to avoid obstacle
+                thrust = (thrust * 0.5).max(0.05); // Apply some minimal thrust to help clear the area
+            }
+        }
+
+        // --- Fuel Management Re-check ---
+        let fuel_needed_this_step = thrust * self.config.max_thrust * TIME_STEP.as_secs_f64();
+        if state.fuel_remaining < fuel_needed_this_step {
+            thrust = 0.0; // Not enough fuel, cut thrust.
+        }
+
+        // --- Final Clamping ---
+        thrust = thrust.max(0.0).min(1.0);
+        turn = turn.max(-1.0).min(1.0);
+
+        (thrust, turn)
+    }
+
+    // Helper to simulate one physics step for prediction.
+    // Returns the next state and a boolean indicating if the simulation was valid.
+    fn simulate_step(&self, current_state: &ShipState, thrust_cmd: f64, turn_cmd: f64) -> (ShipState, bool) {
+        // Basic physics simulation:
+        // gravity pulls down (positive vy)
+        // thrust applies force in lander's facing direction
+        // turn applies angular velocity
+
+        let dt = TIME_STEP.as_secs_f64();
+
+        // --- Angular Velocity and Angle ---
+        // Clamp turn command to PID output limits, if they are set.
+        let turn_cmd_clamped = turn_cmd.max(-1.0).min(1.0); // Assume turn_cmd is already clamped by PID limits [-1, 1]
+
+        let new_angular_vel = current_state.angular_vel + turn_cmd_clamped * dt; // Simplified: turn rate directly affects angular vel.
+        let new_angle = current_state.angle + new_angular_vel * dt;
+        
+        // Normalize angle to be within [-PI, PI] or [0, 2PI] for consistency
+        let mut normalized_angle = new_angle;
+        while normalized_angle > std::f64::consts::PI { normalized_angle -= 2.0 * std::f64::consts::PI; }
+        while normalized_angle < -std::f64::consts::PI { normalized_angle += 2.0 * std::f64::consts::PI; }
+
+        // --- Thrust and Velocity ---
+        let mut thrust_force_x = 0.0;
+        let mut thrust_force_y = 0.0;
+        let mut fuel_used = 0.0;
+
+        if thrust_cmd > 0.0 {
+            // Thrust is applied in the direction of `current_state.angle`.
+            // Angle 0 is up. Positive is clockwise.
+            // To get force components:
+            // F_x = thrust * max_thrust * sin(angle) (positive x is right)
+            // F_y = thrust * max_thrust * cos(angle) (positive y is down)
+            let engine_force = thrust_cmd * self.config.max_thrust;
+            thrust_force_x = engine_force * new_angle.sin();
+            thrust_force_y = engine_force * new_angle.cos(); // cos(0)=1 (up), cos(PI)=-1 (down) - this is incorrect for y-down convention
+                                                            // If angle 0 is up, and positive angle is clockwise, then:
+                                                            // For thrust UP: angle is 0, cos(0)=1. F_y should be negative.
+                                                            // For thrust DOWN: angle is PI, cos(PI)=-1. F_y should be positive.
+                                                            // So, F_y = -thrust * max_thrust * cos(angle) for y-down convention.
+            thrust_force_y = -engine_force * new_angle.cos(); // Corrected for y-down convention.
+
+            // Fuel calculation
+            fuel_used = thrust_cmd * self.config.max_thrust * dt; // Assuming 1 unit fuel/sec at max thrust
+        }
+
+        // --- Gravity ---
+        // Assuming mass = 1.0. Gravity pulls downwards.
+        let gravity_force_y = self.config.gravity;
+
+        // --- Update Velocity ---
+        // F_net_x = thrust_force_x
+        // F_net_y = thrust_force_y + gravity_force_y
+        let vx = current_state.vx + thrust_force_x * dt; // assuming mass = 1.0
+        let vy = current_state.vy + (thrust_force_y + gravity_force_y) * dt; // assuming mass = 1.0
+
+        // --- Update Position ---
+        let x = current_state.x + vx * dt;
+        let y = current_state.y + vy * dt;
+        
+        // --- Check for invalid states ---
+        // If position goes out of bounds or velocity becomes NaN, consider it invalid.
+        if x.is_nan() || y.is_nan() || vx.is_nan() || vy.is_nan() || normalized_angle.is_nan() || new_angular_vel.is_nan() {
+            return (ShipState { x: 0.0, y: 0.0, vx: 0.0, vy: 0.0, angle: 0.0, angular_vel: 0.0, fuel_remaining: 0.0 }, false);
+        }
+
+        // Basic boundary check (though map checks should handle this more granularly)
+        if x < 0.0 || y < 0.0 || x > self.config.width * 2.0 || y > self.config.height * 2.0 { // Allow some buffer
+            // Consider out of bounds a failure in prediction.
+            return (ShipState { x: 0.0, y: 0.0, vx: 0.0, vy: 0.0, angle: 0.0, angular_vel: 0.0, fuel_remaining: 0.0 }, false);
+        }
+
+        (ShipState {
+            x,
+            y,
+            vx,
+            vy,
+            angle: normalized_angle,
+            angular_vel: new_angular_vel,
+            fuel_remaining: current_state.fuel_remaining - fuel_used, // Fuel is only consumed if thrust > 0
+        }, true)
+    }
+
+    // Helper to check if a coordinate is within map bounds
+    fn is_within_map(&self, x: f64, y: f64) -> bool {
+        x >= 0.0 && x < self.config.width && y >= 0.0 && y < self.config.height
+    }
+
+    // Helper to convert continuous coords to grid cell indices
+    fn coords_to_grid(&self, x: f64, y: f64) -> Option<(usize, usize)> {
+        if self.is_within_map(x, y) {
+            let grid_x = (x as usize); // Integer part gives grid cell
+            let grid_y = (y as usize);
+            Some((grid_x, grid_y))
+        } else {
+            None
+        }
+    }
+    
+    // Checks if a given grid cell is an obstacle.
+    fn is_obstacle_at_grid(&self, grid_x: usize, grid_y: usize) -> bool {
+        if grid_y < self.config.map.len() && grid_x < self.config.map[grid_y].len() {
+            self.config.map[grid_y][grid_x] == '#'
+        } else {
+            true // Treat out-of-bounds as an obstacle
+        }
+    }
+
+    // Checks if a given grid cell is part of the landing zone or target.
+    fn is_landing_target_at_grid(&self, grid_x: usize, grid_y: usize) -> bool {
+        if grid_y < self.config.map.len() && grid_x < self.config.map[grid_y].len() {
+            self.config.map[grid_y][grid_x] == 'T' || self.config.map[grid_y][grid_x] == 'L'
+        } else {
+            false
+        }
+    }
+}
+
+
+fn main() {
+    let stdin = io::stdin();
+    let mut stdout = io::stdout();
+
+    let mut reader = BufReader::new(stdin.lock());
+    
+    let (tx, rx) = mpsc::channel::<String>();
+
+    // Input thread: Reads from stdin and sends lines to the main thread
+    thread::spawn(move || {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => break, // EOF
+                Ok(_) => {
+                    if tx.send(line.clone()).is_err() {
+                        break; // Receiver dropped
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Input thread read error: {}", e);
+                    break;
+                }
+            }
+        }
+    });
+
+    let mut game_config: Option<GameConfig> = None;
+    let mut map_rows: Vec<Vec<char>> = Vec::new();
+    let mut lander_controller: Option<LanderController> = None;
+
+    let mut start_time = Instant::now(); // For timing the loop
+
+    loop {
+        match rx.recv_timeout(TIME_STEP) {
+            Ok(line) => {
+                let trimmed_line = line.trim_end();
+
+                if game_config.is_none() {
+                    // --- Parse Initial Configuration ---
+                    if let Some(cfg) = parse_config(trimmed_line.to_string()) {
+                        game_config = Some(cfg);
+                        lander_controller = Some(LanderController::new(game_config.as_ref().unwrap().clone()));
+                    } else {
+                        eprintln!("Failed to parse game configuration from line: {}", trimmed_line);
+                        return; // Critical error, cannot proceed
+                    }
+                } else if lander_controller.is_none() {
+                    eprintln!("Error: Lander controller not initialized after config parsing.");
+                    return;
+                }
+                else {
+                    let expected_map_rows = game_config.as_ref().map_or(0, |cfg| cfg.height as usize);
+
+                    if map_rows.len() < expected_map_rows {
+                        // --- Parse Map Rows ---
+                        if trimmed_line.parse::<f64>().is_err() {
+                            map_rows.push(trimmed_line.chars().collect());
+                            if map_rows.len() == expected_map_rows {
+                                if let Some(ref mut cfg) = game_config {
+                                    cfg.map = map_rows.clone();
+                                }
+                            }
+                        } else {
+                            eprintln!("Warning: Expected map row, but received potential state update line: {}", trimmed_line);
+                            if let Some(ref mut cfg) = game_config {
+                                cfg.map = map_rows.clone();
+                            }
+                            if let Some(state) = parse_state(trimmed_line.to_string()) {
+                                process_state_update(lander_controller.as_mut().unwrap(), state, &mut stdout, &mut start_time);
+                            } else {
+                                eprintln!("Failed to parse ship state from line: {}", trimmed_line);
+                            }
+                        }
+                    } else {
+                        // --- Parse State Updates ---
+                        if let Some(state) = parse_state(trimmed_line.to_string()) {
+                            process_state_update(lander_controller.as_mut().unwrap(), state, &mut stdout, &mut start_time);
+                        } else {
+                            eprintln!("Failed to parse ship state from line: {}", trimmed_line);
+                        }
+                    }
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // Timeout occurred. No new input. External system might detect stall.
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                eprintln!("Input channel disconnected. Exiting.");
+                break; // Exit loop
+            }
+        }
+    }
+}
+
+// Helper function to process a state update and output controls
+fn process_state_update(
+    controller: &mut LanderController,
+    state: ShipState,
+    stdout: &mut io::Stdout,
+    start_time: &mut Instant,
+) {
+    let (thrust, turn) = controller.decide_controls(&state);
+
+    // --- Output ---
+    let output_line = format!("{:.6} {:.6}
+", thrust, turn);
+    if let Err(e) = stdout.write_all(output_line.as_bytes()) {
+        eprintln!("Error writing to stdout: {}", e);
+    }
+    if let Err(e) = stdout.flush() {
+        eprintln!("Error flushing stdout: {}", e);
+    }
+    
+    *start_time = Instant::now(); // Reset timer for next cycle
+}

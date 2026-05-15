@@ -1,0 +1,594 @@
+﻿using System;
+using System.Collections.Generic;
+using System.Runtime.CompilerServices;
+
+public static class Program
+{
+    // Minesweeper solver that outputs only provably safe moves (never guesses).
+    //
+    // Strategy:
+    // 1) Fast local inference (single-number rules): if remaining mines == remaining unknown => all unknown are mines;
+    //    if remaining mines == 0 => all unknown are safe.
+    // 2) Subset inference between constraints: A âŠ† B => derive new constraint on B\A.
+    // 3) If the frontier (unknown cells adjacent to numbers) is small, run exact component-wise CSP enumeration
+    //    to prove some cells are always safe across all solutions consistent with revealed numbers + flagged mines.
+    //
+    // Adaptive:
+    // - For huge boards, it builds constraints only around revealed numbers (frontier-based).
+    // - CSP is applied only on small connected components to stay scalable.
+    public static void Main()
+    {
+        string? header = Console.ReadLine();
+        if (header == null)
+        {
+            Console.WriteLine("0");
+            return;
+        }
+        header = header.TrimEnd();
+        if (header.Length == 0)
+        {
+            Console.WriteLine("0");
+            return;
+        }
+
+        var parts = header.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length < 2 || !int.TryParse(parts[0], out int h) || !int.TryParse(parts[1], out int w) || h < 0 || w < 0)
+        {
+            Console.WriteLine("0");
+            return;
+        }
+
+        var grid = new char[h][];
+        for (int y = 0; y < h; y++)
+        {
+            string? line = Console.ReadLine();
+            if (line == null) line = "";
+            if (line.Length < w) line = line + new string(' ', w - line.Length);
+            else if (line.Length > w) line = line.Substring(0, w);
+            grid[y] = line.ToCharArray();
+        }
+
+        var solver = new Solver(grid, h, w);
+        var safe = solver.Solve();
+
+        Console.WriteLine(safe.Count);
+        for (int i = 0; i < safe.Count; i++)
+        {
+            Console.WriteLine($"{safe[i].x} {safe[i].y}");
+        }
+    }
+
+    private sealed class Solver
+    {
+        private readonly char[][] g;
+        private readonly int H, W;
+
+        private readonly List<Constraint> constraints = new();
+        private readonly Dictionary<int, int> frontierIndex = new();
+        private readonly List<int> frontierCells = new();
+        private readonly HashSet<int> provenSafe = new();
+        private readonly HashSet<int> provenMine = new();
+        private readonly Dictionary<int, List<int>> frontierToConstraints = new();
+
+        private const int MaxFrontierForCsp = 70;
+        private const int MaxComponentVarsForCsp = 26;
+        private const int MaxComponentStatesBudget = 2_000_000;
+        private const int MaxSubsetIterations = 6;
+
+        public Solver(char[][] grid, int h, int w)
+        {
+            g = grid;
+            H = h;
+            W = w;
+        }
+
+        public List<(int x, int y)> Solve()
+        {
+            BuildConstraints();
+
+            bool changed;
+            int iters = 0;
+            do
+            {
+                changed = false;
+                changed |= ApplySingleNumberRules();
+                changed |= ApplySubsetRules();
+                changed |= ApplySingleNumberRules();
+                iters++;
+            } while (changed && iters < 32);
+
+            if (frontierCells.Count <= MaxFrontierForCsp)
+                RunComponentCsp();
+
+            var result = new List<(int x, int y)>(provenSafe.Count);
+            foreach (int id in provenSafe)
+            {
+                int x = id % W;
+                int y = id / W;
+                if (InBounds(x, y) && g[y][x] == ' ')
+                    result.Add((x, y));
+            }
+            return result;
+        }
+
+        private void BuildConstraints()
+        {
+            constraints.Clear();
+            frontierIndex.Clear();
+            frontierCells.Clear();
+            provenSafe.Clear();
+            provenMine.Clear();
+            frontierToConstraints.Clear();
+
+            for (int y = 0; y < H; y++)
+            {
+                var row = g[y];
+                for (int x = 0; x < W; x++)
+                {
+                    char c = row[x];
+                    if (c < '0' || c > '8') continue;
+                    int number = c - '0';
+
+                    Span<int> neigh = stackalloc int[8];
+                    int nCount = 0;
+                    int flagged = 0;
+                    for (int dy = -1; dy <= 1; dy++)
+                    {
+                        for (int dx = -1; dx <= 1; dx++)
+                        {
+                            if (dx == 0 && dy == 0) continue;
+                            int nx = x + dx, ny = y + dy;
+                            if (!InBounds(nx, ny)) continue;
+                            char nc = g[ny][nx];
+                            if (nc == '*') flagged++;
+                            else if (nc == ' ')
+                                neigh[nCount++] = CellId(nx, ny);
+                        }
+                    }
+                    int minesNeeded = number - flagged;
+                    if (minesNeeded < 0) continue;
+                    if (nCount == 0) continue;
+
+                    var vars = new int[nCount];
+                    for (int i = 0; i < nCount; i++) vars[i] = GetOrAddFrontier(neigh[i]);
+                    Array.Sort(vars);
+
+                    int cIndex = constraints.Count;
+                    constraints.Add(new Constraint(vars, minesNeeded));
+                    for (int i = 0; i < vars.Length; i++)
+                    {
+                        int cellId = frontierCells[vars[i]];
+                        if (!frontierToConstraints.TryGetValue(cellId, out var list))
+                        {
+                            list = new List<int>(2);
+                            frontierToConstraints[cellId] = list;
+                        }
+                        list.Add(cIndex);
+                    }
+                }
+            }
+        }
+
+        private bool ApplySingleNumberRules()
+        {
+            bool changed = false;
+            for (int ci = 0; ci < constraints.Count; ci++)
+            {
+                var c = constraints[ci];
+                if (c.Vars.Length == 0) continue;
+
+                int unknown = 0;
+                int minesFixed = 0;
+                for (int i = 0; i < c.Vars.Length; i++)
+                {
+                    int cellId = frontierCells[c.Vars[i]];
+                    if (provenMine.Contains(cellId)) minesFixed++;
+                    else if (!provenSafe.Contains(cellId)) unknown++;
+                }
+                int remaining = c.Mines - minesFixed;
+                if (remaining < 0) continue;
+                if (unknown == 0) continue;
+
+                if (remaining == 0)
+                {
+                    for (int i = 0; i < c.Vars.Length; i++)
+                    {
+                        int cellId = frontierCells[c.Vars[i]];
+                        if (provenSafe.Contains(cellId) || provenMine.Contains(cellId)) continue;
+                        provenSafe.Add(cellId);
+                        changed = true;
+                    }
+                }
+                else if (remaining == unknown)
+                {
+                    for (int i = 0; i < c.Vars.Length; i++)
+                    {
+                        int cellId = frontierCells[c.Vars[i]];
+                        if (provenSafe.Contains(cellId) || provenMine.Contains(cellId)) continue;
+                        provenMine.Add(cellId);
+                        changed = true;
+                    }
+                }
+            }
+            return changed;
+        }
+
+        private bool ApplySubsetRules()
+        {
+            if (constraints.Count < 2) return false;
+            bool changed = false;
+
+            var visitedPairs = new HashSet<long>();
+            int passes = 0;
+            bool passChanged;
+            do
+            {
+                passChanged = false;
+                visitedPairs.Clear();
+
+                for (int v = 0; v < frontierCells.Count; v++)
+                {
+                    int cellId = frontierCells[v];
+                    if (!frontierToConstraints.TryGetValue(cellId, out var clist) || clist.Count < 2) continue;
+
+                    for (int i = 0; i < clist.Count; i++)
+                    {
+                        int aIdx = clist[i];
+                        var A0 = constraints[aIdx];
+                        var A = A0.ActiveView(frontierCells, provenSafe, provenMine);
+                        if (A.Vars.Length == 0) continue;
+
+                        for (int j = i + 1; j < clist.Count; j++)
+                        {
+                            int bIdx = clist[j];
+                            long key = PairKey(aIdx, bIdx);
+                            if (!visitedPairs.Add(key)) continue;
+
+                            var B0 = constraints[bIdx];
+                            var B = B0.ActiveView(frontierCells, provenSafe, provenMine);
+                            if (B.Vars.Length == 0) continue;
+
+                            if (TryDeriveFromSubset(A, B, out var derived1) && derived1.Vars.Length > 0)
+                            {
+                                AddDerivedConstraint(derived1);
+                                passChanged = true;
+                            }
+                            if (TryDeriveFromSubset(B, A, out var derived2) && derived2.Vars.Length > 0)
+                            {
+                                AddDerivedConstraint(derived2);
+                                passChanged = true;
+                            }
+                        }
+                    }
+                }
+
+                changed |= passChanged;
+                passes++;
+            } while (passChanged && passes < MaxSubsetIterations);
+
+            return changed;
+        }
+
+        private void AddDerivedConstraint(Constraint derived)
+        {
+            Array.Sort(derived.Vars);
+            int idx = constraints.Count;
+            constraints.Add(derived);
+            for (int i = 0; i < derived.Vars.Length; i++)
+            {
+                int cellId = frontierCells[derived.Vars[i]];
+                if (!frontierToConstraints.TryGetValue(cellId, out var list))
+                {
+                    list = new List<int>(2);
+                    frontierToConstraints[cellId] = list;
+                }
+                list.Add(idx);
+            }
+        }
+
+        private static bool TryDeriveFromSubset(ActiveConstraint A, ActiveConstraint B, out Constraint derived)
+        {
+            derived = default;
+            if (A.Vars.Length == 0 || B.Vars.Length == 0) return false;
+            if (A.Vars.Length > B.Vars.Length) return false;
+
+            if (!IsSubsetSorted(A.Vars, B.Vars, out int[] diffVars))
+                return false;
+
+            int mines = B.Mines - A.Mines;
+            if (mines < 0 || mines > diffVars.Length) return false;
+            derived = new Constraint(diffVars, mines);
+            return true;
+        }
+
+        private void RunComponentCsp()
+        {
+            var varToConstraints = new List<int>[frontierCells.Count];
+            for (int v = 0; v < frontierCells.Count; v++) varToConstraints[v] = new List<int>(2);
+            for (int ci = 0; ci < constraints.Count; ci++)
+            {
+                var c = constraints[ci];
+                for (int i = 0; i < c.Vars.Length; i++)
+                    varToConstraints[c.Vars[i]].Add(ci);
+            }
+
+            var seen = new bool[frontierCells.Count];
+            var queue = new Queue<int>();
+
+            for (int start = 0; start < frontierCells.Count; start++)
+            {
+                int startCellId = frontierCells[start];
+                if (provenSafe.Contains(startCellId) || provenMine.Contains(startCellId))
+                {
+                    seen[start] = true;
+                    continue;
+                }
+                if (seen[start]) continue;
+
+                var compVars = new List<int>();
+                var compConstraintsSet = new HashSet<int>();
+                queue.Clear();
+                queue.Enqueue(start);
+                seen[start] = true;
+
+                while (queue.Count > 0)
+                {
+                    int v = queue.Dequeue();
+                    int cellId = frontierCells[v];
+                    if (provenSafe.Contains(cellId) || provenMine.Contains(cellId)) continue;
+                    compVars.Add(v);
+
+                    foreach (int ci in varToConstraints[v])
+                    {
+                        compConstraintsSet.Add(ci);
+                        var c0 = constraints[ci];
+                        for (int k = 0; k < c0.Vars.Length; k++)
+                        {
+                            int u = c0.Vars[k];
+                            int uCellId = frontierCells[u];
+                            if (provenSafe.Contains(uCellId) || provenMine.Contains(uCellId)) continue;
+                            if (!seen[u])
+                            {
+                                seen[u] = true;
+                                queue.Enqueue(u);
+                            }
+                        }
+                    }
+                }
+
+                if (compVars.Count == 0) continue;
+                if (compVars.Count > MaxComponentVarsForCsp) continue;
+
+                var compConstraints = new List<ActiveConstraint>();
+                foreach (int ci in compConstraintsSet)
+                {
+                    var ac = constraints[ci].ActiveView(frontierCells, provenSafe, provenMine);
+                    if (ac.Vars.Length != 0) compConstraints.Add(ac);
+                }
+                if (compConstraints.Count == 0) continue;
+
+                compVars.Sort();
+                var map = new Dictionary<int, int>(compVars.Count);
+                for (int i = 0; i < compVars.Count; i++) map[compVars[i]] = i;
+
+                var remappedConstraints = new List<SmallConstraint>(compConstraints.Count);
+                for (int i = 0; i < compConstraints.Count; i++)
+                {
+                    var ac = compConstraints[i];
+                    var vs = new int[ac.Vars.Length];
+                    for (int j = 0; j < vs.Length; j++) vs[j] = map[ac.Vars[j]];
+                    Array.Sort(vs);
+                    remappedConstraints.Add(new SmallConstraint(vs, ac.Mines));
+                }
+
+                EnumerateComponent(compVars, remappedConstraints);
+            }
+        }
+
+        private void EnumerateComponent(List<int> compVarsGlobal, List<SmallConstraint> cons)
+        {
+            int n = compVarsGlobal.Count;
+            var varCons = new List<int>[n];
+            for (int i = 0; i < n; i++) varCons[i] = new List<int>(2);
+            for (int ci = 0; ci < cons.Count; ci++)
+            {
+                var c = cons[ci];
+                for (int j = 0; j < c.Vars.Length; j++) varCons[c.Vars[j]].Add(ci);
+            }
+
+            int m = cons.Count;
+            var assignedMines = new int[m];
+            var remaining = new int[m];
+            for (int ci = 0; ci < m; ci++) remaining[ci] = cons[ci].Vars.Length;
+
+            var order = new int[n];
+            for (int i = 0; i < n; i++) order[i] = i;
+            Array.Sort(order, (a, b) => varCons[b].Count.CompareTo(varCons[a].Count));
+
+            var assignment = new sbyte[n];
+            for (int i = 0; i < n; i++) assignment[i] = -1;
+
+            long solutions = 0;
+            var seenSafe = new bool[n];
+            var seenMine = new bool[n];
+
+            int states = 0;
+            void Dfs(int depth)
+            {
+                if (states++ > MaxComponentStatesBudget) return;
+                if (depth == n)
+                {
+                    for (int ci = 0; ci < m; ci++)
+                        if (assignedMines[ci] != cons[ci].Mines) return;
+                    solutions++;
+                    for (int i = 0; i < n; i++)
+                    {
+                        if (assignment[i] == 0) seenSafe[i] = true;
+                        else if (assignment[i] == 1) seenMine[i] = true;
+                    }
+                    return;
+                }
+
+                int v = order[depth];
+                if (TryAssign(v, 0))
+                {
+                    Dfs(depth + 1);
+                    Unassign(v, 0);
+                }
+                if (TryAssign(v, 1))
+                {
+                    Dfs(depth + 1);
+                    Unassign(v, 1);
+                }
+            }
+
+            bool TryAssign(int v, sbyte val)
+            {
+                assignment[v] = val;
+                foreach (int ci in varCons[v])
+                {
+                    remaining[ci]--;
+                    if (val == 1) assignedMines[ci]++;
+                    int mines = cons[ci].Mines;
+                    int am = assignedMines[ci];
+                    int rem = remaining[ci];
+                    if (am > mines) return false;
+                    if (am + rem < mines) return false;
+                }
+                return true;
+            }
+
+            void Unassign(int v, sbyte val)
+            {
+                foreach (int ci in varCons[v])
+                {
+                    if (val == 1) assignedMines[ci]--;
+                    remaining[ci]++;
+                }
+                assignment[v] = -1;
+            }
+
+            Dfs(0);
+
+            if (solutions == 0) return;
+
+            for (int i = 0; i < n; i++)
+            {
+                int globalVar = compVarsGlobal[i];
+                int cellId = frontierCells[globalVar];
+                if (provenSafe.Contains(cellId) || provenMine.Contains(cellId)) continue;
+                if (seenMine[i] && !seenSafe[i]) provenMine.Add(cellId);
+                else if (seenSafe[i] && !seenMine[i]) provenSafe.Add(cellId);
+            }
+        }
+
+        private int GetOrAddFrontier(int cellId)
+        {
+            if (frontierIndex.TryGetValue(cellId, out int idx)) return idx;
+            idx = frontierCells.Count;
+            frontierIndex[cellId] = idx;
+            frontierCells.Add(cellId);
+            return idx;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private int CellId(int x, int y) => y * W + x;
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private bool InBounds(int x, int y) => (uint)x < (uint)W && (uint)y < (uint)H;
+
+        private static long PairKey(int a, int b)
+        {
+            if (a > b) (a, b) = (b, a);
+            return ((long)a << 32) ^ (uint)b;
+        }
+
+        private static bool IsSubsetSorted(int[] a, int[] b, out int[] diff)
+        {
+            int i = 0, j = 0;
+            var diffList = new List<int>(Math.Max(0, b.Length - a.Length));
+            while (j < b.Length)
+            {
+                if (i < a.Length && a[i] == b[j])
+                {
+                    i++; j++;
+                }
+                else if (i < a.Length && a[i] < b[j])
+                {
+                    diff = Array.Empty<int>();
+                    return false;
+                }
+                else
+                {
+                    diffList.Add(b[j]);
+                    j++;
+                }
+            }
+            if (i != a.Length)
+            {
+                diff = Array.Empty<int>();
+                return false;
+            }
+            diff = diffList.ToArray();
+            return true;
+        }
+
+        private readonly struct Constraint
+        {
+            public readonly int[] Vars;
+            public readonly int Mines;
+            public Constraint(int[] vars, int mines)
+            {
+                Vars = vars;
+                Mines = mines;
+            }
+
+            public ActiveConstraint ActiveView(List<int> frontierCells, HashSet<int> safe, HashSet<int> mine)
+            {
+                int minesFixed = 0;
+                int activeCount = 0;
+                for (int i = 0; i < Vars.Length; i++)
+                {
+                    int cellId = frontierCells[Vars[i]];
+                    if (mine.Contains(cellId)) minesFixed++;
+                    else if (!safe.Contains(cellId)) activeCount++;
+                }
+                int remainingMines = Mines - minesFixed;
+                if (activeCount == 0) return new ActiveConstraint(Array.Empty<int>(), remainingMines);
+
+                var active = new int[activeCount];
+                int k = 0;
+                for (int i = 0; i < Vars.Length; i++)
+                {
+                    int cellId = frontierCells[Vars[i]];
+                    if (mine.Contains(cellId) || safe.Contains(cellId)) continue;
+                    active[k++] = Vars[i];
+                }
+                Array.Sort(active);
+                return new ActiveConstraint(active, remainingMines);
+            }
+        }
+
+        private readonly struct ActiveConstraint
+        {
+            public readonly int[] Vars;
+            public readonly int Mines;
+            public ActiveConstraint(int[] vars, int mines)
+            {
+                Vars = vars;
+                Mines = mines;
+            }
+        }
+
+        private readonly struct SmallConstraint
+        {
+            public readonly int[] Vars;
+            public readonly int Mines;
+            public SmallConstraint(int[] vars, int mines)
+            {
+                Vars = vars;
+                Mines = mines;
+            }
+        }
+    }
+}

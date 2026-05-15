@@ -1,0 +1,219 @@
+# Module-level state for PID integral terms and previous values
+class PIDController:
+    def __init__(self, kp=0.1, ki=0.01, kd=0.05):
+        self.kp = kp
+        self.ki = ki
+        self.kd = kd
+        self.integral = 0.0
+        self.prev_error = 0.0
+
+    def update(self, error, dt):
+        if dt <= 0:
+            return 0
+        self.integral += error * dt
+        self.integral = max(-100, min(100, self.integral))
+        deriv = (error - self.prev_error) / dt
+        self.prev_error = error
+        return self.kp * error + self.ki * self.integral + self.kd * deriv
+
+# Global controllers
+_alt_ctrl = PIDController(0.05, 0.01, 0.1)
+_spd_ctrl = PIDController(0.002, 0.0003, 0.001)
+_hdg_ctrl = PIDController(0.08, 0.01, 0.04)
+_roll_ctrl = PIDController(0.15, 0.02, 0.08)
+_pitch_ctrl = PIDController(0.25, 0.05, 0.1)
+_vs_ctrl = PIDController(0.08, 0.01, 0.05)
+_trim_integral = 0.0
+
+def autopilot_step(state: dict, dt: float) -> dict:
+    global _trim_integral
+
+    def median(values):
+        if not values:
+            return None
+        sorted_v = sorted(values)
+        return sorted_v[len(sorted_v) // 2]
+
+    def get_sensor(key_base, num=3):
+        """Sensor fusion: return median of valid readings"""
+        valid_readings = []
+        for i in range(1, num + 1):
+            val_key = f"{key_base}_{i}_valid"
+            data_key = f"{key_base}_{i}"
+            if data_key in state:
+                if state.get(val_key, False) or val_key not in state:
+                    val = state[data_key]
+                    if val is not None:
+                        valid_readings.append(val)
+        return median(valid_readings) if valid_readings else None
+
+    def get_raw(key, default=0):
+        return state.get(key, default)
+
+    # Sensor fusion - use voting/median for critical parameters
+    alt = get_sensor("baro_alt")
+    if alt is None:
+        alt = get_sensor("gps", 3)
+        if alt is None:
+            alt = get_raw("adc_1_pressure_alt_ft", 5000)
+
+    radar_alt = get_sensor("radar_alt")
+    if radar_alt is not None and radar_alt < 2500:  # Use radar below 2500ft
+        if alt is not None and abs(alt - radar_alt) > 500:
+            alt = radar_alt  # Trust radar if there's large discrepancy
+
+    ias = get_sensor("ias")
+    if ias is None:
+        ias = get_raw("ground_speed_kt", 100)
+
+    hdg = get_sensor("irs", 3)
+    if hdg is None:
+        hdg = get_raw("magnetic_heading_deg", 0)
+
+    pitch_readings = [get_raw(f"irs_{i}_pitch_deg") for i in range(1, 4)
+                      if get_raw(f"irs_{i}_valid", False)]
+    pitch = median(pitch_readings) if pitch_readings else 0
+
+    roll_readings = [get_raw(f"irs_{i}_roll_deg") for i in range(1, 4)
+                     if get_raw(f"irs_{i}_valid", False)]
+    roll = median(roll_readings) if roll_readings else 0
+
+    vs_readings = [get_raw(f"irs_{i}_vs_fpm") for i in range(1, 4)
+                   if get_raw(f"irs_{i}_valid", False)]
+    vs = median(vs_readings) if vs_readings else 0
+
+    aoa = get_sensor("aoa")
+    if aoa is None:
+        aoa = 0
+
+    # Engine status
+    eng1_running = get_raw("engine_1_running", False)
+    eng2_running = get_raw("engine_2_running", False)
+    both_running = eng1_running and eng2_running
+
+    eng1_thrust = get_raw("engine_1_thrust_pct", 50)
+    eng2_thrust = get_raw("engine_2_thrust_pct", 50)
+
+    # Weight on wheels
+    wow = (get_raw("weight_on_wheels_left", False) or
+           get_raw("weight_on_wheels_nose", False) or
+           get_raw("weight_on_wheels_right", False))
+
+    # Get targets
+    target_alt = get_raw("target_alt_ft", alt)
+    target_hdg = get_raw("target_hdg_deg", hdg)
+    target_ias = get_raw("target_ias_kt", 200)
+    target_vs = get_raw("target_vs_fpm", 0)
+
+    ap_engaged = get_raw("ap_engaged", True)
+    at_engaged = get_raw("at_engaged", True)
+
+    output = {}
+
+    # SPEED CONTROL (Throttle)
+    if at_engaged:
+        speed_error = target_ias - ias
+        throttle_cmd = _spd_ctrl.update(speed_error, dt)
+
+        # Safety: Overspeed protection (Vne ~365 KIAS / M0.82)
+        mach = get_sensor("mach")
+        if ias > 360 or (mach is not None and mach > 0.81):
+            throttle_cmd = -0.3  # Pitch up to slow down
+            output["elevator"] = 0.3
+        # Stall protection
+        elif aoa > 16 or ias < 100:
+            throttle_cmd = 0.8
+            output["elevator"] = -0.2
+
+        throttle_cmd = max(0.0, min(1.0, throttle_cmd))
+
+        # Engine asymmetry correction
+        if eng1_running and not eng2_running:
+            output["throttle_1"] = throttle_cmd
+            output["throttle_2"] = 0.0
+        elif eng2_running and not eng1_running:
+            output["throttle_1"] = 0.0
+            output["throttle_2"] = throttle_cmd
+        else:
+            output["throttle_1"] = throttle_cmd
+            output["throttle_2"] = throttle_cmd
+
+    # ALTITUDE & PITCH CONTROL
+    if ap_engaged:
+        alt_error = target_alt - alt
+        pitch_cmd = _alt_ctrl.update(alt_error, dt)
+        pitch_cmd = max(-8, min(8, pitch_cmd))
+
+        pitch_error = pitch_cmd - pitch
+        elevator_cmd = _pitch_ctrl.update(pitch_error, dt)
+
+        if "elevator" not in output:
+            output["elevator"] = max(-1.0, min(1.0, elevator_cmd))
+
+        # Elevator trim adjustment
+        _trim_integral += elevator_cmd * dt * 0.02
+        _trim_integral = max(-1.0, min(1.0, _trim_integral))
+        output["elevator_trim"] = _trim_integral
+
+    # HEADING & ROLL CONTROL
+    if ap_engaged:
+        hdg_error = target_hdg - hdg
+        while hdg_error > 180:
+            hdg_error -= 360
+        while hdg_error < -180:
+            hdg_error += 360
+
+        bank_cmd = _hdg_ctrl.update(hdg_error, dt)
+        bank_cmd = max(-25, min(25, bank_cmd))
+
+        roll_error = bank_cmd - roll
+        aileron_cmd = _roll_ctrl.update(roll_error, dt)
+        output["aileron"] = max(-1.0, min(1.0, aileron_cmd))
+
+        # Yaw damping & coordination
+        gyro_yaw = get_raw("gyro_1_yaw_rate_dps", 0)
+        rudder_base = -0.03 * gyro_yaw
+
+        # Asymmetric thrust correction
+        thrust_diff = abs(eng1_thrust - eng2_thrust)
+        if thrust_diff > 20:
+            if eng1_thrust > eng2_thrust:
+                rudder_base -= 0.15
+            else:
+                rudder_base += 0.15
+
+        output["rudder"] = max(-1.0, min(1.0, rudder_base))
+
+    # FLAP MANAGEMENT
+    if wow or ias < 200:
+        if ias > 280:
+            output["flaps"] = 0
+        elif ias > 230:
+            output["flaps"] = 5
+        elif ias > 180:
+            output["flaps"] = 15
+        elif ias > 140:
+            output["flaps"] = 25
+        else:
+            output["flaps"] = 40
+    else:
+        output["flaps"] = 0
+
+    # SPEEDBRAKE
+    descent_rate = target_alt - alt if target_alt < alt else 0
+    if descent_rate < -2000 or vs > 2000:
+        output["speedbrake"] = 0.6
+    elif descent_rate < -1000 or vs > 1000:
+        output["speedbrake"] = 0.3
+    else:
+        output["speedbrake"] = 0.0
+
+    # LANDING GEAR
+    if wow:
+        output["gear"] = 1
+    elif ias < 180 and alt < 5000:
+        output["gear"] = 1
+    elif ias > 220 and alt > 2000:
+        output["gear"] = 0
+
+    return output

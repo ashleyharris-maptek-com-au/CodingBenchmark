@@ -1,0 +1,375 @@
+import math
+
+
+_MEM = {
+    "r": [0.0, 0.0, 0.0],
+    "v": [0.0, 0.0, 0.0],
+    "calls": 0,
+}
+
+
+def _clamp(v, lo, hi):
+    return lo if v < lo else hi if v > hi else v
+
+
+def _is_valid(state, key):
+    return bool(state.get(key, False))
+
+
+def _num(state, key, default=None):
+    v = state.get(key, default)
+    return float(v) if isinstance(v, (int, float)) else default
+
+
+def _mean_weighted(pairs):
+    total_w = 0.0
+    total_v = 0.0
+    for value, weight in pairs:
+        if value is None or weight <= 0.0:
+            continue
+        total_v += value * weight
+        total_w += weight
+    if total_w <= 0.0:
+        return None
+    return total_v / total_w
+
+
+def _sensor_axis(state, base, axis):
+    v_key = f"{base}_{axis}_valid"
+    if not _is_valid(state, v_key):
+        return None
+    if base in ("gps_1_pos", "gps_2_pos"):
+        key = f"{base}_{axis}_m"
+    elif base.startswith("gyro_"):
+        key = f"{base}_{axis}_dps"
+    elif base.startswith("star_tracker_"):
+        key = f"{base}_{axis}_deg"
+    elif base.startswith("accel_"):
+        key = f"{base}_{axis}_ms2"
+    else:
+        key = f"{base}_{axis}_m"
+    return _num(state, key)
+
+
+def _fuse_pos_vel(state, range_hint=None):
+    # Relative position and velocity from radar/lidar are the primary sources.
+    sensors = []
+    if range_hint is None:
+        range_hint = None
+
+    for name, pos_prefix, vel_prefix in (
+        ("radar", "radar_rel_pos", "radar_rel_vel"),
+        ("lidar", "lidar_rel_pos", "lidar_rel_vel"),
+    ):
+        p = []
+        v = []
+        pv = True
+        vv = True
+        for ax in ("x", "y", "z"):
+            pval = _num(state, f"{pos_prefix}_{ax}_m")
+            vval = _num(state, f"{vel_prefix}_{ax}_ms")
+            if not _is_valid(state, f"{pos_prefix}_{ax}_valid"):
+                pv = False
+                pval = None
+            if not _is_valid(state, f"{vel_prefix}_{ax}_valid"):
+                vv = False
+                vval = None
+            p.append(pval)
+            v.append(vval)
+        sensors.append((name, p, v, pv, vv))
+
+    # Weighted axis-by-axis fusion.
+    # Radar is usually better at long range; lidar is better when close.
+    if range_hint is None:
+        range_hint = 200.0
+    radar_w = 1.4 if range_hint > 150.0 else 1.0
+    lidar_w = 1.4 if range_hint <= 150.0 else 1.0
+
+    r = [None, None, None]
+    vel = [None, None, None]
+    for i in range(3):
+        pairs_p = []
+        pairs_v = []
+        for name, p, v, pv, vv in sensors:
+            if p[i] is not None:
+                w = radar_w if name == "radar" else lidar_w
+                pairs_p.append((p[i], w))
+            if v[i] is not None:
+                w = radar_w if name == "radar" else lidar_w
+                pairs_v.append((v[i], w))
+        r[i] = _mean_weighted(pairs_p)
+        vel[i] = _mean_weighted(pairs_v)
+
+    # Fill missing axes from dead reckoning / previous state.
+    prev_r = _MEM["r"]
+    prev_v = _MEM["v"]
+    for i in range(3):
+        if r[i] is None:
+            r[i] = prev_r[i]
+        if vel[i] is None:
+            vel[i] = prev_v[i]
+
+    # Range sensors: use them to correct magnitude while preserving direction.
+    ranges = []
+    for k in ("range_1", "range_2", "range_3"):
+        if _is_valid(state, f"{k}_valid"):
+            val = _num(state, f"{k}_m")
+            if val is not None and val > 0.0:
+                ranges.append(val)
+    if _is_valid(state, "dock_camera_active"):
+        cam_r = _num(state, "dock_camera_range_m")
+        if cam_r is not None and cam_r > 0.0:
+            ranges.append(cam_r)
+    range_meas = sum(ranges) / len(ranges) if ranges else None
+
+    norm_r = math.sqrt(r[0] * r[0] + r[1] * r[1] + r[2] * r[2])
+    if range_meas is not None and range_meas > 0.0:
+        if norm_r > 1e-6:
+            # Blend the vector norm toward the measured range.
+            scale = range_meas / norm_r
+            blend = 0.35
+            r = [ri * (1.0 + blend * (scale - 1.0)) for ri in r]
+        else:
+            # If we only have a scalar range, preserve the last known direction.
+            prev_norm = math.sqrt(prev_r[0] * prev_r[0] + prev_r[1] * prev_r[1] + prev_r[2] * prev_r[2])
+            if prev_norm > 1e-6:
+                r = [prev_r[i] * (range_meas / prev_norm) for i in range(3)]
+
+    # Velocity from finite differences if all else is missing or stale.
+    if vel is None:
+        vel = prev_v[:]
+    for i in range(3):
+        if vel[i] is None:
+            vel[i] = (r[i] - prev_r[i]) / max(1e-3, _MEM.get("last_dt", 1.0))
+
+    return r, vel, range_meas
+
+
+def _estimate_mean_motion(state):
+    # Prefer semimajor axis if available, otherwise derive from altitude or speed.
+    mu = 3.986004418e14
+    earth_r = 6378137.0
+    candidates = []
+
+    a = _num(state, "ground_semi_major_axis_m")
+    if a is not None and _is_valid(state, "ground_semi_major_axis_m_valid") and a > 1.0e6:
+        candidates.append(a)
+
+    alt_km = _num(state, "ground_altitude_km")
+    if alt_km is not None and _is_valid(state, "ground_altitude_km_valid"):
+        candidates.append(earth_r + alt_km * 1000.0)
+
+    speed = _num(state, "ground_speed_ms")
+    if speed is not None and _is_valid(state, "ground_speed_ms_valid") and speed > 10.0:
+        a_from_v = mu / (speed * speed)
+        if a_from_v > 1.0e6:
+            candidates.append(a_from_v)
+
+    if candidates:
+        a_est = sum(candidates) / len(candidates)
+    else:
+        a_est = earth_r + 420000.0
+
+    a_est = _clamp(a_est, earth_r + 180000.0, earth_r + 2000000.0)
+    return math.sqrt(mu / (a_est * a_est * a_est))
+
+
+def _controller(r, v, n, fuel_scale, range_meas, target_speed):
+    x, y, z = r
+    vx, vy, vz = v
+    rho = math.sqrt(x * x + y * y + z * z)
+    rho = max(rho, 1e-6)
+    closing = (x * vx + y * vy + z * vz) / rho
+    speed = math.sqrt(vx * vx + vy * vy + vz * vz)
+
+    # Gain scheduling.
+    if rho > 1000.0:
+        kp_xy = 0.0015
+        kp_z = 0.0012
+        kd = 0.018
+    elif rho > 200.0:
+        kp_xy = 0.0032
+        kp_z = 0.0028
+        kd = 0.028
+    elif rho > 50.0:
+        kp_xy = 0.0060
+        kp_z = 0.0050
+        kd = 0.050
+    else:
+        kp_xy = 0.0100
+        kp_z = 0.0085
+        kd = 0.085
+
+    # Prioritize along-track phasing when far away; prioritize radial and cross-track alignment when close.
+    if rho > 150.0:
+        ky = kp_xy * 1.35
+        kx = kp_xy * 0.75
+        kz = kp_z * 0.80
+    else:
+        ky = kp_xy * 1.00
+        kx = kp_xy * 0.95
+        kz = kp_z * 1.00
+
+    # If closing too fast, increase damping.
+    if speed > max(0.3, 1.5 * target_speed):
+        kd *= 1.35
+    if closing < -target_speed:
+        kd *= 1.20
+    elif closing > target_speed:
+        kd *= 1.10
+
+    # Along-track sign is intentionally aligned with the prompt:
+    # negative y => retrograde, positive y => prograde.
+    ux = -kx * x - kd * vx
+    uy = ky * y - kd * vy
+    uz = -kz * z - kd * vz
+
+    # Help suppress off-axis errors when the camera / range is close in.
+    if rho < 80.0:
+        ux *= 1.10
+        uz *= 1.10
+        uy *= 0.95
+
+    # Final phase should be gentle.
+    if rho < 10.0:
+        ux *= 0.50
+        uy *= 0.50
+        uz *= 0.50
+    elif rho < 25.0:
+        ux *= 0.70
+        uy *= 0.70
+        uz *= 0.70
+
+    # Fuel conservation.
+    ux *= fuel_scale
+    uy *= fuel_scale
+    uz *= fuel_scale
+
+    # Normalize as a vector so one saturated axis does not dominate.
+    m = max(1.0, abs(ux), abs(uy), abs(uz))
+    if m > 1.0:
+        ux /= m
+        uy /= m
+        uz /= m
+
+    # Small deadband to avoid chatter near the capture point.
+    if rho < 2.0 and speed < 0.3:
+        ux *= 0.2
+        uy *= 0.2
+        uz *= 0.2
+
+    return {
+        "thrust_x": _clamp(ux, -1.0, 1.0),
+        "thrust_y": _clamp(uy, -1.0, 1.0),
+        "thrust_z": _clamp(uz, -1.0, 1.0),
+    }
+
+
+def _attitude_rates(state):
+    # Use gyros to damp angular rates and star trackers to gently drive toward a neutral attitude.
+    gyro_axes = {"roll": [], "pitch": [], "yaw": []}
+    for i in (1, 2, 3):
+        for ax in ("roll", "pitch", "yaw"):
+            if _is_valid(state, f"gyro_{i}_{ax}_valid"):
+                v = _num(state, f"gyro_{i}_{ax}_dps")
+                if v is not None:
+                    gyro_axes[ax].append(v * math.pi / 180.0)
+
+    star_axes = {"roll": [], "pitch": [], "yaw": []}
+    for i in (1, 2, 3):
+        if f"star_tracker_{i}_pitch_valid" in state and _is_valid(state, f"star_tracker_{i}_pitch_valid"):
+            v = _num(state, f"star_tracker_{i}_pitch_deg")
+            if v is not None:
+                star_axes["pitch"].append(v * math.pi / 180.0)
+        if f"star_tracker_{i}_roll_valid" in state and _is_valid(state, f"star_tracker_{i}_roll_valid"):
+            v = _num(state, f"star_tracker_{i}_roll_deg")
+            if v is not None:
+                star_axes["roll"].append(v * math.pi / 180.0)
+        if f"star_tracker_{i}_yaw_valid" in state and _is_valid(state, f"star_tracker_{i}_yaw_valid"):
+            v = _num(state, f"star_tracker_{i}_yaw_deg")
+            if v is not None:
+                star_axes["yaw"].append(v * math.pi / 180.0)
+
+    out = {}
+    for ax in ("roll", "pitch", "yaw"):
+        gyro = sum(gyro_axes[ax]) / len(gyro_axes[ax]) if gyro_axes[ax] else 0.0
+        star = sum(star_axes[ax]) / len(star_axes[ax]) if star_axes[ax] else 0.0
+        # Keep the rates small; the simulator typically uses them as a command, not a direct body-rate setpoint.
+        cmd = -0.22 * gyro - 0.01 * star
+        out[ax] = _clamp(cmd, -0.035, 0.035)
+    return {
+        "att_rate_roll": out["roll"],
+        "att_rate_pitch": out["pitch"],
+        "att_rate_yaw": out["yaw"],
+    }
+
+
+def autopilot_step(state: dict, dt: float) -> dict:
+    dt = float(dt) if isinstance(dt, (int, float)) and dt > 0.0 else 1.0
+    _MEM["last_dt"] = dt
+    _MEM["calls"] += 1
+
+    target_speed = _num(state, "target_dock_speed_ms")
+    if target_speed is None or target_speed <= 0.0:
+        target_speed = 0.3
+    target_speed = max(0.08, target_speed)
+
+    fuel_pct = _num(state, "fuel_remaining_pct")
+    fuel_kg = _num(state, "fuel_remaining_kg")
+    fuel_scale = 1.0
+    if fuel_pct is not None:
+        if fuel_pct < 0.10:
+            fuel_scale = min(fuel_scale, 0.35)
+        elif fuel_pct < 0.20:
+            fuel_scale = min(fuel_scale, 0.55)
+        elif fuel_pct < 0.35:
+            fuel_scale = min(fuel_scale, 0.75)
+    if fuel_kg is not None:
+        if fuel_kg < 20.0:
+            fuel_scale = min(fuel_scale, 0.30)
+        elif fuel_kg < 50.0:
+            fuel_scale = min(fuel_scale, 0.50)
+        elif fuel_kg < 100.0:
+            fuel_scale = min(fuel_scale, 0.70)
+
+    # First pass fusion using the current memory as a rough range hint.
+    prev_r = _MEM["r"]
+    prev_range = math.sqrt(prev_r[0] * prev_r[0] + prev_r[1] * prev_r[1] + prev_r[2] * prev_r[2])
+    r, v, range_meas = _fuse_pos_vel(state, range_hint=prev_range if prev_range > 1.0 else None)
+
+    # If the measurement is wildly inconsistent with memory, treat it as a scenario reset.
+    r_norm = math.sqrt(r[0] * r[0] + r[1] * r[1] + r[2] * r[2])
+    if _MEM["calls"] <= 2 or abs(r_norm - prev_range) > max(500.0, 4.0 * prev_range):
+        _MEM["r"] = r[:]
+        _MEM["v"] = v[:]
+    else:
+        # Blend toward the observed state for robustness against flicker and silent failures.
+        alpha = 0.72 if range_meas is not None else 0.45
+        beta = 0.62 if range_meas is not None else 0.35
+        _MEM["r"] = [prev_r[i] * (1.0 - alpha) + r[i] * alpha for i in range(3)]
+        _MEM["v"] = [_MEM["v"][i] * (1.0 - beta) + v[i] * beta for i in range(3)]
+
+    # Dead-reckon very slightly when sensors are noisy or missing.
+    accel = [0.0, 0.0, 0.0]
+    for i in (1, 2, 3):
+        vals = []
+        for ax_i, ax in enumerate(("x", "y", "z")):
+            if _is_valid(state, f"accel_{i}_{ax}_valid"):
+                a = _num(state, f"accel_{i}_{ax}_ms2")
+                if a is not None:
+                    vals.append((ax_i, a))
+        for ax_i, a in vals:
+            accel[ax_i] += a
+    for i in range(3):
+        accel[i] /= 3.0
+
+    if range_meas is None:
+        for i in range(3):
+            _MEM["v"][i] += 0.10 * accel[i] * dt
+            _MEM["r"][i] += _MEM["v"][i] * dt
+
+    n = _estimate_mean_motion(state)
+    cmd = _controller(_MEM["r"], _MEM["v"], n, fuel_scale, range_meas, target_speed)
+    att = _attitude_rates(state)
+    cmd.update(att)
+    return cmd

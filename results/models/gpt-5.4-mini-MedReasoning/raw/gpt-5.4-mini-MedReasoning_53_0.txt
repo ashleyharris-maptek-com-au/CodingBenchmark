@@ -1,0 +1,233 @@
+import math
+
+
+_MEM = {
+    "pos": [0.0, 0.0, 0.0],
+    "vel": [0.0, 0.0, 0.0],
+    "dir": [1.0, 0.0, 0.0],
+}
+
+
+def _finite(x):
+    return isinstance(x, (int, float)) and math.isfinite(x)
+
+
+def _clamp(x, lo, hi):
+    return lo if x < lo else hi if x > hi else x
+
+
+def _median(values):
+    if not values:
+        return None
+    values = sorted(values)
+    n = len(values)
+    mid = n // 2
+    if n & 1:
+        return float(values[mid])
+    return 0.5 * (values[mid - 1] + values[mid])
+
+
+def _unit(vec):
+    n = math.sqrt(sum(v * v for v in vec))
+    if n <= 1e-9:
+        return None
+    return [v / n for v in vec]
+
+
+def _norm(vec):
+    return math.sqrt(sum(v * v for v in vec))
+
+
+def _dot(a, b):
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+
+
+def _sensor_value(state, key, valid_key):
+    if state.get(valid_key, False):
+        v = state.get(key)
+        if _finite(v):
+            return float(v)
+    return None
+
+
+def _fuse_relative(state, dt):
+    prev_pos = _MEM["pos"]
+    prev_vel = _MEM["vel"]
+    axes = ("x", "y", "z")
+
+    pos_cands = {a: [] for a in axes}
+    vel_cands = {a: [] for a in axes}
+
+    # Radar and lidar are the primary relative sensors.
+    for src in ("radar", "lidar"):
+        for a in axes:
+            pv = _sensor_value(state, f"{src}_rel_pos_{a}_m", f"{src}_rel_{a}_valid")
+            vv = _sensor_value(state, f"{src}_rel_vel_{a}_ms", f"{src}_relv_{a}_valid")
+            if pv is not None:
+                pos_cands[a].append(pv)
+            if vv is not None:
+                vel_cands[a].append(vv)
+
+    # Dock camera gives a bearing and range when active; use it as a direction cue.
+    cam_pos = None
+    if state.get("dock_camera_active", False):
+        bearing = []
+        ok = True
+        for a in axes:
+            bv = _sensor_value(state, f"dock_camera_bearing_{a}", f"dock_camera_bearing_{a}_valid")
+            if bv is None:
+                ok = False
+                break
+            bearing.append(bv)
+        rng = state.get("dock_camera_range_m")
+        if ok and _finite(rng) and rng > 0.0:
+            u = _unit(bearing)
+            if u is not None:
+                cam_pos = [u[i] * float(rng) for i in range(3)]
+                for i, a in enumerate(axes):
+                    pos_cands[a].append(cam_pos[i])
+
+    # Range finders help recover magnitude if the vector estimate is degraded.
+    range_vals = []
+    for i in (1, 2, 3):
+        rv = state.get(f"range_{i}_m")
+        if state.get(f"range_{i}_valid", False) and _finite(rv) and rv > 0.0:
+            range_vals.append(float(rv))
+    range_mag = _median(range_vals)
+
+    pos = [0.0, 0.0, 0.0]
+    pos_have_any = False
+    for idx, a in enumerate(axes):
+        m = _median(pos_cands[a])
+        if m is None:
+            pos[idx] = prev_pos[idx]
+        else:
+            pos_have_any = True
+            # Light smoothing to reduce flicker, but keep responsiveness.
+            pos[idx] = 0.8 * m + 0.2 * prev_pos[idx]
+
+    if not pos_have_any:
+        # If all direct position sensors failed, coast the estimate forward.
+        pos = [prev_pos[i] + prev_vel[i] * dt for i in range(3)]
+
+    # Use range magnitude as a soft correction when we have a nonzero direction estimate.
+    pos_norm = _norm(pos)
+    if range_mag is not None and pos_norm > 1e-6:
+        scale = 0.6 + 0.4 * (range_mag / pos_norm)
+        pos = [p * scale for p in pos]
+        pos_norm = _norm(pos)
+    elif range_mag is not None and pos_norm <= 1e-6:
+        d = _MEM["dir"]
+        pos = [d[i] * range_mag for i in range(3)]
+        pos_norm = range_mag
+
+    vel = [0.0, 0.0, 0.0]
+    vel_have_any = False
+    for idx, a in enumerate(axes):
+        m = _median(vel_cands[a])
+        if m is None:
+            vel[idx] = (pos[idx] - prev_pos[idx]) / dt if dt > 1e-6 else prev_vel[idx]
+        else:
+            vel_have_any = True
+            vel[idx] = 0.7 * m + 0.3 * prev_vel[idx]
+
+    if not vel_have_any and dt <= 1e-6:
+        vel = prev_vel[:]
+
+    if pos_norm > 1e-6:
+        u = [pos[i] / pos_norm for i in range(3)]
+        _MEM["dir"] = u
+
+    _MEM["pos"] = pos[:]
+    _MEM["vel"] = vel[:]
+    return pos, vel, range_mag
+
+
+def autopilot_step(state: dict, dt: float) -> dict:
+    pos, vel, range_mag = _fuse_relative(state, dt)
+    x, y, z = pos
+    vx, vy, vz = vel
+
+    dist = _norm(pos)
+    speed = _norm(vel)
+    if range_mag is not None:
+        dist = range_mag if dist <= 1e-6 else 0.7 * dist + 0.3 * range_mag
+
+    fuel_kg = state.get("fuel_remaining_kg")
+    fuel_pct = state.get("fuel_remaining_pct")
+    fuel_factor = 1.0
+    if _finite(fuel_pct):
+        if fuel_pct < 0.1:
+            fuel_factor = 0.45
+        elif fuel_pct < 0.2:
+            fuel_factor = 0.6
+        elif fuel_pct < 0.35:
+            fuel_factor = 0.8
+    if _finite(fuel_kg) and fuel_kg < 80.0:
+        fuel_factor = min(fuel_factor, 0.55)
+
+    # Success condition: near-zero range and speed.
+    target_speed = 0.1 if dist < 10.0 else 0.15 if dist < 50.0 else 0.3 if dist < 200.0 else 0.6
+
+    # Mode-based control.
+    if dist > 200.0:
+        # Far: favor V-bar phasing. Along-track sign follows the orbital phase error.
+        ky, kvy = 1.0 / 260.0, 0.35
+        kx, kvx = 1.0 / 700.0, 0.12
+        kz, kvz = 1.0 / 700.0, 0.12
+        limit_xy, limit_z = 0.9, 0.6
+    elif dist > 50.0:
+        ky, kvy = 1.0 / 120.0, 0.55
+        kx, kvx = 1.0 / 140.0, 0.25
+        kz, kvz = 1.0 / 140.0, 0.25
+        limit_xy, limit_z = 0.65, 0.5
+    elif dist > 10.0:
+        ky, kvy = 1.0 / 55.0, 0.8
+        kx, kvx = 1.0 / 70.0, 0.5
+        kz, kvz = 1.0 / 70.0, 0.5
+        limit_xy, limit_z = 0.42, 0.35
+    else:
+        ky, kvy = 1.0 / 30.0, 1.2
+        kx, kvx = 1.0 / 35.0, 1.0
+        kz, kvz = 1.0 / 35.0, 1.0
+        limit_xy, limit_z = 0.24, 0.2
+
+    # Along-track: positive is prograde, negative is retrograde.
+    # Behind the station (negative y), retrograde thrust lowers orbit and helps close phase.
+    thrust_y = ky * y - kvy * vy
+
+    # Radial and cross-track: conventional PD damping toward zero.
+    thrust_x = -kx * x - kvx * vx
+    thrust_z = -kz * z - kvz * vz
+
+    # If approach is too fast, brake along the measured relative velocity.
+    brake = 0.0
+    if speed > target_speed:
+        brake = _clamp((speed - target_speed) / max(target_speed, 0.1), 0.0, 1.0)
+    if brake > 0.0:
+        thrust_x += -0.9 * vx * brake
+        thrust_y += -0.9 * vy * brake
+        thrust_z += -0.9 * vz * brake
+
+    # If close and the line-of-sight closing rate is still high, be more conservative.
+    if dist < 20.0 and dist > 1e-6:
+        closing_rate = _dot(pos, vel) / dist
+        if closing_rate < -0.12:
+            thrust_x += -0.6 * vx
+            thrust_y += -0.6 * vy
+            thrust_z += -0.6 * vz
+
+    thrust_x = _clamp(thrust_x * fuel_factor, -limit_xy, limit_xy)
+    thrust_y = _clamp(thrust_y * fuel_factor, -limit_xy, limit_xy)
+    thrust_z = _clamp(thrust_z * fuel_factor, -limit_z, limit_z)
+
+    # Attitude control is kept neutral unless the simulator couples it tightly to thrust.
+    # Zero rates avoid unnecessary oscillation when attitude state is ambiguous.
+    return {
+        "thrust_x": float(_clamp(thrust_x, -1.0, 1.0)),
+        "thrust_y": float(_clamp(thrust_y, -1.0, 1.0)),
+        "thrust_z": float(_clamp(thrust_z, -1.0, 1.0)),
+        "att_rate_roll": 0.0,
+        "att_rate_pitch": 0.0,
+        "att_rate_yaw": 0.0,
+    }

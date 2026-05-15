@@ -20,13 +20,13 @@ from pathlib import Path
 from typing import List, Tuple, Dict
 
 from native_compiler import CSharpCompiler, compile_and_run, describe_this_pc
-from solver_utils import GradeCache
+from solver_utils import GradeCache, normalize_code_result
 
 title = "1D Cutting Stock - Minimum Waste (C#)"
 
 tags = [
   "csharp",
-  "structured response",
+  "freeform response",
   "optimization",
   "packing",
 ]
@@ -39,6 +39,7 @@ _grade_cache = GradeCache('test9')
 
 
 def _cache_key_parts(result: dict, subPass: int) -> tuple:
+  result = normalize_code_result(result, "csharp_code")
   case = TEST_CASES[subPass]
   code = result.get("csharp_code", "")
   return (
@@ -233,23 +234,7 @@ Write complete, compilable C# code with a static void Main method.
 # List of subpasses to grade the single answer against all difficulty levels
 extraGradeAnswerRuns = list(range(len(TEST_CASES)))
 
-structure = {
-  "type": "object",
-  "properties": {
-    "reasoning": {
-      "type":
-      "string",
-      "description":
-      "Explain your cutting stock algorithm and how it adapts to different problem sizes"
-    },
-    "csharp_code": {
-      "type": "string",
-      "description": "Complete C# code with Main method that handles all scales"
-    }
-  },
-  "required": ["reasoning", "csharp_code"],
-  "additionalProperties": False
-}
+structure = None
 
 
 def validate_solution(solution: Dict, cuts: List[int], stock_length: int) -> Tuple[bool, str]:
@@ -583,6 +568,7 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
     - 0.0: could trivially save 2+ stocks (lazy packing)
     - Ratio-based penalties still apply on top.
     """
+  result = normalize_code_result(result, "csharp_code")
   grade_t0 = time.time()
   if not result:
     return 0.0, "No result provided"
@@ -676,6 +662,7 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
 
 def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
   """Generate HTML report."""
+  result = normalize_code_result(result, "csharp_code")
   if not result:
     return "<p style='color:red'>No result provided</p>"
 

@@ -36,14 +36,14 @@ import numpy as np
 
 from shader_test_utils import compile_glsl, validate_spirv
 from compute_test_utils import ComputeShaderRunner, grade_compute_pingpong
-from solver_utils import GradeCache
+from solver_utils import GradeCache, normalize_code_result
 from native_compiler import CppCompiler, CompilationError, ExecutionError
 
 title = "N-Body Gravitational Simulation (GLSL Compute)"
 
 tags = [
   "glsl",
-  "structured response",
+  "freeform response",
   "gpu compute",
   "simulation",
 ]
@@ -379,21 +379,7 @@ Write the complete GLSL compute shader source code.
 
 extraGradeAnswerRuns = list(range(1, len(SUBPASSES)))
 
-structure = {
-  "type": "object",
-  "properties": {
-    "reasoning": {
-      "type": "string",
-      "description": "Explain your approach to the N-body compute shader"
-    },
-    "shader_code": {
-      "type": "string",
-      "description": "Complete GLSL compute shader source code"
-    }
-  },
-  "required": ["reasoning", "shader_code"],
-  "additionalProperties": False
-}
+structure = None
 
 _runner_cache = None
 _ref_cache = {}
@@ -411,6 +397,7 @@ def _normalize_shader_code(code: str) -> str:
 
 
 def _cache_key_parts(result, subPass):
+  result = normalize_code_result(result, "shader_code")
   code = result.get("shader_code", "")
   n, timesteps, dt, softening = SUBPASSES[subPass]
   code_norm = _normalize_shader_code(code)
@@ -468,6 +455,7 @@ def _store_cpu_reference(n, timesteps, dt, softening, ref_bodies):
 
 
 def _grade_answer_inner(result, subPass, aiEngineName):
+  result = normalize_code_result(result, "shader_code")
   global _runner_cache, _ref_cache
 
   if not result or "shader_code" not in result:
@@ -575,6 +563,7 @@ def _grade_answer_inner(result, subPass, aiEngineName):
 
 def gradeAnswer(result, subPass, aiEngineName):
   """Run grading in an isolated subprocess to survive GPU hangs/TDRs."""
+  result = normalize_code_result(result, "shader_code")
   if not result or "shader_code" not in result:
     return 0.0, "No shader code provided"
 
@@ -694,6 +683,7 @@ def _build_svg_projection(samples, width=520, height=360):
 
 
 def resultToNiceReport(result, subPass, aiEngineName):
+  result = normalize_code_result(result, "shader_code")
   cache_parts = _cache_key_parts(result or {}, subPass)
   cached = _grade_cache.get_report(*cache_parts)
   if cached is not None:

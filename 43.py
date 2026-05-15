@@ -36,6 +36,7 @@ import tempfile
 from typing import Tuple, Optional, Dict
 from PIL import Image
 
+from solver_utils import normalize_code_result
 from shader_test_utils import (
     ShaderRenderer, compile_hlsl, validate_spirv,
     compare_images, load_reference, save_reference, get_reference_path,
@@ -46,7 +47,7 @@ title = "Fragment Shaders (HLSL)"
 
 tags = [
   "hlsl",
-  "structured response",
+  "freeform response",
   "shader",
   "gpu",
 ]
@@ -109,7 +110,7 @@ float4 main(PSInput input) : SV_Target0   // RGBA float, stored as rgba8unorm
 - Use `mul()` for matrix-vector operations if needed
 
 **Write ONLY the complete HLSL source code.** Do not include any other text or explanation
-outside the shader_code field.
+outside the shader source.
 """
 
 # ---------------------------------------------------------------------------
@@ -263,21 +264,7 @@ SUBPASSES = [
 # Test interface
 # ---------------------------------------------------------------------------
 
-structure = {
-    "type": "object",
-    "properties": {
-        "reasoning": {
-            "type": "string",
-            "description": "Explain your approach to writing this HLSL shader"
-        },
-        "shader_code": {
-            "type": "string",
-            "description": "Complete HLSL source code for the pixel shader"
-        }
-    },
-    "required": ["reasoning", "shader_code"],
-    "additionalProperties": False
-}
+structure = None
 
 
 def prepareSubpassPrompt(subPass: int) -> str:
@@ -290,6 +277,7 @@ extraGradeAnswerRuns = []
 
 
 def _grade_answer_inner(result: dict, subPass: int, aiEngineName: str) -> tuple:
+    result = normalize_code_result(result, "shader_code")
     if not result:
         return 0.0, "No result provided", {"error": "no_result"}
     if "shader_code" not in result:
@@ -333,6 +321,7 @@ def _grade_answer_inner(result: dict, subPass: int, aiEngineName: str) -> tuple:
 
 def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
     """Run grading in an isolated subprocess to survive GPU hangs/TDRs."""
+    result = normalize_code_result(result, "shader_code")
     if not result or "shader_code" not in result:
         return 0.0, "No shader code provided"
 
@@ -405,6 +394,7 @@ if __name__ == "__main__":
 
 
 def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
+    result = normalize_code_result(result, "shader_code")
     if not result:
         return "<p style='color:red'>No result provided</p>"
     desc = SUBPASSES[subPass]["description"]

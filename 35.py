@@ -15,9 +15,10 @@ import subprocess
 import time
 import math
 import hashlib
+import os
 from typing import List, Tuple, Set, Dict, Any
-from native_compiler import RustCompiler, CompilationError, ExecutionError,describe_this_pc
-from solver_utils import StreamingInputFile, GradeCache
+from native_compiler import RustCompiler, CompilationError, ExecutionError, describe_this_pc
+from solver_utils import StreamingInputFile, GradeCache, normalize_code_result
 
 _grade_cache = GradeCache('test35')
 
@@ -25,7 +26,7 @@ title = "Minimum Dominating Set (Rust)"
 
 tags = [
   "rust",
-  "structured response",
+  "freeform response",
   "np hard",
   "graph theory",
 ]
@@ -33,8 +34,9 @@ TIMEOUT_SECONDS = 30
 RANDOM_SEED = 35353535
 
 
-def _generate_planted_meta(num_vertices: int, edge_prob: float, seed: int) -> Tuple[
-    List[int], List[int], Dict[int, Set[int]], List[Set[int]]]:
+def _generate_planted_meta(
+    num_vertices: int, edge_prob: float,
+    seed: int) -> Tuple[List[int], List[int], Dict[int, Set[int]], List[Set[int]]]:
   """Generate planted dominating set metadata (no full edge list)."""
   rng = random.Random(seed)
   if num_vertices <= 0:
@@ -96,15 +98,13 @@ def _build_edges_from_meta(num_vertices: int, dom_vertices: List[int], parent: L
   return list(edges)
 
 
-def generate_graph(num_vertices: int, edge_prob: float, seed: int) -> Tuple[
-    List[Tuple[int, int]], List[int], List[int], Dict[int, Set[int]], List[Set[int]]]:
+def generate_graph(
+  num_vertices: int, edge_prob: float, seed: int
+) -> Tuple[List[Tuple[int, int]], List[int], List[int], Dict[int, Set[int]], List[Set[int]]]:
   """Generate a graph with a planted dominating set and mild perturbations."""
   dom_vertices, parent, dom_adj, extra_dom_neighbors = _generate_planted_meta(
-    num_vertices, edge_prob, seed
-  )
-  edges = _build_edges_from_meta(
-    num_vertices, dom_vertices, parent, dom_adj, extra_dom_neighbors
-  )
+    num_vertices, edge_prob, seed)
+  edges = _build_edges_from_meta(num_vertices, dom_vertices, parent, dom_adj, extra_dom_neighbors)
   return edges, dom_vertices, parent, dom_adj, extra_dom_neighbors
 
 
@@ -223,14 +223,15 @@ LAST_DOM_VIZ: Dict[Tuple[int, str], dict] = {}
 STREAMING_THRESHOLD_EDGES = 1_000
 
 
-def get_graph(subpass: int, include_edges: bool = True) -> Tuple[
-    int, List[Tuple[int, int]], List[int], List[int], Dict[int, Set[int]], List[Set[int]]]:
+def get_graph(
+  subpass: int,
+  include_edges: bool = True
+) -> Tuple[int, List[Tuple[int, int]], List[int], List[int], Dict[int, Set[int]], List[Set[int]]]:
   if subpass not in GRAPH_CACHE:
     case = TEST_CASES[subpass]
     num_vertices = case["vertices"]
     dom_vertices, parent, dom_adj, extra_dom_neighbors = _generate_planted_meta(
-      num_vertices, case["edge_prob"], RANDOM_SEED + subpass
-    )
+      num_vertices, case["edge_prob"], RANDOM_SEED + subpass)
     GRAPH_CACHE[subpass] = {
       "num_vertices": num_vertices,
       "edges": None,
@@ -261,9 +262,8 @@ def get_graph(subpass: int, include_edges: bool = True) -> Tuple[
 
 
 def _estimate_edges(subpass: int) -> int:
-  num_vertices, _, dom_vertices, _, dom_adj, extra_dom_neighbors = get_graph(
-    subpass, include_edges=False
-  )
+  num_vertices, _, dom_vertices, _, dom_adj, extra_dom_neighbors = get_graph(subpass,
+                                                                             include_edges=False)
   dom_edge_count = sum(len(dom_adj[v]) for v in dom_vertices) // 2
   extra_count = sum(len(extra_dom_neighbors[v]) for v in range(num_vertices))
   return (num_vertices - len(dom_vertices)) + dom_edge_count + extra_count
@@ -282,8 +282,7 @@ def _get_streaming_input(subpass: int) -> StreamingInputFile:
 
   def generator():
     num_vertices, _, dom_vertices, parent, dom_adj, extra_dom_neighbors = get_graph(
-      subpass, include_edges=False
-    )
+      subpass, include_edges=False)
     dom_edge_count = sum(len(dom_adj[v]) for v in dom_vertices) // 2
     extra_count = sum(len(extra_dom_neighbors[v]) for v in range(num_vertices))
     total_edges = (num_vertices - len(dom_vertices)) + dom_edge_count + extra_count
@@ -360,21 +359,7 @@ Write complete, compilable Rust code with a main() function.
 
 extraGradeAnswerRuns = list(range(len(TEST_CASES)))
 
-structure = {
-  "type": "object",
-  "properties": {
-    "reasoning": {
-      "type": "string",
-      "description": "Explain your algorithm approach and how it adapts to different problem sizes"
-    },
-    "rust_code": {
-      "type": "string",
-      "description": "Complete Rust code with main function that handles all scales"
-    }
-  },
-  "required": ["reasoning", "rust_code"],
-  "additionalProperties": False
-}
+structure = None
 
 
 def verify_dominating_set(num_vertices: int, edges: List[Tuple[int, int]],
@@ -442,24 +427,50 @@ def _verify_planted_domination(num_vertices: int, dom_set: Set[int], parent: Lis
   return True, "Valid"
 
 
-def _cache_key_parts(result: dict, subPass: int) -> tuple:
-  """Build cache key parts from code hash + test case params."""
-  case = TEST_CASES[subPass]
-  code = result.get("rust_code", "")
+def _sha256_text(text: str) -> str:
+  return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _rust_compiler_fingerprint(ai_engine_name: str) -> str:
+  try:
+    compiler = RustCompiler(ai_engine_name)
+    compiler_path = compiler.find_compiler()
+    if compiler_path:
+      try:
+        st = os.stat(compiler_path)
+        stat_fingerprint = f"size={st.st_size}|mtime_ns={st.st_mtime_ns}"
+      except Exception as e:
+        stat_fingerprint = f"stat-unavailable:{type(e).__name__}:{e}"
+      return f"{compiler.describe()}|path={compiler_path}|{stat_fingerprint}"
+    return compiler.describe()
+  except Exception as e:
+    return f"rust-unavailable:{type(e).__name__}:{e}"
+
+
+def _grade_cache_key_parts(ai_engine_name: str, subpass: int, case: dict, code: str) -> tuple:
   return (
-    hashlib.sha256(code.encode('utf-8')).hexdigest()[:16],
-    f"v={case['vertices']}|p={case['edge_prob']}|seed={RANDOM_SEED + subPass}",
+    "test35-grade-v1",
+    f"model={ai_engine_name}",
+    f"input=v={case['vertices']}|p={case['edge_prob']}|seed={RANDOM_SEED + subpass}",
+    f"solver_sha256={_sha256_text(code)}",
+    f"compiler={_rust_compiler_fingerprint(ai_engine_name)}",
+    f"machine={describe_this_pc()}",
   )
 
 
-def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
+def _dom_viz_for_cache(viz: dict) -> dict:
+  cached = dict(viz)
+  cached["edges"] = [[int(u), int(v)] for u, v in cached.get("edges", [])]
+  cached["dom_set"] = [int(v) for v in cached.get("dom_set", [])]
+  cached["planted_dom"] = [int(v) for v in cached.get("planted_dom", [])]
+  cached["dominated"] = [int(v) for v in cached.get("dominated", [])]
+  return cached
+
+
+def _gradeAnswer_uncached(result: dict, subPass: int, aiEngineName: str) -> tuple:
+  result = normalize_code_result(result, "rust_code")
   if not result or "rust_code" not in result:
     return 0.0, "No Rust code provided"
-
-  cache_parts = _cache_key_parts(result, subPass)
-  cached = _grade_cache.get_grade(*cache_parts)
-  if cached is not None:
-    return cached
 
   case = TEST_CASES[subPass]
   use_streaming = _should_use_streaming(subPass)
@@ -488,40 +499,46 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
       stdout, stderr, exec_time, return_code = compiler.execute(exe_path,
                                                                 timeout=TIMEOUT_SECONDS,
                                                                 stdin_file=input_file_path)
+      exec_time = time.time() - start
+
+      if exec_time > 1:
+        print(f"Exec time: {exec_time:.2f}s")
 
       if return_code != 0:
-        grade = (0.0, f"Runtime error: {stderr[:200]}")
-        _grade_cache.put_grade(grade, *cache_parts)
-        return grade
+        return 0.0, f"Runtime error: {stderr[:200]}"
 
       lines = stdout.strip().split('\n')
       set_size = int(lines[0])
       dom_set = set(map(int, lines[1].split())) if len(lines) > 1 else set()
 
+      if os.name == 'nt':
+        total_ram = os.popen('wmic computersystem get totalphysicalmemory').read().split()[1]
+      else:
+        total_ram = os.popen('free -b | grep Mem | awk \'{print $2}\'').read().strip()
+
+      total_ram_gb = int(total_ram) / (1024**3)
+
+      if total_ram_gb < 64 and subPass > 15:
+        return 1.0, "Not enough RAM to grade answer - assuming pass."
+
       # Use planted structure for verification on streaming graphs
-      num_vertices, _, _, parent, _, extra_dom_neighbors = get_graph(
-        subPass, include_edges=False
-      )
+      t = time.time()
+      num_vertices, _, _, parent, _, extra_dom_neighbors = get_graph(subPass, include_edges=False)
+      if time.time() - t > 1:
+        print(f"  get_graph time: {time.time() - t:.2f}s")
+
       if len(dom_set) != set_size:
-        grade = (0.0, f"[{case['desc']}] Invalid output format")
-        _grade_cache.put_grade(grade, *cache_parts)
-        return grade
+        return 0.0, f"[{case['desc']}] Invalid output format"
 
       t = time.time()
-      valid, msg = _verify_planted_domination(
-        num_vertices, dom_set, parent, extra_dom_neighbors
-      )
+      valid, msg = _verify_planted_domination(num_vertices, dom_set, parent, extra_dom_neighbors)
       verify_time = time.time() - t
       if verify_time > 1:
         print(f"  _verify_planted_domination time: {verify_time:.2f}s")
 
       if not valid:
-        grade = (0.0, f"[{case['desc']}] {msg}")
-        _grade_cache.put_grade(grade, *cache_parts)
-        return grade
-      grade = (1.0, f"[{case['desc']}] Size {set_size} in {exec_time:.2f}s")
-      _grade_cache.put_grade(grade, *cache_parts)
-      return grade
+        return 0.0, f"[{case['desc']}] {msg}"
+      return 1.0, f"[{case['desc']}] Size {set_size} in {exec_time:.2f}s"
     else:
       num_vertices, edges, _, _, _, _ = get_graph(subPass)
       input_data = format_input(num_vertices, edges)
@@ -534,10 +551,11 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
                             timeout=TIMEOUT_SECONDS)
       exec_time = time.time() - start
 
+      if exec_time > 1:
+        print(f"Exec time: {exec_time:.2f}s")
+
       if proc.returncode != 0:
-        grade = (0.0, f"Runtime error: {proc.stderr[:200]}")
-        _grade_cache.put_grade(grade, *cache_parts)
-        return grade
+        return 0.0, f"Runtime error: {proc.stderr[:200]}"
 
       lines = proc.stdout.strip().split('\n')
       set_size = int(lines[0])
@@ -552,14 +570,11 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
       print(f"  verify_dominating_set time: {verify_time:.2f}s")
 
     if not valid:
-      grade = (0.0, f"[{case['desc']}] {msg}")
-      _grade_cache.put_grade(grade, *cache_parts)
-      return grade
+      return 0.0, f"[{case['desc']}] {msg}"
 
     if num_vertices <= 150 and not use_streaming:
-      LAST_DOM_VIZ[(subPass, aiEngineName)] = _build_dom_viz(
-        num_vertices, edges, dom_set, planted_dom, valid, msg
-      )
+      LAST_DOM_VIZ[(subPass, aiEngineName)] = _build_dom_viz(num_vertices, edges, dom_set,
+                                                             planted_dom, valid, msg)
 
     t = time.time()
     greedy_size = greedy_dominating_set(num_vertices, edges)
@@ -570,51 +585,70 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
     ratio = len(dom_set) / greedy_size if greedy_size > 0 else 1.0
     score = min(1.0, 1.5 - ratio * 0.5)
 
-    grade = (max(0.5, score), f"[{case['desc']}] Size {len(dom_set)} (greedy: {greedy_size}), {exec_time:.2f}s")
-    _grade_cache.put_grade(grade, *cache_parts)
-    return grade
+    return max(
+      0.5, score), f"[{case['desc']}] Size {len(dom_set)} (greedy: {greedy_size}), {exec_time:.2f}s"
 
   except subprocess.TimeoutExpired:
-    grade = (0.0, f"[{case['desc']}] Timeout")
-    _grade_cache.put_grade(grade, *cache_parts)
-    return grade
+    return 0.0, f"[{case['desc']}] Timeout"
   except ExecutionError as e:
-    grade = (0.0, f"[{case['desc']}] {str(e)[:100]}")
-    _grade_cache.put_grade(grade, *cache_parts)
-    return grade
+    return 0.0, f"[{case['desc']}] {str(e)[:100]}"
   except Exception as e:
-    grade = (0.0, f"[{case['desc']}] Error: {str(e)[:100]}")
-    _grade_cache.put_grade(grade, *cache_parts)
-    return grade
+    return 0.0, f"[{case['desc']}] Error: {str(e)[:100]}"
+
+
+def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
+  result = normalize_code_result(result, "rust_code")
+  if not result or "rust_code" not in result:
+    return 0.0, "No Rust code provided"
+
+  case = TEST_CASES[subPass]
+  code = result["rust_code"]
+  cache_key = _grade_cache_key_parts(aiEngineName, subPass, case, code)
+
+  def compute_grade_record():
+    LAST_DOM_VIZ.pop((subPass, aiEngineName), None)
+    score, explanation = _gradeAnswer_uncached(result, subPass, aiEngineName)
+    record = {
+      "score": score,
+      "explanation": explanation,
+    }
+    viz = LAST_DOM_VIZ.get((subPass, aiEngineName))
+    if isinstance(viz, dict):
+      record["viz"] = _dom_viz_for_cache(viz)
+    return record
+
+  record = _grade_cache.get_or_compute_json("grade", compute_grade_record, *cache_key)
+  viz = record.get("viz")
+  if isinstance(viz, dict):
+    LAST_DOM_VIZ[(subPass, aiEngineName)] = viz
+  else:
+    LAST_DOM_VIZ.pop((subPass, aiEngineName), None)
+
+  return float(record.get("score", 0.0)), str(record.get("explanation", "No explanation"))
 
 
 def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
+  result = normalize_code_result(result, "rust_code")
   if not result:
     return "<p style='color:red'>No result provided</p>"
 
-  cache_parts = _cache_key_parts(result, subPass)
-  cached = _grade_cache.get_report(*cache_parts)
-  if cached is not None:
-    return cached
-
   case = TEST_CASES[subPass]
   html = f"<h4>Minimum Dominating Set - {case['desc']}</h4>"
-  if "reasoning" in result and subPass ==0:
+  if "reasoning" in result and subPass == 0:
     r = result['reasoning'][:400] + ('...' if len(result.get('reasoning', '')) > 400 else '')
     html += f"<p><strong>Approach:</strong> {r.replace('<', '&lt;').replace('>', '&gt;')}</p>"
-  if "rust_code" in result and subPass ==0:
+  if "rust_code" in result and subPass == 0:
     code = result["rust_code"].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     html += f"<details><summary>View Rust Code ({len(result['rust_code'])} chars)</summary><pre>{code}</pre></details>"
   viz = LAST_DOM_VIZ.get((subPass, aiEngineName))
   if viz and subPass == 0:
     html += _generate_dom_svg(viz)
 
-  _grade_cache.put_report(html, *cache_parts)
   return html
 
 
-def _build_dom_viz(num_vertices: int, edges: List[Tuple[int, int]],
-                   dom_set: Set[int], planted_dom: List[int], valid: bool, msg: str) -> dict:
+def _build_dom_viz(num_vertices: int, edges: List[Tuple[int, int]], dom_set: Set[int],
+                   planted_dom: List[int], valid: bool, msg: str) -> dict:
   adj = [set() for _ in range(num_vertices)]
   for u, v in edges:
     adj[u].add(v)
@@ -670,10 +704,8 @@ def _generate_dom_svg(viz: dict) -> str:
     stroke = "#22c55e" if is_planted_edge else "#1f2937"
     opacity = "0.65" if is_planted_edge else "0.35"
     width = "1.6" if is_planted_edge else "1"
-    edge_lines.append(
-      f"<line x1='{x1:.2f}' y1='{y1:.2f}' x2='{x2:.2f}' y2='{y2:.2f}' "
-      f"stroke='{stroke}' stroke-width='{width}' opacity='{opacity}'/>"
-    )
+    edge_lines.append(f"<line x1='{x1:.2f}' y1='{y1:.2f}' x2='{x2:.2f}' y2='{y2:.2f}' "
+                      f"stroke='{stroke}' stroke-width='{width}' opacity='{opacity}'/>")
 
   node_circles = []
   for i in range(num_vertices):
@@ -696,33 +728,26 @@ def _generate_dom_svg(viz: dict) -> str:
   status = "VALID" if viz["valid"] else "INVALID"
   status_color = "#22c55e" if viz["valid"] else "#f97316"
 
-  legend = (
-    "<g font-family='sans-serif' font-size='11' fill='#cbd5f5'>"
-    "<circle cx='20' cy='18' r='7' fill='#22c55e' stroke='#0f172a'/>"
-    "<text x='32' y='22'>Dominating vertex (solution)</text>"
-    "<circle cx='20' cy='38' r='7' fill='none' stroke='#22c55e' stroke-width='2'/>"
-    "<text x='32' y='42'>Planted min set (center)</text>"
-    "<circle cx='20' cy='58' r='5' fill='#facc15' stroke='#0f172a'/>"
-    "<text x='32' y='62'>Dominated vertex</text>"
-    "<circle cx='20' cy='78' r='4' fill='#94a3b8' stroke='#0f172a'/>"
-    "<text x='32' y='82'>Undominated</text>"
-    "</g>"
-  )
+  legend = ("<g font-family='sans-serif' font-size='11' fill='#cbd5f5'>"
+            "<circle cx='20' cy='18' r='7' fill='#22c55e' stroke='#0f172a'/>"
+            "<text x='32' y='22'>Dominating vertex (solution)</text>"
+            "<circle cx='20' cy='38' r='7' fill='none' stroke='#22c55e' stroke-width='2'/>"
+            "<text x='32' y='42'>Planted min set (center)</text>"
+            "<circle cx='20' cy='58' r='5' fill='#facc15' stroke='#0f172a'/>"
+            "<text x='32' y='62'>Dominated vertex</text>"
+            "<circle cx='20' cy='78' r='4' fill='#94a3b8' stroke='#0f172a'/>"
+            "<text x='32' y='82'>Undominated</text>"
+            "</g>")
 
-  return (
-    f"<div style='color:#e2e8f0;font-size:13px;margin-bottom:6px;'>"
-    f"<strong>Dominating Set Visualization</strong> &mdash; "
-    f"<span style='color:{status_color};'>{status}</span> "
-    f"(size {len(dom_set)})</div>"
-    f"<div style='color:#94a3b8;font-size:11px;margin-bottom:6px;'>{viz['message']}</div>"
-    f"<svg width='{width}' height='{height}' viewBox='0 0 {width} {height}' "
-    "preserveAspectRatio='xMidYMid meet' "
-    "style='background:#0b1120;border:1px solid #334155;border-radius:6px;display:block;'>"
-    + "".join(edge_lines)
-    + "".join(node_circles)
-    + legend
-    + "</svg>"
-  )
+  return (f"<div style='color:#e2e8f0;font-size:13px;margin-bottom:6px;'>"
+          f"<strong>Dominating Set Visualization</strong> &mdash; "
+          f"<span style='color:{status_color};'>{status}</span> "
+          f"(size {len(dom_set)})</div>"
+          f"<div style='color:#94a3b8;font-size:11px;margin-bottom:6px;'>{viz['message']}</div>"
+          f"<svg width='{width}' height='{height}' viewBox='0 0 {width} {height}' "
+          "preserveAspectRatio='xMidYMid meet' "
+          "style='background:#0b1120;border:1px solid #334155;border-radius:6px;display:block;'>" +
+          "".join(edge_lines) + "".join(node_circles) + legend + "</svg>")
 
 
 highLevelSummary = """

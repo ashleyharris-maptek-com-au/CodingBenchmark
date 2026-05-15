@@ -1,0 +1,240 @@
+#define _USE_MATH_DEFINES
+#include <iostream>
+#include <fstream>
+#include <sstream>
+#include <string>
+#include <vector>
+#include <thread>
+#include <atomic>
+#include <mutex>
+#include <chrono>
+#include <cmath>
+#include <algorithm>
+#include <cstdint>
+#include <cstdio>
+
+#ifdef _WIN32
+#include <io.h>
+#include <fcntl.h>
+#endif
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+struct State {
+    double x=0,y=0,z=0,vx=0,vy=0,vz=0;
+    double pitch=0,yaw=0,roll=0;
+    double prate=0,yrate=0,rrate=0;
+    double fuel=0;
+    bool valid=false;
+};
+
+static std::atomic<bool> g_terrain_loaded{false};
+static std::vector<uint16_t> g_terrain;
+static int g_w=0, g_d=0;
+
+static void load_terrain(std::string path, int width, int depth) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) { g_terrain_loaded.store(true); return; }
+    size_t n = (size_t)width * depth * 3;
+    try { g_terrain.assign(n, 0); } catch(...) { g_terrain_loaded.store(true); return; }
+    const size_t CHUNK = 1<<20;
+    size_t off = 0;
+    while (off < n) {
+        size_t take = std::min(CHUNK, n - off);
+        f.read(reinterpret_cast<char*>(g_terrain.data() + off), take * sizeof(uint16_t));
+        std::streamsize got = f.gcount();
+        if (got <= 0) break;
+        off += got / sizeof(uint16_t);
+    }
+    g_w = width; g_d = depth;
+    g_terrain_loaded.store(true, std::memory_order_release);
+}
+
+static std::mutex g_state_mu;
+static State g_state;
+static std::atomic<bool> g_running{true};
+static std::atomic<long long> g_last_update_ms{0};
+
+static long long now_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+static void reader_thread() {
+    std::string line;
+    while (g_running.load()) {
+        if (!std::getline(std::cin, line)) {
+            g_running.store(false);
+            return;
+        }
+        if (line.empty()) continue;
+        std::istringstream iss(line);
+        State s;
+        if (iss >> s.x >> s.y >> s.z >> s.vx >> s.vy >> s.vz
+                >> s.pitch >> s.yaw >> s.roll
+                >> s.prate >> s.yrate >> s.rrate >> s.fuel) {
+            s.valid = true;
+            {
+                std::lock_guard<std::mutex> lk(g_state_mu);
+                g_state = s;
+            }
+            g_last_update_ms.store(now_ms());
+        }
+    }
+}
+
+static double clamp(double v, double lo, double hi) {
+    return std::max(lo, std::min(hi, v));
+}
+
+int main() {
+#ifdef _WIN32
+    _setmode(_fileno(stdin), _O_BINARY);
+#endif
+
+    int width, depth, height_m;
+    double gravity, max_thrust, fuel;
+    double sx, sy, sz, tx, ty, tz;
+
+    if (!(std::cin >> width >> depth >> height_m >> gravity >> max_thrust >> fuel)) return 1;
+    if (!(std::cin >> sx >> sy >> sz >> tx >> ty >> tz)) return 1;
+    std::cin.ignore(8192, '\n');
+    std::string terrain_path;
+    std::getline(std::cin, terrain_path);
+    std::string tag;
+    std::getline(std::cin, tag); // STATE
+
+    std::thread loader(load_terrain, terrain_path, width, depth);
+    loader.detach();
+
+    std::thread reader(reader_thread);
+    reader.detach();
+
+    const double g = gravity;
+
+    auto next = std::chrono::steady_clock::now();
+
+    auto wrap = [](double a){ while(a>M_PI) a-=2*M_PI; while(a<-M_PI) a+=2*M_PI; return a; };
+
+    while (g_running.load()) {
+        next += std::chrono::milliseconds(50);
+
+        State s;
+        {
+            std::lock_guard<std::mutex> lk(g_state_mu);
+            s = g_state;
+        }
+
+        double thrust = 0.0, pcmd = 0.0, ycmd = 0.0, rcmd = 0.0;
+
+        if (s.valid) {
+            double ex = tx - s.x;
+            double ey = ty - s.y;
+            double horiz_dist = std::sqrt(ex*ex + ey*ey);
+            double height_above = s.z - tz;
+
+            // Desired horizontal velocity toward target (capped)
+            double vcap = std::min(30.0, std::max(2.0, std::sqrt(2.0 * 1.5 * std::max(horiz_dist, 0.1))));
+            double dvx = 0, dvy = 0;
+            if (horiz_dist > 0.1) {
+                dvx = ex / horiz_dist * std::min(vcap, horiz_dist * 0.5);
+                dvy = ey / horiz_dist * std::min(vcap, horiz_dist * 0.5);
+            }
+
+            double ax_des = (dvx - s.vx) * 1.0;
+            double ay_des = (dvy - s.vy) * 1.0;
+
+            // Limit horizontal accel
+            double a_h_mag = std::sqrt(ax_des*ax_des + ay_des*ay_des);
+            double a_h_cap = std::min(max_thrust * 0.5, 5.0);
+            if (a_h_mag > a_h_cap && a_h_mag > 0) {
+                ax_des *= a_h_cap / a_h_mag;
+                ay_des *= a_h_cap / a_h_mag;
+                a_h_mag = a_h_cap;
+            }
+
+            // Vertical desired velocity
+            double vz_des;
+            if (horiz_dist > std::max(5.0, height_above * 0.5) && height_above < 50) {
+                vz_des = 0.5; // hold altitude until centered
+            } else if (height_above > 100) {
+                vz_des = -std::min(20.0, std::sqrt(2.0 * 3.0 * height_above));
+            } else if (height_above > 20) {
+                vz_des = -std::min(8.0, std::sqrt(2.0 * 1.5 * height_above));
+            } else if (height_above > 5) {
+                vz_des = -std::min(2.0, height_above * 0.3);
+            } else if (height_above > 1) {
+                vz_des = -0.8;
+            } else {
+                vz_des = -0.3;
+            }
+
+            double az_des = (vz_des - s.vz) * 1.2 + g;
+            if (az_des < 0) az_des = 0;
+
+            // Compute desired thrust direction
+            // Body-up thrust rotates by yaw then tilts by pitch.
+            // Assume: at yaw=0, +pitch -> horizontal component in -X.
+            //   horiz_dir_world = (-cos(yaw), -sin(yaw)) * sin(pitch) * T
+            //   vert = cos(pitch) * T
+            // So we want (-cos(yaw),-sin(yaw)) parallel to (ax_des, ay_des).
+            double desired_yaw = s.yaw;
+            double desired_pitch = 0;
+
+            if (a_h_mag > 0.05) {
+                double dx = ax_des / a_h_mag;
+                double dy = ay_des / a_h_mag;
+                desired_yaw = std::atan2(-dy, -dx);
+                desired_pitch = std::atan2(a_h_mag, std::max(az_des, 0.5));
+                desired_pitch = clamp(desired_pitch, 0.0, 0.6);
+            }
+
+            double yaw_err = wrap(desired_yaw - s.yaw);
+            ycmd = clamp(yaw_err * 3.0 - s.yrate * 2.0, -1.0, 1.0);
+
+            // If yaw misaligned, reduce pitch demand to avoid pushing wrong direction
+            if (std::abs(yaw_err) > 0.4) desired_pitch *= 0.1;
+
+            double pitch_err = desired_pitch - s.pitch;
+            pcmd = clamp(pitch_err * 5.0 - s.prate * 2.5, -1.0, 1.0);
+
+            rcmd = clamp(-s.roll * 4.0 - s.rrate * 2.0, -1.0, 1.0);
+
+            // Required total thrust magnitude
+            double T_mag = std::sqrt(a_h_mag*a_h_mag + az_des*az_des);
+            // Compensate for current pitch (actual vertical contribution reduced)
+            double cp = std::cos(s.pitch);
+            if (cp < 0.2) cp = 0.2;
+            double thrust_needed = az_des / cp; // ensure vertical at minimum
+            T_mag = std::max(T_mag, thrust_needed);
+
+            thrust = clamp(T_mag / max_thrust, 0.0, 1.0);
+
+            // Final approach safeguard
+            if (horiz_dist < 5.0 && height_above < 15.0) {
+                desired_pitch = 0;
+                pcmd = clamp(-s.pitch * 5.0 - s.prate * 2.5, -1.0, 1.0);
+                double vz_target = (height_above > 2) ? -1.0 : -0.3;
+                double az = (vz_target - s.vz) * 1.5 + g;
+                thrust = clamp(az / max_thrust / cp, 0.0, 1.0);
+            }
+
+            // Out of fuel safety: max thrust if falling fast and low
+            if (height_above < 10 && s.vz < -4) thrust = 1.0;
+        }
+
+        // Output
+        char buf[128];
+        int n = std::snprintf(buf, sizeof(buf), "%.4f %.4f %.4f %.4f\n",
+                              thrust, pcmd, ycmd, rcmd);
+        if (n > 0) {
+            std::fwrite(buf, 1, n, stdout);
+            std::fflush(stdout);
+        }
+
+        std::this_thread::sleep_until(next);
+    }
+    return 0;
+}

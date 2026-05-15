@@ -22,7 +22,7 @@ from typing import Dict, List, Tuple, Optional
 # Constants
 # ──────────────────────────────────────────────────────────────────────────────
 MU_EARTH = 3.986004418e14  # m³/s² gravitational parameter
-R_EARTH = 6.371e6          # m mean radius
+R_EARTH = 6.371e6  # m mean radius
 DEG2RAD = math.pi / 180.0
 RAD2DEG = 180.0 / math.pi
 
@@ -30,55 +30,63 @@ RAD2DEG = 180.0 / math.pi
 # Spacecraft Parameters (Soyuz/Dragon-class)
 # ──────────────────────────────────────────────────────────────────────────────
 SC = {
-  'mass': 7000,                # kg dry mass
-  'fuel_mass': 500,            # kg propellant
-  'thrust_per_jet': 220,       # N per RCS thruster
-  'num_thrusters': 24,         # 4 per axis (± in each of 6 DOF)
-  'isp': 290,                  # s specific impulse
+  'mass': 7000,  # kg dry mass
+  'fuel_mass': 500,  # kg propellant
+  'thrust_per_jet': 220,  # N per RCS thruster
+  'num_thrusters': 24,  # 4 per axis (± in each of 6 DOF)
+  'isp': 290,  # s specific impulse
   'max_attitude_rate': 2.0 * DEG2RAD,  # rad/s max rotation rate
   'attitude_deadband': 0.5 * DEG2RAD,
   'docking_port_axis': [1, 0, 0],  # +x axis
   # Docking tolerances
-  'dock_range_m': 2.0,        # must be within 2m
-  'dock_speed_ms': 0.3,       # max approach speed
-  'dock_lateral_m': 0.5,      # max lateral offset
-  'dock_angle_deg': 5.0,      # max angular misalignment
+  'dock_range_m': 2.0,  # must be within 2m
+  'dock_speed_ms': 0.3,  # max approach speed
+  'dock_lateral_m': 0.5,  # max lateral offset
+  'dock_angle_deg': 5.0,  # max angular misalignment
 }
 
 # Target station parameters
 STATION = {
-  'orbit_alt_km': 408,         # ISS-like orbit
-  'orbit_inc_deg': 51.6,       # ISS inclination
+  'orbit_alt_km': 408,  # ISS-like orbit
+  'orbit_inc_deg': 51.6,  # ISS inclination
   'docking_axis': [-1, 0, 0],  # -x axis (faces chaser)
-  'mass': 420000,              # kg
+  'mass': 420000,  # kg
 }
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Orbital Mechanics Helpers
 # ──────────────────────────────────────────────────────────────────────────────
 def _vec_add(a, b):
-  return [a[0]+b[0], a[1]+b[1], a[2]+b[2]]
+  return [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
+
 
 def _vec_sub(a, b):
-  return [a[0]-b[0], a[1]-b[1], a[2]-b[2]]
+  return [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+
 
 def _vec_scale(a, s):
-  return [a[0]*s, a[1]*s, a[2]*s]
+  return [a[0] * s, a[1] * s, a[2] * s]
+
 
 def _vec_dot(a, b):
-  return a[0]*b[0] + a[1]*b[1] + a[2]*b[2]
+  return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+
 
 def _vec_cross(a, b):
-  return [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]]
+  return [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
+
 
 def _vec_norm(a):
   return math.sqrt(a[0]**2 + a[1]**2 + a[2]**2)
+
 
 def _vec_unit(a):
   n = _vec_norm(a)
   if n < 1e-12:
     return [0, 0, 0]
-  return [a[0]/n, a[1]/n, a[2]/n]
+  return [a[0] / n, a[1] / n, a[2] / n]
+
 
 def circular_orbit_state(alt_km, inc_deg, raan_deg=0, arg_lat_deg=0):
   """Position and velocity for a circular orbit at given altitude/inclination."""
@@ -124,25 +132,26 @@ def grav_accel(pos):
 
 def rk4_step(pos, vel, accel_fn, dt):
   """4th order Runge-Kutta integration step for orbital mechanics."""
+
   def derivs(p, v):
     a = accel_fn(p)
     return v, a
 
   v1, a1 = derivs(pos, vel)
-  p2 = _vec_add(pos, _vec_scale(v1, dt/2))
-  v2_tmp = _vec_add(vel, _vec_scale(a1, dt/2))
+  p2 = _vec_add(pos, _vec_scale(v1, dt / 2))
+  v2_tmp = _vec_add(vel, _vec_scale(a1, dt / 2))
   v2, a2 = derivs(p2, v2_tmp)
 
-  p3 = _vec_add(pos, _vec_scale(v2, dt/2))
-  v3_tmp = _vec_add(vel, _vec_scale(a2, dt/2))
+  p3 = _vec_add(pos, _vec_scale(v2, dt / 2))
+  v3_tmp = _vec_add(vel, _vec_scale(a2, dt / 2))
   v3, a3 = derivs(p3, v3_tmp)
 
   p4 = _vec_add(pos, _vec_scale(v3, dt))
   v4_tmp = _vec_add(vel, _vec_scale(a3, dt))
   v4, a4 = derivs(p4, v4_tmp)
 
-  new_pos = [pos[i] + dt/6 * (v1[i] + 2*v2[i] + 2*v3[i] + v4[i]) for i in range(3)]
-  new_vel = [vel[i] + dt/6 * (a1[i] + 2*a2[i] + 2*a3[i] + a4[i]) for i in range(3)]
+  new_pos = [pos[i] + dt / 6 * (v1[i] + 2 * v2[i] + 2 * v3[i] + v4[i]) for i in range(3)]
+  new_vel = [vel[i] + dt / 6 * (a1[i] + 2 * a2[i] + 2 * a3[i] + a4[i]) for i in range(3)]
   return new_pos, new_vel
 
 
@@ -157,10 +166,10 @@ def eci_to_lvlh(target_pos, target_vel, chaser_pos, chaser_vel):
   Returns (relative_pos_lvlh, relative_vel_lvlh).
   """
   # LVLH basis vectors
-  r_hat = _vec_unit(target_pos)               # radial
-  h = _vec_cross(target_pos, target_vel)       # angular momentum
-  h_hat = _vec_unit(h)                         # cross-track
-  v_hat = _vec_cross(h_hat, r_hat)             # along-track
+  r_hat = _vec_unit(target_pos)  # radial
+  h = _vec_cross(target_pos, target_vel)  # angular momentum
+  h_hat = _vec_unit(h)  # cross-track
+  v_hat = _vec_cross(h_hat, r_hat)  # along-track
 
   # Relative position/velocity in ECI
   dr = _vec_sub(chaser_pos, target_pos)
@@ -169,7 +178,7 @@ def eci_to_lvlh(target_pos, target_vel, chaser_pos, chaser_vel):
   # Project onto LVLH
   rel_pos = [_vec_dot(dr, r_hat), _vec_dot(dr, v_hat), _vec_dot(dr, h_hat)]
   # Account for rotating frame
-  omega = _vec_norm(h) / (_vec_norm(target_pos) ** 2)
+  omega = _vec_norm(h) / (_vec_norm(target_pos)**2)
   rel_vel = [
     _vec_dot(dv, r_hat) - omega * _vec_dot(dr, v_hat),
     _vec_dot(dv, v_hat) + omega * _vec_dot(dr, r_hat),
@@ -181,9 +190,12 @@ def eci_to_lvlh(target_pos, target_vel, chaser_pos, chaser_vel):
 # ──────────────────────────────────────────────────────────────────────────────
 # Docking Truth State
 # ──────────────────────────────────────────────────────────────────────────────
-def make_dock_truth(chaser_offset_lvlh=None, chaser_dv_lvlh=None,
-                    station_alt_km=408, station_inc_deg=51.6,
-                    station_raan_deg=0, station_arg_lat_deg=0):
+def make_dock_truth(chaser_offset_lvlh=None,
+                    chaser_dv_lvlh=None,
+                    station_alt_km=408,
+                    station_inc_deg=51.6,
+                    station_raan_deg=0,
+                    station_arg_lat_deg=0):
   """Create initial truth state for docking scenario."""
   if chaser_offset_lvlh is None:
     chaser_offset_lvlh = [0, -200, 0]  # 200m behind in V-bar
@@ -191,8 +203,8 @@ def make_dock_truth(chaser_offset_lvlh=None, chaser_dv_lvlh=None,
     chaser_dv_lvlh = [0, 0, 0]
 
   # Station state
-  s_pos, s_vel = circular_orbit_state(station_alt_km, station_inc_deg,
-                                       station_raan_deg, station_arg_lat_deg)
+  s_pos, s_vel = circular_orbit_state(station_alt_km, station_inc_deg, station_raan_deg,
+                                      station_arg_lat_deg)
 
   # Convert LVLH offset to ECI
   r_hat = _vec_unit(s_pos)
@@ -200,23 +212,26 @@ def make_dock_truth(chaser_offset_lvlh=None, chaser_dv_lvlh=None,
   h_hat = _vec_unit(h)
   v_hat = _vec_cross(h_hat, r_hat)
 
-  c_pos = _vec_add(s_pos, _vec_add(
-    _vec_scale(r_hat, chaser_offset_lvlh[0]),
-    _vec_add(_vec_scale(v_hat, chaser_offset_lvlh[1]),
-             _vec_scale(h_hat, chaser_offset_lvlh[2]))))
+  c_pos = _vec_add(
+    s_pos,
+    _vec_add(
+      _vec_scale(r_hat, chaser_offset_lvlh[0]),
+      _vec_add(_vec_scale(v_hat, chaser_offset_lvlh[1]), _vec_scale(h_hat, chaser_offset_lvlh[2]))))
 
-  omega = _vec_norm(h) / (_vec_norm(s_pos) ** 2)
-  c_vel = _vec_add(s_vel, _vec_add(
-    _vec_scale(r_hat, chaser_dv_lvlh[0] + omega * chaser_offset_lvlh[1]),
-    _vec_add(_vec_scale(v_hat, chaser_dv_lvlh[1] - omega * chaser_offset_lvlh[0]),
-             _vec_scale(h_hat, chaser_dv_lvlh[2]))))
+  omega = _vec_norm(h) / (_vec_norm(s_pos)**2)
+  c_vel = _vec_add(
+    s_vel,
+    _vec_add(
+      _vec_scale(r_hat, chaser_dv_lvlh[0] + omega * chaser_offset_lvlh[1]),
+      _vec_add(_vec_scale(v_hat, chaser_dv_lvlh[1] - omega * chaser_offset_lvlh[0]),
+               _vec_scale(h_hat, chaser_dv_lvlh[2]))))
 
   return {
     'station_pos': list(s_pos),
     'station_vel': list(s_vel),
     'chaser_pos': list(c_pos),
     'chaser_vel': list(c_vel),
-    'chaser_att': [0.0, 0.0, 0.0],    # roll, pitch, yaw (relative to LVLH)
+    'chaser_att': [0.0, 0.0, 0.0],  # roll, pitch, yaw (relative to LVLH)
     'chaser_att_rate': [0.0, 0.0, 0.0],
     'fuel_mass': SC['fuel_mass'],
     'thruster_failed': [False] * SC['num_thrusters'],
@@ -286,16 +301,14 @@ def dock_physics_step(truth, controls, dt=1.0):
 
   # ── Propagate orbits ──
   # Station (no thrust, just gravity)
-  t['station_pos'], t['station_vel'] = rk4_step(
-    t['station_pos'], t['station_vel'], grav_accel, dt)
+  t['station_pos'], t['station_vel'] = rk4_step(t['station_pos'], t['station_vel'], grav_accel, dt)
 
   # Chaser (gravity + thrust)
   def chaser_accel(pos):
     g = grav_accel(pos)
     return _vec_add(g, accel_eci)
 
-  t['chaser_pos'], t['chaser_vel'] = rk4_step(
-    t['chaser_pos'], t['chaser_vel'], chaser_accel, dt)
+  t['chaser_pos'], t['chaser_vel'] = rk4_step(t['chaser_pos'], t['chaser_vel'], chaser_accel, dt)
 
   t['time'] += dt
   return t
@@ -305,6 +318,7 @@ def dock_physics_step(truth, controls, dt=1.0):
 # Sensor Model
 # ──────────────────────────────────────────────────────────────────────────────
 class DockSensorModel:
+
   def __init__(self, seed=42):
     self.rng = random.Random(seed)
     self.failures = {}
@@ -350,9 +364,8 @@ class DockSensorModel:
     s = {}
 
     # Compute LVLH relative state
-    rel_pos, rel_vel = eci_to_lvlh(
-      t['station_pos'], t['station_vel'],
-      t['chaser_pos'], t['chaser_vel'])
+    rel_pos, rel_vel = eci_to_lvlh(t['station_pos'], t['station_vel'], t['chaser_pos'],
+                                   t['chaser_vel'])
     rng = _vec_norm(rel_pos)
 
     # ── Range finders (3 redundant) ──
@@ -409,7 +422,7 @@ class DockSensorModel:
       r_mag = _vec_norm(t['chaser_pos'])
       v_mag = _vec_norm(t['chaser_vel'])
       self._last_ground = {
-        'semi_major_axis_m': 1 / (2/r_mag - v_mag**2/MU_EARTH),
+        'semi_major_axis_m': 1 / (2 / r_mag - v_mag**2 / MU_EARTH),
         'altitude_km': (r_mag - R_EARTH) / 1000,
         'speed_ms': v_mag,
       }
@@ -453,6 +466,7 @@ class DockSensorModel:
 # Simulation Runner
 # ──────────────────────────────────────────────────────────────────────────────
 class DockSimRunner:
+
   def __init__(self, truth, sensor_model):
     self.truth = truth
     self.sensors = sensor_model
@@ -483,9 +497,8 @@ class DockSimRunner:
       self.truth = dock_physics_step(self.truth, controls, dt)
 
       # Compute relative state
-      rel_pos, rel_vel = eci_to_lvlh(
-        self.truth['station_pos'], self.truth['station_vel'],
-        self.truth['chaser_pos'], self.truth['chaser_vel'])
+      rel_pos, rel_vel = eci_to_lvlh(self.truth['station_pos'], self.truth['station_vel'],
+                                     self.truth['chaser_pos'], self.truth['chaser_vel'])
       rng = _vec_norm(rel_pos)
       approach_speed = -_vec_dot(rel_vel, _vec_unit(rel_pos)) if rng > 0.1 else 0
 
@@ -540,11 +553,11 @@ class DockSimRunner:
     if self.min_range < 10:
       score = 0.7
     elif self.min_range < 50:
-      score = 0.5
-    elif self.min_range < 200:
-      score = 0.3
-    else:
       score = 0.1
+    elif self.min_range < 200:
+      score = 0.05
+    else:
+      return 0.0, "Ship missed catastrophicly. Likely burnt up or everyone suffocated."
 
     return score, f'Did not dock. Min range: {self.min_range:.1f} m, Final fuel: {self.truth["fuel_mass"]:.0f} kg'
 

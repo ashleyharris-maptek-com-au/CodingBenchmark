@@ -1,0 +1,394 @@
+// 3D Tetrahedron packing heuristic solver (C++20, MSVC)
+// Strategy:
+//  - Build convex hull from input vertices (QuickHull, triangular faces).
+//  - Approximate tetrahedron collision/containment via its circumscribed sphere of radius R.
+//    Non-overlap: center distances >= 2R. Containment: center inside hull offset inward by R.
+//  - Pack centers on an adaptive hexagonal-close-packed (HCP) lattice inside the shrunken hull.
+//  - Use fixed orientation (Euler angles = 0) for all tetrahedra.
+//
+// Notes:
+//  - This is a scalable heuristic: as container size grows, lattice spacing is increased to cap runtime.
+//  - Works for any convex container described by vertices. If the vertex set is non-convex, we pack
+//    within its convex hull (always safe if hull is considered container envelope).
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstdint>
+#include <iomanip>
+#include <iostream>
+#include <limits>
+#include <random>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+using std::array;
+using std::int64_t;
+using std::size_t;
+using std::vector;
+
+static constexpr double EPS = 1e-9;
+static constexpr double INSIDE_EPS = 1e-9;
+
+struct Vec3 {
+  double x = 0, y = 0, z = 0;
+  Vec3() = default;
+  Vec3(double x_, double y_, double z_) : x(x_), y(y_), z(z_) {}
+  Vec3 operator+(const Vec3& o) const { return {x + o.x, y + o.y, z + o.z}; }
+  Vec3 operator-(const Vec3& o) const { return {x - o.x, y - o.y, z - o.z}; }
+  Vec3 operator*(double s) const { return {x * s, y * s, z * s}; }
+  Vec3 operator/(double s) const { return {x / s, y / s, z / s}; }
+};
+
+static inline double dot(const Vec3& a, const Vec3& b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+static inline Vec3 cross(const Vec3& a, const Vec3& b) {
+  return {a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x};
+}
+static inline double norm2(const Vec3& a) { return dot(a, a); }
+static inline double norm(const Vec3& a) { return std::sqrt(norm2(a)); }
+
+struct AABB {
+  Vec3 mn, mx;
+};
+
+static AABB compute_aabb(const vector<Vec3>& pts) {
+  AABB b;
+  b.mn = {std::numeric_limits<double>::infinity(), std::numeric_limits<double>::infinity(),
+          std::numeric_limits<double>::infinity()};
+  b.mx = {-std::numeric_limits<double>::infinity(), -std::numeric_limits<double>::infinity(),
+          -std::numeric_limits<double>::infinity()};
+  for (const auto& p : pts) {
+    b.mn.x = std::min(b.mn.x, p.x);
+    b.mn.y = std::min(b.mn.y, p.y);
+    b.mn.z = std::min(b.mn.z, p.z);
+    b.mx.x = std::max(b.mx.x, p.x);
+    b.mx.y = std::max(b.mx.y, p.y);
+    b.mx.z = std::max(b.mx.z, p.z);
+  }
+  return b;
+}
+
+// ---------------- QuickHull (3D) ----------------
+// Compact, robust-enough implementation for packing use-cases.
+
+struct Face {
+  int a = -1, b = -1, c = -1; // CCW seen from outside
+  Vec3 n;                     // outward unit normal
+  double d = 0;               // plane: n·x <= d for inside
+  bool disabled = false;
+};
+
+static Vec3 triangle_normal(const Vec3& A, const Vec3& B, const Vec3& C) { return cross(B - A, C - A); }
+
+static double point_plane_signed(const Face& f, const Vec3& p) { return dot(f.n, p) - f.d; }
+
+static Face make_face(int a, int b, int c, const vector<Vec3>& pts, const Vec3& interior_hint) {
+  Face f;
+  f.a = a;
+  f.b = b;
+  f.c = c;
+  Vec3 nn = triangle_normal(pts[a], pts[b], pts[c]);
+  double len = norm(nn);
+  if (len < EPS) {
+    f.n = {0, 0, 0};
+    f.d = 0;
+    return f;
+  }
+  nn = nn / len;
+  double dd = dot(nn, pts[a]);
+  // Ensure interior point is on the "inside" (n·x <= d)
+  if (dot(nn, interior_hint) > dd) {
+    std::swap(f.b, f.c);
+    nn = nn * -1.0;
+    dd = -dd;
+  }
+  f.n = nn;
+  f.d = dd;
+  return f;
+}
+
+struct EdgeKey {
+  int u, v;
+  bool operator==(const EdgeKey& o) const { return u == o.u && v == o.v; }
+};
+struct EdgeKeyHash {
+  size_t operator()(const EdgeKey& e) const noexcept {
+    return (static_cast<size_t>(e.u) << 32) ^ static_cast<size_t>(e.v);
+  }
+};
+
+static vector<Face> quickhull3d(const vector<Vec3>& pts) {
+  const int n = static_cast<int>(pts.size());
+  vector<Face> faces;
+  if (n < 4) return faces;
+
+  // 1) Pick extreme points to form initial tetrahedron.
+  int ix_min = 0, ix_max = 0;
+  for (int i = 1; i < n; i++) {
+    if (pts[i].x < pts[ix_min].x) ix_min = i;
+    if (pts[i].x > pts[ix_max].x) ix_max = i;
+  }
+  if (ix_min == ix_max) return faces;
+  // Farthest from line (ix_min, ix_max)
+  int i2 = -1;
+  double best = -1;
+  Vec3 A = pts[ix_min], B = pts[ix_max];
+  Vec3 AB = B - A;
+  double ab2 = norm2(AB);
+  for (int i = 0; i < n; i++) {
+    if (i == ix_min || i == ix_max) continue;
+    Vec3 AP = pts[i] - A;
+    Vec3 cr = cross(AB, AP);
+    double dist2 = norm2(cr) / std::max(ab2, EPS);
+    if (dist2 > best) {
+      best = dist2;
+      i2 = i;
+    }
+  }
+  if (i2 < 0 || best < EPS) return faces; // collinear
+  // Farthest from plane (ix_min, ix_max, i2)
+  int i3 = -1;
+  best = -1;
+  Vec3 C = pts[i2];
+  Vec3 n0 = triangle_normal(A, B, C);
+  double n0len = norm(n0);
+  for (int i = 0; i < n; i++) {
+    if (i == ix_min || i == ix_max || i == i2) continue;
+    double dist = std::abs(dot(n0, pts[i] - A)) / std::max(n0len, EPS);
+    if (dist > best) {
+      best = dist;
+      i3 = i;
+    }
+  }
+  if (i3 < 0 || best < EPS) return faces; // coplanar
+
+  int i0 = ix_min, i1 = ix_max;
+  Vec3 D = pts[i3];
+  Vec3 interior = (A + B + C + D) / 4.0;
+
+  // Initial hull: 4 triangular faces of tetrahedron.
+  faces.reserve(4);
+  faces.push_back(make_face(i0, i1, i2, pts, interior));
+  faces.push_back(make_face(i0, i3, i1, pts, interior));
+  faces.push_back(make_face(i0, i2, i3, pts, interior));
+  faces.push_back(make_face(i1, i3, i2, pts, interior));
+
+  // Helper: find farthest outside point for a face.
+  auto farthest_outside = [&](const Face& f, const vector<char>& alive) -> std::pair<int, double> {
+    int idx = -1;
+    double md = 0;
+    for (int i = 0; i < n; i++) {
+      if (!alive[i]) continue;
+      double s = point_plane_signed(f, pts[i]);
+      if (s > md + 1e-12) {
+        md = s;
+        idx = i;
+      }
+    }
+    return {idx, md};
+  };
+
+  vector<char> alive(n, 1);
+  alive[i0] = alive[i1] = alive[i2] = alive[i3] = 0;
+
+  // Main expansion loop: repeatedly add the point that is farthest outside any face.
+  for (;;) {
+    int best_p = -1;
+    double best_dist = 0;
+    int best_face = -1;
+    for (int fi = 0; fi < (int)faces.size(); fi++) {
+      if (faces[fi].disabled) continue;
+      auto [p, dist] = farthest_outside(faces[fi], alive);
+      if (p != -1 && dist > best_dist) {
+        best_dist = dist;
+        best_p = p;
+        best_face = fi;
+      }
+    }
+    if (best_p == -1 || best_dist < 1e-10) break;
+
+    // Determine all faces visible from p (signed > 0).
+    vector<int> visible;
+    visible.reserve(32);
+    for (int fi = 0; fi < (int)faces.size(); fi++) {
+      if (faces[fi].disabled) continue;
+      if (point_plane_signed(faces[fi], pts[best_p]) > 1e-12) visible.push_back(fi);
+    }
+    if (visible.empty()) {
+      alive[best_p] = 0;
+      continue;
+    }
+
+    // Build horizon edges: edges that belong to exactly one visible face.
+    std::unordered_map<EdgeKey, int, EdgeKeyHash> edge_count;
+    edge_count.reserve(visible.size() * 3);
+    auto add_edge = [&](int u, int v) {
+      EdgeKey k{u, v};
+      auto it = edge_count.find(k);
+      if (it == edge_count.end())
+        edge_count.emplace(k, 1);
+      else
+        it->second++;
+    };
+
+    // For horizon orientation, also track opposite direction counts.
+    for (int fi : visible) {
+      Face& f = faces[fi];
+      add_edge(f.a, f.b);
+      add_edge(f.b, f.c);
+      add_edge(f.c, f.a);
+    }
+
+    // An undirected edge is on horizon if (u,v) is in visible but (v,u) is not equally counted.
+    vector<std::pair<int, int>> horizon;
+    horizon.reserve(edge_count.size());
+    for (const auto& kv : edge_count) {
+      const EdgeKey& e = kv.first;
+      EdgeKey rev{e.v, e.u};
+      auto itrev = edge_count.find(rev);
+      int revc = (itrev == edge_count.end() ? 0 : itrev->second);
+      if (kv.second > 0 && revc == 0) {
+        horizon.emplace_back(e.u, e.v); // oriented along visible face boundary
+      }
+    }
+
+    for (int fi : visible) faces[fi].disabled = true;
+
+    // Update interior hint slightly toward old interior + new point.
+    interior = (interior * 0.9) + (pts[best_p] * 0.1);
+
+    // Create new faces from horizon edges to p.
+    for (auto [u, v] : horizon) {
+      Face nf = make_face(u, v, best_p, pts, interior);
+      // Skip degenerate faces
+      if (norm2(nf.n) < EPS) continue;
+      faces.push_back(nf);
+    }
+
+    alive[best_p] = 0;
+  }
+
+  // Remove disabled faces
+  vector<Face> out;
+  out.reserve(faces.size());
+  for (auto& f : faces) {
+    if (f.disabled) continue;
+    if (norm2(f.n) < EPS) continue;
+    out.push_back(f);
+  }
+  return out;
+}
+
+static bool inside_convex_offset(const vector<Face>& faces, const Vec3& p, double offset) {
+  // offset > 0 means shrink inward by offset along face normals.
+  for (const auto& f : faces) {
+    double s = dot(f.n, p) - (f.d - offset);
+    if (s > INSIDE_EPS) return false;
+  }
+  return true;
+}
+
+// ---------------- Packing ----------------
+
+int main() {
+  std::ios::sync_with_stdio(false);
+  std::cin.tie(nullptr);
+
+  int V = 0;
+  double e = 1.0;
+  if (!(std::cin >> V >> e)) return 0;
+  vector<Vec3> pts;
+  pts.reserve(std::max(0, V));
+  for (int i = 0; i < V; i++) {
+    Vec3 p;
+    std::cin >> p.x >> p.y >> p.z;
+    pts.push_back(p);
+  }
+
+  // Tetra circumsphere radius
+  const double R = e * std::sqrt(3.0 / 8.0);
+  const double min_sep = 2.0 * R;
+
+  vector<Face> hull = quickhull3d(pts);
+  if (hull.empty()) {
+    // Fallback: no hull (degenerate input) -> output nothing safely.
+    std::cout << 0 << "\n";
+    return 0;
+  }
+
+  AABB box = compute_aabb(pts);
+
+  // HCP lattice base spacings (for sphere packing with diameter=min_sep).
+  double a = min_sep;
+  double dx = a;
+  double dy = a * std::sqrt(3.0) / 2.0;
+  double dz = a * std::sqrt(2.0 / 3.0);
+
+  // Estimate candidate count from AABB volume and HCP cell volume and scale up spacing if too large.
+  double vol_box = std::max(0.0, (box.mx.x - box.mn.x) * (box.mx.y - box.mn.y) * (box.mx.z - box.mn.z));
+  double cell_vol = (dx * dy * dz);
+  double est = (cell_vol > 0) ? (vol_box / cell_vol) : 0.0;
+
+  const double HARD_CAP = 800000.0; // keep within 30s comfortably on 12 cores without threads
+  double scale = 1.0;
+  if (est > HARD_CAP) {
+    scale = std::cbrt(est / HARD_CAP);
+    scale = std::min(scale, 1000.0);
+  }
+  dx *= scale;
+  dy *= scale;
+  dz *= scale;
+
+  // Expand AABB slightly to ensure boundary coverage, then we rely on inside test.
+  Vec3 mn = box.mn - Vec3{R, R, R};
+  Vec3 mx = box.mx + Vec3{R, R, R};
+
+  vector<Vec3> centers;
+  centers.reserve(static_cast<size_t>(std::min(est, HARD_CAP)));
+
+  // Generate HCP: layer k, row j, column i.
+  // Offsets for ABAB stacking:
+  //  - Even layers: base
+  //  - Odd layers: shift by (dx/2, dy/3)
+  // Within a layer, alternate rows shift by dx/2.
+  int64_t kmin = static_cast<int64_t>(std::floor((mn.z) / dz)) - 1;
+  int64_t kmax = static_cast<int64_t>(std::ceil((mx.z) / dz)) + 1;
+
+  for (int64_t k = kmin; k <= kmax; k++) {
+    double z = k * dz;
+    double layer_shift_x = (k & 1LL) ? (dx * 0.5) : 0.0;
+    double layer_shift_y = (k & 1LL) ? (dy / 3.0) : 0.0;
+
+    int64_t jmin = static_cast<int64_t>(std::floor((mn.y - layer_shift_y) / dy)) - 2;
+    int64_t jmax = static_cast<int64_t>(std::ceil((mx.y - layer_shift_y) / dy)) + 2;
+    for (int64_t j = jmin; j <= jmax; j++) {
+      double y = j * dy + layer_shift_y;
+      double row_shift_x = (j & 1LL) ? (dx * 0.5) : 0.0;
+
+      int64_t imin = static_cast<int64_t>(std::floor((mn.x - layer_shift_x - row_shift_x) / dx)) - 2;
+      int64_t imax = static_cast<int64_t>(std::ceil((mx.x - layer_shift_x - row_shift_x) / dx)) + 2;
+      for (int64_t i = imin; i <= imax; i++) {
+        double x = i * dx + layer_shift_x + row_shift_x;
+        Vec3 p{x, y, z};
+
+        if (p.x < mn.x || p.x > mx.x || p.y < mn.y || p.y > mx.y || p.z < mn.z || p.z > mx.z) continue;
+        if (!inside_convex_offset(hull, p, R)) continue;
+
+        centers.push_back(p);
+        if (centers.size() >= static_cast<size_t>(HARD_CAP)) goto done;
+      }
+    }
+  }
+done:
+
+  // Output
+  std::cout << centers.size() << "\n";
+  std::cout.setf(std::ios::fixed);
+  std::cout << std::setprecision(10);
+  for (const auto& c : centers) {
+    std::cout << c.x << " " << c.y << " " << c.z << " "
+              << 0.0 << " " << 0.0 << " " << 0.0 << "\n";
+  }
+  return 0;
+}

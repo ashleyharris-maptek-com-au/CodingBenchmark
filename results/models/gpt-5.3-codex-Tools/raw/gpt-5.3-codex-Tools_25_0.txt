@@ -1,0 +1,357 @@
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Linq;
+
+public static class Program
+{
+    private const double G = 6.67430e-11;
+    private const double SecondsPerDay = 86400.0;
+    private const double InterceptDistance = 1_000_000.0; // 1000 km
+
+    private sealed class Body
+    {
+        public string Name = "";
+        public double Mass;
+        public Vec3 Pos;
+        public Vec3 Vel;
+    }
+
+    private struct Vec3
+    {
+        public double X;
+        public double Y;
+        public double Z;
+
+        public Vec3(double x, double y, double z)
+        {
+            X = x; Y = y; Z = z;
+        }
+
+        public static Vec3 operator +(Vec3 a, Vec3 b) => new Vec3(a.X + b.X, a.Y + b.Y, a.Z + b.Z);
+        public static Vec3 operator -(Vec3 a, Vec3 b) => new Vec3(a.X - b.X, a.Y - b.Y, a.Z - b.Z);
+        public static Vec3 operator *(Vec3 a, double s) => new Vec3(a.X * s, a.Y * s, a.Z * s);
+        public static Vec3 operator *(double s, Vec3 a) => a * s;
+        public static Vec3 operator /(Vec3 a, double s) => new Vec3(a.X / s, a.Y / s, a.Z / s);
+
+        public double Dot(Vec3 b) => X * b.X + Y * b.Y + Z * b.Z;
+        public double Norm2() => Dot(this);
+        public double Norm() => Math.Sqrt(Norm2());
+
+        public Vec3 Normalized()
+        {
+            double n = Norm();
+            return n > 0 ? this / n : new Vec3(0, 0, 0);
+        }
+    }
+
+    private sealed class Scenario
+    {
+        public int NumBodies;
+        public double WarningDays;
+        public double ImpactorMass;
+        public double DeltaVBudget;
+        public double AsteroidMass;
+        public double T0UnixUtc;
+        public List<Body> Bodies = new List<Body>();
+        public string BspPath = "";
+    }
+
+    private sealed class Burn
+    {
+        public double TimeDays;
+        public Vec3 DV;
+    }
+
+    public static void Main()
+    {
+        var sc = ReadScenario();
+
+        var earth = sc.Bodies.FirstOrDefault(b => string.Equals(b.Name, "Earth", StringComparison.OrdinalIgnoreCase));
+        var asteroid = sc.Bodies.FirstOrDefault(b => string.Equals(b.Name, "Asteroid", StringComparison.OrdinalIgnoreCase));
+
+        if (earth == null || asteroid == null)
+        {
+            EmitFallback(sc.WarningDays, sc.DeltaVBudget);
+            return;
+        }
+
+        var majorBodies = sc.Bodies.Where(b => !string.Equals(b.Name, "Asteroid", StringComparison.OrdinalIgnoreCase)).ToList();
+
+        // Choose a launch time heuristic: earlier for short warning, some lead for long warning.
+        double launchDays = ChooseLaunchTime(sc.WarningDays);
+
+        // Predict asteroid state at launch.
+        var astAtLaunch = PropagateBody(asteroid, majorBodies, launchDays * SecondsPerDay);
+        var earthAtLaunch = PropagateBody(earth, majorBodies, launchDays * SecondsPerDay);
+
+        // Search time of flight and arrival direction to find a feasible intercept.
+        // We model spacecraft with 2-body Sun transfer from Earth launch state to asteroid predicted point.
+        // Use coarse search and select minimum total DV within budget.
+        double maxTofDays = Math.Max(5.0, sc.WarningDays - launchDays);
+        if (maxTofDays < 1.0) maxTofDays = 1.0;
+
+        bool found = false;
+        Burn launchBurn = new Burn { TimeDays = launchDays, DV = new Vec3(0, 0, 0) };
+        Burn midBurn = new Burn { TimeDays = launchDays + Math.Min(30.0, maxTofDays * 0.5), DV = new Vec3(0, 0, 0) };
+        Burn impactBurn = new Burn { TimeDays = Math.Min(sc.WarningDays, launchDays + maxTofDays), DV = new Vec3(0, 0, 0) };
+
+        double bestCost = double.PositiveInfinity;
+        Vec3 bestLaunchDv = new Vec3(0, 0, 0);
+        Vec3 bestMidDv = new Vec3(0, 0, 0);
+        double bestImpactDay = impactBurn.TimeDays;
+
+        // Grid search over TOF; use linear targeting + gravity correction fudge.
+        for (int i = 0; i < 80; i++)
+        {
+            double tofDays = 1.0 + i * (maxTofDays - 1.0) / 79.0;
+            double impactDay = launchDays + tofDays;
+            if (impactDay > sc.WarningDays) continue;
+
+            var astAtImpact = PropagateBody(asteroid, majorBodies, impactDay * SecondsPerDay);
+
+            Vec3 r0 = earthAtLaunch.Pos;
+            Vec3 v0 = earthAtLaunch.Vel;
+            Vec3 rt = astAtImpact.Pos;
+
+            // First-order required inertial velocity to hit target ignoring spacecraft gravity assists.
+            Vec3 reqVel = (rt - r0) / (tofDays * SecondsPerDay);
+
+            // Apply a simple correction for solar gravity over transfer arc.
+            Vec3 sunPos = GetSunPositionAt(sc, impactDay);
+            Vec3 rMid = (r0 + rt) * 0.5 - sunPos;
+            double rMidN = Math.Max(rMid.Norm(), 1e6);
+            double muSun = FindBodyMass(sc.Bodies, "Sun") * G;
+            Vec3 gravApprox = rMid * (-muSun / (rMidN * rMidN * rMidN));
+            Vec3 corr = gravApprox * (0.5 * tofDays * SecondsPerDay);
+            reqVel -= corr;
+
+            Vec3 launchDv = reqVel - v0;
+            double launchDvMag = launchDv.Norm();
+
+            // Mid-course small trim toward predicted miss distance at 60% TOF.
+            double midDay = launchDays + 0.6 * tofDays;
+            var astAtMid = PropagateBody(asteroid, majorBodies, midDay * SecondsPerDay);
+            Vec3 scMidPos = r0 + reqVel * ((midDay - launchDays) * SecondsPerDay);
+            Vec3 missVec = astAtMid.Pos - scMidPos;
+            Vec3 midDv = missVec / Math.Max((impactDay - midDay) * SecondsPerDay, 1.0);
+            double midDvMag = midDv.Norm();
+
+            double totalDv = launchDvMag + midDvMag;
+
+            // Favor earlier impact and lower total DV.
+            double cost = totalDv + 0.01 * impactDay;
+
+            if (totalDv <= sc.DeltaVBudget && cost < bestCost)
+            {
+                bestCost = cost;
+                bestLaunchDv = launchDv;
+                bestMidDv = midDv;
+                bestImpactDay = impactDay;
+                found = true;
+            }
+        }
+
+        if (!found)
+        {
+            // Budget-constrained fallback: use all budget at launch in asteroid-relative direction.
+            Vec3 rel = astAtLaunch.Pos - earthAtLaunch.Pos;
+            Vec3 dir = rel.Normalized();
+            bestLaunchDv = dir * (sc.DeltaVBudget * 0.9);
+            bestMidDv = dir * (sc.DeltaVBudget * 0.1);
+            bestImpactDay = Math.Min(sc.WarningDays, launchDays + Math.Max(1.0, maxTofDays * 0.5));
+        }
+
+        launchBurn = new Burn { TimeDays = launchDays, DV = bestLaunchDv };
+        midBurn = new Burn { TimeDays = Math.Min(sc.WarningDays, launchDays + Math.Max(0.5, (bestImpactDay - launchDays) * 0.6)), DV = bestMidDv };
+
+        // Final approach burn is minimal: match asteroid relative velocity direction for kinetic hit.
+        var astAtImpactFinal = PropagateBody(asteroid, majorBodies, bestImpactDay * SecondsPerDay);
+        Vec3 impactDv = astAtImpactFinal.Vel.Normalized() * Math.Min(5.0, sc.DeltaVBudget * 0.01);
+        impactBurn = new Burn { TimeDays = bestImpactDay, DV = impactDv };
+
+        // Enforce budget by scaling correction/impact burns first.
+        EnforceBudget(sc.DeltaVBudget, launchBurn, midBurn, impactBurn);
+
+        // Emit 3-burn profile: launch, correction, impact.
+        Console.WriteLine("3");
+        WriteBurn(launchBurn);
+        WriteBurn(midBurn);
+        WriteBurn(impactBurn);
+    }
+
+    private static Scenario ReadScenario()
+    {
+        string input = Console.In.ReadToEnd();
+        var toks = Tokenize(input);
+        int idx = 0;
+
+        var sc = new Scenario();
+        sc.NumBodies = ParseInt(toks, ref idx);
+        sc.WarningDays = ParseDouble(toks, ref idx);
+        sc.ImpactorMass = ParseDouble(toks, ref idx);
+        sc.DeltaVBudget = ParseDouble(toks, ref idx);
+        sc.AsteroidMass = ParseDouble(toks, ref idx);
+        sc.T0UnixUtc = ParseDouble(toks, ref idx);
+
+        for (int i = 0; i < sc.NumBodies; i++)
+        {
+            var b = new Body();
+            b.Name = toks[idx++];
+            b.Mass = ParseDouble(toks, ref idx);
+            double x = ParseDouble(toks, ref idx);
+            double y = ParseDouble(toks, ref idx);
+            double z = ParseDouble(toks, ref idx);
+            double vx = ParseDouble(toks, ref idx);
+            double vy = ParseDouble(toks, ref idx);
+            double vz = ParseDouble(toks, ref idx);
+            b.Pos = new Vec3(x, y, z);
+            b.Vel = new Vec3(vx, vy, vz);
+            sc.Bodies.Add(b);
+        }
+
+        if (idx < toks.Count)
+        {
+            sc.BspPath = toks[idx];
+        }
+
+        return sc;
+    }
+
+    private static List<string> Tokenize(string s)
+    {
+        return s.Split((char[])null, StringSplitOptions.RemoveEmptyEntries).ToList();
+    }
+
+    private static int ParseInt(List<string> toks, ref int idx)
+    {
+        return int.Parse(toks[idx++], CultureInfo.InvariantCulture);
+    }
+
+    private static double ParseDouble(List<string> toks, ref int idx)
+    {
+        return double.Parse(toks[idx++], NumberStyles.Float | NumberStyles.AllowThousands, CultureInfo.InvariantCulture);
+    }
+
+    private static double ChooseLaunchTime(double warningDays)
+    {
+        if (warningDays <= 30.0) return 0.0;
+        if (warningDays <= 365.0) return Math.Min(warningDays, warningDays * 0.05);
+        return Math.Min(warningDays, Math.Max(1.0, warningDays * 0.08));
+    }
+
+    private static (Vec3 Pos, Vec3 Vel) PropagateBody(Body target, List<Body> gravBodies, double dt)
+    {
+        // RK4 propagation under point-mass gravity from provided bodies (excluding self).
+        int steps = Math.Max(10, (int)Math.Ceiling(Math.Abs(dt) / (12 * 3600.0))); // up to 12h steps
+        double h = dt / steps;
+
+        Vec3 r = target.Pos;
+        Vec3 v = target.Vel;
+
+        for (int i = 0; i < steps; i++)
+        {
+            var k1r = v;
+            var k1v = Accel(r, gravBodies, target.Name);
+
+            var k2r = v + k1v * (0.5 * h);
+            var k2v = Accel(r + k1r * (0.5 * h), gravBodies, target.Name);
+
+            var k3r = v + k2v * (0.5 * h);
+            var k3v = Accel(r + k2r * (0.5 * h), gravBodies, target.Name);
+
+            var k4r = v + k3v * h;
+            var k4v = Accel(r + k3r * h, gravBodies, target.Name);
+
+            r += (k1r + 2 * k2r + 2 * k3r + k4r) * (h / 6.0);
+            v += (k1v + 2 * k2v + 2 * k3v + k4v) * (h / 6.0);
+        }
+
+        return (r, v);
+    }
+
+    private static Vec3 Accel(Vec3 pos, List<Body> bodies, string selfName)
+    {
+        Vec3 a = new Vec3(0, 0, 0);
+        foreach (var b in bodies)
+        {
+            if (string.Equals(b.Name, selfName, StringComparison.OrdinalIgnoreCase)) continue;
+            Vec3 dr = b.Pos - pos;
+            double r2 = dr.Norm2() + 1e3;
+            double r = Math.Sqrt(r2);
+            double invR3 = 1.0 / (r2 * r);
+            a += dr * (G * b.Mass * invR3);
+        }
+        return a;
+    }
+
+    private static Vec3 GetSunPositionAt(Scenario sc, double day)
+    {
+        var sun = sc.Bodies.FirstOrDefault(b => string.Equals(b.Name, "Sun", StringComparison.OrdinalIgnoreCase));
+        if (sun == null) return new Vec3(0, 0, 0);
+        var major = sc.Bodies.Where(b => !string.Equals(b.Name, "Sun", StringComparison.OrdinalIgnoreCase)).ToList();
+        return PropagateBody(sun, major, day * SecondsPerDay).Pos;
+    }
+
+    private static double FindBodyMass(List<Body> bodies, string name)
+    {
+        var b = bodies.FirstOrDefault(x => string.Equals(x.Name, name, StringComparison.OrdinalIgnoreCase));
+        return b?.Mass ?? 1.98847e30;
+    }
+
+    private static void EnforceBudget(double budget, Burn launch, Burn mid, Burn impact)
+    {
+        double l = launch.DV.Norm();
+        double m = mid.DV.Norm();
+        double i = impact.DV.Norm();
+        double total = l + m + i;
+        if (total <= budget || total <= 0) return;
+
+        // Preserve launch as much as possible, scale others first.
+        double remain = Math.Max(0.0, budget - l);
+        double mi = m + i;
+        if (mi <= 0)
+        {
+            launch.DV = launch.DV * (budget / total);
+            mid.DV = new Vec3(0, 0, 0);
+            impact.DV = new Vec3(0, 0, 0);
+            return;
+        }
+
+        double scale = remain / mi;
+        scale = Math.Max(0.0, Math.Min(1.0, scale));
+        mid.DV = mid.DV * scale;
+        impact.DV = impact.DV * scale;
+
+        double newTotal = launch.DV.Norm() + mid.DV.Norm() + impact.DV.Norm();
+        if (newTotal > budget && launch.DV.Norm() > 0)
+        {
+            double launchScale = (budget - mid.DV.Norm() - impact.DV.Norm()) / launch.DV.Norm();
+            launchScale = Math.Max(0.0, Math.Min(1.0, launchScale));
+            launch.DV = launch.DV * launchScale;
+        }
+    }
+
+    private static void WriteBurn(Burn b)
+    {
+        Console.WriteLine(string.Format(
+            CultureInfo.InvariantCulture,
+            "{0:R} {1:R} {2:R} {3:R}",
+            b.TimeDays,
+            b.DV.X,
+            b.DV.Y,
+            b.DV.Z));
+    }
+
+    private static void EmitFallback(double warningDays, double budget)
+    {
+        double launch = 0.0;
+        double corr = Math.Min(warningDays, Math.Max(0.5, warningDays * 0.5));
+        double impact = Math.Min(warningDays, Math.Max(corr + 0.5, warningDays * 0.9));
+
+        Console.WriteLine("3");
+        Console.WriteLine(string.Format(CultureInfo.InvariantCulture, "{0:R} {1:R} 0 0", launch, budget * 0.8));
+        Console.WriteLine(string.Format(CultureInfo.InvariantCulture, "{0:R} {1:R} 0 0", corr, budget * 0.15));
+        Console.WriteLine(string.Format(CultureInfo.InvariantCulture, "{0:R} {1:R} 0 0", impact, budget * 0.05));
+    }
+}

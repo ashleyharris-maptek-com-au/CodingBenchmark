@@ -17,12 +17,13 @@ import time
 from typing import List, Tuple, Dict, Optional
 
 from native_compiler import CSharpCompiler, compile_and_run, describe_this_pc
+from solver_utils import BaselineCache, normalize_code_result
 
 title = "3D Bin Packing - Polyhedra in Box (C#)"
 
 tags = [
   "csharp",
-  "structured response",
+  "freeform response",
   "optimization",
   "packing",
   "geometry",
@@ -33,6 +34,8 @@ TIMEOUT_SECONDS = 30
 
 # Seed for reproducibility
 RANDOM_SEED = 55555
+
+_BASELINE_CACHE = BaselineCache("test12_polyhedra_packing")
 
 
 def make_box_mesh(sx: float, sy: float, sz: float) -> Dict:
@@ -266,23 +269,7 @@ Include adaptive logic that chooses different strategies based on problem scale.
 # List of subpasses to grade the single answer against all difficulty levels
 extraGradeAnswerRuns = list(range(len(TEST_CASES)))
 
-structure = {
-  "type": "object",
-  "properties": {
-    "reasoning": {
-      "type":
-      "string",
-      "description":
-      "Explain your 3D packing algorithm and how it adapts to different container sizes and polyhedron complexities"
-    },
-    "csharp_code": {
-      "type": "string",
-      "description": "Complete C# code with Main method that handles all scales"
-    }
-  },
-  "required": ["reasoning", "csharp_code"],
-  "additionalProperties": False
-}
+structure = None
 
 
 def quaternion_multiply(q1, q2):
@@ -477,6 +464,24 @@ def format_input(poly: Dict, container: Tuple) -> str:
   return "\n".join(lines)
 
 
+def _get_cached_baseline_count(poly: Dict, container: Tuple) -> int:
+  return int(_BASELINE_CACHE.get_or_compute_json(
+    "baseline",
+    lambda: {"count": get_baseline_count(poly, container)},
+    "test12-baseline-v1",
+    format_input(poly, container),
+  )["count"])
+
+
+def _get_cached_smart_baseline_count(poly: Dict, container: Tuple) -> int:
+  return int(_BASELINE_CACHE.get_or_compute_json(
+    "smart_baseline",
+    lambda: {"count": get_smart_baseline_count(poly, container)},
+    "test12-smart-baseline-v1",
+    format_input(poly, container),
+  )["count"])
+
+
 def parse_packing_output(output: str) -> tuple:
   text = output.strip()
   if not text:
@@ -536,6 +541,7 @@ def execute_solver(code: str,
 
 def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
   """Grade the 3D packing solver."""
+  result = normalize_code_result(result, "csharp_code")
   if not result:
     return 0.0, "No result provided"
 
@@ -572,7 +578,7 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
 
   # Compare to baseline
   t1 = time.time()
-  baseline_count = get_baseline_count(poly, container)
+  baseline_count = _get_cached_baseline_count(poly, container)
   t2 = time.time()
   baseline_time = t2 - t1
   if baseline_time > 1.0:
@@ -605,7 +611,7 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
   # If the smart baseline (trying all 6 AABB orientations) packs ≥2x more,
   # the solution missed obvious improvements.
   penalty_note = ""
-  smart_baseline = get_smart_baseline_count(poly, container)
+  smart_baseline = _get_cached_smart_baseline_count(poly, container)
   if smart_baseline > baseline_count and valid_count > 0:
     if valid_count * 2 <= smart_baseline:
       score = 0.0
@@ -623,12 +629,22 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
   return score, explanation
 
 
+def setup() -> None:
+  for subPass in range(len(TEST_CASES)):
+    case = TEST_CASES[subPass]
+    poly = case["polyhedron"]
+    container = case["container"]
+    _get_cached_baseline_count(poly, container)
+    _get_cached_smart_baseline_count(poly, container)
+
+
 lastSolution = None
 lastCase = None
 
 
 def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
   """Generate HTML report."""
+  result = normalize_code_result(result, "csharp_code")
   if not result:
     return "<p style='color:red'>No result provided</p>"
 

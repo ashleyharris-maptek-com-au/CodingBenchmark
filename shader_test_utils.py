@@ -8,7 +8,7 @@ Shared module for tests 41-60. Provides:
 - UV sphere mesh generation with positions, normals, UVs, tangents, colors
 """
 
-import base64
+import html
 import hashlib
 import math
 import os
@@ -21,6 +21,11 @@ from typing import Optional, Tuple, List, Dict, Any
 
 import numpy as np
 from PIL import Image
+
+try:
+  from LLMBenchCore import ResultPaths as rp
+except Exception:
+  rp = None
 
 # ---------------------------------------------------------------------------
 # SPIR-V Tools (from Vulkan SDK)
@@ -919,12 +924,12 @@ def image_pair_html(render_path: Optional[str], reference_path: Optional[str]) -
     if not path or not os.path.exists(path):
       return f"<div style='color:#ef4444;font-size:12px'>{label}: missing</div>"
     try:
-      with open(path, "rb") as img_file:
-        data = base64.b64encode(img_file.read()).decode("utf-8")
+      src = rp.report_relpath(path) if rp else path
+      src = html.escape(src.replace("\\", "/"), quote=True)
       return (
         f"<div style='text-align:center;font-size:12px;color:#cbd5f5'>"
         f"{label}</div>"
-        f"<img src='data:image/png;base64,{data}' "
+        f"<img src='{src}' "
         "style='max-width:320px;width:100%;height:auto;border:1px solid #334155;border-radius:6px;'/>"
       )
     except Exception:

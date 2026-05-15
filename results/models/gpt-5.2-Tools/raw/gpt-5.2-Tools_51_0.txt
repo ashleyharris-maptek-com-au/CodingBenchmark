@@ -1,0 +1,434 @@
+```python
+import math
+
+# Module-level persistent controller state
+_AP = {
+    "init": False,
+    "alt_i": 0.0,
+    "ias_i": 0.0,
+    "hdg_i": 0.0,
+    "vs_i": 0.0,
+    "alt_prev_err": 0.0,
+    "ias_prev_err": 0.0,
+    "hdg_prev_err": 0.0,
+    "vs_prev_err": 0.0,
+    "pitch_cmd": 0.0,
+    "roll_cmd": 0.0,
+    "yaw_cmd": 0.0,
+    "last_time": None,
+}
+
+
+def _clamp(x, lo, hi):
+    if x < lo:
+        return lo
+    if x > hi:
+        return hi
+    return x
+
+
+def _wrap180(deg):
+    # wrap to (-180, 180]
+    d = (deg + 180.0) % 360.0 - 180.0
+    return 180.0 if d == -180.0 else d
+
+
+def _median(vals):
+    vs = sorted(vals)
+    n = len(vs)
+    if n == 0:
+        return None
+    if n % 2 == 1:
+        return vs[n // 2]
+    return 0.5 * (vs[n // 2 - 1] + vs[n // 2])
+
+
+def _robust_fuse(candidates, max_dev=None):
+    """
+    candidates: list of (value, weight) where weight>=0; values may be None
+    Returns robust estimate: median with outlier rejection and weighted mean fallback.
+    """
+    vals = [v for v, w in candidates if v is not None and w > 0]
+    if not vals:
+        return None
+    med = _median(vals)
+    if med is None:
+        return None
+    if max_dev is not None:
+        inliers = [(v, w) for v, w in candidates if v is not None and w > 0 and abs(v - med) <= max_dev]
+        if inliers:
+            num = sum(v * w for v, w in inliers)
+            den = sum(w for _, w in inliers)
+            return num / den if den > 0 else med
+        return med
+    # trimmed mean around median (reject farthest third if >2 samples)
+    if len(vals) >= 3:
+        vals_sorted = sorted(vals, key=lambda v: abs(v - med))
+        keep = vals_sorted[: max(2, int(math.ceil(len(vals) * 0.67)))]
+        return sum(keep) / len(keep)
+    return med
+
+
+def _w(valid_flag):
+    # trust but verify: valid flag contributes, but doesn't dominate
+    return 1.0 if bool(valid_flag) else 0.5
+
+
+def _get(state, key, default=None):
+    v = state.get(key, default)
+    # normalize NaN to None
+    try:
+        if isinstance(v, float) and math.isnan(v):
+            return default
+    except Exception:
+        pass
+    return v
+
+
+def _fused_alt_ft(state):
+    # Baro altitude (pressure altitude / baro altimeters) for cruise/large changes
+    baros = []
+    for i in (1, 2, 3):
+        baros.append((_get(state, f"baro_alt_{i}_ft"), _w(_get(state, f"baro_alt_{i}_valid", True))))
+    baro = _robust_fuse(baros, max_dev=500.0)
+
+    # GPS altitude (useful when baro unreliable; can be noisy)
+    gps = []
+    for i in (1, 2, 3):
+        gps.append((_get(state, f"gps_{i}_alt_ft"), _w(_get(state, f"gps_{i}_valid", True))))
+    gps_alt = _robust_fuse(gps, max_dev=800.0)
+
+    # Radar altitude only meaningful near ground; also helps detect baro runaway
+    rad = []
+    for i in (1, 2, 3):
+        rad.append((_get(state, f"radar_alt_{i}_ft"), _w(_get(state, f"radar_alt_{i}_valid", True))))
+    radar_alt = _robust_fuse(rad, max_dev=100.0)
+
+    # Choose blend based on radar altitude availability (AGL proxy)
+    if radar_alt is not None and radar_alt < 2500.0:
+        # near ground: prefer radar for short-term, but keep baro trend
+        if baro is None:
+            return radar_alt
+        alpha = _clamp((2500.0 - radar_alt) / 2500.0, 0.0, 1.0)  # 1 at ground
+        return alpha * (baro - (baro - radar_alt)) + (1 - alpha) * baro  # effectively radar near ground
+
+    # enroute: prefer baro; use gps as sanity cross-check
+    if baro is None:
+        return gps_alt
+    if gps_alt is None:
+        return baro
+    # if large disagreement, trust the one consistent with vertical speed sources
+    if abs(baro - gps_alt) > 1200.0:
+        return baro  # baro generally better for flight levels in this sim
+    return 0.8 * baro + 0.2 * gps_alt
+
+
+def _fused_vs_fpm(state):
+    # Use IRS vertical speed if available, else navigation vertical_speed_fpm
+    irs_vs = []
+    for i in (1, 2, 3):
+        irs_vs.append((_get(state, f"irs_{i}_vs_fpm"), _w(_get(state, f"irs_{i}_valid", True))))
+    vs_irs = _robust_fuse(irs_vs, max_dev=1500.0)
+    vs_nav = _get(state, "vertical_speed_fpm")
+    if vs_irs is None and vs_nav is None:
+        return None
+    if vs_irs is None:
+        return vs_nav
+    if vs_nav is None:
+        return vs_irs
+    return 0.7 * vs_irs + 0.3 * vs_nav
+
+
+def _fused_ias_kt(state):
+    ias = []
+    for i in (1, 2, 3):
+        ias.append((_get(state, f"ias_{i}_kt"), _w(_get(state, f"ias_{i}_valid", True))))
+    return _robust_fuse(ias, max_dev=25.0)
+
+
+def _fused_heading_deg(state):
+    # Prefer IRS heading; fallback to nav/true/mag heading
+    hdgs = []
+    for i in (1, 2, 3):
+        hdgs.append((_get(state, f"irs_{i}_heading_deg"), _w(_get(state, f"irs_{i}_valid", True))))
+    h_irs = _robust_fuse(hdgs, max_dev=8.0)
+    if h_irs is not None:
+        return h_irs % 360.0
+    h = _get(state, "magnetic_heading_deg")
+    if h is None:
+        h = _get(state, "true_heading_deg")
+    return None if h is None else (h % 360.0)
+
+
+def _fused_track_deg(state):
+    # Track can help in high winds; prefer IRS track, then GPS track, then nav track
+    trs = []
+    for i in (1, 2, 3):
+        trs.append((_get(state, f"irs_{i}_track_deg"), _w(_get(state, f"irs_{i}_valid", True))))
+    tr_irs = _robust_fuse(trs, max_dev=10.0)
+    if tr_irs is not None:
+        return tr_irs % 360.0
+    g = []
+    for i in (1, 2, 3):
+        g.append((_get(state, f"gps_{i}_track_deg"), _w(_get(state, f"gps_{i}_valid", True))))
+    tr_gps = _robust_fuse(g, max_dev=15.0)
+    if tr_gps is not None:
+        return tr_gps % 360.0
+    tr = _get(state, "track_deg")
+    return None if tr is None else (tr % 360.0)
+
+
+def _fused_pitch_roll(state):
+    p = []
+    r = []
+    for i in (1, 2, 3):
+        w = _w(_get(state, f"irs_{i}_valid", True))
+        p.append((_get(state, f"irs_{i}_pitch_deg"), w))
+        r.append((_get(state, f"irs_{i}_roll_deg"), w))
+    pitch = _robust_fuse(p, max_dev=6.0)
+    roll = _robust_fuse(r, max_dev=8.0)
+    return pitch, roll
+
+
+def _fused_rates(state):
+    pr = []
+    rr = []
+    yr = []
+    for i in (1, 2, 3):
+        w = _w(_get(state, f"gyro_{i}_valid", True))
+        pr.append((_get(state, f"gyro_{i}_pitch_rate_dps"), w))
+        rr.append((_get(state, f"gyro_{i}_roll_rate_dps"), w))
+        yr.append((_get(state, f"gyro_{i}_yaw_rate_dps"), w))
+    return (
+        _robust_fuse(pr, max_dev=25.0),
+        _robust_fuse(rr, max_dev=35.0),
+        _robust_fuse(yr, max_dev=35.0),
+    )
+
+
+def _fused_aoa_deg(state):
+    aoa = []
+    for i in (1, 2, 3):
+        aoa.append((_get(state, f"aoa_{i}_deg"), _w(_get(state, f"aoa_{i}_valid", True))))
+    return _robust_fuse(aoa, max_dev=5.0)
+
+
+def _pid(name, err, dt, kp, ki, kd, i_limit):
+    i_key = f"{name}_i"
+    p_key = f"{name}_prev_err"
+    i = _AP[i_key]
+    i = _clamp(i + err * max(1e-3, dt), -i_limit, i_limit)
+    de = (err - _AP[p_key]) / max(1e-3, dt)
+    _AP[p_key] = err
+    _AP[i_key] = i
+    return kp * err + ki * i + kd * de
+
+
+def autopilot_step(state: dict, dt: float) -> dict:
+    # Normalize dt
+    dt_in = dt if dt is not None else _get(state, "dt", 0.05)
+    dt = float(dt_in) if dt_in and dt_in > 0 else 0.05
+
+    ap_on = bool(_get(state, "ap_engaged", True))
+    at_on = bool(_get(state, "at_engaged", True))
+
+    # If not engaged, do nothing (hold)
+    if not ap_on and not at_on:
+        return {}
+
+    alt = _fused_alt_ft(state)
+    vs = _fused_vs_fpm(state)
+    ias = _fused_ias_kt(state)
+    hdg = _fused_heading_deg(state)
+    trk = _fused_track_deg(state)
+    pitch, roll = _fused_pitch_roll(state)
+    pitch_rate, roll_rate, yaw_rate = _fused_rates(state)
+    aoa = _fused_aoa_deg(state)
+
+    # Determine basic flight phase / protections
+    wow = bool(_get(state, "weight_on_wheels_left", False) or _get(state, "weight_on_wheels_right", False) or _get(state, "weight_on_wheels_nose", False))
+    radar_alt = _robust_fuse(
+        [
+            (_get(state, "radar_alt_1_ft"), _w(_get(state, "radar_alt_1_valid", True))),
+            (_get(state, "radar_alt_2_ft"), _w(_get(state, "radar_alt_2_valid", True))),
+            (_get(state, "radar_alt_3_ft"), _w(_get(state, "radar_alt_3_valid", True))),
+        ],
+        max_dev=100.0,
+    )
+    agl = radar_alt if radar_alt is not None else 99999.0
+
+    # Targets
+    tgt_alt = _get(state, "target_alt_ft")
+    tgt_hdg = _get(state, "target_hdg_deg")
+    tgt_ias = _get(state, "target_ias_kt")
+    tgt_vs = _get(state, "target_vs_fpm")
+
+    # Default fallbacks if targets missing
+    if tgt_alt is None and alt is not None:
+        tgt_alt = alt
+    if tgt_hdg is None:
+        tgt_hdg = trk if trk is not None else hdg
+    if tgt_ias is None and ias is not None:
+        tgt_ias = ias
+    if tgt_vs is None:
+        tgt_vs = 0.0
+
+    # Speed protections
+    # Conservative A320-class: keep >= 135kts clean, higher if heavy; avoid Vne.
+    gw = _get(state, "gross_weight_kg", 65000.0) or 65000.0
+    min_speed = 130.0 + _clamp((gw - 55000.0) / 2000.0, 0.0, 25.0)  # 130..155
+    vne = 365.0
+    if tgt_ias is not None:
+        tgt_ias = _clamp(float(tgt_ias), min_speed, vne - 10.0)
+
+    # AoA / stall avoidance: if AoA high, command nose down and add thrust
+    aoa_high = aoa is not None and aoa > 12.0
+    aoa_crit = aoa is not None and aoa > 16.0
+
+    # Configuration scheduling (simple)
+    # Aim: flaps on approach; gear down late; speedbrake for descent/overspeed.
+    flaps_cmd = None
+    gear_cmd = None
+    spdbrk_cmd = None
+    if not wow and ias is not None:
+        if agl < 2000.0:
+            if ias < 170.0:
+                flaps_cmd = 15
+            elif ias < 200.0:
+                flaps_cmd = 10
+            else:
+                flaps_cmd = 0
+            if agl < 1200.0 and ias < 190.0:
+                gear_cmd = 1
+            else:
+                gear_cmd = 0
+        else:
+            flaps_cmd = 0
+            gear_cmd = 0
+
+    # Lateral control: heading hold/track hold with roll command
+    roll_out = 0.0
+    if ap_on and tgt_hdg is not None and (hdg is not None or trk is not None):
+        # use heading for short term, track for windy if available
+        ref = hdg if hdg is not None else trk
+        err_hdg = _wrap180(float(tgt_hdg) - float(ref))
+        # Limit bank command based on altitude/phase
+        max_bank = 25.0 if agl > 500.0 else 15.0
+        # Simple PI to desired bank angle
+        bank_cmd = _pid("hdg", err_hdg, dt, kp=0.04, ki=0.002, kd=0.01, i_limit=50.0)
+        bank_cmd = _clamp(bank_cmd, -max_bank, max_bank)
+        # Bank angle controller to aileron
+        if roll is not None:
+            bank_err = bank_cmd - float(roll)
+        else:
+            bank_err = bank_cmd
+        # roll rate damping
+        rr = float(roll_rate) if roll_rate is not None else 0.0
+        roll_out = _clamp(0.08 * bank_err - 0.02 * rr, -1.0, 1.0)
+
+    # Yaw damper / asym thrust compensation (rudder)
+    rud_out = 0.0
+    if ap_on:
+        # if large thrust split, add rudder to counter yaw; also damp yaw rate
+        t1 = _get(state, "engine_1_thrust_pct")
+        t2 = _get(state, "engine_2_thrust_pct")
+        if t1 is None:
+            t1 = 0.0
+        if t2 is None:
+            t2 = 0.0
+        thrust_asym = (float(t2) - float(t1)) / 100.0  # + means yaw left needed
+        yr = float(yaw_rate) if yaw_rate is not None else 0.0
+        rud_out = _clamp(0.35 * (-thrust_asym) - 0.02 * yr, -0.6, 0.6)
+
+    # Vertical guidance: altitude + VS with speed/aoa protection
+    elev_out = 0.0
+    trim_out = 0.0
+    if ap_on and alt is not None:
+        alt_err = float(tgt_alt) - float(alt)
+        # Outer loop generates a VS command (fpm)
+        vs_cmd = _clamp(alt_err * 0.25, -2000.0, 2000.0)
+        # Blend with target VS if provided
+        vs_cmd = 0.6 * vs_cmd + 0.4 * float(tgt_vs)
+        # Speed/aoa protection: reduce climb if slow/high aoa
+        if ias is not None and tgt_ias is not None:
+            spd_err = float(tgt_ias) - float(ias)
+            if spd_err > 10.0:
+                vs_cmd = min(vs_cmd, 500.0)  # don't climb hard if below target speed
+        if aoa_high:
+            vs_cmd = min(vs_cmd, 0.0)
+        if aoa_crit:
+            vs_cmd = -1500.0
+
+        # Inner loop: VS controller to pitch command
+        vs_meas = float(vs) if vs is not None else 0.0
+        vs_err = vs_cmd - vs_meas
+        pitch_cmd = _pid("vs", vs_err, dt, kp=0.0025, ki=0.0004, kd=0.0015, i_limit=4000.0)
+        # Convert pitch_cmd (deg) to elevator with pitch & rate feedback
+        pitch_target_deg = _clamp(pitch_cmd, -8.0, 12.0)
+        if pitch is not None:
+            pitch_err = pitch_target_deg - float(pitch)
+        else:
+            pitch_err = pitch_target_deg
+        pr = float(pitch_rate) if pitch_rate is not None else 0.0
+        elev_out = _clamp(0.06 * pitch_err - 0.015 * pr, -1.0, 1.0)
+
+        # Trim: slowly remove steady elevator bias when stable and not near ground
+        if agl > 200.0 and not aoa_high:
+            trim_out = _clamp(0.02 * elev_out, -0.2, 0.2)
+
+    # Autothrottle: hold IAS with protections (and limit overspeed)
+    thr1 = None
+    thr2 = None
+    if at_on and ias is not None and tgt_ias is not None:
+        ias_err = float(tgt_ias) - float(ias)
+        # Base throttle around current if available
+        base1 = _get(state, "throttle_1_pos")
+        base2 = _get(state, "throttle_2_pos")
+        base = 0.5 * (float(base1) if base1 is not None else 0.5 + float(base2) if base2 is not None else 0.5)
+        # PI(D) on speed -> throttle delta
+        dthr = _pid("ias", ias_err, dt, kp=0.006, ki=0.0015, kd=0.004, i_limit=80.0)
+        # Overspeed hard reduction
+        if float(ias) > vne - 5.0:
+            dthr -= 0.4
+            spdbrk_cmd = 1.0
+        # Underspeed / stall margin
+        if float(ias) < min_speed + 5.0 or aoa_high:
+            dthr += 0.25
+        if aoa_crit:
+            dthr += 0.45
+        thr = _clamp(base + dthr, 0.0, 1.0)
+        thr1 = thr
+        thr2 = thr
+
+    # Speedbrake: help meet descent / reduce overspeed (avoid on approach)
+    if spdbrk_cmd is None and not wow and ias is not None and tgt_ias is not None:
+        if float(ias) > float(tgt_ias) + 15.0 and agl > 1500.0:
+            spdbrk_cmd = _clamp((float(ias) - float(tgt_ias) - 15.0) / 40.0, 0.0, 0.8)
+        else:
+            spdbrk_cmd = 0.0
+    if agl < 1200.0:
+        spdbrk_cmd = 0.0
+
+    # Gear/flaps safety on ground
+    if wow:
+        gear_cmd = 1 if bool(_get(state, "gear_handle_down", True)) else 0
+        spdbrk_cmd = 0.0
+
+    # Final command dict (omit keys if None to "maintain")
+    out = {}
+    if ap_on:
+        out["elevator"] = float(_clamp(elev_out, -1.0, 1.0))
+        out["aileron"] = float(_clamp(roll_out, -1.0, 1.0))
+        out["rudder"] = float(_clamp(rud_out, -1.0, 1.0))
+        out["elevator_trim"] = float(_clamp(trim_out, -1.0, 1.0))
+    if at_on and thr1 is not None and thr2 is not None:
+        out["throttle_1"] = float(thr1)
+        out["throttle_2"] = float(thr2)
+    if flaps_cmd is not None:
+        out["flaps"] = int(_clamp(flaps_cmd, 0, 40))
+    if spdbrk_cmd is not None:
+        out["speedbrake"] = float(_clamp(spdbrk_cmd, 0.0, 1.0))
+    if gear_cmd is not None:
+        out["gear"] = int(1 if gear_cmd else 0)
+    return out
+```

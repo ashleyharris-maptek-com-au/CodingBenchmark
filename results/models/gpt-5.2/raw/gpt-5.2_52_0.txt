@@ -1,0 +1,563 @@
+import math
+from statistics import median
+
+# Module-level persistent memory for filtering and fault tolerance
+_mem = {
+    "init": False,
+    "speed_mps_f": 0.0,
+    "heading_deg_f": 0.0,
+    "yaw_rate_dps_f": 0.0,
+    "lane_offset_f": 0.0,
+    "curvature_1pm_f": 0.0,
+    "obstacle_dist_f": None,
+    "obstacle_rel_speed_mps_f": 0.0,
+    "last_good_lane_offset": 0.0,
+    "last_steer": 0.0,
+    "last_throttle": 0.0,
+    "last_brake": 0.0,
+    "bad_sensor_score": {},  # key -> score
+}
+
+
+def _clamp(x, lo, hi):
+    return lo if x < lo else hi if x > hi else x
+
+
+def _wrap_deg(a):
+    a = (a + 180.0) % 360.0 - 180.0
+    return a
+
+
+def _ema(prev, x, alpha):
+    if prev is None:
+        return x
+    return prev + alpha * (x - prev)
+
+
+def _get(state, key, default=None):
+    try:
+        return state[key]
+    except KeyError:
+        return default
+
+
+def _is_number(x):
+    return isinstance(x, (int, float)) and math.isfinite(x)
+
+
+def _robust_valid(state, value_key, valid_key=None, expected_range=None, max_jump=None, prev=None):
+    """
+    Treat validity flags as hints; apply plausibility checks.
+    expected_range: (lo, hi) or None
+    max_jump: maximum absolute difference allowed vs prev (same units)
+    """
+    v = _get(state, value_key, None)
+    flag = True
+    if valid_key is not None:
+        flag = bool(_get(state, valid_key, True))
+    if not _is_number(v):
+        return None
+    if expected_range is not None:
+        lo, hi = expected_range
+        if v < lo or v > hi:
+            flag = False
+    if prev is not None and max_jump is not None and _is_number(prev):
+        if abs(v - prev) > max_jump:
+            flag = False
+    return v if flag else None
+
+
+def _vote_numeric(values):
+    vals = [v for v in values if _is_number(v)]
+    if not vals:
+        return None
+    return float(median(vals))
+
+
+def _min_valid(values):
+    vals = [v for v in values if _is_number(v)]
+    return min(vals) if vals else None
+
+
+def _max_valid(values):
+    vals = [v for v in values if _is_number(v)]
+    return max(vals) if vals else None
+
+
+def _score_sensor(key, ok):
+    # simple leaky integrator for sensor health; higher = worse
+    s = _mem["bad_sensor_score"].get(key, 0.0)
+    if ok:
+        s = max(0.0, s - 0.5)
+    else:
+        s = min(10.0, s + 1.0)
+    _mem["bad_sensor_score"][key] = s
+    return s
+
+
+def autopilot_step(state: dict, dt: float) -> dict:
+    # Prefer provided dt if reasonable
+    dt_state = _get(state, "dt", None)
+    if _is_number(dt_state) and 0.001 <= dt_state <= 0.5:
+        dt = float(dt_state)
+    if not _is_number(dt) or dt <= 0.0:
+        dt = 0.05
+    dt = _clamp(dt, 0.01, 0.2)
+
+    if not _mem["init"]:
+        _mem["init"] = True
+        _mem["speed_mps_f"] = 0.0
+        _mem["heading_deg_f"] = 0.0
+        _mem["yaw_rate_dps_f"] = 0.0
+        _mem["lane_offset_f"] = 0.0
+        _mem["curvature_1pm_f"] = 0.0
+        _mem["last_good_lane_offset"] = 0.0
+        _mem["last_steer"] = 0.0
+        _mem["last_throttle"] = 0.0
+        _mem["last_brake"] = 0.0
+
+    # --- Traction / environment ---
+    mu = _get(state, "estimated_mu", 1.0)
+    if not _is_number(mu):
+        mu = 1.0
+    mu = _clamp(float(mu), 0.05, 1.2)
+    rain = bool(_get(state, "rain_sensor", False))
+    temp_c = _get(state, "temperature_c", 20.0)
+    if not _is_number(temp_c):
+        temp_c = 20.0
+
+    # Conservative scaling for low traction
+    mu_factor = _clamp((mu - 0.1) / 0.9, 0.0, 1.0)
+    # Extra caution if raining or near freezing
+    env_caution = 1.0
+    if rain:
+        env_caution *= 0.85
+    if _is_number(temp_c) and temp_c < 2.0:
+        env_caution *= 0.85
+    traction_caution = _clamp(mu_factor * env_caution, 0.0, 1.0)
+
+    # --- Speed estimation (fusion) ---
+    # Wheel speeds: plausibility 0..300 km/h
+    ws = []
+    for corner in ("fl", "fr", "rl", "rr"):
+        v = _robust_valid(
+            state,
+            f"wheel_speed_{corner}_kmh",
+            f"wheel_speed_{corner}_valid",
+            expected_range=(0.0, 300.0),
+            max_jump=60.0,
+            prev=None,
+        )
+        ok = v is not None
+        _score_sensor(f"wheel_{corner}", ok)
+        if v is not None:
+            ws.append(v)
+    wheel_speed_kmh = _vote_numeric(ws)
+
+    # Vehicle speed sensors (no explicit valid): plausibility 0..300, jump-limited vs filtered
+    prev_speed_kmh = _mem["speed_mps_f"] * 3.6
+    vs1 = _robust_valid(state, "vehicle_speed_1_kmh", None, (0.0, 300.0), 80.0, prev_speed_kmh)
+    vs2 = _robust_valid(state, "vehicle_speed_2_kmh", None, (0.0, 300.0), 80.0, prev_speed_kmh)
+    _score_sensor("vehicle_speed_1", vs1 is not None)
+    _score_sensor("vehicle_speed_2", vs2 is not None)
+    veh_speed_kmh = _vote_numeric([vs1, vs2])
+
+    # GPS speeds
+    gps_speeds = []
+    for i in (1, 2):
+        v = _robust_valid(
+            state,
+            f"gps_{i}_speed_kmh",
+            f"gps_{i}_valid",
+            expected_range=(0.0, 300.0),
+            max_jump=80.0,
+            prev=prev_speed_kmh,
+        )
+        _score_sensor(f"gps_{i}_speed", v is not None)
+        if v is not None:
+            gps_speeds.append(v)
+    gps_speed_kmh = _vote_numeric(gps_speeds)
+
+    # Fuse: prefer wheel/vehicle; fall back to GPS; cross-check for slip (low mu)
+    candidates = []
+    if wheel_speed_kmh is not None:
+        candidates.append(wheel_speed_kmh)
+    if veh_speed_kmh is not None:
+        candidates.append(veh_speed_kmh)
+    if gps_speed_kmh is not None:
+        candidates.append(gps_speed_kmh)
+    speed_kmh = _vote_numeric(candidates)
+    if speed_kmh is None:
+        speed_kmh = prev_speed_kmh
+
+    # If low mu and wheel speed differs a lot from GPS, trust GPS more (avoid wheel slip)
+    if mu < 0.4 and gps_speed_kmh is not None and wheel_speed_kmh is not None:
+        if abs(wheel_speed_kmh - gps_speed_kmh) > 15.0:
+            speed_kmh = 0.7 * gps_speed_kmh + 0.3 * speed_kmh
+
+    speed_mps = max(0.0, speed_kmh / 3.6)
+    # Filter speed
+    _mem["speed_mps_f"] = _ema(_mem["speed_mps_f"], speed_mps, alpha=_clamp(dt * 3.0, 0.05, 0.5))
+    speed_mps_f = _mem["speed_mps_f"]
+
+    # --- Yaw rate / heading ---
+    yaw_rates = []
+    for i in (1, 2, 3):
+        y = _robust_valid(state, f"gyro_{i}_yaw_rate_dps", f"gyro_{i}_valid", (-200.0, 200.0), 200.0, None)
+        _score_sensor(f"gyro_{i}", y is not None)
+        if y is not None:
+            yaw_rates.append(y)
+    yaw_rate_dps = _vote_numeric(yaw_rates)
+    if yaw_rate_dps is None:
+        yaw_rate_dps = _mem["yaw_rate_dps_f"]
+    _mem["yaw_rate_dps_f"] = _ema(_mem["yaw_rate_dps_f"], yaw_rate_dps, alpha=_clamp(dt * 4.0, 0.05, 0.6))
+    yaw_rate_dps_f = _mem["yaw_rate_dps_f"]
+
+    # GPS heading (use if valid)
+    headings = []
+    for i in (1, 2):
+        h = _robust_valid(state, f"gps_{i}_heading_deg", f"gps_{i}_valid", (-360.0, 360.0), 90.0, None)
+        _score_sensor(f"gps_{i}_heading", h is not None)
+        if h is not None:
+            headings.append(_wrap_deg(h))
+    gps_heading = _vote_numeric(headings)
+    if gps_heading is not None:
+        _mem["heading_deg_f"] = _wrap_deg(_ema(_mem["heading_deg_f"], gps_heading, alpha=_clamp(dt * 1.5, 0.02, 0.3)))
+    else:
+        # dead-reckon heading from yaw rate
+        _mem["heading_deg_f"] = _wrap_deg(_mem["heading_deg_f"] + yaw_rate_dps_f * dt)
+    heading_deg_f = _mem["heading_deg_f"]
+
+    # --- Lane / road model (fusion vision + lidar) ---
+    lane_offsets = []
+    curvatures = []
+    speed_limits = []
+
+    obstacle_flags = []
+    obstacle_dists = []
+    obstacle_rel_speeds = []
+
+    # Use vision sensors with plausibility; lane offset in [-2.5, 2.5] m
+    for i in (1, 2, 3):
+        lo = _robust_valid(state, f"vision_{i}_lane_offset_m", None, (-3.0, 3.0), 1.5, _mem["lane_offset_f"])
+        # lane lines validity: if both lines invalid, discount
+        left_valid = bool(_get(state, f"vision_{i}_left_line_valid", True))
+        right_valid = bool(_get(state, f"vision_{i}_right_line_valid", True))
+        # If flags say invalid, trust but allow occasional recovery via plausibility
+        if not left_valid and not right_valid:
+            lo = None
+        _score_sensor(f"vision_{i}_lane", lo is not None)
+        if lo is not None:
+            lane_offsets.append(lo)
+
+        curv = _robust_valid(state, f"vision_{i}_road_curvature_1pm", None, (-50.0, 50.0), 20.0, _mem["curvature_1pm_f"])
+        _score_sensor(f"vision_{i}_curv", curv is not None)
+        if curv is not None:
+            curvatures.append(curv)
+
+        sl_valid = bool(_get(state, f"vision_{i}_speed_limit_valid", False))
+        sl = _get(state, f"vision_{i}_speed_limit_kmh", None)
+        if sl_valid and _is_number(sl) and 10.0 <= sl <= 140.0:
+            speed_limits.append(float(sl))
+
+        obs_valid = bool(_get(state, f"vision_{i}_obstacle_valid", False))
+        obs_det = bool(_get(state, f"vision_{i}_obstacle_detected", False))
+        obs_dist = _get(state, f"vision_{i}_obstacle_dist_m", None)
+        obs_rel = _get(state, f"vision_{i}_obstacle_rel_speed_kmh", None)
+        if obs_valid and obs_det and _is_number(obs_dist) and 0.0 < obs_dist < 250.0:
+            obstacle_flags.append(True)
+            obstacle_dists.append(float(obs_dist))
+            if _is_number(obs_rel):
+                obstacle_rel_speeds.append(float(obs_rel) / 3.6)
+        else:
+            obstacle_flags.append(False)
+
+    lane_offset = _vote_numeric(lane_offsets)
+    if lane_offset is None:
+        lane_offset = _mem["last_good_lane_offset"]
+    else:
+        _mem["last_good_lane_offset"] = lane_offset
+    _mem["lane_offset_f"] = _ema(_mem["lane_offset_f"], lane_offset, alpha=_clamp(dt * 2.5, 0.05, 0.5))
+    lane_offset_f = _mem["lane_offset_f"]
+
+    curvature_1pm = _vote_numeric(curvatures)
+    if curvature_1pm is None:
+        curvature_1pm = _mem["curvature_1pm_f"]
+    _mem["curvature_1pm_f"] = _ema(_mem["curvature_1pm_f"], curvature_1pm, alpha=_clamp(dt * 2.0, 0.04, 0.4))
+    curvature_1pm_f = _mem["curvature_1pm_f"]
+
+    speed_limit_kmh = _vote_numeric(speed_limits)
+    # If no sign, don't force limit; treat as absent
+
+    # Lidar obstacle / lead vehicle estimation: use front beams near 0 deg
+    lidar_front = []
+    for ang in ("+005", "-005", "+015", "-015", "+030", "-030"):
+        rng = _robust_valid(
+            state,
+            f"lidar_{ang}_deg_range_m",
+            f"lidar_{ang}_deg_valid",
+            expected_range=(0.2, 250.0),
+            max_jump=80.0,
+            prev=None,
+        )
+        _score_sensor(f"lidar_{ang}", rng is not None)
+        if rng is not None:
+            lidar_front.append(rng)
+    front_range = _min_valid(lidar_front)
+
+    # Side lidar for lane change safety (left/right near +/-60 and +/-90)
+    lidar_left = []
+    lidar_right = []
+    for ang in ("+060", "+090", "+045", "+030", "+015"):
+        rng = _robust_valid(state, f"lidar_{ang}_deg_range_m", f"lidar_{ang}_deg_valid", (0.2, 120.0), 80.0, None)
+        if rng is not None:
+            lidar_left.append(rng)
+    for ang in ("-060", "-090", "-045", "-030", "-015"):
+        rng = _robust_valid(state, f"lidar_{ang}_deg_range_m", f"lidar_{ang}_deg_valid", (0.2, 120.0), 80.0, None)
+        if rng is not None:
+            lidar_right.append(rng)
+    left_clear_m = _min_valid(lidar_left)
+    right_clear_m = _min_valid(lidar_right)
+
+    # Decide obstacle presence: vision OR lidar
+    vision_obstacle = any(obstacle_flags) and len(obstacle_dists) > 0
+    vision_obs_dist = _vote_numeric(obstacle_dists) if obstacle_dists else None
+    vision_obs_rel = _vote_numeric(obstacle_rel_speeds) if obstacle_rel_speeds else 0.0
+
+    # Prefer min distance among sources
+    obs_dist = None
+    obs_rel_mps = 0.0
+    if vision_obs_dist is not None:
+        obs_dist = vision_obs_dist
+        obs_rel_mps = float(vision_obs_rel or 0.0)
+    if front_range is not None:
+        if obs_dist is None or front_range < obs_dist:
+            obs_dist = front_range
+            # If lidar-only, assume worst-case: stationary obstacle ahead if close
+            obs_rel_mps = min(obs_rel_mps, 0.0)
+
+    # Filter obstacle distance (handle flicker)
+    if obs_dist is not None:
+        prev_obs = _mem["obstacle_dist_f"]
+        if prev_obs is None:
+            _mem["obstacle_dist_f"] = obs_dist
+        else:
+            # If a sudden large increase, keep previous for a bit (flicker)
+            if obs_dist - prev_obs > 25.0:
+                _mem["obstacle_dist_f"] = _ema(prev_obs, obs_dist, alpha=0.1)
+            else:
+                _mem["obstacle_dist_f"] = _ema(prev_obs, obs_dist, alpha=_clamp(dt * 3.0, 0.1, 0.6))
+        _mem["obstacle_rel_speed_mps_f"] = _ema(_mem["obstacle_rel_speed_mps_f"], obs_rel_mps, alpha=_clamp(dt * 2.0, 0.05, 0.4))
+    else:
+        # decay to no obstacle
+        if _mem["obstacle_dist_f"] is not None:
+            _mem["obstacle_dist_f"] = _ema(_mem["obstacle_dist_f"], 300.0, alpha=0.05)
+            if _mem["obstacle_dist_f"] > 280.0:
+                _mem["obstacle_dist_f"] = None
+        _mem["obstacle_rel_speed_mps_f"] = _ema(_mem["obstacle_rel_speed_mps_f"], 0.0, alpha=0.05)
+
+    obs_dist_f = _mem["obstacle_dist_f"]
+    obs_rel_mps_f = _mem["obstacle_rel_speed_mps_f"]
+
+    # --- Targets ---
+    target_speed_kmh = _get(state, "target_speed_kmh", 100.0)
+    if not _is_number(target_speed_kmh):
+        target_speed_kmh = 100.0
+    target_speed_kmh = _clamp(float(target_speed_kmh), 0.0, 140.0)
+
+    # Respect speed limit if present
+    if speed_limit_kmh is not None:
+        target_speed_kmh = min(target_speed_kmh, float(speed_limit_kmh))
+
+    # Reduce target speed based on traction and curvature (lateral accel limit)
+    # a_lat ~ v^2 * kappa, where kappa ~ curvature(1/m). curvature_1pm is 1/m * 1e-2? Actually 1/pm = 1 per meter.
+    # We'll treat curvature_1pm as 1/m directly (as stated) but keep conservative.
+    kappa = abs(curvature_1pm_f) * 0.01  # interpret 1/pm as 0.01 1/m (conservative)
+    # Limit lateral accel based on mu (approx mu*g*0.6 safety)
+    a_lat_max = max(0.5, mu * 9.81 * 0.6)
+    if kappa > 1e-4:
+        v_curve_max = math.sqrt(a_lat_max / kappa)
+        target_speed_kmh = min(target_speed_kmh, v_curve_max * 3.6)
+    # Global traction reduction
+    target_speed_kmh *= (0.55 + 0.45 * traction_caution)  # down to 55% on very low traction
+    target_speed_kmh = _clamp(target_speed_kmh, 0.0, 140.0)
+
+    current_lane = int(_get(state, "current_lane", 1) or 1)
+    target_lane = int(_get(state, "target_lane", current_lane) or current_lane)
+    current_lane = _clamp(current_lane, 0, 2)
+    target_lane = _clamp(target_lane, 0, 2)
+
+    # --- Obstacle handling: time gap and lane change logic ---
+    # Desired time headway increases with low traction
+    base_headway = 1.6 + (1.2 * (1.0 - traction_caution))  # up to ~2.8s
+    # Emergency thresholds
+    ttc = None
+    if obs_dist_f is not None and speed_mps_f > 0.5:
+        closing = max(0.0, speed_mps_f - max(0.0, speed_mps_f + obs_rel_mps_f))  # if rel is negative, closing grows
+        # Better: estimate obstacle speed = ego + rel
+        obs_speed = max(0.0, speed_mps_f + obs_rel_mps_f)
+        closing = max(0.0, speed_mps_f - obs_speed)
+        if closing > 0.1:
+            ttc = obs_dist_f / closing
+
+    # Decide if we should attempt lane change to avoid slower/stopped object
+    want_lane_change = False
+    desired_lane = target_lane
+    if obs_dist_f is not None:
+        # "Too close" relative to speed => respond
+        desired_gap = max(8.0, base_headway * speed_mps_f)
+        if obs_dist_f < desired_gap * 1.2:
+            want_lane_change = True
+
+    # Check lane availability with lidar (simple)
+    # left_clear_m/right_clear_m are min ranges; require some clearance ahead+side
+    min_side_clear = max(8.0, speed_mps_f * 0.8)
+    can_left = left_clear_m is None or left_clear_m > min_side_clear
+    can_right = right_clear_m is None or right_clear_m > min_side_clear
+
+    if want_lane_change:
+        # Prefer towards target_lane if feasible, else away from obstacle by choosing lane with more clearance
+        if target_lane > current_lane and can_left:
+            desired_lane = current_lane + 1
+        elif target_lane < current_lane and can_right:
+            desired_lane = current_lane - 1
+        else:
+            # Opportunistic: pick clearer side if within bounds
+            if current_lane < 2 and can_left and (left_clear_m or 999.0) >= (right_clear_m or 0.0):
+                desired_lane = current_lane + 1
+            elif current_lane > 0 and can_right:
+                desired_lane = current_lane - 1
+            else:
+                desired_lane = current_lane
+
+    # If we must avoid imminent collision, don't lane-change aggressively; brake hard
+    emergency = False
+    if obs_dist_f is not None:
+        if obs_dist_f < 6.0:
+            emergency = True
+        if ttc is not None and ttc < (1.0 + 1.0 * (1.0 - traction_caution)):
+            emergency = True
+
+    # --- Lateral control (lane keeping + lane change) ---
+    # Interpret lane_offset as positive right of center -> need steer left (negative)
+    # Use yaw-rate damping and curvature feedforward
+    # Convert desired lane change into an offset target (assume lane width ~3.6m)
+    lane_width = 3.6
+    lane_delta = desired_lane - current_lane
+    desired_offset = lane_offset_f - lane_delta * lane_width  # shift center target
+
+    # Lateral gains scaled by speed and traction
+    speed_gain = _clamp(speed_mps_f / 30.0, 0.3, 1.2)
+    kp = (0.35 + 0.25 * speed_gain) * (0.4 + 0.6 * traction_caution)
+    kd = 0.08 * (0.5 + 0.5 * traction_caution)
+    kff = 0.15 * (0.5 + 0.5 * traction_caution)
+
+    # Road curvature feedforward (sign): positive curvature => turn left? We'll approximate sign with curvature_1pm_f:
+    # If curvature is positive, steer left (negative), else right (positive)
+    steer_ff = -_clamp(curvature_1pm_f * 0.03, -0.3, 0.3)
+    steer_cmd = (-kp * desired_offset) + (-kd * (yaw_rate_dps_f / 30.0)) + (kff * steer_ff)
+
+    # Limit steering based on traction and "jammed" scenario robustness
+    steer_limit = 0.9 * (0.35 + 0.65 * traction_caution)
+    # Smooth to avoid oscillation / gusts
+    steer_cmd = _clamp(steer_cmd, -steer_limit, steer_limit)
+    steer_cmd = _ema(_mem["last_steer"], steer_cmd, alpha=_clamp(dt * 4.5, 0.08, 0.6))
+
+    # If emergency braking, keep steering gentle and centered to maintain stability
+    if emergency:
+        steer_cmd = _clamp(steer_cmd, -0.25, 0.25)
+
+    # --- Longitudinal control (speed + obstacle) ---
+    # Use a simple PI controller with anti-windup in memory
+    if "speed_int" not in _mem:
+        _mem["speed_int"] = 0.0
+
+    target_speed_mps = target_speed_kmh / 3.6
+    speed_err = target_speed_mps - speed_mps_f
+
+    # If obstacle ahead, compute comfortable follow speed based on headway
+    follow_speed_mps = None
+    if obs_dist_f is not None:
+        desired_gap = max(6.0, base_headway * speed_mps_f)
+        if obs_dist_f < desired_gap * 2.0:
+            # Reduce speed proportional to gap shortfall
+            gap_ratio = _clamp((obs_dist_f - 3.0) / max(1.0, desired_gap), 0.0, 2.0)
+            follow_speed_mps = speed_mps_f * gap_ratio
+            target_speed_mps = min(target_speed_mps, follow_speed_mps)
+            speed_err = target_speed_mps - speed_mps_f
+
+    # Traction-based accel limits
+    max_accel = 2.2 * (0.3 + 0.7 * traction_caution)  # m/s^2
+    max_decel = 4.5 * (0.3 + 0.7 * traction_caution)  # m/s^2 (service braking)
+    emerg_decel = 8.0 * (0.35 + 0.65 * traction_caution)
+
+    kp_v = 0.35
+    ki_v = 0.12
+    # integrate only when not saturated and not emergency
+    _mem["speed_int"] = _clamp(_mem["speed_int"] + speed_err * dt, -10.0, 10.0)
+    accel_cmd = kp_v * speed_err + ki_v * _mem["speed_int"]
+
+    # If TTC small, command stronger decel
+    if ttc is not None:
+        if ttc < 2.0 + 2.0 * (1.0 - traction_caution):
+            accel_cmd -= (2.0 - _clamp(ttc, 0.0, 2.0)) * 3.0
+
+    # Convert accel_cmd to throttle/brake; assume throttle maps to +accel, brake to -decel
+    throttle = 0.0
+    brake = 0.0
+
+    if emergency:
+        throttle = 0.0
+        # Hard brake, but modulated by traction
+        brake = _clamp((obs_dist_f is not None and obs_dist_f < 20.0) and (1.0 - obs_dist_f / 20.0) or 0.7, 0.7, 1.0)
+    else:
+        # Saturate accel command by traction limits
+        accel_cmd = _clamp(accel_cmd, -max_decel, max_accel)
+        if accel_cmd >= 0.0:
+            throttle = _clamp(accel_cmd / max(0.1, max_accel), 0.0, 1.0)
+            brake = 0.0
+        else:
+            brake = _clamp((-accel_cmd) / max(0.1, max_decel), 0.0, 1.0)
+            throttle = 0.0
+
+    # Additional safety: if very close obstacle, override brake
+    if obs_dist_f is not None and obs_dist_f < 10.0:
+        brake = max(brake, _clamp((10.0 - obs_dist_f) / 10.0, 0.0, 1.0))
+        throttle = 0.0
+
+    # Gentle inputs on low traction
+    throttle *= (0.4 + 0.6 * traction_caution)
+    brake *= (0.55 + 0.45 * traction_caution)
+
+    # Smooth throttle/brake (also helps stuck actuators scenarios)
+    throttle = _ema(_mem["last_throttle"], throttle, alpha=_clamp(dt * 3.0, 0.05, 0.5))
+    brake = _ema(_mem["last_brake"], brake, alpha=_clamp(dt * 4.0, 0.08, 0.6))
+
+    # Avoid simultaneous throttle+brake
+    if brake > 0.05:
+        throttle = 0.0
+
+    # Rate limit steering and pedals to handle jam/stuck/failure scenarios more safely
+    def _rate_limit(prev, cmd, rate_per_s):
+        max_step = rate_per_s * dt
+        return prev + _clamp(cmd - prev, -max_step, max_step)
+
+    steer_cmd = _rate_limit(_mem["last_steer"], steer_cmd, rate_per_s=2.5)
+    throttle = _rate_limit(_mem["last_throttle"], throttle, rate_per_s=2.0)
+    brake = _rate_limit(_mem["last_brake"], brake, rate_per_s=3.0)
+
+    # Keep small creep brake when stopped with obstacle close
+    if speed_mps_f < 0.3 and obs_dist_f is not None and obs_dist_f < 8.0:
+        brake = max(brake, 0.3)
+        throttle = 0.0
+
+    # Update last commands
+    _mem["last_steer"] = float(steer_cmd)
+    _mem["last_throttle"] = float(_clamp(throttle, 0.0, 1.0))
+    _mem["last_brake"] = float(_clamp(brake, 0.0, 1.0))
+
+    return {
+        "steering": float(_clamp(steer_cmd, -1.0, 1.0)),
+        "throttle": float(_clamp(throttle, 0.0, 1.0)),
+        "brake": float(_clamp(brake, 0.0, 1.0)),
+    }

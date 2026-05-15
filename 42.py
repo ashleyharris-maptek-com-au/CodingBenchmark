@@ -47,6 +47,7 @@ import tempfile
 from typing import Tuple, Optional, Dict
 from PIL import Image
 
+from solver_utils import normalize_code_result
 from shader_test_utils import (
     assemble_spirv, validate_spirv, compare_images,
     load_reference, save_reference, UBO_SIZE,
@@ -57,7 +58,7 @@ title = "Geometry Shaders (SPIR-V Assembly)"
 
 tags = [
   "spirv",
-  "structured response",
+  "freeform response",
   "shader",
   "gpu",
 ]
@@ -555,21 +556,7 @@ Use GLSL.std.450 Normalize(69), FMax(40) for the lighting math.
 # Test interface
 # ---------------------------------------------------------------------------
 
-structure = {
-    "type": "object",
-    "properties": {
-        "reasoning": {
-            "type": "string",
-            "description": "Explain your approach to writing this SPIR-V geometry shader"
-        },
-        "spirv_code": {
-            "type": "string",
-            "description": "Complete SPIR-V assembly text for the geometry shader"
-        }
-    },
-    "required": ["reasoning", "spirv_code"],
-    "additionalProperties": False
-}
+structure = None
 
 
 def prepareSubpassPrompt(subPass: int) -> str:
@@ -626,6 +613,7 @@ def _get_geometry_data(topology):
 
 
 def _grade_answer_inner(result: dict, subPass: int, aiEngineName: str) -> tuple:
+    result = normalize_code_result(result, "spirv_code")
     if not result:
         return 0.0, "No result provided", {"error": "no_result"}
     if "spirv_code" not in result:
@@ -683,6 +671,7 @@ def _grade_answer_inner(result: dict, subPass: int, aiEngineName: str) -> tuple:
 
 def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
     """Run grading in an isolated subprocess to survive GPU hangs/TDRs."""
+    result = normalize_code_result(result, "spirv_code")
     if not result or "spirv_code" not in result:
         return 0.0, "No SPIR-V code provided"
 
@@ -755,6 +744,7 @@ if __name__ == "__main__":
 
 
 def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
+    result = normalize_code_result(result, "spirv_code")
     if not result:
         return "<p style='color:red'>No result provided</p>"
     desc = SUBPASSES[subPass]["description"]

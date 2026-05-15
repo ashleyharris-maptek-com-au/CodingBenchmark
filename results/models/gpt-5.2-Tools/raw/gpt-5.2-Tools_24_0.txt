@@ -1,0 +1,436 @@
+﻿// Lunar Lander 3D controller (C++20, MSVC)
+// Reads initial header + terrain path, then streams state and outputs control at >=10Hz.
+// Focus: robust IO + scale-invariant PD guidance to reach target and land softly.
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <limits>
+#include <mutex>
+#include <optional>
+#include <sstream>
+#include <string>
+#include <thread>
+#include <vector>
+
+using namespace std;
+
+static constexpr double kPi = 3.1415926535897932384626433832795;
+
+static inline double clampd(double v, double lo, double hi) {
+  return (v < lo) ? lo : (v > hi) ? hi : v;
+}
+static inline double wrap_pi(double a) {
+  while (a > kPi) a -= 2.0 * kPi;
+  while (a < -kPi) a += 2.0 * kPi;
+  return a;
+}
+static inline bool is_finite(double v) { return std::isfinite(v) != 0; }
+
+struct Vec3 {
+  double x = 0, y = 0, z = 0;
+  Vec3() = default;
+  Vec3(double X, double Y, double Z) : x(X), y(Y), z(Z) {}
+  Vec3 operator+(const Vec3& o) const { return {x + o.x, y + o.y, z + o.z}; }
+  Vec3 operator-(const Vec3& o) const { return {x - o.x, y - o.y, z - o.z}; }
+  Vec3 operator*(double s) const { return {x * s, y * s, z * s}; }
+  Vec3 operator/(double s) const { return {x / s, y / s, z / s}; }
+  Vec3& operator+=(const Vec3& o) { x += o.x; y += o.y; z += o.z; return *this; }
+};
+static inline double dot(const Vec3& a, const Vec3& b) { return a.x*b.x + a.y*b.y + a.z*b.z; }
+static inline double norm(const Vec3& a) { return std::sqrt(dot(a,a)); }
+
+struct TerrainColumn {
+  uint16_t a = 0, b = 0, c = 0;
+};
+
+struct Terrain {
+  int width = 0, depth = 0, height = 0;
+  vector<TerrainColumn> cols; // size width*depth
+  atomic<bool> loaded{false};
+  atomic<bool> failed{false};
+
+  Terrain() = default;
+  Terrain(int w, int d, int h) : width(w), depth(d), height(h) {}
+
+  static bool read_u16_le(ifstream& f, uint16_t& out) {
+    unsigned char b[2];
+    if (!f.read(reinterpret_cast<char*>(b), 2)) return false;
+    out = static_cast<uint16_t>(b[0] | (static_cast<uint16_t>(b[1]) << 8));
+    return true;
+  }
+
+  void load_async(const string& path) {
+    thread([this, path]() {
+      try {
+        ifstream f(path, ios::binary);
+        if (!f) { failed.store(true); loaded.store(true); return; }
+        cols.resize(static_cast<size_t>(width) * static_cast<size_t>(depth));
+        for (int x = 0; x < width; x++) {
+          for (int y = 0; y < depth; y++) {
+            uint16_t a, b, c;
+            if (!read_u16_le(f, a) || !read_u16_le(f, b) || !read_u16_le(f, c)) {
+              failed.store(true); loaded.store(true); return;
+            }
+            cols[static_cast<size_t>(x) * static_cast<size_t>(depth) + static_cast<size_t>(y)] = {a, b, c};
+          }
+        }
+        loaded.store(true);
+      } catch (...) {
+        failed.store(true);
+        loaded.store(true);
+      }
+    }).detach();
+  }
+
+  inline bool in_bounds(int xi, int yi, int zi) const {
+    return xi >= 0 && xi < width && yi >= 0 && yi < depth && zi >= 0 && zi < height;
+  }
+
+  inline TerrainColumn get(int xi, int yi) const {
+    return cols[static_cast<size_t>(xi) * static_cast<size_t>(depth) + static_cast<size_t>(yi)];
+  }
+
+  // Conservative "is solid" check for current cell, if loaded.
+  bool is_solid(double x, double y, double z) const {
+    if (!loaded.load() || failed.load()) return false;
+    int xi = static_cast<int>(floor(x));
+    int yi = static_cast<int>(floor(y));
+    int zi = static_cast<int>(floor(z));
+    if (!in_bounds(xi, yi, zi)) return true; // out of bounds treated as collision
+    TerrainColumn col = get(xi, yi);
+    if (zi < static_cast<int>(col.a)) return true;
+    if (col.b == col.c) return false;
+    if (zi >= static_cast<int>(col.b) && zi < static_cast<int>(col.c)) return true;
+    return false;
+  }
+
+  // Returns approximate ground "top" height a at (x,y), clamped, if loaded.
+  double ground_a(double x, double y) const {
+    if (!loaded.load() || failed.load()) return 0.0;
+    int xi = static_cast<int>(clampd(floor(x), 0.0, double(width - 1)));
+    int yi = static_cast<int>(clampd(floor(y), 0.0, double(depth - 1)));
+    TerrainColumn col = get(xi, yi);
+    return double(col.a);
+  }
+
+  // Quick conservative check for "has floating rock at (x,y)".
+  bool has_floating(double x, double y) const {
+    if (!loaded.load() || failed.load()) return false;
+    int xi = static_cast<int>(clampd(floor(x), 0.0, double(width - 1)));
+    int yi = static_cast<int>(clampd(floor(y), 0.0, double(depth - 1)));
+    TerrainColumn col = get(xi, yi);
+    return col.b < col.c;
+  }
+};
+
+struct State {
+  Vec3 p;
+  Vec3 v;
+  double pitch=0, yaw=0, roll=0;
+  double pitch_rate=0, yaw_rate=0, roll_rate=0;
+  double fuel=0;
+  bool valid=false;
+};
+
+struct Control {
+  double thrust=0;
+  double pitch_cmd=0;
+  double yaw_cmd=0;
+  double roll_cmd=0;
+};
+
+// Convert desired acceleration vector in world coords to desired pitch/yaw.
+// Assumes thrust direction for pitch=0,yaw=0 is +Z; +pitch tilts toward -X.
+static inline void accel_to_attitude(const Vec3& a_des, double& pitch_des, double& yaw_des) {
+  // If only vertical accel, keep yaw 0.
+  double ax = a_des.x, ay = a_des.y, az = a_des.z;
+  // yaw: heading of horizontal component, with sign chosen so +yaw rotates thrust toward +Y when pitch != 0.
+  // With our thrust dir mapping below, horizontal thrust component is:
+  //   tx = -sin(pitch)*cos(yaw), ty = -sin(pitch)*sin(yaw)
+  // So yaw = atan2(ty, tx) = atan2(-sin(p)*sin(y), -sin(p)*cos(y)) -> atan2(ay, ax) + pi, but depends on desired.
+  // We'll derive from wanting thrust horizontal to align with a_h.
+  double hx = ax;
+  double hy = ay;
+  double h = std::sqrt(hx*hx + hy*hy);
+  if (h < 1e-9) {
+    yaw_des = 0.0;
+    pitch_des = 0.0;
+    return;
+  }
+  // We want thrust horizontal component to point along a_h (since thrust provides acceleration).
+  // Given tx,ty above, direction in XY is (-cos(yaw), -sin(yaw)) times sin(pitch).
+  // So set yaw such that (-cos(yaw), -sin(yaw)) aligns with (hx,hy).
+  yaw_des = wrap_pi(std::atan2(-hy, -hx));
+  // pitch magnitude sets horizontal vs vertical ratio; for small angles, sin(p) ~ p.
+  // Desired thrust direction unit t should align with a_des direction. Use:
+  // t = [-sin(p)*cos(y), -sin(p)*sin(y), cos(p)]
+  // So tan(|p|) = h/az' where az' is vertical component along +Z.
+  double az_safe = std::max(1e-6, az);
+  double p = std::atan2(h, az_safe);
+  pitch_des = clampd(p, 0.0, kPi/2.0);
+}
+
+// Compute thrust direction unit vector from pitch,yaw.
+static inline Vec3 thrust_dir(double pitch, double yaw) {
+  double sp = std::sin(pitch), cp = std::cos(pitch);
+  double cy = std::cos(yaw), sy = std::sin(yaw);
+  return Vec3{-sp * cy, -sp * sy, cp};
+}
+
+static Control compute_control(const State& s,
+                               const Vec3& target,
+                               double gravity,
+                               double max_thrust,
+                               double zone_radius,
+                               const Terrain* terrain) {
+  Control u;
+
+  Vec3 e = target - s.p;
+  Vec3 v = s.v;
+  double dist_xy = std::sqrt(e.x*e.x + e.y*e.y);
+
+  // Estimate "altitude above local ground".
+  double ground = 0.0;
+  if (terrain) ground = terrain->ground_a(s.p.x, s.p.y);
+  double alt = s.p.z - ground;
+
+  // Phase logic:
+  // 1) Far: fly toward target horizontally while staying safely above terrain.
+  // 2) Near: reduce horizontal speed, descend.
+  // 3) Final: settle with low vertical speed and align above pad.
+
+  // Safety altitude target: proportional to map scale but bounded.
+  double map_scale = std::max(1.0, std::max<double>(zone_radius * 50.0, std::max(1.0, std::min(10000.0, (double)std::max(terrain ? terrain->width : 100, terrain ? terrain->depth : 100)))));
+  (void)map_scale;
+
+  double safe_alt = 30.0;
+  if (terrain) {
+    // Increase safe altitude if floating rocks exist locally.
+    if (terrain->loaded.load() && !terrain->failed.load() && terrain->has_floating(s.p.x, s.p.y)) safe_alt = 80.0;
+  }
+  // Scale safe altitude with scenario size but keep reasonable:
+  safe_alt = clampd(safe_alt + 0.02 * dist_xy, 20.0, 5000.0);
+
+  bool final = (dist_xy < zone_radius * 0.6) && (alt < 50.0);
+  bool near = (dist_xy < zone_radius * 4.0) || (alt < safe_alt * 0.8);
+
+  // Desired horizontal velocity: proportional to distance, capped.
+  double vxy_cap_far = 120.0;
+  double vxy_cap_near = 20.0;
+  double vxy_cap_final = 4.0;
+
+  double vxy_cap = final ? vxy_cap_final : (near ? vxy_cap_near : vxy_cap_far);
+  // Scale caps with map size lightly (works from 100m to 100km).
+  vxy_cap *= clampd(0.5 + 0.0005 * zone_radius, 0.6, 3.0);
+
+  Vec3 v_des_xy{0,0,0};
+  if (dist_xy > 1e-6) {
+    Vec3 dir_xy{e.x / dist_xy, e.y / dist_xy, 0};
+    double speed = clampd(0.8 * dist_xy, 0.0, vxy_cap);
+    // Slow down as we approach.
+    if (near) speed = clampd(0.4 * dist_xy, 0.0, vxy_cap);
+    if (final) speed = clampd(0.2 * dist_xy, 0.0, vxy_cap);
+    v_des_xy = dir_xy * speed;
+  }
+
+  // Vertical velocity plan.
+  double vz_des = -5.0;
+  if (!near) vz_des = (alt < safe_alt) ? 5.0 : -10.0; // climb if too low, else descend faster.
+  if (near) vz_des = clampd(-0.25 * alt, -12.0, -1.0);
+  if (final) vz_des = clampd(-0.15 * alt, -3.0, -0.3);
+
+  Vec3 v_des{v_des_xy.x, v_des_xy.y, vz_des};
+
+  // PD acceleration in world coords.
+  // Gains chosen to be stable across tick=0.1s without needing dt.
+  double kp = final ? 0.20 : (near ? 0.12 : 0.06);
+  double kd = final ? 0.90 : (near ? 0.70 : 0.45);
+
+  Vec3 a_cmd = (e * kp) + ((v_des - v) * kd);
+
+  // Add gravity compensation for vertical axis.
+  a_cmd.z += gravity;
+
+  // Clamp commanded acceleration magnitude to what thrust can provide.
+  double a_max = max_thrust; // since mass treated as 1 in sim units (implicit).
+  double a_mag = norm(a_cmd);
+  if (a_mag > a_max) a_cmd = a_cmd * (a_max / std::max(1e-9, a_mag));
+
+  // If too low, prioritize vertical safety.
+  if (alt < 10.0) {
+    a_cmd.x *= 0.2;
+    a_cmd.y *= 0.2;
+    a_cmd.z = std::max(a_cmd.z, gravity + 2.0);
+  }
+
+  // Convert to desired attitude and thrust fraction.
+  double pitch_des=0, yaw_des=0;
+  // We need desired thrust direction aligned with a_cmd. For stability, ensure z positive.
+  Vec3 a_use = a_cmd;
+  if (a_use.z < 0.1) a_use.z = 0.1;
+  accel_to_attitude(a_use, pitch_des, yaw_des);
+
+  // Limit tilt more aggressively near ground to avoid large horizontal speeds.
+  double pitch_limit = final ? (20.0 * kPi / 180.0) : (near ? (35.0 * kPi / 180.0) : (60.0 * kPi / 180.0));
+  pitch_des = clampd(pitch_des, 0.0, pitch_limit);
+
+  // Our pitch sign convention: +pitch tilts forward and redirects thrust into -X.
+  // We computed pitch_des as positive magnitude. We choose sign to achieve desired ax.
+  // With yaw already chosen, thrust_dir uses negative horizontal; we can adjust pitch sign by matching ax sign.
+  // If desired horizontal along +X (east), then pitch should be negative (to point thrust toward +X).
+  // Determine sign by projecting desired horizontal onto local -X axis in world (cos yaw, sin yaw):
+  Vec3 hdir = Vec3{std::cos(yaw_des), std::sin(yaw_des), 0}; // points where negative pitch? handle below
+  double desired_along = a_use.x * (-hdir.x) + a_use.y * (-hdir.y); // along (-cos yaw, -sin yaw)
+  double pitch_signed = (desired_along >= 0.0) ? pitch_des : -pitch_des;
+
+  // Compute thrust needed along current desired direction.
+  Vec3 tdir = thrust_dir(std::abs(pitch_des), yaw_des);
+  // If pitch_signed is negative, thrust_dir formula horizontal flips; easiest compute actual:
+  Vec3 tdir_actual = thrust_dir(pitch_signed, yaw_des);
+  (void)tdir;
+  double thrust_acc = dot(a_use, tdir_actual);
+  thrust_acc = clampd(thrust_acc, 0.0, a_max);
+  u.thrust = clampd(thrust_acc / std::max(1e-9, max_thrust), 0.0, 1.0);
+
+  // Attitude control: PD on pitch/yaw angles and rates -> command in [-1,1]
+  double kp_ang = 2.0;
+  double kd_ang = 0.8;
+
+  double pitch_err = clampd(pitch_signed - s.pitch, -kPi, kPi);
+  pitch_err = wrap_pi(pitch_err);
+  double yaw_err = wrap_pi(yaw_des - s.yaw);
+
+  double pitch_u = kp_ang * pitch_err - kd_ang * s.pitch_rate;
+  double yaw_u = kp_ang * yaw_err - kd_ang * s.yaw_rate;
+
+  u.pitch_cmd = clampd(pitch_u, -1.0, 1.0);
+  u.yaw_cmd = clampd(yaw_u, -1.0, 1.0);
+
+  // Roll: damp to 0.
+  double roll_u = -1.2 * s.roll - 0.6 * s.roll_rate;
+  u.roll_cmd = clampd(roll_u, -1.0, 1.0);
+
+  // Fuel-aware throttling: if very low fuel, avoid aggressive lateral.
+  if (s.fuel < 5.0) {
+    u.pitch_cmd = clampd(u.pitch_cmd * 0.5, -1.0, 1.0);
+    u.yaw_cmd = clampd(u.yaw_cmd * 0.5, -1.0, 1.0);
+    u.thrust = clampd(u.thrust, 0.0, 1.0);
+  }
+
+  // Final safety: if descending too fast close to ground, increase thrust.
+  if (alt < 20.0 && s.v.z < -6.0) {
+    u.thrust = std::max(u.thrust, 0.9);
+    // reduce tilt when recovering
+    u.pitch_cmd = clampd(u.pitch_cmd * 0.6, -1.0, 1.0);
+    u.yaw_cmd = clampd(u.yaw_cmd * 0.6, -1.0, 1.0);
+  }
+
+  return u;
+}
+
+// Threaded stdin reader: reads tokens/lines, pushes parsed states to latest snapshot.
+struct SharedState {
+  mutex m;
+  State latest;
+  atomic<bool> has_state{false};
+  atomic<bool> done{false};
+};
+
+static bool parse_state_line(const string& line, State& out) {
+  std::istringstream iss(line);
+  double x,y,z,vx,vy,vz,pitch,yaw,roll,pr,yr,rr,fuel;
+  if (!(iss >> x >> y >> z >> vx >> vy >> vz >> pitch >> yaw >> roll >> pr >> yr >> rr >> fuel)) return false;
+  if (!(is_finite(x)&&is_finite(y)&&is_finite(z)&&is_finite(vx)&&is_finite(vy)&&is_finite(vz))) return false;
+  out.p = {x,y,z};
+  out.v = {vx,vy,vz};
+  out.pitch = pitch; out.yaw = yaw; out.roll = roll;
+  out.pitch_rate = pr; out.yaw_rate = yr; out.roll_rate = rr;
+  out.fuel = fuel;
+  out.valid = true;
+  return true;
+}
+
+int main() {
+  ios::sync_with_stdio(false);
+  cin.tie(nullptr);
+
+  int width=0, depth=0, height=0;
+  double gravity=1.62, max_thrust=10.0, fuel0=0.0;
+  double start_x=0,start_y=0,start_z=0, target_x=0,target_y=0,target_z=0;
+
+  if (!(cin >> width >> depth >> height >> gravity >> max_thrust >> fuel0)) return 0;
+  if (!(cin >> start_x >> start_y >> start_z >> target_x >> target_y >> target_z)) return 0;
+
+  string terrain_path;
+  {
+    // consume endline after previous >>
+    string dummy;
+    std::getline(cin, dummy);
+    std::getline(cin, terrain_path);
+  }
+  // Expect "STATE" next (but don't depend on it strictly).
+  string marker;
+  cin >> marker;
+
+  double zone_radius = std::max(5.0, std::min<double>(std::min(width, depth) * 0.02, 2000.0));
+  Vec3 target{target_x, target_y, target_z};
+
+  Terrain terrain(width, depth, height);
+  terrain.load_async(terrain_path);
+
+  SharedState shared;
+
+  // Reader thread: keep consuming stdin lines fast.
+  thread reader([&]() {
+    string line;
+    // Consume remainder of marker line.
+    std::getline(cin, line);
+    while (std::getline(cin, line)) {
+      if (line.empty()) continue;
+      State s;
+      if (!parse_state_line(line, s)) continue;
+      {
+        lock_guard<mutex> lg(shared.m);
+        shared.latest = s;
+      }
+      shared.has_state.store(true);
+    }
+    shared.done.store(true);
+  });
+
+  // Control loop at 20Hz to be safe vs missed ticks.
+  auto next = chrono::steady_clock::now();
+  while (!shared.done.load()) {
+    next += chrono::milliseconds(50);
+
+    State s;
+    bool ok = shared.has_state.load();
+    if (ok) {
+      lock_guard<mutex> lg(shared.m);
+      s = shared.latest;
+    } else {
+      // No state yet: output neutral.
+      cout << fixed << setprecision(6) << 0.0 << " " << 0.0 << " " << 0.0 << " " << 0.0 << "\n";
+      cout.flush();
+      this_thread::sleep_until(next);
+      continue;
+    }
+
+    Control u = compute_control(s, target, gravity, max_thrust, zone_radius, &terrain);
+
+    cout << fixed << setprecision(6)
+         << u.thrust << " " << u.pitch_cmd << " " << u.yaw_cmd << " " << u.roll_cmd << "\n";
+    cout.flush();
+
+    this_thread::sleep_until(next);
+  }
+
+  if (reader.joinable()) reader.join();
+  return 0;
+}

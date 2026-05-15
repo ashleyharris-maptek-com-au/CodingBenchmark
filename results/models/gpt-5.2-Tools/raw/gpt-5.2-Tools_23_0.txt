@@ -1,0 +1,369 @@
+use std::f64::consts::PI;
+use std::io::{self, Read, Write};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
+
+#[derive(Clone, Copy, Default)]
+struct State {
+    x: f64,
+    y: f64,
+    vx: f64,
+    vy: f64,
+    angle: f64,
+    ang_v: f64,
+    fuel: f64,
+    t: f64,
+    valid: bool,
+}
+
+fn clamp(v: f64, lo: f64, hi: f64) -> f64 {
+    if v < lo {
+        lo
+    } else if v > hi {
+        hi
+    } else {
+        v
+    }
+}
+
+fn wrap_pi(mut a: f64) -> f64 {
+    while a > PI {
+        a -= 2.0 * PI;
+    }
+    while a < -PI {
+        a += 2.0 * PI;
+    }
+    a
+}
+
+fn lerp(a: f64, b: f64, t: f64) -> f64 {
+    a + (b - a) * t
+}
+
+fn main() {
+    // Read all stdin in a dedicated reader thread into a growing buffer, while the
+    // controller loop runs at 20Hz+ and never blocks on IO.
+    let shared = Arc::new(Mutex::new(String::new()));
+    let shared_reader = Arc::clone(&shared);
+    thread::spawn(move || {
+        let mut stdin = io::stdin().lock();
+        let mut buf = [0u8; 1 << 15];
+        loop {
+            match stdin.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if let Ok(s) = std::str::from_utf8(&buf[..n]) {
+                        let mut w = shared_reader.lock().unwrap();
+                        w.push_str(s);
+                    } else {
+                        // Fallback: lossy.
+                        let s = String::from_utf8_lossy(&buf[..n]);
+                        let mut w = shared_reader.lock().unwrap();
+                        w.push_str(&s);
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    // Parser state.
+    let mut consumed: usize = 0;
+    let mut tokens: Vec<String> = Vec::with_capacity(1024);
+
+    // World constants.
+    let mut _width: usize = 0;
+    let mut height: usize;
+    let mut gravity: f64 = 1.62;
+    let mut max_thrust: f64 = 10.0;
+    let mut _start_x: f64 = 0.0;
+    let mut _start_y: f64 = 0.0;
+    let mut target_x: f64;
+    let mut target_y: f64 = 0.0;
+
+    // Landing zone bounds (inclusive in grid coords), derived from 'L' cells and target.
+    let mut l_min_x: f64 = f64::INFINITY;
+    let mut l_max_x: f64 = f64::NEG_INFINITY;
+    let mut l_y: Option<f64> = None;
+
+    // For multi-gb maps: do not store whole map; only scan for landing zone row and bounds.
+    // Map rows are read as tokens (strings) after the initial numeric header.
+
+    // Shared state from updates.
+    let state = Arc::new(Mutex::new(State::default()));
+    let state_for_parser = Arc::clone(&state);
+
+    let mut initialized = false;
+    let mut map_rows_read: usize = 0;
+
+    // Control loop at >= 20Hz.
+    let mut stdout = io::BufWriter::new(io::stdout().lock());
+    let mut last_out = Instant::now();
+    let mut last_seen_t = Instant::now();
+    let mut last_state = State::default();
+
+    // Simple controller parameters.
+    let mut last_desired_angle: f64 = 0.0;
+
+    loop {
+        // Parse any newly arrived data.
+        {
+            let snapshot = { shared.lock().unwrap().clone() };
+            if consumed < snapshot.len() {
+                let new_part = &snapshot[consumed..];
+                // Tokenize incrementally; keep last partial token in the shared buffer by only
+                // consuming up to last whitespace.
+                let mut last_ws = None;
+                for (i, ch) in new_part.char_indices() {
+                    if ch.is_whitespace() {
+                        last_ws = Some(i);
+                    }
+                }
+                if let Some(i) = last_ws {
+                    let to_take = &new_part[..=i];
+                    for tok in to_take.split_whitespace() {
+                        tokens.push(tok.to_string());
+                    }
+                    consumed += i + 1;
+                }
+            }
+        }
+
+        // Initialization parsing: header + start/target + map rows.
+        if !initialized {
+            // Need at least: width height gravity max_thrust fuel (fuel ignored here)
+            if tokens.len() >= 5 {
+                _width = tokens[0].parse::<usize>().unwrap_or(0);
+                height = tokens[1].parse::<usize>().unwrap_or(0);
+                gravity = tokens[2].parse::<f64>().unwrap_or(gravity);
+                max_thrust = tokens[3].parse::<f64>().unwrap_or(max_thrust);
+                // initial fuel is tokens[4], not needed for control (fuel_remaining comes in updates)
+                tokens.drain(0..5);
+            } else {
+                // Not enough yet; output safe idle.
+                let now = Instant::now();
+                if now.duration_since(last_out) >= Duration::from_millis(50) {
+                    writeln!(stdout, "0 0").ok();
+                    stdout.flush().ok();
+                    last_out = now;
+                }
+                thread::sleep(Duration::from_millis(5));
+                continue;
+            }
+
+            // start_x start_y target_x target_y
+            while tokens.len() < 4 {
+                // wait for more.
+                let now = Instant::now();
+                if now.duration_since(last_out) >= Duration::from_millis(50) {
+                    writeln!(stdout, "0 0").ok();
+                    stdout.flush().ok();
+                    last_out = now;
+                }
+                thread::sleep(Duration::from_millis(5));
+                // parse more data next iteration
+                break;
+            }
+            if tokens.len() >= 4 {
+                _start_x = tokens[0].parse::<f64>().unwrap_or(0.0);
+                _start_y = tokens[1].parse::<f64>().unwrap_or(0.0);
+                target_x = tokens[2].parse::<f64>().unwrap_or(0.0);
+                target_y = tokens[3].parse::<f64>().unwrap_or(0.0);
+                tokens.drain(0..4);
+            } else {
+                continue;
+            }
+
+            // Read map rows as strings; scan for L and T.
+            // Height can be huge, but input provides one token per row.
+            while map_rows_read < height {
+                if tokens.is_empty() {
+                    break;
+                }
+                let row = tokens.remove(0);
+                if row.is_empty() {
+                    map_rows_read += 1;
+                    continue;
+                }
+                // Identify landing zone markers.
+                // Row y coordinate is map_rows_read (0 at top).
+                let y = map_rows_read as f64;
+                let bytes = row.as_bytes();
+                for (x, &b) in bytes.iter().enumerate() {
+                    if b == b'L' || b == b'T' {
+                        // Accept 'T' as part of zone if no L exists.
+                        if b == b'L' {
+                            l_min_x = l_min_x.min(x as f64);
+                            l_max_x = l_max_x.max(x as f64);
+                            l_y = Some(y);
+                        }
+                    }
+                }
+                // If no explicit L found yet, consider target row as zone row.
+                map_rows_read += 1;
+            }
+
+            if map_rows_read >= height {
+                if l_y.is_none() {
+                    // No L cells: assume 1-cell pad around target.
+                    l_y = Some(target_y.floor());
+                    l_min_x = target_x.floor();
+                    l_max_x = target_x.floor();
+                }
+                if !l_min_x.is_finite() || !l_max_x.is_finite() {
+                    l_min_x = target_x.floor();
+                    l_max_x = target_x.floor();
+                }
+                initialized = true;
+            } else {
+                // Still reading map; output safe.
+                let now = Instant::now();
+                if now.duration_since(last_out) >= Duration::from_millis(50) {
+                    writeln!(stdout, "0 0").ok();
+                    stdout.flush().ok();
+                    last_out = now;
+                }
+                thread::sleep(Duration::from_millis(1));
+                continue;
+            }
+        }
+
+        // After init, parse any full state updates available.
+        // Each update has 7 floats.
+        while tokens.len() >= 7 {
+            let x = tokens[0].parse::<f64>().unwrap_or(last_state.x);
+            let y = tokens[1].parse::<f64>().unwrap_or(last_state.y);
+            let vx = tokens[2].parse::<f64>().unwrap_or(last_state.vx);
+            let vy = tokens[3].parse::<f64>().unwrap_or(last_state.vy);
+            let angle = tokens[4].parse::<f64>().unwrap_or(last_state.angle);
+            let ang_v = tokens[5].parse::<f64>().unwrap_or(last_state.ang_v);
+            let fuel = tokens[6].parse::<f64>().unwrap_or(last_state.fuel);
+            tokens.drain(0..7);
+
+            let mut st = state_for_parser.lock().unwrap();
+            st.x = x;
+            st.y = y;
+            st.vx = vx;
+            st.vy = vy;
+            st.angle = angle;
+            st.ang_v = ang_v;
+            st.fuel = fuel;
+            st.valid = true;
+            st.t += 0.1;
+            last_seen_t = Instant::now();
+        }
+
+        // Compute control at 20Hz.
+        let now = Instant::now();
+        if now.duration_since(last_out) < Duration::from_millis(50) {
+            thread::sleep(Duration::from_millis(1));
+            continue;
+        }
+        last_out = now;
+
+        let st = *state.lock().unwrap();
+        if !st.valid {
+            writeln!(stdout, "0 0").ok();
+            stdout.flush().ok();
+            continue;
+        }
+        last_state = st;
+
+        // Landing zone geometry.
+        let zone_y = l_y.unwrap_or(target_y.floor());
+        let zone_center_x = 0.5 * (l_min_x + l_max_x) + 0.5;
+        let zone_half_w = 0.5 * ((l_max_x - l_min_x).max(0.0) + 1.0);
+
+        // Approach point: aim above zone center, then descend.
+        let dx = zone_center_x - st.x;
+        let dy_to_pad = zone_y - st.y;
+
+        // Desired velocities: proportional guidance.
+        let mut desired_vx = clamp(dx * 0.6, -6.0, 6.0);
+        // Reduce horizontal aggressiveness near pad.
+        if dy_to_pad.abs() < 15.0 {
+            desired_vx = clamp(dx * 0.35, -3.0, 3.0);
+        }
+        // If within pad bounds, push vx to zero.
+        if dx.abs() <= zone_half_w.max(1.0) {
+            desired_vx = 0.0;
+        }
+
+        // Vertical speed profile: fast when high, gentle near pad.
+        let desired_vy = if dy_to_pad > 50.0 {
+            8.0 // moving down (positive) allowed
+        } else if dy_to_pad > 20.0 {
+            lerp(8.0, 3.0, (50.0 - dy_to_pad) / 30.0)
+        } else if dy_to_pad > 5.0 {
+            lerp(3.0, 1.0, (20.0 - dy_to_pad) / 15.0)
+        } else {
+            0.0
+        };
+
+        // PD on velocity to compute desired accelerations.
+        let ax_cmd = clamp((desired_vx - st.vx) * 1.8, -max_thrust, max_thrust);
+        let ay_cmd = clamp((desired_vy - st.vy) * 2.2, -max_thrust, max_thrust);
+
+        // Convert desired world acceleration to thrust fraction & desired angle.
+        // World +y is down; gravity is +g; thrust in body axis points "up" when angle=0.
+        // Thrust acceleration vector: a_thrust = -T * [sin(angle), cos(angle)] where cos at angle=0 points up.
+        // Net acceleration: a = [ax, ay] = a_thrust + [0, gravity]
+        // => a_thrust = [ax, ay - gravity]
+        let a_tx = ax_cmd;
+        let a_ty = ay_cmd - gravity;
+        let a_mag = (a_tx * a_tx + a_ty * a_ty).sqrt();
+        let mut thrust = if max_thrust > 1e-6 {
+            clamp(a_mag / max_thrust, 0.0, 1.0)
+        } else {
+            0.0
+        };
+
+        let mut desired_angle: f64;
+        // Angle that makes -T*[sin,cos] align with [a_tx,a_ty].
+        // We want body "up" direction u = [-sin(angle), -cos(angle)] to match a_t/a_mag.
+        // So sin(angle) = -a_tx/a_mag, cos(angle) = -a_ty/a_mag.
+        if a_mag > 1e-6 {
+            desired_angle = (-a_tx).atan2(-a_ty); // atan2(sin, cos)
+        } else {
+            desired_angle = 0.0;
+            thrust = 0.0;
+        }
+
+        // Clamp desired angle to avoid trying to flip fully over; keep within [-pi/2, pi/2] around up.
+        desired_angle = clamp(wrap_pi(desired_angle), -PI * 0.49, PI * 0.49);
+
+        // Near pad, prioritize upright and soft landing.
+        let speed = (st.vx * st.vx + st.vy * st.vy).sqrt();
+        if dy_to_pad >= -1.0 && dy_to_pad < 8.0 {
+            // Strongly damp horizontal motion, keep upright.
+            desired_angle = clamp(-st.vx * 0.12, -0.35, 0.35);
+            // If descending too fast, burn.
+            let vy_target = if dy_to_pad < 2.0 { 0.5 } else { 1.0 };
+            let a_needed = (vy_target - st.vy) * 3.0; // world ay command
+            let a_t = (a_needed - gravity).abs();
+            thrust = clamp(a_t / max_thrust, 0.0, 1.0);
+        }
+
+        // If we haven't seen updates recently, reduce thrust to avoid runaway.
+        if now.duration_since(last_seen_t) > Duration::from_millis(300) {
+            thrust = 0.0;
+            desired_angle = 0.0;
+        }
+
+        // Rotate control: P + D on angle error and angular velocity.
+        // Smooth desired angle changes to reduce oscillation.
+        let smoothed = lerp(last_desired_angle, desired_angle, 0.35);
+        last_desired_angle = smoothed;
+        let ang_err2 = wrap_pi(smoothed - st.angle);
+        let turn = clamp(ang_err2 * 2.8 - st.ang_v * 0.6, -1.0, 1.0);
+
+        // Fuel saving: if speed is small and near pad, limit thrust.
+        if dy_to_pad >= -1.0 && dy_to_pad < 8.0 && speed < 2.5 && st.fuel < 2.0 {
+            thrust = clamp(thrust, 0.0, 0.6);
+        }
+
+        writeln!(stdout, "{:.6} {:.6}", thrust, turn).ok();
+        stdout.flush().ok();
+    }
+}

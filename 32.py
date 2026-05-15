@@ -16,13 +16,13 @@ import time
 import math
 from typing import List, Tuple, Set, Dict, Any
 from native_compiler import CppCompiler, CompilationError, ExecutionError, describe_this_pc
-from solver_utils import StreamingInputFile
+from solver_utils import StreamingInputFile, normalize_code_result
 
 title = "Steiner Tree (C++)"
 
 tags = [
   "cpp",
-  "structured response",
+  "freeform response",
   "np hard",
   "graph theory",
 ]
@@ -328,23 +328,7 @@ Write complete, compilable C++ code with a main() function.
 
 extraGradeAnswerRuns = list(range(len(TEST_CASES)))
 
-structure = {
-  "type": "object",
-  "properties": {
-    "reasoning": {
-      "type":
-      "string",
-      "description":
-      "Explain your algorithm approach and how it adapts to different Steiner tree complexities"
-    },
-    "cpp_code": {
-      "type": "string",
-      "description": "Complete C++ code with main() function that handles all scales"
-    }
-  },
-  "required": ["reasoning", "cpp_code"],
-  "additionalProperties": False
-}
+structure = None
 
 
 def verify_steiner_tree(num_vertices: int, edges: List[Tuple[int, int, int]], terminals: Set[int],
@@ -479,6 +463,7 @@ def mst_upper_bound(num_vertices: int, edges: List[Tuple[int, int, int]],
 
 
 def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
+  result = normalize_code_result(result, "cpp_code")
   if not result or "cpp_code" not in result:
     return 0.0, "No C++ code provided"
 
@@ -583,6 +568,7 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
 
 
 def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
+  result = normalize_code_result(result, "cpp_code")
   if not result:
     return "<p style='color:red'>No result provided</p>"
   case = TEST_CASES[subPass]

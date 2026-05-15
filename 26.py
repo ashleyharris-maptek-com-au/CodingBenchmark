@@ -34,12 +34,13 @@ import tempfile
 
 # Import our native compiler helper
 from native_compiler import RustCompiler, CompilationError, ExecutionError
+from solver_utils import normalize_code_result
 
 title = "3D Point Clustering (Rust)"
 
 tags = [
   "rust",
-  "structured response",
+  "freeform response",
   "algorithm design",
   "optimization",
 ]
@@ -353,23 +354,7 @@ Include adaptive logic that chooses different strategies based on clustering com
 # List of subpasses to grade the single answer against all difficulty levels
 extraGradeAnswerRuns = list(range(len(TEST_CASES)))
 
-structure = {
-  "type": "object",
-  "properties": {
-    "reasoning": {
-      "type":
-      "string",
-      "description":
-      "Explain your algorithm approach and how it adapts to different clustering complexities"
-    },
-    "rust_code": {
-      "type": "string",
-      "description": "Complete Rust code with main function that handles all scales"
-    }
-  },
-  "required": ["reasoning", "rust_code"],
-  "additionalProperties": False
-}
+structure = None
 
 
 def run_clustering(code: str, case: dict, subpass: int,
@@ -460,6 +445,7 @@ def run_clustering(code: str, case: dict, subpass: int,
 
 def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
   """Grade the clustering solution."""
+  result = normalize_code_result(result, "rust_code")
   if not result:
     return 0.0, "No result provided"
 
@@ -491,7 +477,7 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
     return 0.0, f"[{description}] {error}"
 
   if len(clusters) != num_points:
-    return 0.1, f"[{description}] Wrong output count: {len(clusters)} vs {num_points}"
+    return 0.0, f"[{description}] Wrong output count: {len(clusters)} vs {num_points}"
 
   # Validate cluster indices
   invalid = sum(1 for c in clusters if c < 0 or c >= num_clusters)
@@ -529,6 +515,7 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
 
 def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
   """Generate HTML report with clustering visualization."""
+  result = normalize_code_result(result, "rust_code")
   if not result:
     return "<p style='color:red'>No result provided</p>"
 

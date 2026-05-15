@@ -16,18 +16,20 @@ import time
 from typing import List, Tuple, Dict
 
 from native_compiler import CppCompiler, compile_and_run, describe_this_pc
+from solver_utils import BaselineCache, normalize_code_result
 
 title = "2D Cutting Stock - Rectangle Packing (C++)"
 
 tags = [
   "cpp",
-  "structured response",
+  "freeform response",
   "optimization",
   "packing",
 ]
 
 # Timeout in seconds (30 seconds)
 TIMEOUT_SECONDS = 30
+_BASELINE_CACHE = BaselineCache("test10_rectangle_cutting")
 
 # Seed for reproducibility
 RANDOM_SEED = 77777
@@ -181,22 +183,7 @@ Write complete, compilable C++ code with a main() function.
 # List of subpasses to grade the single answer against all difficulty levels
 extraGradeAnswerRuns = list(range(len(TEST_CASES)))
 
-structure = {
-  "type": "object",
-  "properties": {
-    "reasoning": {
-      "type": "string",
-      "description":
-      "Explain your 2D packing algorithm and how it adapts to different problem sizes"
-    },
-    "cpp_code": {
-      "type": "string",
-      "description": "Complete C++ code with main() that handles all scales"
-    }
-  },
-  "required": ["reasoning", "cpp_code"],
-  "additionalProperties": False
-}
+structure = None
 
 
 def validate_solution(solution: Dict, rects: List[Tuple[int, int]], board_w: int,
@@ -357,6 +344,16 @@ def check_top_waste_repack_2d(placements, rects, board_w, board_h) -> Tuple[int,
   return N_FOCUS, optimal
 
 
+def _get_cached_baseline_solution(rects: List[Tuple[int, int]], board_w: int,
+                                  board_h: int) -> int:
+  return int(_BASELINE_CACHE.get_or_compute_json(
+    "baseline",
+    lambda: {"num_boards": get_baseline_solution(rects, board_w, board_h)},
+    "test10-baseline-v1",
+    format_input(rects, board_w, board_h),
+  )["num_boards"])
+
+
 def get_baseline_solution(rects: List[Tuple[int, int]], board_w: int, board_h: int) -> int:
   """
     Compute baseline using Shelf Next Fit Decreasing Height (SNFDH).
@@ -488,6 +485,7 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
     - 0.7: <= 1.5x baseline
     - 0.0: Inefficient, invalid, or error
     """
+  result = normalize_code_result(result, "cpp_code")
   if not result:
     return 0.0, "No result provided"
 
@@ -516,7 +514,7 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
 
   # Compare to baseline
   num_boards = solution["num_boards"]
-  baseline_boards = get_baseline_solution(rects, board_w, board_h)
+  baseline_boards = _get_cached_baseline_solution(rects, board_w, board_h)
   waste = compute_waste(solution["placements"], rects, board_w, board_h)
 
   ratio = num_boards / baseline_boards if baseline_boards > 0 else float('inf')
@@ -560,8 +558,17 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
   return score, explanation
 
 
+def setup() -> None:
+  for subPass in range(len(TEST_CASES)):
+    case = TEST_CASES[subPass]
+    rects = case["rectangles"]
+    board_w, board_h = case["board_size"]
+    _get_cached_baseline_solution(rects, board_w, board_h)
+
+
 def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
   """Generate HTML report."""
+  result = normalize_code_result(result, "cpp_code")
   if not result:
     return "<p style='color:red'>No result provided</p>"
 

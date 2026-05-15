@@ -1,0 +1,557 @@
+﻿using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using System.Numerics;
+using System.Threading;
+using System.Threading.Tasks;
+
+public static class Program
+{
+    // Hard time limit from prompt is 5 minutes; keep a small buffer.
+    private const double TimeLimitSeconds = 295.0;
+
+    public static void Main()
+    {
+        var sw = Stopwatch.StartNew();
+
+        var reader = new FastScanner(Console.OpenStandardInput());
+        int n = reader.NextInt();
+        int m = reader.NextInt();
+
+        if (n <= 0)
+        {
+            Console.WriteLine(0);
+            Console.WriteLine();
+            return;
+        }
+
+        // Read edges, build adjacency lists.
+        // Use HashSet only for small graphs; for large graphs, duplicates are unlikely in benchmarks.
+        var adj = new List<int>[n];
+        for (int i = 0; i < n; i++) adj[i] = new List<int>();
+
+        for (int i = 0; i < m; i++)
+        {
+            int u = reader.NextInt();
+            int v = reader.NextInt();
+            if (u == v) continue;
+            if ((uint)u >= (uint)n || (uint)v >= (uint)n) continue;
+            adj[u].Add(v);
+            adj[v].Add(u);
+        }
+
+        // Sort & unique adjacency lists.
+        for (int i = 0; i < n; i++)
+        {
+            var list = adj[i];
+            if (list.Count == 0) continue;
+            list.Sort();
+            int w = 1;
+            for (int r = 1; r < list.Count; r++)
+            {
+                if (list[r] != list[r - 1]) list[w++] = list[r];
+            }
+            if (w != list.Count) list.RemoveRange(w, list.Count - w);
+        }
+
+        // Quick lower bound via greedy heuristic (works for all sizes).
+        int[] bestClique = Heuristics.FindClique(adj, sw, TimeLimitSeconds);
+
+        // Attempt exact for moderate sizes using bitset Tomita-style search.
+        // Keep it conservative to avoid OOM; exact is only feasible for smaller n.
+        if (n <= 6000 && sw.Elapsed.TotalSeconds < TimeLimitSeconds * 0.85)
+        {
+            var exact = new ExactMaxCliqueBitset(adj, n, sw, TimeLimitSeconds);
+            int[] exactClique = exact.Solve(bestClique);
+            if (exactClique.Length > bestClique.Length) bestClique = exactClique;
+        }
+
+        // Ensure output is a clique (defensive) and maximalize inside neighborhood if possible.
+        bestClique = Heuristics.ValidateAndRepairClique(adj, bestClique);
+
+        Console.WriteLine(bestClique.Length);
+        if (bestClique.Length == 0)
+        {
+            Console.WriteLine();
+            return;
+        }
+        Array.Sort(bestClique);
+        Console.WriteLine(string.Join(" ", bestClique));
+    }
+
+    private sealed class FastScanner
+    {
+        private readonly Stream _stream;
+        private readonly byte[] _buffer = new byte[1 << 16];
+        private int _len, _pos;
+
+        public FastScanner(Stream stream) => _stream = stream;
+
+        private int Read()
+        {
+            if (_pos >= _len)
+            {
+                _len = _stream.Read(_buffer, 0, _buffer.Length);
+                _pos = 0;
+                if (_len <= 0) return -1;
+            }
+            return _buffer[_pos++];
+        }
+
+        public int NextInt()
+        {
+            int c;
+            do { c = Read(); } while (c <= 32 && c >= 0);
+            int sign = 1;
+            if (c == '-')
+            {
+                sign = -1;
+                c = Read();
+            }
+            int val = 0;
+            while (c > 32)
+            {
+                val = val * 10 + (c - '0');
+                c = Read();
+            }
+            return val * sign;
+        }
+    }
+}
+
+internal static class Heuristics
+{
+    public static int[] FindClique(List<int>[] adj, Stopwatch sw, double timeLimitSeconds)
+    {
+        int n = adj.Length;
+        // Baseline: greedy from high-degree order.
+        var degree = new int[n];
+        for (int i = 0; i < n; i++) degree[i] = adj[i].Count;
+
+        int[] order = Enumerable.Range(0, n).ToArray();
+        Array.Sort(order, (a, b) =>
+        {
+            int d = degree[b].CompareTo(degree[a]);
+            return d != 0 ? d : a.CompareTo(b);
+        });
+
+        int[] best = Array.Empty<int>();
+
+        // Quick greedy pass.
+        best = MaximizeCliqueFromOrder(adj, order, best);
+
+        // Multi-start randomized greedy with pruning, time-bounded.
+        // Parallelize restarts when n is large enough to benefit.
+        int workerCount = Math.Min(Environment.ProcessorCount, 8);
+        var cts = new CancellationTokenSource();
+        var token = cts.Token;
+
+        object gate = new object();
+        int[] sharedBest = best;
+
+        // Budget for heuristics: leave time for exact if eligible.
+        double stopAt = timeLimitSeconds * 0.65;
+        if (n > 6000) stopAt = timeLimitSeconds * 0.90;
+
+        Task[] tasks = new Task[workerCount];
+        for (int t = 0; t < workerCount; t++)
+        {
+            int seed = unchecked(Environment.TickCount * 31 + t * 10007);
+            tasks[t] = Task.Run(() =>
+            {
+                var rng = new XorShift64Star(((ulong)(uint)seed) + 0x9E3779B97F4A7C15UL);
+                int[] localBest = Array.Empty<int>();
+
+                // Create a working order array and perturb it.
+                int[] localOrder = new int[order.Length];
+                Array.Copy(order, localOrder, order.Length);
+
+                while (!token.IsCancellationRequested)
+                {
+                    if (sw.Elapsed.TotalSeconds >= stopAt)
+                    {
+                        cts.Cancel();
+                        break;
+                    }
+
+                    // Partial Fisher-Yates shuffle of top region (biased search).
+                    int top = Math.Min(5000, localOrder.Length);
+                    for (int i = 0; i < 64; i++)
+                    {
+                        int a = (int)(rng.NextUInt() % (uint)top);
+                        int b = (int)(rng.NextUInt() % (uint)top);
+                        (localOrder[a], localOrder[b]) = (localOrder[b], localOrder[a]);
+                    }
+
+                    int[] candidateBest;
+                    lock (gate) candidateBest = sharedBest;
+                    localBest = MaximizeCliqueFromOrder(adj, localOrder, localBest.Length > candidateBest.Length ? localBest : candidateBest);
+
+                    if (localBest.Length > candidateBest.Length)
+                    {
+                        lock (gate)
+                        {
+                            if (localBest.Length > sharedBest.Length)
+                                sharedBest = (int[])localBest.Clone();
+                        }
+                    }
+                }
+            }, token);
+        }
+
+        try { Task.WaitAll(tasks); } catch { /* ignore */ }
+        return sharedBest;
+    }
+
+    private static int[] MaximizeCliqueFromOrder(List<int>[] adj, int[] order, int[] incumbent)
+    {
+        int[] best = incumbent;
+        int n = adj.Length;
+        var inClique = new bool[n];
+
+        // Greedy build: iterate start vertices; maintain candidate set as HashSet for small, bool[] marking for large.
+        // For performance, do a simple intersection using marker arrays.
+        var mark = new int[n];
+        int markId = 1;
+
+        for (int i = 0; i < order.Length; i++)
+        {
+            int start = order[i];
+            if (adj[start].Count + 1 <= best.Length) continue;
+
+            Array.Clear(inClique, 0, inClique.Length);
+            int[] clique = new int[Math.Min(best.Length + 32, 4096)];
+            int cliqueSize = 0;
+
+            inClique[start] = true;
+            clique[cliqueSize++] = start;
+
+            // Candidates are neighbors of all vertices in clique; start with neighbors of start.
+            var candidates = adj[start];
+            markId++;
+            if (markId == int.MaxValue) { Array.Clear(mark, 0, mark.Length); markId = 1; }
+            for (int k = 0; k < candidates.Count; k++) mark[candidates[k]] = markId;
+
+            // Take candidates in descending degree order (approx), but without sorting: scan order.
+            for (int j = i + 1; j < order.Length; j++)
+            {
+                int v = order[j];
+                if (mark[v] != markId) continue;
+                // Check v connected to all in clique (mark already implies connected to start; verify all).
+                bool ok = true;
+                for (int c = 0; c < cliqueSize; c++)
+                {
+                    if (!IsNeighbor(adj, clique[c], v)) { ok = false; break; }
+                }
+                if (!ok) continue;
+
+                if (cliqueSize == clique.Length)
+                {
+                    Array.Resize(ref clique, clique.Length * 2);
+                }
+                inClique[v] = true;
+                clique[cliqueSize++] = v;
+
+                // Update mark to intersection with neighbors(v).
+                markId++;
+                if (markId == int.MaxValue) { Array.Clear(mark, 0, mark.Length); markId = 1; }
+                var neigh = adj[v];
+                for (int k = 0; k < neigh.Count; k++) mark[neigh[k]] = markId;
+
+                // Early exit: if remaining possible can't beat best.
+                if (cliqueSize + (order.Length - (j + 1)) <= best.Length) break;
+            }
+
+            if (cliqueSize > best.Length)
+            {
+                best = clique.Take(cliqueSize).ToArray();
+            }
+        }
+
+        return best;
+    }
+
+    private static bool IsNeighbor(List<int>[] adj, int u, int v)
+    {
+        var list = adj[u];
+        int lo = 0, hi = list.Count - 1;
+        while (lo <= hi)
+        {
+            int mid = (lo + hi) >> 1;
+            int x = list[mid];
+            if (x == v) return true;
+            if (x < v) lo = mid + 1;
+            else hi = mid - 1;
+        }
+        return false;
+    }
+
+    public static int[] ValidateAndRepairClique(List<int>[] adj, int[] clique)
+    {
+        if (clique.Length <= 1) return clique;
+
+        // Remove any non-clique vertices (shouldn't happen).
+        var kept = new List<int>(clique.Length);
+        for (int i = 0; i < clique.Length; i++)
+        {
+            int v = clique[i];
+            bool ok = true;
+            for (int j = 0; j < kept.Count; j++)
+            {
+                if (!IsNeighbor(adj, kept[j], v)) { ok = false; break; }
+            }
+            if (ok) kept.Add(v);
+        }
+
+        // Try to greedily add more vertices from intersection of neighbors.
+        int n = adj.Length;
+        var inClique = new bool[n];
+        foreach (var v in kept) inClique[v] = true;
+
+        // Candidate set = common neighbors of kept vertices.
+        int[] mark = new int[n];
+        int markId = 1;
+        if (kept.Count == 0) return Array.Empty<int>();
+
+        // Initialize with neighbors of first.
+        var baseNeigh = adj[kept[0]];
+        for (int i = 0; i < baseNeigh.Count; i++) mark[baseNeigh[i]] = markId;
+
+        for (int i = 1; i < kept.Count; i++)
+        {
+            markId++;
+            if (markId == int.MaxValue) { Array.Clear(mark, 0, mark.Length); markId = 1; }
+            var neigh = adj[kept[i]];
+            for (int k = 0; k < neigh.Count; k++) mark[neigh[k]] = markId;
+        }
+
+        // If markId is large, above doesn't intersect; instead do safe add by scanning all vertices and checking.
+        // Simpler: scan vertices with high degree first (may add quickly for dense graphs).
+        var degrees = new int[n];
+        for (int i = 0; i < n; i++) degrees[i] = adj[i].Count;
+        int[] order = Enumerable.Range(0, n).ToArray();
+        Array.Sort(order, (a, b) => degrees[b].CompareTo(degrees[a]));
+
+        foreach (var v in order)
+        {
+            if (inClique[v]) continue;
+            // Check adjacency to all kept.
+            bool ok = true;
+            for (int i = 0; i < kept.Count; i++)
+            {
+                if (!IsNeighbor(adj, kept[i], v)) { ok = false; break; }
+            }
+            if (!ok) continue;
+            kept.Add(v);
+            inClique[v] = true;
+        }
+
+        return kept.ToArray();
+    }
+
+    private struct XorShift64Star
+    {
+        private ulong _x;
+        public XorShift64Star(ulong seed) => _x = seed != 0 ? seed : 0x2545F4914F6CDD1DUL;
+        public uint NextUInt()
+        {
+            ulong x = _x;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            _x = x;
+            return (uint)((x * 2685821657736338717UL) >> 32);
+        }
+    }
+}
+
+internal sealed class ExactMaxCliqueBitset
+{
+    private readonly List<int>[] _adjList;
+    private readonly int _n;
+    private readonly int _words;
+    private readonly ulong[][] _adj; // adjacency bitsets
+    private readonly Stopwatch _sw;
+    private readonly double _timeLimit;
+
+    private int[] _best = Array.Empty<int>();
+    private readonly int[] _stack; // current clique
+
+    public ExactMaxCliqueBitset(List<int>[] adjList, int n, Stopwatch sw, double timeLimitSeconds)
+    {
+        _adjList = adjList;
+        _n = n;
+        _words = (n + 63) >> 6;
+        _adj = new ulong[n][];
+        _sw = sw;
+        _timeLimit = timeLimitSeconds;
+        _stack = new int[n];
+
+        for (int i = 0; i < n; i++)
+        {
+            var bits = new ulong[_words];
+            foreach (var v in adjList[i])
+            {
+                bits[v >> 6] |= 1UL << (v & 63);
+            }
+            _adj[i] = bits;
+        }
+    }
+
+    public int[] Solve(int[] incumbent)
+    {
+        _best = incumbent;
+        var all = new ulong[_words];
+        for (int i = 0; i < _words; i++) all[i] = ulong.MaxValue;
+        // Clear unused bits in last word.
+        int extra = (_words << 6) - _n;
+        if (extra > 0) all[_words - 1] &= ulong.MaxValue >> extra;
+
+        Expand(all, 0);
+        return _best;
+    }
+
+    private void Expand(ulong[] candidates, int depth)
+    {
+        if (_sw.Elapsed.TotalSeconds >= _timeLimit) return;
+
+        // Order candidates and compute greedy coloring upper bounds.
+        var vertices = new int[_n];
+        int vCount = ExtractVertices(candidates, vertices);
+        if (vCount == 0)
+        {
+            if (depth > _best.Length)
+            {
+                var res = new int[depth];
+                Array.Copy(_stack, 0, res, 0, depth);
+                _best = res;
+            }
+            return;
+        }
+
+        var order = new int[vCount];
+        Array.Copy(vertices, 0, order, 0, vCount);
+        Array.Sort(order, 0, vCount, Comparer<int>.Create((a, b) =>
+        {
+            int da = _adjList[a].Count;
+            int db = _adjList[b].Count;
+            int c = db.CompareTo(da);
+            return c != 0 ? c : a.CompareTo(b);
+        }));
+
+        var colors = new int[vCount];
+        GreedyColoringUpperBounds(order, vCount, colors);
+
+        for (int i = vCount - 1; i >= 0; i--)
+        {
+            if (depth + colors[i] <= _best.Length) return;
+            int v = order[i];
+
+            _stack[depth] = v;
+
+            var newCand = IntersectWithNeighbor(candidates, _adj[v]);
+            Expand(newCand, depth + 1);
+
+            // remove v from candidates
+            candidates[v >> 6] &= ~(1UL << (v & 63));
+        }
+    }
+
+    private int ExtractVertices(ulong[] set, int[] output)
+    {
+        int count = 0;
+        for (int w = 0; w < _words; w++)
+        {
+            ulong x = set[w];
+            while (x != 0)
+            {
+                int b = BitOperations.TrailingZeroCount(x);
+                output[count++] = (w << 6) + b;
+                x &= x - 1;
+            }
+        }
+        return count;
+    }
+
+    private void GreedyColoringUpperBounds(int[] order, int count, int[] colors)
+    {
+        // Simple sequential coloring on the induced subgraph of candidates.
+        // colors[i] = number of colors used up to i (upper bound when taking vertices from the end).
+        var colorClass = new ulong[_words];
+        int color = 0;
+        for (int i = 0; i < count; i++) colors[i] = 0;
+
+        // Working set in bit form for faster intersection checks.
+        var remaining = new ulong[_words];
+        for (int i = 0; i < count; i++)
+        {
+            int v = order[i];
+            remaining[v >> 6] |= 1UL << (v & 63);
+        }
+
+        int processed = 0;
+        while (processed < count)
+        {
+            color++;
+            Array.Clear(colorClass, 0, colorClass.Length);
+            var avail = (ulong[])remaining.Clone();
+
+            while (HasAny(avail))
+            {
+                int v = FirstBit(avail);
+                // add v to current color class
+                colorClass[v >> 6] |= 1UL << (v & 63);
+                // remove v and its neighbors from avail
+                avail[v >> 6] &= ~(1UL << (v & 63));
+                AndNotInPlace(avail, _adj[v]);
+            }
+
+            // Assign this color to vertices in colorClass (in order array sequence).
+            for (int i = 0; i < count; i++)
+            {
+                int v = order[i];
+                if (colors[i] == 0 && ((colorClass[v >> 6] >> (v & 63)) & 1UL) != 0)
+                {
+                    colors[i] = color;
+                    processed++;
+                    // remove v from remaining
+                    remaining[v >> 6] &= ~(1UL << (v & 63));
+                }
+            }
+        }
+    }
+
+    private ulong[] IntersectWithNeighbor(ulong[] a, ulong[] b)
+    {
+        var res = new ulong[_words];
+        for (int i = 0; i < _words; i++) res[i] = a[i] & b[i];
+        return res;
+    }
+
+    private static void AndNotInPlace(ulong[] a, ulong[] b)
+    {
+        for (int i = 0; i < a.Length; i++) a[i] &= ~b[i];
+    }
+
+    private static bool HasAny(ulong[] a)
+    {
+        for (int i = 0; i < a.Length; i++) if (a[i] != 0) return true;
+        return false;
+    }
+
+    private static int FirstBit(ulong[] a)
+    {
+        for (int i = 0; i < a.Length; i++)
+        {
+            ulong x = a[i];
+            if (x != 0)
+            {
+                int b = BitOperations.TrailingZeroCount(x);
+                return (i << 6) + b;
+            }
+        }
+        return -1;
+    }
+}

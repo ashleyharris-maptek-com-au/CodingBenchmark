@@ -1,0 +1,326 @@
+const fs = require('fs');
+
+const input = fs.readFileSync(0, 'utf8').trim();
+const data = input.length ? JSON.parse(input) : {};
+
+const grid = data.probability || [];
+const H = grid.length;
+const W = H ? grid[0].length : 0;
+const drones = data.drones || [];
+const maxStepsPerDrone = Math.max(0, data.maxStepsPerDrone | 0);
+
+function inBounds(x, y) {
+  return y >= 0 && y < H && x >= 0 && x < W;
+}
+
+function isFree(x, y) {
+  return inBounds(x, y) && grid[y][x] !== -1;
+}
+
+// 4-neighborhood + stay
+const DIRS = [
+  [0, 0],
+  [1, 0],
+  [-1, 0],
+  [0, 1],
+  [0, -1],
+];
+
+// Fast visited set using integer keys.
+// key = y*W + x (fits in 32-bit for typical benchmark sizes)
+const covered = new Uint8Array(Math.max(0, W * H));
+
+function idx(x, y) {
+  return y * W + x;
+}
+
+function cellValue(x, y) {
+  const v = grid[y][x];
+  return v > 0 ? v : 0;
+}
+
+function markCovered(x, y) {
+  if (W === 0 || H === 0) return;
+  const k = idx(x, y);
+  covered[k] = 1;
+}
+
+function isCovered(x, y) {
+  if (W === 0 || H === 0) return false;
+  return covered[idx(x, y)] === 1;
+}
+
+// Precompute list of positive cells (targets).
+const targets = [];
+if (H && W) {
+  for (let y = 0; y < H; y++) {
+    const row = grid[y];
+    for (let x = 0; x < W; x++) {
+      const v = row[x];
+      if (v > 0) targets.push({ x, y, v });
+    }
+  }
+}
+
+// Sort descending by value; tie-breaker stable-ish.
+targets.sort((a, b) => (b.v - a.v) || (a.y - b.y) || (a.x - b.x));
+
+// Build a quick list of top-K targets to focus on (scales better for huge grids).
+const TOP_K = Math.min(2000, targets.length);
+const topTargets = targets.slice(0, TOP_K);
+
+// BFS distances from a start, limited to maxDist, returning dist array (Int32) for reachable nodes.
+// Uses a queue with preallocated arrays for speed.
+function bfsLimited(sx, sy, maxDist) {
+  const total = W * H;
+  const dist = new Int32Array(total);
+  dist.fill(-1);
+  const qx = new Int32Array(total);
+  const qy = new Int32Array(total);
+  let qh = 0, qt = 0;
+
+  const sIndex = idx(sx, sy);
+  dist[sIndex] = 0;
+  qx[qt] = sx; qy[qt] = sy; qt++;
+
+  while (qh < qt) {
+    const x = qx[qh];
+    const y = qy[qh];
+    const d = dist[idx(x, y)];
+    qh++;
+    if (d >= maxDist) continue;
+    // 4-neighbors only for traversal.
+    for (let i = 1; i < 5; i++) {
+      const nx = x + DIRS[i][0];
+      const ny = y + DIRS[i][1];
+      if (!isFree(nx, ny)) continue;
+      const ni = idx(nx, ny);
+      if (dist[ni] !== -1) continue;
+      dist[ni] = d + 1;
+      qx[qt] = nx; qy[qt] = ny; qt++;
+    }
+  }
+  return dist;
+}
+
+// Reconstruct a shortest path from start to goal using a distance map from start.
+function reconstructPathFromDist(sx, sy, gx, gy, dist) {
+  const path = [];
+  let x = gx, y = gy;
+  let d = dist[idx(x, y)];
+  if (d < 0) return null;
+  path.push([x, y]);
+  while (d > 0) {
+    // step to a neighbor with dist = d-1
+    let moved = false;
+    for (let i = 1; i < 5; i++) {
+      const px = x + DIRS[i][0];
+      const py = y + DIRS[i][1];
+      if (!isFree(px, py)) continue;
+      const pd = dist[idx(px, py)];
+      if (pd === d - 1) {
+        x = px; y = py; d = pd;
+        path.push([x, y]);
+        moved = true;
+        break;
+      }
+    }
+    if (!moved) break; // should not happen
+  }
+  path.reverse();
+  // ensure starts at (sx,sy)
+  if (path[0][0] !== sx || path[0][1] !== sy) return null;
+  return path;
+}
+
+function clampStayPath(path, maxSteps) {
+  // Ensure length exactly maxSteps+1 by staying at end, or truncate if longer.
+  const wantLen = maxSteps + 1;
+  if (path.length > wantLen) return path.slice(0, wantLen);
+  if (path.length === wantLen) return path;
+  const out = path.slice();
+  const last = out[out.length - 1];
+  while (out.length < wantLen) out.push([last[0], last[1]]);
+  return out;
+}
+
+// Assign target goals to drones with a simple load-balanced heuristic:
+// repeatedly pick the highest-value uncovered cell and assign to the drone with smallest estimated travel cost.
+const droneStates = drones.map((d, i) => ({
+  id: d.id,
+  x: d.x | 0,
+  y: d.y | 0,
+  remaining: maxStepsPerDrone,
+  goals: [],
+  index: i,
+}));
+
+// Validate starting positions; if invalid, just output stays.
+for (const st of droneStates) {
+  if (!isFree(st.x, st.y)) {
+    st.invalid = true;
+  }
+}
+
+// Distance cache per drone (recomputed as goals get appended to keep it simple).
+// For scalability, keep assignments modest.
+const ASSIGN_LIMIT_PER_DRONE = 25;
+const ASSIGN_GLOBAL_LIMIT = Math.min(ASSIGN_LIMIT_PER_DRONE * droneStates.length, TOP_K);
+
+let assignedCount = 0;
+for (let ti = 0; ti < topTargets.length && assignedCount < ASSIGN_GLOBAL_LIMIT; ti++) {
+  const t = topTargets[ti];
+  if (grid[t.y][t.x] === -1) continue;
+  // If already covered at start by any drone position, skip assigning.
+  // (We'll mark coverage from actual paths later, but starting cells count.)
+  let skip = false;
+  for (const st of droneStates) {
+    if (!st.invalid && st.x === t.x && st.y === t.y) {
+      skip = true;
+      break;
+    }
+  }
+  if (skip) continue;
+
+  let bestDrone = -1;
+  let bestScore = Infinity;
+  for (let di = 0; di < droneStates.length; di++) {
+    const st = droneStates[di];
+    if (st.invalid) continue;
+    if (st.goals.length >= ASSIGN_LIMIT_PER_DRONE) continue;
+    // Estimate cost as Manhattan distance (cheap) with penalty for current goal chain.
+    const last = st.goals.length ? st.goals[st.goals.length - 1] : { x: st.x, y: st.y };
+    const man = Math.abs(last.x - t.x) + Math.abs(last.y - t.y);
+    const slack = st.remaining - man;
+    if (slack < 0) continue;
+    // Prefer closer and less-loaded drones.
+    const score = man + st.goals.length * 2;
+    if (score < bestScore) {
+      bestScore = score;
+      bestDrone = di;
+    }
+  }
+  if (bestDrone >= 0) {
+    droneStates[bestDrone].goals.push({ x: t.x, y: t.y, v: t.v });
+    assignedCount++;
+  }
+}
+
+// Now build concrete paths for each drone:
+// - Move along shortest paths (BFS) to each assigned goal while time allows.
+// - Greedily pick local next step with best immediate gain when not heading to a goal.
+const paths = [];
+
+// Mark starting cells as covered
+for (const st of droneStates) {
+  if (!st.invalid && isFree(st.x, st.y)) markCovered(st.x, st.y);
+}
+
+for (const st of droneStates) {
+  const path = [[st.x, st.y]];
+  if (st.invalid || !isFree(st.x, st.y) || maxStepsPerDrone === 0) {
+    paths.push(clampStayPath(path, maxStepsPerDrone));
+    continue;
+  }
+
+  let cx = st.x, cy = st.y;
+  let stepsLeft = maxStepsPerDrone;
+
+  // Execute goal list
+  for (let gi = 0; gi < st.goals.length && stepsLeft > 0; gi++) {
+    const g = st.goals[gi];
+    if (cx === g.x && cy === g.y) continue;
+    // BFS limited by stepsLeft to avoid full grid search for far goals.
+    const dist = bfsLimited(cx, cy, stepsLeft);
+    const dGoal = dist[idx(g.x, g.y)];
+    if (dGoal < 0 || dGoal > stepsLeft) continue;
+    const seg = reconstructPathFromDist(cx, cy, g.x, g.y, dist);
+    if (!seg || seg.length < 2) continue;
+    // Walk segment (skip first cell since already in path)
+    for (let si = 1; si < seg.length && stepsLeft > 0; si++) {
+      cx = seg[si][0];
+      cy = seg[si][1];
+      path.push([cx, cy]);
+      stepsLeft--;
+      markCovered(cx, cy);
+    }
+  }
+
+  // Fill remaining steps with local greedy moves toward nearby high value uncovered cells.
+  // Uses a small radius scan; occasionally do a limited BFS to the best target in radius.
+  const RADIUS = 10;
+  let cooldown = 0;
+  while (stepsLeft > 0) {
+    if (cooldown === 0) {
+      // Find best uncovered target within manhattan radius (cheap scan of topTargets).
+      let bestT = null;
+      let bestGain = 0;
+      for (let ti = 0; ti < topTargets.length; ti++) {
+        const t = topTargets[ti];
+        if (isCovered(t.x, t.y)) continue;
+        const man = Math.abs(cx - t.x) + Math.abs(cy - t.y);
+        if (man === 0) continue;
+        if (man > Math.min(RADIUS, stepsLeft)) continue;
+        // gain per step heuristic
+        const gain = t.v / (man + 0.5);
+        if (gain > bestGain) {
+          bestGain = gain;
+          bestT = t;
+        }
+      }
+      if (bestT) {
+        const dist = bfsLimited(cx, cy, Math.min(stepsLeft, RADIUS));
+        const dGoal = dist[idx(bestT.x, bestT.y)];
+        if (dGoal > 0 && dGoal <= stepsLeft) {
+          const seg = reconstructPathFromDist(cx, cy, bestT.x, bestT.y, dist);
+          if (seg && seg.length >= 2) {
+            for (let si = 1; si < seg.length && stepsLeft > 0; si++) {
+              cx = seg[si][0];
+              cy = seg[si][1];
+              path.push([cx, cy]);
+              stepsLeft--;
+              markCovered(cx, cy);
+            }
+            cooldown = 2;
+            continue;
+          }
+        }
+      }
+    }
+
+    // Step-level greedy: choose neighbor with best (uncovered value + slight future bias)
+    let bestNx = cx, bestNy = cy;
+    let bestScore = -1;
+    for (let i = 0; i < 5; i++) {
+      const nx = cx + DIRS[i][0];
+      const ny = cy + DIRS[i][1];
+      if (!isFree(nx, ny)) continue;
+      const v = cellValue(nx, ny);
+      const gain = isCovered(nx, ny) ? 0 : v;
+      // small lookahead: sum of uncovered neighbor values
+      let neigh = 0;
+      for (let j = 1; j < 5; j++) {
+        const ax = nx + DIRS[j][0];
+        const ay = ny + DIRS[j][1];
+        if (!isFree(ax, ay)) continue;
+        if (isCovered(ax, ay)) continue;
+        neigh += cellValue(ax, ay);
+      }
+      const score = gain * 2 + neigh * 0.25;
+      if (score > bestScore) {
+        bestScore = score;
+        bestNx = nx;
+        bestNy = ny;
+      }
+    }
+    cx = bestNx; cy = bestNy;
+    path.push([cx, cy]);
+    stepsLeft--;
+    markCovered(cx, cy);
+    if (cooldown > 0) cooldown--;
+  }
+
+  paths.push(clampStayPath(path, maxStepsPerDrone));
+}
+
+process.stdout.write(JSON.stringify({ paths }));

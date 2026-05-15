@@ -17,12 +17,13 @@ from typing import List, Tuple, Dict
 
 from native_compiler import CSharpCompiler, compile_and_run, describe_this_pc
 from visualization_utils import generate_threejs_aabb_visualization
+from solver_utils import BaselineCache, normalize_code_result
 
 title = "3D AABB Bin Packing (C#)"
 
 tags = [
   "csharp",
-  "structured response",
+  "freeform response",
   "optimization",
   "packing",
   "geometry",
@@ -33,6 +34,8 @@ TIMEOUT_SECONDS = 30
 
 # Seed for reproducibility
 RANDOM_SEED = 99999
+
+_BASELINE_CACHE = BaselineCache("test17_aabb_packing")
 
 
 def generate_boxes(num_boxes: int, container: Tuple[int, int, int], min_size: int, max_size: int,
@@ -167,23 +170,7 @@ Write complete, compilable C# code with a static void Main method.
 # List of subpasses to grade the single answer against all difficulty levels
 extraGradeAnswerRuns = list(range(8))  #list(range(len(TEST_CASES)))
 
-structure = {
-  "type": "object",
-  "properties": {
-    "reasoning": {
-      "type":
-      "string",
-      "description":
-      "Explain your 3D packing algorithm and how it adapts to different container sizes and box counts"
-    },
-    "csharp_code": {
-      "type": "string",
-      "description": "Complete C# code with Main method that handles all scales"
-    }
-  },
-  "required": ["reasoning", "csharp_code"],
-  "additionalProperties": False
-}
+structure = None
 
 
 def boxes_overlap(pos1, size1, pos2, size2) -> bool:
@@ -338,6 +325,15 @@ def format_input(boxes: List[Tuple], container: Tuple) -> str:
   return "\n".join(lines)
 
 
+def _get_cached_baseline_count(boxes: List[Tuple], container: Tuple) -> int:
+  return int(_BASELINE_CACHE.get_or_compute_json(
+    "baseline",
+    lambda: {"count": greedy_pack(boxes, container)},
+    "test17-baseline-v1",
+    format_input(boxes, container),
+  )["count"])
+
+
 def parse_packing_output(output: str, boxes: List[Tuple]) -> tuple:
   text = output.strip()
   if not text:
@@ -398,6 +394,7 @@ def execute_solver(code: str,
 
 def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
   """Grade the 3D packing solver."""
+  result = normalize_code_result(result, "csharp_code")
   if not result:
     return 0.0, "No result provided"
 
@@ -432,7 +429,7 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
     return 0.0, f"[{description}] {validation_error}"
 
   # Get baseline
-  baseline_count = greedy_pack(boxes, container)
+  baseline_count = _get_cached_baseline_count(boxes, container)
 
   if packed_count == 0:
     return 0.0, f"[{description}] No boxes packed"
@@ -457,8 +454,15 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
   return score, explanation
 
 
+def setup() -> None:
+  for subPass in range(len(TEST_CASES)):
+    case = TEST_CASES[subPass]
+    _get_cached_baseline_count(case["boxes"], case["container"])
+
+
 def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
   """Generate HTML report."""
+  result = normalize_code_result(result, "csharp_code")
   if not result:
     return "<p style='color:red'>No result provided</p>"
 

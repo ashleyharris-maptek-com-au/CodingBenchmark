@@ -32,6 +32,7 @@ import tempfile
 from typing import Tuple, Optional, Dict
 from PIL import Image
 
+from solver_utils import normalize_code_result
 from shader_test_utils import (
   ShaderRenderer, assemble_spirv, validate_spirv,
   compare_images, load_reference, save_reference, grade_shader,
@@ -42,7 +43,7 @@ title = "Fragment Shaders (SPIR-V Assembly)"
 
 tags = [
   "spirv",
-  "structured response",
+  "freeform response",
   "shader",
   "gpu",
 ]
@@ -94,7 +95,7 @@ layout(location = 0) out vec4 outColor;  RGBA float, will be stored as rgba8unor
 - Entry point function name must be "main"
 
 **Write ONLY the complete SPIR-V assembly text.** Do not include any other text or explanation
-outside the spirv_code field.
+outside the SPIR-V text.
 """
 
 # ---------------------------------------------------------------------------
@@ -287,21 +288,7 @@ SUBPASSES = [
 # Test interface (follows benchmark conventions)
 # ---------------------------------------------------------------------------
 
-structure = {
-  "type": "object",
-  "properties": {
-    "reasoning": {
-      "type": "string",
-      "description": "Explain your approach to writing this SPIR-V assembly shader"
-    },
-    "spirv_code": {
-      "type": "string",
-      "description": "Complete SPIR-V assembly text for the fragment shader"
-    }
-  },
-  "required": ["reasoning", "spirv_code"],
-  "additionalProperties": False
-}
+structure = None
 
 
 def prepareSubpassPrompt(subPass: int) -> str:
@@ -331,6 +318,7 @@ def _grade_answer_inner(result: dict, subPass: int, aiEngineName: str) -> tuple:
   Grade the SPIR-V assembly fragment shader.
   Assembles it, renders on the sphere, compares to reference image.
   """
+  result = normalize_code_result(result, "spirv_code")
   if not result:
     return 0.0, "No result provided", {"error": "no_result"}
 
@@ -374,6 +362,7 @@ def _grade_answer_inner(result: dict, subPass: int, aiEngineName: str) -> tuple:
 
 def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
   """Run grading in an isolated subprocess to survive GPU hangs/TDRs."""
+  result = normalize_code_result(result, "spirv_code")
   if not result or "spirv_code" not in result:
     return 0.0, "No SPIR-V code provided"
 
@@ -446,6 +435,7 @@ if __name__ == "__main__":
 
 
 def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
+  result = normalize_code_result(result, "spirv_code")
   if not result:
     return "<p style='color:red'>No result provided</p>"
   desc = SUBPASSES[subPass]["description"]

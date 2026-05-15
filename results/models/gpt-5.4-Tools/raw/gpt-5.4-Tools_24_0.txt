@@ -1,0 +1,464 @@
+#include <algorithm>
+#include <atomic>
+#include <cmath>
+#include <condition_variable>
+#include <cstdint>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <limits>
+#include <mutex>
+#include <sstream>
+#include <string>
+#include <thread>
+#include <vector>
+
+namespace {
+
+constexpr double kPi = 3.14159265358979323846;
+constexpr double kGravityDefault = 1.62;
+constexpr double kAngularAccelPerUnit = 2.0;
+
+struct Vec3 {
+    double x = 0.0;
+    double y = 0.0;
+    double z = 0.0;
+
+    Vec3 operator+(const Vec3& other) const { return {x + other.x, y + other.y, z + other.z}; }
+    Vec3 operator-(const Vec3& other) const { return {x - other.x, y - other.y, z - other.z}; }
+    Vec3 operator*(double s) const { return {x * s, y * s, z * s}; }
+    Vec3 operator/(double s) const { return {x / s, y / s, z / s}; }
+    Vec3& operator+=(const Vec3& other) {
+        x += other.x;
+        y += other.y;
+        z += other.z;
+        return *this;
+    }
+};
+
+double dot(const Vec3& a, const Vec3& b) {
+    return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+
+double norm(const Vec3& v) {
+    return std::sqrt(dot(v, v));
+}
+
+double clamp(double v, double lo, double hi) {
+    return std::max(lo, std::min(hi, v));
+}
+
+double wrapAngle(double a) {
+    while (a > kPi) a -= 2.0 * kPi;
+    while (a < -kPi) a += 2.0 * kPi;
+    return a;
+}
+
+struct Header {
+    int width = 0;
+    int depth = 0;
+    int height = 0;
+    double gravity = kGravityDefault;
+    double maxThrust = 0.0;
+    double fuel = 0.0;
+    Vec3 start;
+    Vec3 target;
+    std::string terrainPath;
+};
+
+struct State {
+    Vec3 pos;
+    Vec3 vel;
+    double pitch = 0.0;
+    double yaw = 0.0;
+    double roll = 0.0;
+    double pitchRate = 0.0;
+    double yawRate = 0.0;
+    double rollRate = 0.0;
+    double fuelRemaining = 0.0;
+};
+
+struct Command {
+    double thrust = 0.0;
+    double pitchCmd = 0.0;
+    double yawCmd = 0.0;
+    double rollCmd = 0.0;
+};
+
+struct Cell {
+    std::uint16_t groundTop = 0;
+    std::uint16_t floatBottom = 0;
+    std::uint16_t floatTop = 0;
+};
+
+class TerrainMap {
+public:
+    TerrainMap() = default;
+
+    void startLoading(const Header& header) {
+        width_ = header.width;
+        depth_ = header.depth;
+        height_ = header.height;
+        const std::size_t total = static_cast<std::size_t>(width_) * static_cast<std::size_t>(depth_);
+        cells_.resize(total);
+        loadedCount_.store(0);
+        ready_.store(false);
+        worker_ = std::thread([this, path = header.terrainPath]() { loadWorker(path); });
+    }
+
+    ~TerrainMap() {
+        if (worker_.joinable()) {
+            worker_.join();
+        }
+    }
+
+    bool isLoaded() const {
+        return ready_.load(std::memory_order_acquire);
+    }
+
+    double loadedFraction() const {
+        const std::size_t total = cells_.size();
+        if (total == 0) return 1.0;
+        return static_cast<double>(loadedCount_.load(std::memory_order_acquire)) / static_cast<double>(total);
+    }
+
+    bool sampleCell(int x, int y, Cell& out) const {
+        if (x < 0 || y < 0 || x >= width_ || y >= depth_) return false;
+        const std::size_t idx = static_cast<std::size_t>(x) * static_cast<std::size_t>(depth_) + static_cast<std::size_t>(y);
+        if (idx >= loadedCount_.load(std::memory_order_acquire)) return false;
+        out = cells_[idx];
+        return true;
+    }
+
+    bool isSolid(double x, double y, double z) const {
+        if (x < 0.0 || y < 0.0 || z < 0.0 || x >= width_ || y >= depth_ || z >= height_) {
+            return true;
+        }
+        const int xi = static_cast<int>(std::floor(x));
+        const int yi = static_cast<int>(std::floor(y));
+        Cell cell;
+        if (!sampleCell(xi, yi, cell)) {
+            return false;
+        }
+        if (z < static_cast<double>(cell.groundTop)) return true;
+        if (cell.floatBottom < cell.floatTop && z >= static_cast<double>(cell.floatBottom) && z < static_cast<double>(cell.floatTop)) {
+            return true;
+        }
+        return false;
+    }
+
+    double clearanceAbove(double x, double y, double z) const {
+        const int xi = static_cast<int>(std::floor(x));
+        const int yi = static_cast<int>(std::floor(y));
+        Cell cell;
+        if (!sampleCell(xi, yi, cell)) return std::numeric_limits<double>::infinity();
+        if (z < static_cast<double>(cell.groundTop)) return -1.0;
+        if (cell.floatBottom < cell.floatTop) {
+            if (z < static_cast<double>(cell.floatBottom)) {
+                return static_cast<double>(cell.floatBottom) - z;
+            }
+            if (z < static_cast<double>(cell.floatTop)) {
+                return -1.0;
+            }
+        }
+        return std::numeric_limits<double>::infinity();
+    }
+
+private:
+    void loadWorker(const std::string& path) {
+        std::ifstream in(path, std::ios::binary);
+        if (!in) {
+            ready_.store(true, std::memory_order_release);
+            return;
+        }
+
+        constexpr std::size_t kChunkCells = 1u << 16;
+        std::vector<char> buffer(kChunkCells * 6);
+        std::size_t cellIndex = 0;
+        while (in && cellIndex < cells_.size()) {
+            const std::size_t remaining = cells_.size() - cellIndex;
+            const std::size_t take = std::min(kChunkCells, remaining);
+            const std::size_t bytes = take * 6;
+            in.read(buffer.data(), static_cast<std::streamsize>(bytes));
+            const std::size_t got = static_cast<std::size_t>(in.gcount());
+            const std::size_t parsedCells = got / 6;
+            for (std::size_t i = 0; i < parsedCells; ++i) {
+                const unsigned char* p = reinterpret_cast<const unsigned char*>(buffer.data() + i * 6);
+                cells_[cellIndex + i] = Cell{
+                    static_cast<std::uint16_t>(p[0] | (p[1] << 8)),
+                    static_cast<std::uint16_t>(p[2] | (p[3] << 8)),
+                    static_cast<std::uint16_t>(p[4] | (p[5] << 8))
+                };
+            }
+            cellIndex += parsedCells;
+            loadedCount_.store(cellIndex, std::memory_order_release);
+            if (parsedCells < take) break;
+        }
+        ready_.store(true, std::memory_order_release);
+    }
+
+    int width_ = 0;
+    int depth_ = 0;
+    int height_ = 0;
+    std::vector<Cell> cells_;
+    std::atomic<std::size_t> loadedCount_{0};
+    std::atomic<bool> ready_{false};
+    std::thread worker_;
+};
+
+class StateQueue {
+public:
+    void push(const State& state) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            latest_ = state;
+            hasLatest_ = true;
+        }
+        cv_.notify_one();
+    }
+
+    bool waitPop(State& out) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        cv_.wait(lock, [&] { return hasLatest_ || closed_; });
+        if (!hasLatest_ && closed_) return false;
+        out = latest_;
+        hasLatest_ = false;
+        return true;
+    }
+
+    void close() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            closed_ = true;
+        }
+        cv_.notify_all();
+    }
+
+private:
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    State latest_;
+    bool hasLatest_ = false;
+    bool closed_ = false;
+};
+
+Vec3 thrustDirection(double pitch, double yaw) {
+    const double cp = std::cos(pitch);
+    const double sp = std::sin(pitch);
+    const double cy = std::cos(yaw);
+    const double sy = std::sin(yaw);
+    return {-sp, cp * sy, cp * cy};
+}
+
+class Autopilot {
+public:
+    Autopilot(const Header& header, const TerrainMap& terrain)
+        : header_(header), terrain_(terrain) {
+        landingRadius_ = std::max(5.0, std::min(header_.width, header_.depth) * 0.02);
+        maxAccel_ = header_.maxThrust > 0.0 ? header_.maxThrust : header_.gravity * 2.0;
+    }
+
+    Command update(const State& s) {
+        const Vec3 toTarget = header_.target - s.pos;
+        const double horizontalDist = std::sqrt(toTarget.x * toTarget.x + toTarget.y * toTarget.y);
+        const double altitudeAboveTarget = s.pos.z - header_.target.z;
+        const double speed = norm(s.vel);
+
+        const bool finalApproach = horizontalDist < landingRadius_ * 1.5;
+        const double maxTilt = finalApproach ? 0.25 : 0.6;
+
+        Vec3 desiredAcc{};
+        desiredAcc.x = lateralAccelAxis(toTarget.x, s.vel.x, horizontalDist, landingRadius_);
+        desiredAcc.y = lateralAccelAxis(toTarget.y, s.vel.y, horizontalDist, landingRadius_);
+
+        const double safeVz = targetVerticalSpeed(altitudeAboveTarget, horizontalDist, terrainClearanceAhead(s));
+        const double vzError = safeVz - s.vel.z;
+        desiredAcc.z = header_.gravity + clamp(0.9 * vzError, -header_.gravity * 0.5, maxAccel_);
+
+        desiredAcc = avoidTerrain(s, desiredAcc);
+
+        const double desiredMag = norm(desiredAcc);
+        double thrust = 0.0;
+        Vec3 dir{0.0, 0.0, 1.0};
+        if (desiredMag > 1e-6) {
+            thrust = clamp(desiredMag / std::max(maxAccel_, 1e-6), 0.0, 1.0);
+            dir = desiredAcc / desiredMag;
+        }
+
+        const double targetPitch = clamp(-std::asin(clamp(dir.x, -1.0, 1.0)), -maxTilt, maxTilt);
+        const double cp = std::cos(targetPitch);
+        double targetYaw = s.yaw;
+        if (std::abs(cp) > 1e-4) {
+            targetYaw = std::atan2(dir.y, dir.z);
+        }
+        targetYaw = wrapAngle(targetYaw);
+
+        if (s.fuelRemaining < std::max(20.0, header_.fuel * 0.05)) {
+            thrust = clamp(thrust, 0.0, 0.75);
+            if (altitudeAboveTarget > 10.0) {
+                desiredAcc.x *= 0.5;
+                desiredAcc.y *= 0.5;
+            }
+        }
+
+        Command cmd;
+        cmd.thrust = thrust;
+        cmd.pitchCmd = attitudeController(targetPitch, s.pitch, s.pitchRate);
+        cmd.yawCmd = attitudeController(wrapAngle(targetYaw - s.yaw), 0.0, s.yawRate);
+        cmd.rollCmd = attitudeController(0.0, s.roll, s.rollRate);
+        return cmd;
+    }
+
+private:
+    double lateralAccelAxis(double posErr, double vel, double horizontalDist, double radius) const {
+        const double distScale = std::max(radius * 2.0, horizontalDist);
+        const double kp = clamp(2.0 / std::sqrt(distScale + 1.0), 0.03, 0.35);
+        const double kd = clamp(1.2 * std::sqrt(kp), 0.15, 0.8);
+        return clamp(kp * posErr - kd * vel, -maxAccel_ * 0.45, maxAccel_ * 0.45);
+    }
+
+    double targetVerticalSpeed(double altitude, double horizontalDist, double clearanceAhead) const {
+        double target = -1.2;
+        if (altitude > 2000.0) target = -35.0;
+        else if (altitude > 500.0) target = -20.0;
+        else if (altitude > 150.0) target = -12.0;
+        else if (altitude > 50.0) target = -7.0;
+        else if (altitude > 20.0) target = -4.5;
+        else if (altitude > 8.0) target = -2.5;
+        if (horizontalDist > landingRadius_ * 4.0) {
+            target = std::min(target, -6.0);
+        }
+        if (clearanceAhead < 20.0) {
+            target = std::max(target, -2.0);
+        }
+        return target;
+    }
+
+    double terrainClearanceAhead(const State& s) const {
+        const double lookTime = 2.0;
+        double best = std::numeric_limits<double>::infinity();
+        for (int i = 1; i <= 8; ++i) {
+            const double t = lookTime * static_cast<double>(i) / 8.0;
+            const double x = s.pos.x + s.vel.x * t;
+            const double y = s.pos.y + s.vel.y * t;
+            const double z = s.pos.z + s.vel.z * t;
+            best = std::min(best, terrain_.clearanceAbove(x, y, z));
+        }
+        return best;
+    }
+
+    Vec3 avoidTerrain(const State& s, Vec3 desiredAcc) const {
+        if (!terrain_.isLoaded() && terrain_.loadedFraction() < 0.01) {
+            return desiredAcc;
+        }
+        const double lookTime = clamp(1.5 + norm(s.vel) / 20.0, 1.0, 5.0);
+        bool threat = false;
+        Vec3 repel{};
+        for (int i = 1; i <= 10; ++i) {
+            const double t = lookTime * static_cast<double>(i) / 10.0;
+            const Vec3 probe = s.pos + s.vel * t;
+            if (terrain_.isSolid(probe.x, probe.y, probe.z)) {
+                threat = true;
+                repel.x -= s.vel.x;
+                repel.y -= s.vel.y;
+                repel.z += std::max(5.0, std::abs(s.vel.z) + 2.0);
+                break;
+            }
+            const double clr = terrain_.clearanceAbove(probe.x, probe.y, probe.z);
+            if (clr >= 0.0 && clr < 8.0) {
+                repel.z += (8.0 - clr) * 0.8;
+            }
+        }
+        if (threat || repel.z > 0.0) {
+            desiredAcc += repel;
+        }
+        return desiredAcc;
+    }
+
+    double attitudeController(double targetAngle, double currentAngle, double currentRate) const {
+        const double error = wrapAngle(targetAngle - currentAngle);
+        const double desiredAccel = 4.0 * error - 1.6 * currentRate;
+        return clamp(desiredAccel / kAngularAccelPerUnit, -1.0, 1.0);
+    }
+
+    const Header& header_;
+    const TerrainMap& terrain_;
+    double landingRadius_ = 5.0;
+    double maxAccel_ = 1.0;
+};
+
+bool readHeader(Header& header) {
+    if (!(std::cin >> header.width >> header.depth >> header.height >> header.gravity >> header.maxThrust >> header.fuel)) {
+        return false;
+    }
+    if (!(std::cin >> header.start.x >> header.start.y >> header.start.z >> header.target.x >> header.target.y >> header.target.z)) {
+        return false;
+    }
+    std::string discard;
+    std::getline(std::cin, discard);
+    std::getline(std::cin, header.terrainPath);
+    std::string stateLine;
+    std::getline(std::cin, stateLine);
+    return true;
+}
+
+bool parseStateLine(const std::string& line, State& s) {
+    std::istringstream iss(line);
+    return static_cast<bool>(iss >> s.pos.x >> s.pos.y >> s.pos.z
+        >> s.vel.x >> s.vel.y >> s.vel.z
+        >> s.pitch >> s.yaw >> s.roll
+        >> s.pitchRate >> s.yawRate >> s.rollRate
+        >> s.fuelRemaining);
+}
+
+}  // namespace
+
+int main() {
+    std::ios::sync_with_stdio(false);
+    std::cin.tie(nullptr);
+
+    Header header;
+    if (!readHeader(header)) {
+        return 0;
+    }
+
+    TerrainMap terrain;
+    terrain.startLoading(header);
+
+    StateQueue queue;
+    std::atomic<bool> inputDone{false};
+
+    std::thread reader([&]() {
+        std::string line;
+        while (std::getline(std::cin, line)) {
+            if (line.empty()) continue;
+            State state;
+            if (parseStateLine(line, state)) {
+                queue.push(state);
+            }
+        }
+        inputDone.store(true, std::memory_order_release);
+        queue.close();
+    });
+
+    Autopilot autopilot(header, terrain);
+    Command lastCmd{0.7, 0.0, 0.0, 0.0};
+
+    std::cout.setf(std::ios::fixed);
+    std::cout << std::setprecision(6);
+
+    State state;
+    while (queue.waitPop(state)) {
+        lastCmd = autopilot.update(state);
+        std::cout << clamp(lastCmd.thrust, 0.0, 1.0) << ' '
+                  << clamp(lastCmd.pitchCmd, -1.0, 1.0) << ' '
+                  << clamp(lastCmd.yawCmd, -1.0, 1.0) << ' '
+                  << clamp(lastCmd.rollCmd, -1.0, 1.0) << '\n';
+        std::cout.flush();
+    }
+
+    if (reader.joinable()) {
+        reader.join();
+    }
+    return 0;
+}

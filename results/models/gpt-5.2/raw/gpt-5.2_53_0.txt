@@ -1,0 +1,409 @@
+import math
+
+
+def autopilot_step(state: dict, dt: float) -> dict:
+    """
+    Autopilot for LVLH-frame docking.
+
+    Frame: x = radial (out), y = along-track (prograde), z = cross-track.
+    Negative y means "behind" the station.
+
+    This controller is deliberately conservative with thrust, robust to partial
+    sensor failures, and uses the key orbital-mechanics insight far from target:
+    to reduce a negative y gap (catch up from behind), bias thrust in -Y
+    (retrograde) to drop to a lower orbit and increase mean motion.
+    """
+
+    # ----------------------------
+    # Helpers
+    # ----------------------------
+    def clamp(v: float, lo: float, hi: float) -> float:
+        return lo if v < lo else hi if v > hi else v
+
+    def v3_norm(x: float, y: float, z: float) -> float:
+        return math.sqrt(x * x + y * y + z * z)
+
+    def get_valid(name: str, valid_name: str, default=None):
+        try:
+            if bool(state.get(valid_name, False)):
+                return state.get(name, default)
+        except Exception:
+            return default
+        return default
+
+    def median(vals):
+        vals = [v for v in vals if v is not None and math.isfinite(float(v))]
+        if not vals:
+            return None
+        vals = sorted(vals)
+        n = len(vals)
+        mid = n // 2
+        return vals[mid] if (n % 2) else 0.5 * (vals[mid - 1] + vals[mid])
+
+    # Persistent memory across calls (per scenario)
+    mem = getattr(autopilot_step, "_mem", None)
+    if mem is None:
+        mem = {
+            "t": 0.0,
+            "last_pos": None,
+            "last_vel": None,
+            "last_range": None,
+            "stale_count": 0,
+            "int_x": 0.0,
+            "int_y": 0.0,
+            "int_z": 0.0,
+            "bias_est_x": 0.0,
+            "bias_est_y": 0.0,
+            "bias_est_z": 0.0,
+        }
+        autopilot_step._mem = mem
+
+    # Guard dt
+    if not (isinstance(dt, (int, float)) and dt > 1e-4 and math.isfinite(dt)):
+        dt = 0.1
+
+    mem["t"] += dt
+
+    # ----------------------------
+    # Sensor fusion (simple, robust)
+    # Prefer radar/lidar relative pos/vel, fallback to camera bearing + scalar ranges
+    # ----------------------------
+    # Radar
+    rpx = get_valid("radar_rel_pos_x_m", "radar_rel_x_valid")
+    rpy = get_valid("radar_rel_pos_y_m", "radar_rel_y_valid")
+    rpz = get_valid("radar_rel_pos_z_m", "radar_rel_z_valid")
+    rvx = get_valid("radar_rel_vel_x_ms", "radar_relv_x_valid")
+    rvy = get_valid("radar_rel_vel_y_ms", "radar_relv_y_valid")
+    rvz = get_valid("radar_rel_vel_z_ms", "radar_relv_z_valid")
+
+    # Lidar
+    lpx = get_valid("lidar_rel_pos_x_m", "lidar_rel_x_valid")
+    lpy = get_valid("lidar_rel_pos_y_m", "lidar_rel_y_valid")
+    lpz = get_valid("lidar_rel_pos_z_m", "lidar_rel_z_valid")
+    lvx = get_valid("lidar_rel_vel_x_ms", "lidar_relv_x_valid")
+    lvy = get_valid("lidar_rel_vel_y_ms", "lidar_relv_y_valid")
+    lvz = get_valid("lidar_rel_vel_z_ms", "lidar_relv_z_valid")
+
+    # Pick best available 3D pos/vel by consistency and availability
+    pos_candidates = []
+    if rpx is not None and rpy is not None and rpz is not None:
+        pos_candidates.append(("radar", (float(rpx), float(rpy), float(rpz))))
+    if lpx is not None and lpy is not None and lpz is not None:
+        pos_candidates.append(("lidar", (float(lpx), float(lpy), float(lpz))))
+
+    vel_candidates = []
+    if rvx is not None and rvy is not None and rvz is not None:
+        vel_candidates.append(("radar", (float(rvx), float(rvy), float(rvz))))
+    if lvx is not None and lvy is not None and lvz is not None:
+        vel_candidates.append(("lidar", (float(lvx), float(lvy), float(lvz))))
+
+    pos = None
+    vel = None
+
+    # If both pos sources exist, choose the one closer to last_pos (reduces flicker)
+    if pos_candidates:
+        if len(pos_candidates) == 1 or mem["last_pos"] is None:
+            pos = pos_candidates[0][1]
+        else:
+            lx0, ly0, lz0 = mem["last_pos"]
+            best = None
+            best_d = None
+            for _, (x, y, z) in pos_candidates:
+                d = (x - lx0) ** 2 + (y - ly0) ** 2 + (z - lz0) ** 2
+                if best_d is None or d < best_d:
+                    best_d = d
+                    best = (x, y, z)
+            pos = best
+
+    # Same for velocity
+    if vel_candidates:
+        if len(vel_candidates) == 1 or mem["last_vel"] is None:
+            vel = vel_candidates[0][1]
+        else:
+            lvx0, lvy0, lvz0 = mem["last_vel"]
+            best = None
+            best_d = None
+            for _, (x, y, z) in vel_candidates:
+                d = (x - lvx0) ** 2 + (y - lvy0) ** 2 + (z - lvz0) ** 2
+                if best_d is None or d < best_d:
+                    best_d = d
+                    best = (x, y, z)
+            vel = best
+
+    # Range finders (scalar)
+    ranges = [
+        get_valid("range_1_m", "range_1_valid"),
+        get_valid("range_2_m", "range_2_valid"),
+        get_valid("range_3_m", "range_3_valid"),
+    ]
+    scalar_range = median(ranges)
+    if scalar_range is not None:
+        scalar_range = float(scalar_range)
+
+    # Docking camera bearing (unit-ish vector) + camera range if present
+    cam_active = bool(state.get("dock_camera_active", False))
+    cbx = get_valid("dock_camera_bearing_x", "dock_camera_bearing_x_valid")
+    cby = get_valid("dock_camera_bearing_y", "dock_camera_bearing_y_valid")
+    cbz = get_valid("dock_camera_bearing_z", "dock_camera_bearing_z_valid")
+    cam_range = state.get("dock_camera_range_m", None)
+    if cam_range is not None and isinstance(cam_range, (int, float)) and math.isfinite(cam_range):
+        cam_range = float(cam_range)
+    else:
+        cam_range = None
+
+    # If no 3D pos, attempt to reconstruct from camera bearing + scalar range
+    if pos is None:
+        use_r = cam_range if cam_range is not None else scalar_range
+        if cam_active and cbx is not None and cby is not None and cbz is not None and use_r is not None:
+            bx, by, bz = float(cbx), float(cby), float(cbz)
+            bn = v3_norm(bx, by, bz)
+            if bn > 1e-6:
+                bx, by, bz = bx / bn, by / bn, bz / bn
+                pos = (bx * use_r, by * use_r, bz * use_r)
+
+    # If no velocity, estimate from position delta
+    if vel is None and pos is not None and mem["last_pos"] is not None:
+        x, y, z = pos
+        x0, y0, z0 = mem["last_pos"]
+        vel = ((x - x0) / dt, (y - y0) / dt, (z - z0) / dt)
+
+    # If still no pos, hold attitude and do nothing (safe)
+    if pos is None:
+        return {
+            "thrust_x": 0.0,
+            "thrust_y": 0.0,
+            "thrust_z": 0.0,
+            "att_rate_roll": 0.0,
+            "att_rate_pitch": 0.0,
+            "att_rate_yaw": 0.0,
+        }
+
+    if vel is None:
+        vel = (0.0, 0.0, 0.0)
+
+    # Update staleness / flicker detection
+    if mem["last_pos"] is not None:
+        dx = pos[0] - mem["last_pos"][0]
+        dy = pos[1] - mem["last_pos"][1]
+        dz = pos[2] - mem["last_pos"][2]
+        if dx * dx + dy * dy + dz * dz < 1e-10:
+            mem["stale_count"] += 1
+        else:
+            mem["stale_count"] = 0
+    else:
+        mem["stale_count"] = 0
+
+    mem["last_pos"] = pos
+    mem["last_vel"] = vel
+
+    x, y, z = pos
+    vx, vy, vz = vel
+
+    # Compute range (prefer 3D if available)
+    r3 = v3_norm(x, y, z)
+    if scalar_range is not None:
+        # If scalar differs wildly, trust 3D pos (better for control), but keep scalar for sanity
+        range_m = r3
+    else:
+        range_m = r3
+    mem["last_range"] = range_m
+
+    # Fuel-aware aggressiveness
+    fuel_kg = state.get("fuel_remaining_kg", None)
+    fuel_pct = state.get("fuel_remaining_pct", None)
+    low_fuel = False
+    if isinstance(fuel_pct, (int, float)) and math.isfinite(fuel_pct):
+        low_fuel = fuel_pct < 0.15
+    if isinstance(fuel_kg, (int, float)) and math.isfinite(fuel_kg):
+        low_fuel = low_fuel or (fuel_kg < 80.0)
+
+    # ----------------------------
+    # Guidance law
+    # Three regimes:
+    #  - FAR: (>200m) "orbital" behavior: correct along-track (y) primarily with retro/prograde bias
+    #  - MID: (50-200m) gentle, still bias y based on behind/ahead
+    #  - NEAR: (<50m) linear PD to zero position/velocity; very gentle under 10m
+    # ----------------------------
+    # Docking targets
+    target_range = state.get("target_dock_range_m", 2.0)
+    target_speed = state.get("target_dock_speed_ms", 0.3)
+    if not (isinstance(target_range, (int, float)) and math.isfinite(target_range)):
+        target_range = 2.0
+    if not (isinstance(target_speed, (int, float)) and math.isfinite(target_speed)):
+        target_speed = 0.3
+
+    # Base gains (convert desired accel to normalized thrust by assuming fixed accel scale)
+    # We don't know mass; use normalized commands directly with tuned gains.
+    if range_m > 200.0:
+        kp = 0.0025
+        kd = 0.010
+        y_bias = 0.30
+        max_cmd = 0.55
+    elif range_m > 50.0:
+        kp = 0.006
+        kd = 0.020
+        y_bias = 0.18
+        max_cmd = 0.45
+    elif range_m > 10.0:
+        kp = 0.020
+        kd = 0.060
+        y_bias = 0.08
+        max_cmd = 0.30
+    else:
+        kp = 0.030
+        kd = 0.090
+        y_bias = 0.0
+        max_cmd = 0.18
+
+    if low_fuel:
+        kp *= 0.65
+        kd *= 0.65
+        y_bias *= 0.65
+        max_cmd *= 0.75
+
+    # PD to null position and velocity
+    cmd_x = -kp * x - kd * vx
+    cmd_y = -kp * y - kd * vy
+    cmd_z = -kp * z - kd * vz
+
+    # FAR/MID orbital-mechanics along-track bias:
+    # If behind (y < 0), use retrograde (-Y thrust) to drop orbit and speed up (close the y gap).
+    # If ahead (y > 0), use prograde (+Y thrust) to raise orbit and fall back.
+    if range_m > 50.0:
+        bias = 0.0
+        if y < -20.0:
+            bias = -y_bias
+        elif y > 20.0:
+            bias = +y_bias
+        else:
+            bias = -y_bias * (y / 20.0)
+        cmd_y += bias
+
+    # Cross-track damping: prioritize killing z and vz, but keep small in far regime
+    if range_m > 200.0:
+        cmd_z *= 0.6
+        cmd_x *= 0.7
+
+    # Prevent "radial oscillation chasing": limit radial authority when far to avoid wasting fuel
+    if range_m > 200.0:
+        cmd_x = clamp(cmd_x, -0.25, 0.25)
+
+    # Closing-speed safety: if approaching too fast, command braking along line-of-sight
+    # Use a conservative max approach speed envelope based on range.
+    v_rel = v3_norm(vx, vy, vz)
+    # Envelope: allow faster far away, very slow inside 10m
+    if range_m > 200.0:
+        v_allow = 1.8
+    elif range_m > 50.0:
+        v_allow = 0.9
+    elif range_m > 10.0:
+        v_allow = 0.35
+    else:
+        v_allow = 0.12
+
+    if v_rel > v_allow and v_rel > 1e-6:
+        # Project velocity onto position (closing if dot<0 for pos pointing from station to chaser)
+        # Here pos is "station relative to chaser"? Typically rel_pos is chaser relative to station.
+        # We assume pos is chaser relative to station; closing means dot(pos, vel) < 0.
+        dot = x * vx + y * vy + z * vz
+        if dot < 0.0:
+            # Brake along velocity direction (opposes velocity)
+            bx, by, bz = -vx / v_rel, -vy / v_rel, -vz / v_rel
+            brake = clamp((v_rel - v_allow) / max(v_allow, 0.1), 0.0, 1.0)
+            cmd_x += 0.35 * brake * bx
+            cmd_y += 0.35 * brake * by
+            cmd_z += 0.35 * brake * bz
+
+    # Handle uncommanded thrust / biases (simple integral trim)
+    # If we see a persistent velocity offset while near-station, integrate small counter-command.
+    if range_m < 200.0:
+        mem["int_x"] = clamp(mem["int_x"] + (-0.02 * vx) * dt, -0.15, 0.15)
+        mem["int_y"] = clamp(mem["int_y"] + (-0.02 * vy) * dt, -0.15, 0.15)
+        mem["int_z"] = clamp(mem["int_z"] + (-0.02 * vz) * dt, -0.15, 0.15)
+        cmd_x += mem["int_x"]
+        cmd_y += mem["int_y"]
+        cmd_z += mem["int_z"]
+    else:
+        # decay trims far away (avoid windup)
+        mem["int_x"] *= 0.98
+        mem["int_y"] *= 0.98
+        mem["int_z"] *= 0.98
+
+    # Command limiting and deadbands to reduce chatter with flickery sensors
+    dead = 0.01 if range_m > 50.0 else 0.006
+    cmd_x = 0.0 if abs(cmd_x) < dead else cmd_x
+    cmd_y = 0.0 if abs(cmd_y) < dead else cmd_y
+    cmd_z = 0.0 if abs(cmd_z) < dead else cmd_z
+
+    thrust_x = clamp(cmd_x, -max_cmd, max_cmd)
+    thrust_y = clamp(cmd_y, -max_cmd, max_cmd)
+    thrust_z = clamp(cmd_z, -max_cmd, max_cmd)
+
+    # Final approach: enforce very low y-approach speed (V-bar) when close
+    if range_m < 10.0:
+        # If closing faster than target, brake along y primarily (camera points roughly to port)
+        if abs(vy) > max(target_speed, 0.1):
+            thrust_y += clamp(-0.25 * (vy / abs(vy)), -0.12, 0.12)
+        thrust_x = clamp(thrust_x, -0.10, 0.10)
+        thrust_z = clamp(thrust_z, -0.10, 0.10)
+        thrust_y = clamp(thrust_y, -0.12, 0.12)
+
+    # ----------------------------
+    # Attitude rate command
+    # Keep gentle; aim body +Y axis toward docking port line-of-sight when camera is active,
+    # otherwise damp rates to near zero.
+    # ----------------------------
+    max_rate = 0.035
+
+    # Simple yaw/pitch alignment based on bearing vector, assuming:
+    #  - pitch about body X affects Y/Z
+    #  - yaw about body Z affects X/Y
+    # (Exact mapping depends on sim; we use small-rate heuristic.)
+    att_roll = 0.0
+    att_pitch = 0.0
+    att_yaw = 0.0
+
+    if cam_active and cbx is not None and cby is not None and cbz is not None and range_m < 500.0:
+        bx, by, bz = float(cbx), float(cby), float(cbz)
+        bn = v3_norm(bx, by, bz)
+        if bn > 1e-6:
+            bx, by, bz = bx / bn, by / bn, bz / bn
+            # Want bearing to align with +Y => minimize x and z components.
+            # Use proportional rates; keep tiny to avoid instability with bad camera.
+            k_att = 0.020 if range_m < 50.0 else 0.010
+            att_yaw = clamp(-k_att * bx, -max_rate, max_rate)
+            att_pitch = clamp(+k_att * bz, -max_rate, max_rate)
+            att_roll = 0.0
+    else:
+        # Rate damping using gyros if valid
+        # Use median of gyros (deg/s) -> rad/s and command opposite small rate.
+        def gyro_axis(axis: str):
+            vals = []
+            for i in (1, 2, 3):
+                v = get_valid(f"gyro_{i}_{axis}_dps", f"gyro_{i}_{axis}_valid")
+                if v is not None:
+                    vals.append(float(v))
+            m = median(vals)
+            if m is None:
+                return None
+            return (m * math.pi) / 180.0
+
+        g_roll = gyro_axis("roll")
+        g_pitch = gyro_axis("pitch")
+        g_yaw = gyro_axis("yaw")
+        k_damp = 0.6
+        if g_roll is not None:
+            att_roll = clamp(-k_damp * g_roll, -max_rate, max_rate)
+        if g_pitch is not None:
+            att_pitch = clamp(-k_damp * g_pitch, -max_rate, max_rate)
+        if g_yaw is not None:
+            att_yaw = clamp(-k_damp * g_yaw, -max_rate, max_rate)
+
+    return {
+        "thrust_x": float(clamp(thrust_x, -1.0, 1.0)),
+        "thrust_y": float(clamp(thrust_y, -1.0, 1.0)),
+        "thrust_z": float(clamp(thrust_z, -1.0, 1.0)),
+        "att_rate_roll": float(clamp(att_roll, -max_rate, max_rate)),
+        "att_rate_pitch": float(clamp(att_pitch, -max_rate, max_rate)),
+        "att_rate_yaw": float(clamp(att_yaw, -max_rate, max_rate)),
+    }

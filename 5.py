@@ -13,12 +13,13 @@ import time
 from typing import List, Tuple, Set, Optional
 
 from native_compiler import RustCompiler, compile_and_run, describe_this_pc
+from solver_utils import normalize_code_result
 
 title = "Hamiltonian Path on Grid with Obstacles (Rust)"
 
 tags = [
   "rust",
-  "structured response",
+  "freeform response",
   "np hard",
   "graph theory",
   "algorithm design",
@@ -825,23 +826,7 @@ Write complete, compilable Rust code with a main() function.
 # List of subpasses to grade the single answer against all difficulty levels
 extraGradeAnswerRuns = list(range(1, len(GRID_CONFIGS)))
 
-structure = {
-  "type": "object",
-  "properties": {
-    "reasoning": {
-      "type":
-      "string",
-      "description":
-      "Explain your approach to finding Hamiltonian paths and how it adapts to different grid sizes"
-    },
-    "rust_code": {
-      "type": "string",
-      "description": "Complete Rust code with main() that handles all scales"
-    }
-  },
-  "required": ["reasoning", "rust_code"],
-  "additionalProperties": False
-}
+structure = None
 
 
 def validate_path(path: List[Tuple[int, int]], width: int, height: int,
@@ -962,6 +947,7 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
     - 0.5: Partial path (visits >50% of cells correctly)
     - 0.0: No valid path or error
     """
+  result = normalize_code_result(result, "rust_code")
   if not result:
     return 0.0, "No result provided"
 
@@ -1133,6 +1119,7 @@ def create_svg_representation(path: List[Tuple[int, int]], width: int, height: i
 
 def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
   """Generate HTML report."""
+  result = normalize_code_result(result, "rust_code")
   if not result:
     return "<p style='color:red'>No result provided</p>"
 

@@ -47,12 +47,13 @@ from collections import deque
 
 # Import our native compiler helper
 from native_compiler import CppCompiler, CompilationError, ExecutionError, compile_and_run, describe_this_pc
+from solver_utils import normalize_code_result
 
 title = "N-Dimensional Snake Game (C++)"
 
 tags = [
   "cpp",
-  "structured response",
+  "freeform response",
   "game ai",
   "algorithm design",
 ]
@@ -390,23 +391,7 @@ Write complete, compilable C++ code with a main() function.
 
 extraGradeAnswerRuns = list(range(len(TEST_CASES)))
 
-structure = {
-  "type": "object",
-  "properties": {
-    "reasoning": {
-      "type":
-      "string",
-      "description":
-      "Explain your algorithm approach and how it adapts to different dimensional complexities"
-    },
-    "cpp_code": {
-      "type": "string",
-      "description": "Complete C++ code with main() function that handles all scales"
-    }
-  },
-  "required": ["reasoning", "cpp_code"],
-  "additionalProperties": False
-}
+structure = None
 
 
 def execute_snake_game(code: str, input_data: str, case: dict,
@@ -502,6 +487,7 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
     - 1.0: Collected all food
     - Proportional to food/total for partial
     """
+  result = normalize_code_result(result, "cpp_code")
   if not result:
     return 0.0, "No result provided"
 
@@ -543,6 +529,7 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
 
 
 def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
+  result = normalize_code_result(result, "cpp_code")
   if not result:
     return "<p style='color:red'>No result provided</p>"
   case = TEST_CASES[subPass]

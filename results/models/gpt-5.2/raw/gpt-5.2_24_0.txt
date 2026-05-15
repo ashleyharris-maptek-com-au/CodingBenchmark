@@ -1,0 +1,367 @@
+```cpp
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <mutex>
+#include <optional>
+#include <queue>
+#include <sstream>
+#include <string>
+#include <thread>
+#include <vector>
+
+using namespace std;
+
+static inline double clampd(double v, double lo, double hi) {
+  return (v < lo) ? lo : (v > hi) ? hi : v;
+}
+
+struct Vec3 {
+  double x = 0, y = 0, z = 0;
+  Vec3() = default;
+  Vec3(double X, double Y, double Z) : x(X), y(Y), z(Z) {}
+  Vec3 operator+(const Vec3& o) const { return {x + o.x, y + o.y, z + o.z}; }
+  Vec3 operator-(const Vec3& o) const { return {x - o.x, y - o.y, z - o.z}; }
+  Vec3 operator*(double s) const { return {x * s, y * s, z * s}; }
+};
+
+static inline double dot(const Vec3& a, const Vec3& b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+static inline double norm(const Vec3& v) { return sqrt(dot(v, v)); }
+
+// Thread-safe single-slot state (latest only).
+struct LanderState {
+  double x, y, z;
+  double vx, vy, vz;
+  double pitch, yaw, roll;
+  double pitch_rate, yaw_rate, roll_rate;
+  double fuel;
+};
+
+struct SharedState {
+  mutex m;
+  bool has = false;
+  LanderState s{};
+  chrono::steady_clock::time_point t;
+};
+
+struct Terrain {
+  int width = 0, depth = 0, height = 0;
+  // Store ground-top (a) only; b/c overhang features are ignored by this controller (still lands safely on ground).
+  // This is acceptable for "find ground height" near target; collision avoidance for floating rock isn't attempted.
+  vector<uint16_t> groundTop; // size width*depth
+  atomic<bool> ready{false};
+};
+
+static inline size_t idx2(int x, int y, int depth) { return static_cast<size_t>(x) * static_cast<size_t>(depth) + static_cast<size_t>(y); }
+
+static bool read_u16_le(ifstream& in, uint16_t& out) {
+  unsigned char b[2];
+  if (!in.read(reinterpret_cast<char*>(b), 2)) return false;
+  out = static_cast<uint16_t>(b[0] | (static_cast<uint16_t>(b[1]) << 8));
+  return true;
+}
+
+static void terrain_loader_thread(Terrain* terrain, string path) {
+  ifstream in(path, ios::binary);
+  if (!in) {
+    terrain->ready.store(true);
+    return;
+  }
+  terrain->groundTop.assign(static_cast<size_t>(terrain->width) * static_cast<size_t>(terrain->depth), 0);
+  for (int x = 0; x < terrain->width; x++) {
+    for (int y = 0; y < terrain->depth; y++) {
+      uint16_t a = 0, b = 0, c = 0;
+      if (!read_u16_le(in, a) || !read_u16_le(in, b) || !read_u16_le(in, c)) {
+        terrain->ready.store(true);
+        return;
+      }
+      terrain->groundTop[idx2(x, y, terrain->depth)] = a;
+      (void)b;
+      (void)c;
+    }
+  }
+  terrain->ready.store(true);
+}
+
+static optional<LanderState> parse_state_line(const string& line) {
+  if (line.empty()) return nullopt;
+  istringstream iss(line);
+  LanderState s{};
+  if (!(iss >> s.x >> s.y >> s.z >> s.vx >> s.vy >> s.vz >> s.pitch >> s.yaw >> s.roll >> s.pitch_rate >>
+        s.yaw_rate >> s.roll_rate >> s.fuel))
+    return nullopt;
+  return s;
+}
+
+static inline double wrap_pi(double a) {
+  // Wrap to (-pi, pi]
+  constexpr double PI = 3.14159265358979323846;
+  while (a <= -PI) a += 2 * PI;
+  while (a > PI) a -= 2 * PI;
+  return a;
+}
+
+static inline double deg_from_rad(double r) { return r * 180.0 / 3.14159265358979323846; }
+
+// Compute thrust direction unit vector given pitch,yaw (roll ignored).
+// With pitch=yaw=0 => (0,0,1). +pitch tilts forward => thrust partially into -X.
+static Vec3 thrust_dir(double pitch, double yaw) {
+  // Start from +Z and rotate by pitch about +Y (tilt toward -X), then yaw about +Z.
+  double cp = cos(pitch), sp = sin(pitch);
+  // After pitch about Y: x = -sp, y=0, z=cp
+  double x1 = -sp, y1 = 0.0, z1 = cp;
+  double cy = cos(yaw), sy = sin(yaw);
+  // Yaw about Z: x = x1*cy - y1*sy, y = x1*sy + y1*cy
+  double x2 = x1 * cy - y1 * sy;
+  double y2 = x1 * sy + y1 * cy;
+  double z2 = z1;
+  // Normalize (should already be unit)
+  double n = sqrt(x2 * x2 + y2 * y2 + z2 * z2);
+  if (n <= 0) return {0, 0, 1};
+  return {x2 / n, y2 / n, z2 / n};
+}
+
+struct Controller {
+  // World constants
+  double gravity = 1.62;
+  double maxThrustAccel = 20.0; // set from max_thrust, but if max_thrust is force, this is placeholder.
+  // If the sim defines max_thrust as acceleration already, this works directly; otherwise still yields stable-ish behavior.
+
+  // Target
+  Vec3 target;
+  // Terrain & map bounds
+  int width = 0, depth = 0, height = 0;
+  Terrain* terrain = nullptr;
+
+  // Gains
+  double kp_pos_xy = 0.06;
+  double kd_vel_xy = 0.22;
+  double kp_pos_z = 0.08;
+  double kd_vel_z = 0.35;
+
+  double kp_ang = 4.0;
+  double kd_ang = 1.6;
+
+  // Limit tilts by scale / phase
+  double maxTiltRad = 0.45; // ~26 deg
+
+  // Returns commands: thrust [0..1], pitch_cmd,yaw_cmd,roll_cmd [-1..1]
+  array<double, 4> step(const LanderState& s) {
+    const double dt = 0.1;
+    Vec3 pos{s.x, s.y, s.z};
+    Vec3 vel{s.vx, s.vy, s.vz};
+    Vec3 toTarget = target - pos;
+
+    // Estimate ground height under us if available (ignore overhangs).
+    double groundZ = 0.0;
+    if (terrain && terrain->ready.load() && terrain->groundTop.size() == static_cast<size_t>(width) * static_cast<size_t>(depth)) {
+      int xi = (int)floor(clampd(pos.x, 0.0, (double)(width - 1)));
+      int yi = (int)floor(clampd(pos.y, 0.0, (double)(depth - 1)));
+      groundZ = terrain->groundTop[idx2(xi, yi, depth)];
+    }
+
+    double alt = pos.z - groundZ;
+    double distXY = hypot(toTarget.x, toTarget.y);
+
+    // Phase-based tilt limit: allow more tilt far away and higher altitude.
+    double phase = clampd(distXY / max(50.0, 0.2 * max((double)width, (double)depth)), 0.0, 1.0);
+    double altFactor = clampd(alt / 200.0, 0.0, 1.0);
+    maxTiltRad = clampd(0.25 + 0.55 * phase + 0.25 * altFactor, 0.2, 0.75);
+
+    // Desired accelerations in world frame.
+    Vec3 a_des{};
+
+    // XY control: PD on position/velocity.
+    a_des.x = kp_pos_xy * toTarget.x - kd_vel_xy * vel.x;
+    a_des.y = kp_pos_xy * toTarget.y - kd_vel_xy * vel.y;
+
+    // Vertical control: track a descending profile.
+    double desiredAlt = 0.0;
+    // If far away, aim for higher clearance; as we approach, reduce.
+    desiredAlt = 20.0 + 0.2 * distXY;
+    desiredAlt = min(desiredAlt, max(30.0, 0.15 * max((double)width, (double)depth)));
+    double altErr = (desiredAlt - alt);
+
+    // Desired vertical speed: descend faster when high, slow near ground.
+    double vZ_target = -clampd(0.15 * alt, 0.5, 12.0);
+    if (distXY < 30.0) vZ_target = -clampd(0.10 * alt, 0.2, 4.0);
+    if (distXY < 10.0) vZ_target = -clampd(0.08 * alt, 0.1, 2.0);
+
+    a_des.z = kp_pos_z * altErr + kd_vel_z * (vZ_target - vel.z);
+    // a_des.z is additional upward accel beyond gravity compensation.
+
+    // Convert desired world acceleration to desired thrust direction and magnitude.
+    // Net acceleration = thrust_accel * dir + gravityVec (0,0,-g)
+    // => thrust_accel * dir = a_des - gravityVec = (a_des.x, a_des.y, a_des.z + g)
+    Vec3 u{a_des.x, a_des.y, a_des.z + gravity};
+    double u_mag = norm(u);
+
+    // Clamp magnitude to achievable range.
+    // If max_thrust is actually max acceleration, use directly.
+    double maxA = maxThrustAccel;
+    double thrust = 0.0;
+    if (u_mag > 1e-6) {
+      thrust = clampd(u_mag / maxA, 0.0, 1.0);
+      u = u * (1.0 / u_mag); // desired direction unit
+    } else {
+      u = {0, 0, 1};
+      thrust = 0.0;
+    }
+
+    // Safety: near ground, prioritize vertical braking.
+    if (alt < 8.0) {
+      // Reduce lateral correction and keep upright.
+      u.x *= 0.3;
+      u.y *= 0.3;
+      // Renormalize
+      double n = norm(u);
+      if (n > 1e-6) u = u * (1.0 / n);
+      thrust = max(thrust, clampd((gravity + max(0.0, -vel.z * 0.6)) / maxA, 0.0, 1.0));
+    }
+
+    // Map desired direction u to pitch/yaw targets.
+    // Our thrust_dir(pitch,yaw) gives direction. Invert approximately:
+    // For pitch about Y then yaw about Z:
+    // x = -sin(pitch)*cos(yaw)
+    // y = -sin(pitch)*sin(yaw)
+    // z = cos(pitch)
+    // => pitch = acos(z) with sign based on x,y; but since x,y = -sin(pitch)*[cos, sin]
+    // sin(pitch)=sqrt(x^2+y^2); pitch=atan2(sin(p), z) with sign chosen so that -sin(p)*cos(yaw)=x.
+    double sinp = clampd(sqrt(u.x * u.x + u.y * u.y), 0.0, 1.0);
+    double pitch_t = atan2(sinp, clampd(u.z, -1.0, 1.0)); // [0,pi]
+    // Determine sign: u.x = -sin(pitch)*cos(yaw) => sign(pitch) = -sign(u.x*cos(yaw)) but cos(yaw) depends.
+    // Better: for small tilts, u.x ~ -pitch, so pitch sign ~ -u.x.
+    if (u.x > 0) pitch_t = -pitch_t;
+    pitch_t = clampd(pitch_t, -maxTiltRad, maxTiltRad);
+    double yaw_t = atan2(u.y, u.x); // direction of x,y, but with sign conventions; adjust due to minus sign in x,y
+    // since x,y have leading '-' from -sin(p)*[cos, sin], yaw should point opposite of (u.x,u.y) in XY
+    yaw_t = wrap_pi(yaw_t + 3.14159265358979323846);
+
+    // When very close, stop rotating in yaw aggressively.
+    if (distXY < 5.0) {
+      pitch_t = 0.0;
+      yaw_t = s.yaw; // keep current
+    }
+
+    // Angle control to targets.
+    double pitch_err = wrap_pi(pitch_t - s.pitch);
+    double yaw_err = wrap_pi(yaw_t - s.yaw);
+
+    double pitch_cmd = clampd(kp_ang * pitch_err - kd_ang * s.pitch_rate, -1.0, 1.0);
+    double yaw_cmd = clampd(kp_ang * yaw_err - kd_ang * s.yaw_rate, -1.0, 1.0);
+
+    // Roll cosmetic: damp roll rate and keep roll near 0.
+    double roll_err = wrap_pi(0.0 - s.roll);
+    double roll_cmd = clampd(2.0 * roll_err - 0.8 * s.roll_rate, -1.0, 1.0);
+
+    // Extra fuel safety: if fuel low, reduce aggressive lateral moves.
+    if (s.fuel < 10.0) {
+      thrust = min(thrust, 0.85);
+      pitch_cmd *= 0.7;
+      yaw_cmd *= 0.7;
+    }
+
+    // Final near-touchdown: ensure low speed.
+    if (distXY < 3.0 && alt < 4.0) {
+      // Brake vertical & lateral
+      double v = norm(vel);
+      if (v > 2.5) thrust = max(thrust, 0.9);
+      pitch_cmd *= 0.5;
+      yaw_cmd *= 0.5;
+    }
+
+    return {thrust, pitch_cmd, yaw_cmd, roll_cmd};
+  }
+};
+
+int main() {
+  ios::sync_with_stdio(false);
+  cin.tie(nullptr);
+
+  // Read header numbers (whitespace separated)
+  double width_d, depth_d, height_d, gravity, max_thrust, fuel;
+  if (!(cin >> width_d >> depth_d >> height_d >> gravity >> max_thrust >> fuel)) {
+    return 0;
+  }
+  double start_x, start_y, start_z, target_x, target_y, target_z;
+  cin >> start_x >> start_y >> start_z >> target_x >> target_y >> target_z;
+  string dummy;
+  getline(cin, dummy); // consume rest of line
+  string terrain_path;
+  getline(cin, terrain_path); // may contain spaces
+
+  // Read literal "STATE" token line (could be on same line if weird; handle robustly)
+  string stateToken;
+  while (getline(cin, stateToken)) {
+    if (stateToken.find("STATE") != string::npos) break;
+  }
+
+  Terrain terrain;
+  terrain.width = (int)llround(width_d);
+  terrain.depth = (int)llround(depth_d);
+  terrain.height = (int)llround(height_d);
+
+  thread loader(terrain_loader_thread, &terrain, terrain_path);
+  loader.detach(); // continue parsing in background
+
+  SharedState shared;
+  atomic<bool> done{false};
+
+  // Reader thread: continuously drain stdin, keep latest state.
+  thread reader([&]() {
+    string line;
+    while (!done.load()) {
+      if (!std::getline(cin, line)) break;
+      auto st = parse_state_line(line);
+      if (!st) continue;
+      lock_guard<mutex> lk(shared.m);
+      shared.s = *st;
+      shared.has = true;
+      shared.t = chrono::steady_clock::now();
+    }
+    done.store(true);
+  });
+
+  Controller ctl;
+  ctl.gravity = gravity;
+  ctl.maxThrustAccel = max_thrust;
+  ctl.target = Vec3{target_x, target_y, target_z};
+  ctl.width = terrain.width;
+  ctl.depth = terrain.depth;
+  ctl.height = terrain.height;
+  ctl.terrain = &terrain;
+
+  // Control loop at ~20Hz (faster than required 10Hz) using latest state.
+  auto nextTick = chrono::steady_clock::now();
+  while (!done.load()) {
+    nextTick += chrono::milliseconds(50);
+
+    optional<LanderState> s;
+    {
+      lock_guard<mutex> lk(shared.m);
+      if (shared.has) s = shared.s;
+    }
+
+    if (s) {
+      auto cmd = ctl.step(*s);
+      cout << fixed << setprecision(6) << cmd[0] << " " << cmd[1] << " " << cmd[2] << " " << cmd[3] << "\n";
+      cout.flush();
+    } else {
+      // Until first state arrives, output safe idle
+      cout << "0 0 0 0\n";
+      cout.flush();
+    }
+
+    this_thread::sleep_until(nextTick);
+  }
+
+  if (reader.joinable()) reader.join();
+  return 0;
+}
+```

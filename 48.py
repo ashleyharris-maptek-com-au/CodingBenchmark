@@ -19,6 +19,8 @@ Buffer layout:
 """
 
 import base64
+import hashlib
+import html
 import json
 import math
 import os
@@ -35,12 +37,13 @@ import numpy as np
 
 from shader_test_utils import assemble_spirv, validate_spirv
 from compute_test_utils import ComputeShaderRunner, grade_compute_pingpong
+from solver_utils import normalize_code_result
 
 title = "2D Fluid Simulation - Lattice Boltzmann (SPIR-V ASM Compute)"
 
 tags = [
   "spirv",
-  "structured response",
+  "freeform response",
   "gpu compute",
   "simulation",
 ]
@@ -260,21 +263,7 @@ dispatched repeatedly for the required number of timesteps with ping-pong buffer
 
 extraGradeAnswerRuns = list(range(1, len(SUBPASSES)))
 
-structure = {
-  "type": "object",
-  "properties": {
-    "reasoning": {
-      "type": "string",
-      "description": "Explain your approach to the LBM compute shader"
-    },
-    "spirv_code": {
-      "type": "string",
-      "description": "Complete SPIR-V assembly text for the compute shader"
-    }
-  },
-  "required": ["reasoning", "spirv_code"],
-  "additionalProperties": False
-}
+structure = None
 
 _runner_cache = None
 _ref_cache = {}
@@ -282,6 +271,7 @@ _REPORT_CACHE = {}
 
 
 def _grade_answer_inner(result, subPass, aiEngineName):
+  result = normalize_code_result(result, "spirv_code")
   global _runner_cache, _ref_cache
 
   if not result or "spirv_code" not in result:
@@ -359,6 +349,7 @@ def _grade_answer_inner(result, subPass, aiEngineName):
 
 def gradeAnswer(result, subPass, aiEngineName):
   """Run grading in an isolated subprocess to survive GPU hangs/TDRs."""
+  result = normalize_code_result(result, "spirv_code")
   if not result or "spirv_code" not in result:
     return 0.0, "No SPIR-V code provided"
 
@@ -530,7 +521,7 @@ def _png_chunk(tag, data):
 
 def _make_heatmap_png(data_2d, colormap_fn, max_dim=96,
                       vmin=None, vmax=None):
-  """Render a 2D numpy array as a base64-encoded PNG heatmap."""
+  """Render a 2D numpy array as PNG heatmap bytes."""
   data_2d = _downsample(data_2d, max_dim)
   h, w = data_2d.shape
   if vmin is None:
@@ -553,13 +544,30 @@ def _make_heatmap_png(data_2d, colormap_fn, max_dim=96,
   ihdr = _png_chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0))
   idat = _png_chunk(b'IDAT', zlib.compress(bytes(raw), 9))
   iend = _png_chunk(b'IEND', b'')
-  return base64.b64encode(sig + ihdr + idat + iend).decode('ascii')
+  return sig + ihdr + idat + iend
 
 
-def _frame_html(b64_png, label, px=140):
+def _heatmap_src(png_bytes, aiEngineName):
+  try:
+    from LLMBenchCore import ResultPaths as rp
+    digest = hashlib.sha256(png_bytes).hexdigest()
+    out_dir = os.path.join(rp.model_root(aiEngineName), "report_assets", "images")
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, f"fluid_{digest[:24]}.png")
+    if not os.path.exists(out_path):
+      with open(out_path, "wb") as f:
+        f.write(png_bytes)
+    return html.escape(rp.report_relpath(out_path, aiEngineName).replace("\\", "/"), quote=True)
+  except Exception:
+    b64_png = base64.b64encode(png_bytes).decode('ascii')
+    return f"data:image/png;base64,{b64_png}"
+
+
+def _frame_html(png_bytes, label, aiEngineName, px=140):
+  src = _heatmap_src(png_bytes, aiEngineName)
   return (
     f"<div style='text-align:center;flex-shrink:0;'>"
-    f"<img src='data:image/png;base64,{b64_png}' "
+    f"<img src='{src}' "
     f"style='width:{px}px;height:{px}px;image-rendering:pixelated;"
     f"border:1px solid #334155;border-radius:4px;display:block;'>"
     f"<div style='font-size:10px;color:#94a3b8;margin-top:3px;'>"
@@ -572,6 +580,7 @@ def _frame_html(b64_png, label, px=140):
 # ---------------------------------------------------------------------------
 
 def resultToNiceReport(result, subPass, aiEngineName):
+  result = normalize_code_result(result, "spirv_code")
   from html import escape
 
   report = _REPORT_CACHE.get((aiEngineName, subPass))
@@ -615,17 +624,17 @@ def resultToNiceReport(result, subPass, aiEngineName):
       g = _cpu_lbm_step_fast(g, w, h, omega)
       step_done += 1
     rho = _extract_density(g)
-    b64 = _make_heatmap_png(rho, _colormap_fluid,
+    png = _make_heatmap_png(rho, _colormap_fluid,
                             vmin=rho_min, vmax=rho_max)
-    evo_frames.append((f"t={ft}", b64))
+    evo_frames.append((f"t={ft}", png))
 
   evo_panels = []
-  for i, (label, b64) in enumerate(evo_frames):
+  for i, (label, png) in enumerate(evo_frames):
     if i > 0:
       evo_panels.append(
         "<div style='color:#475569;font-size:18px;"
         "align-self:center;padding:0 1px;'>&#x203A;</div>")
-    evo_panels.append(_frame_html(b64, label))
+    evo_panels.append(_frame_html(png, label, aiEngineName))
 
   evo_html = (
     "<div style='font-size:11px;color:#94a3b8;font-weight:600;"
@@ -639,18 +648,18 @@ def resultToNiceReport(result, subPass, aiEngineName):
   verify_panels = []
 
   if ref_rho is not None:
-    b64 = _make_heatmap_png(ref_rho, _colormap_fluid,
+    png = _make_heatmap_png(ref_rho, _colormap_fluid,
                             vmin=rho_min, vmax=rho_max)
-    verify_panels.append(_frame_html(b64, f"CPU ref (t={timesteps})"))
+    verify_panels.append(_frame_html(png, f"CPU ref (t={timesteps})", aiEngineName))
 
-  b64 = _make_heatmap_png(gpu_rho, _colormap_fluid,
+  png = _make_heatmap_png(gpu_rho, _colormap_fluid,
                           vmin=rho_min, vmax=rho_max)
-  verify_panels.append(_frame_html(b64, f"GPU output (t={timesteps})"))
+  verify_panels.append(_frame_html(png, f"GPU output (t={timesteps})", aiEngineName))
 
   if ref_rho is not None:
     error = np.abs(gpu_rho - ref_rho)
-    b64 = _make_heatmap_png(error, _colormap_error)
-    verify_panels.append(_frame_html(b64, "|GPU &#x2212; CPU| error"))
+    png = _make_heatmap_png(error, _colormap_error)
+    verify_panels.append(_frame_html(png, "|GPU &#x2212; CPU| error", aiEngineName))
 
   # Stats card
   status = "PASS" if score > 0 else "FAIL"

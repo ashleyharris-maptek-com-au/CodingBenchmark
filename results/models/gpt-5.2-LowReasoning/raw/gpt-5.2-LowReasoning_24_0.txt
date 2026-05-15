@@ -1,0 +1,363 @@
+// Lunar Lander 3D real-time controller (C++20, MSVC)
+// Reads header + streaming state from stdin and outputs thrust/rotation commands at >=10Hz.
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <limits>
+#include <mutex>
+#include <optional>
+#include <shared_mutex>
+#include <sstream>
+#include <string>
+#include <thread>
+
+using Clock = std::chrono::steady_clock;
+
+static constexpr double kPi = 3.1415926535897932384626433832795;
+
+static double clampd(double v, double lo, double hi) {
+  return std::max(lo, std::min(hi, v));
+}
+
+struct Vec3 {
+  double x = 0, y = 0, z = 0;
+  Vec3() = default;
+  Vec3(double x_, double y_, double z_) : x(x_), y(y_), z(z_) {}
+  Vec3 operator+(const Vec3& o) const { return {x + o.x, y + o.y, z + o.z}; }
+  Vec3 operator-(const Vec3& o) const { return {x - o.x, y - o.y, z - o.z}; }
+  Vec3 operator*(double s) const { return {x * s, y * s, z * s}; }
+  Vec3 operator/(double s) const { return {x / s, y / s, z / s}; }
+};
+
+static double dot(const Vec3& a, const Vec3& b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+static double norm(const Vec3& v) { return std::sqrt(dot(v, v)); }
+static Vec3 normalize(const Vec3& v) {
+  double n = norm(v);
+  if (!std::isfinite(n) || n <= 1e-12) return {0, 0, 1};
+  return v / n;
+}
+
+struct Header {
+  int width = 0;
+  int depth = 0;
+  int height = 0;
+  double gravity = 1.62;
+  double max_thrust = 10.0;
+  double fuel = 0.0;
+  Vec3 start;
+  Vec3 target;
+  std::string terrain_path;
+};
+
+struct State {
+  Vec3 p;
+  Vec3 v;
+  double pitch = 0, yaw = 0, roll = 0;
+  double pitch_rate = 0, yaw_rate = 0, roll_rate = 0;
+  double fuel_remaining = 0;
+  bool valid = false;
+  Clock::time_point t = Clock::now();
+};
+
+// Thread-safe on-demand terrain sampler. Uses random-access reads (6 bytes per (x,y)).
+class TerrainSampler {
+public:
+  TerrainSampler() = default;
+
+  bool open(const std::string& path, int width, int depth) {
+    std::unique_lock<std::shared_mutex> lk(mu_);
+    width_ = width;
+    depth_ = depth;
+    file_.open(path, std::ios::binary);
+    ok_ = file_.is_open();
+    return ok_;
+  }
+
+  struct Column {
+    uint16_t a = 0, b = 0, c = 0;
+    bool ok = false;
+  };
+
+  Column sample(int x, int y) const {
+    std::shared_lock<std::shared_mutex> lk(mu_);
+    if (!ok_ || x < 0 || y < 0 || x >= width_ || y >= depth_) return {};
+    // layout: for x in [0,width): for y in [0,depth): triplet
+    std::streamoff idx = static_cast<std::streamoff>(x) * static_cast<std::streamoff>(depth_) + y;
+    std::streamoff off = idx * 6;
+    file_.clear();
+    file_.seekg(off, std::ios::beg);
+    if (!file_) return {};
+    uint8_t buf[6];
+    file_.read(reinterpret_cast<char*>(buf), 6);
+    if (file_.gcount() != 6) return {};
+    auto rd16 = [&](int i) -> uint16_t {
+      return static_cast<uint16_t>(buf[i]) | (static_cast<uint16_t>(buf[i + 1]) << 8);
+    };
+    Column col;
+    col.a = rd16(0);
+    col.b = rd16(2);
+    col.c = rd16(4);
+    col.ok = true;
+    return col;
+  }
+
+private:
+  mutable std::shared_mutex mu_;
+  mutable std::ifstream file_;
+  int width_ = 0;
+  int depth_ = 0;
+  bool ok_ = false;
+};
+
+static bool read_header(Header& h) {
+  // Read first 6 numbers
+  if (!(std::cin >> h.width >> h.depth >> h.height >> h.gravity >> h.max_thrust >> h.fuel)) return false;
+  if (!(std::cin >> h.start.x >> h.start.y >> h.start.z >> h.target.x >> h.target.y >> h.target.z)) return false;
+  std::string dummy;
+  std::getline(std::cin, dummy); // consume rest of line
+  if (!std::getline(std::cin, h.terrain_path)) return false;
+  std::string marker;
+  if (!(std::cin >> marker)) return false;
+  return marker == "STATE";
+}
+
+static bool parse_state_line(const std::string& line, State& out) {
+  std::istringstream iss(line);
+  State s;
+  if (!(iss >> s.p.x >> s.p.y >> s.p.z >> s.v.x >> s.v.y >> s.v.z >> s.pitch >> s.yaw >> s.roll >>
+        s.pitch_rate >> s.yaw_rate >> s.roll_rate >> s.fuel_remaining)) {
+    return false;
+  }
+  s.valid = true;
+  s.t = Clock::now();
+  out = s;
+  return true;
+}
+
+struct ControlOut {
+  double thrust = 0;
+  double pitch_cmd = 0;
+  double yaw_cmd = 0;
+  double roll_cmd = 0;
+};
+
+static double wrap_pi(double a) {
+  while (a > kPi) a -= 2 * kPi;
+  while (a < -kPi) a += 2 * kPi;
+  return a;
+}
+
+static ControlOut compute_control(const Header& h, const TerrainSampler& terrain, const State& s) {
+  ControlOut u;
+
+  // Terrain awareness: estimate safe "floor" below current (x,y) and avoid being inside floating rock.
+  int cx = static_cast<int>(std::llround(s.p.x));
+  int cy = static_cast<int>(std::llround(s.p.y));
+  auto col = terrain.sample(cx, cy);
+  double ground_top = 0.0;
+  double float_bottom = std::numeric_limits<double>::infinity();
+  double float_top = std::numeric_limits<double>::infinity();
+  if (col.ok) {
+    ground_top = static_cast<double>(col.a);
+    if (col.b != col.c) {
+      float_bottom = static_cast<double>(col.b);
+      float_top = static_cast<double>(col.c);
+    }
+  }
+
+  bool in_floating = (col.ok && (col.b != col.c) && (s.p.z >= float_bottom) && (s.p.z < float_top));
+
+  Vec3 target = h.target;
+
+  // Approach strategy: target XY quickly at high altitude; then descend vertically.
+  Vec3 dp = target - s.p;
+  Vec3 dv = Vec3{0, 0, 0} - s.v;
+
+  double dist_xy = std::sqrt(dp.x * dp.x + dp.y * dp.y);
+  double landing_radius = std::max(5.0, std::min(h.width, h.depth) * 0.02);
+
+  // Desired height above ground while cruising.
+  double min_clear = 8.0; // meters
+  double desired_z = target.z + 0.0;
+  if (dist_xy > landing_radius * 1.2) {
+    // Keep a cushion above local ground; if terrain sample failed, use a conservative cruise height.
+    double ref = col.ok ? (ground_top + 25.0) : (target.z + 50.0);
+    desired_z = std::max(s.p.z, ref);
+  } else {
+    // Near target, aim slightly above pad then settle.
+    desired_z = target.z + 2.0;
+  }
+
+  // If we're close to or below ground estimate, strongly command upward.
+  if (col.ok) {
+    desired_z = std::max(desired_z, ground_top + min_clear);
+  }
+
+  // If inside floating rock, prioritize exiting: push up and laterally toward target.
+  if (in_floating) {
+    desired_z = std::max(desired_z, float_top + min_clear);
+  }
+
+  Vec3 pos_err{target.x - s.p.x, target.y - s.p.y, desired_z - s.p.z};
+
+  // Gain scheduling across map scales.
+  double scale = std::max(100.0, std::max<double>(h.width, h.depth));
+  double kp_xy = 0.08 * (100.0 / scale);
+  double kd_xy = 0.20;
+  double kp_z = 0.12;
+  double kd_z = 0.35;
+
+  // Limit horizontal aggression to avoid flipping.
+  Vec3 a_des;
+  a_des.x = clampd(kp_xy * pos_err.x + kd_xy * dv.x, -4.0, 4.0);
+  a_des.y = clampd(kp_xy * pos_err.y + kd_xy * dv.y, -4.0, 4.0);
+
+  // Vertical control: tighter near landing.
+  double vz_target = 0.0;
+  if (dist_xy <= landing_radius * 1.2) {
+    // Descend gently when centered; slow even more near pad.
+    double alt = s.p.z - target.z;
+    if (alt > 15.0) vz_target = -2.0;
+    else if (alt > 5.0) vz_target = -1.0;
+    else vz_target = -0.3;
+  } else {
+    vz_target = 0.0;
+  }
+  double vz_err = vz_target - s.v.z;
+  a_des.z = clampd(kp_z * (desired_z - s.p.z) + kd_z * vz_err, -3.0, 6.0);
+
+  // Add gravity compensation (+Z).
+  Vec3 a_total = a_des + Vec3{0, 0, h.gravity};
+
+  // Convert desired acceleration into thrust fraction and desired pitch/yaw.
+  Vec3 thrust_dir = normalize(a_total);
+  double a_mag = norm(a_total);
+  u.thrust = clampd(a_mag / std::max(1e-6, h.max_thrust), 0.0, 1.0);
+
+  // If fuel is very low, reduce thrust to avoid burning out completely (better soft crash).
+  if (s.fuel_remaining <= 0.5) u.thrust = std::min(u.thrust, 0.2);
+
+  // Mapping:
+  // dir_x = -sin(pitch) * cos(yaw)
+  // dir_y = -sin(pitch) * sin(yaw)
+  // dir_z =  cos(pitch)
+  // Solve: pitch = acos(dir_z) with sign chosen by -dir_x when yaw=0.
+  double desired_yaw = std::atan2(-thrust_dir.y, -thrust_dir.x); // points along (-x,-y) when pitching forward
+  double horiz = std::sqrt(thrust_dir.x * thrust_dir.x + thrust_dir.y * thrust_dir.y);
+  double desired_pitch = std::atan2(horiz, thrust_dir.z);
+  // Apply sign: when yaw=0, thrust_dir.x = -sin(pitch). So pitch sign = sign(-dir_x).
+  if (std::abs(horiz) > 1e-9) {
+    double sign = (-thrust_dir.x * std::cos(desired_yaw) - thrust_dir.y * std::sin(desired_yaw));
+    if (sign < 0) desired_pitch = -desired_pitch;
+  }
+  desired_pitch = clampd(desired_pitch, -kPi / 2.0, kPi / 2.0);
+
+  // If we're very close to landing, keep attitude near upright.
+  if (dist_xy <= landing_radius && (s.p.z - target.z) < 5.0) {
+    desired_pitch = 0.0;
+    // keep yaw but no need to fight it hard
+  }
+
+  // Simple P controller on angles and rates to produce [-1,1] angular accel commands.
+  auto ang_cmd = [](double err, double rate) {
+    double kp = 1.2;
+    double kd = 0.35;
+    double cmd = kp * err + kd * (-rate);
+    return clampd(cmd, -1.0, 1.0);
+  };
+
+  double pitch_err = wrap_pi(desired_pitch - s.pitch);
+  double yaw_err = wrap_pi(desired_yaw - s.yaw);
+  u.pitch_cmd = ang_cmd(pitch_err, s.pitch_rate);
+  u.yaw_cmd = ang_cmd(yaw_err, s.yaw_rate);
+  u.roll_cmd = clampd(-0.4 * s.roll - 0.2 * s.roll_rate, -1.0, 1.0);
+
+  // If inside floating rock, bias to maximum thrust and upright-ish to escape.
+  if (in_floating) {
+    u.thrust = std::max(u.thrust, 0.9);
+    u.pitch_cmd = clampd(0.8 * u.pitch_cmd, -1.0, 1.0);
+    u.yaw_cmd = clampd(0.8 * u.yaw_cmd, -1.0, 1.0);
+  }
+
+  // Ensure sane output.
+  if (!std::isfinite(u.thrust)) u.thrust = 0.0;
+  if (!std::isfinite(u.pitch_cmd)) u.pitch_cmd = 0.0;
+  if (!std::isfinite(u.yaw_cmd)) u.yaw_cmd = 0.0;
+  if (!std::isfinite(u.roll_cmd)) u.roll_cmd = 0.0;
+  u.thrust = clampd(u.thrust, 0.0, 1.0);
+  u.pitch_cmd = clampd(u.pitch_cmd, -1.0, 1.0);
+  u.yaw_cmd = clampd(u.yaw_cmd, -1.0, 1.0);
+  u.roll_cmd = clampd(u.roll_cmd, -1.0, 1.0);
+  return u;
+}
+
+int main() {
+  std::ios::sync_with_stdio(false);
+  std::cin.tie(nullptr);
+  std::cout.setf(std::ios::fixed);
+  std::cout << std::setprecision(6);
+
+  Header h;
+  if (!read_header(h)) {
+    return 0;
+  }
+
+  TerrainSampler terrain;
+  terrain.open(h.terrain_path, h.width, h.depth);
+
+  std::mutex state_mu;
+  State latest;
+  std::atomic<bool> done{false};
+
+  // Reader thread: continuously drain stdin and keep only the latest state.
+  std::thread reader([&] {
+    std::string line;
+    // Consume to end of the "STATE" token line.
+    std::getline(std::cin, line);
+    while (!done.load(std::memory_order_relaxed)) {
+      if (!std::getline(std::cin, line)) break;
+      State s;
+      if (!parse_state_line(line, s)) continue;
+      {
+        std::lock_guard<std::mutex> lk(state_mu);
+        latest = s;
+      }
+    }
+    done.store(true, std::memory_order_relaxed);
+  });
+
+  auto next_tick = Clock::now();
+  State s;
+
+  // Control loop: run at 20Hz to ensure >=10Hz output even with jitter.
+  while (!done.load(std::memory_order_relaxed)) {
+    next_tick += std::chrono::milliseconds(50);
+
+    {
+      std::lock_guard<std::mutex> lk(state_mu);
+      s = latest;
+    }
+
+    ControlOut u;
+    if (s.valid) {
+      u = compute_control(h, terrain, s);
+    } else {
+      // No state yet: output safe idle commands.
+      u = {0.0, 0.0, 0.0, 0.0};
+    }
+
+    std::cout << u.thrust << ' ' << u.pitch_cmd << ' ' << u.yaw_cmd << ' ' << u.roll_cmd << '\n';
+    std::cout.flush();
+
+    std::this_thread::sleep_until(next_tick);
+  }
+
+  if (reader.joinable()) reader.join();
+  return 0;
+}

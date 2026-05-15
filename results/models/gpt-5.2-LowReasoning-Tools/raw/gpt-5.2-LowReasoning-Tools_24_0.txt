@@ -1,0 +1,393 @@
+// Lunar Lander 3D controller (C++20, MSVC)
+// Reads streamed state updates from stdin and outputs thrust/rotation commands at >=10Hz.
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <condition_variable>
+#include <cstdint>
+#include <deque>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <limits>
+#include <mutex>
+#include <optional>
+#include <queue>
+#include <sstream>
+#include <string>
+#include <thread>
+#include <unordered_map>
+
+using Clock = std::chrono::steady_clock;
+
+static constexpr double kPi = 3.14159265358979323846;
+
+static double clampd(double v, double lo, double hi) { return std::max(lo, std::min(hi, v)); }
+static double wrapPi(double a) {
+  while (a > kPi) a -= 2.0 * kPi;
+  while (a < -kPi) a += 2.0 * kPi;
+  return a;
+}
+
+struct Vec3 {
+  double x = 0, y = 0, z = 0;
+  Vec3() = default;
+  Vec3(double x_, double y_, double z_) : x(x_), y(y_), z(z_) {}
+  Vec3 operator+(const Vec3& o) const { return {x + o.x, y + o.y, z + o.z}; }
+  Vec3 operator-(const Vec3& o) const { return {x - o.x, y - o.y, z - o.z}; }
+  Vec3 operator*(double s) const { return {x * s, y * s, z * s}; }
+};
+static double dot(const Vec3& a, const Vec3& b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+static double norm(const Vec3& v) { return std::sqrt(dot(v, v)); }
+static Vec3 normalizeOr(const Vec3& v, const Vec3& fallback) {
+  double n = norm(v);
+  if (n <= 1e-9) return fallback;
+  return v * (1.0 / n);
+}
+
+struct State {
+  Vec3 p;
+  Vec3 v;
+  double pitch = 0, yaw = 0, roll = 0;
+  double pitch_rate = 0, yaw_rate = 0, roll_rate = 0;
+  double fuel = 0;
+  uint64_t seq = 0;
+  Clock::time_point t = Clock::now();
+};
+
+// Terrain access: worker thread services point queries (x,y)->(a,b,c).
+struct TerrainTriplet {
+  uint16_t a = 0, b = 0, c = 0;
+};
+
+class TerrainService {
+ public:
+  TerrainService() = default;
+  ~TerrainService() { stop(); }
+
+  void start(const std::string& path, int width, int depth) {
+    stop();
+    path_ = path;
+    width_ = width;
+    depth_ = depth;
+    stopFlag_.store(false);
+    worker_ = std::thread([this]() { this->run(); });
+  }
+
+  void stop() {
+    {
+      std::lock_guard<std::mutex> lg(mu_);
+      stopFlag_.store(true);
+      cv_.notify_all();
+    }
+    if (worker_.joinable()) worker_.join();
+  }
+
+  std::optional<TerrainTriplet> query(int x, int y, int timeoutMs = 2) {
+    if (x < 0 || y < 0 || x >= width_ || y >= depth_) return std::nullopt;
+    const uint64_t key = (static_cast<uint64_t>(static_cast<uint32_t>(x)) << 32) |
+                         static_cast<uint32_t>(y);
+    {
+      std::lock_guard<std::mutex> lg(mu_);
+      auto it = cache_.find(key);
+      if (it != cache_.end()) return it->second;
+    }
+
+    uint64_t reqId = 0;
+    {
+      std::lock_guard<std::mutex> lg(mu_);
+      reqId = ++lastReqId_;
+      pending_.push({reqId, x, y, key});
+      cv_.notify_all();
+    }
+
+    const auto deadline = Clock::now() + std::chrono::milliseconds(timeoutMs);
+    std::unique_lock<std::mutex> lk(mu_);
+    while (Clock::now() < deadline) {
+      auto it = cache_.find(key);
+      if (it != cache_.end()) return it->second;
+      cvCache_.wait_until(lk, deadline);
+    }
+    return std::nullopt;
+  }
+
+ private:
+  struct Req {
+    uint64_t id;
+    int x, y;
+    uint64_t key;
+  };
+
+  static uint16_t readU16LE(std::istream& is) {
+    unsigned char b0 = 0, b1 = 0;
+    is.read(reinterpret_cast<char*>(&b0), 1);
+    is.read(reinterpret_cast<char*>(&b1), 1);
+    return static_cast<uint16_t>(static_cast<uint16_t>(b0) | (static_cast<uint16_t>(b1) << 8));
+  }
+
+  void run() {
+    std::ifstream f(path_, std::ios::binary);
+    if (!f) return;
+
+    for (;;) {
+      Req r;
+      {
+        std::unique_lock<std::mutex> lk(mu_);
+        cv_.wait(lk, [this]() { return stopFlag_.load() || !pending_.empty(); });
+        if (stopFlag_.load()) return;
+        r = pending_.front();
+        pending_.pop();
+      }
+
+      // Seek and read triplet.
+      const uint64_t idx = static_cast<uint64_t>(r.x) * static_cast<uint64_t>(depth_) +
+                           static_cast<uint64_t>(r.y);
+      const uint64_t offset = idx * 6ULL;
+      f.clear();
+      f.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+      if (!f) continue;
+
+      TerrainTriplet t;
+      t.a = readU16LE(f);
+      t.b = readU16LE(f);
+      t.c = readU16LE(f);
+      if (!f) continue;
+
+      {
+        std::lock_guard<std::mutex> lg(mu_);
+        // Simple bounded cache to avoid unbounded growth.
+        if (cache_.size() > 200000) cache_.clear();
+        cache_[r.key] = t;
+      }
+      cvCache_.notify_all();
+    }
+  }
+
+  std::string path_;
+  int width_ = 0, depth_ = 0;
+  std::atomic<bool> stopFlag_{false};
+  std::thread worker_;
+
+  std::mutex mu_;
+  std::condition_variable cv_;
+  std::condition_variable cvCache_;
+  std::queue<Req> pending_;
+  std::unordered_map<uint64_t, TerrainTriplet> cache_;
+  uint64_t lastReqId_ = 0;
+};
+
+static double safeAtan2(double y, double x) {
+  if (!std::isfinite(y) || !std::isfinite(x)) return 0.0;
+  return std::atan2(y, x);
+}
+
+static Vec3 computeDesiredAccel(const State& s, const Vec3& target, double g, double maxThrust) {
+  const Vec3 posErr = target - s.p;
+  const Vec3 vel = s.v;
+
+  // Distance-scaled speed targets.
+  const double distXY = std::sqrt(posErr.x * posErr.x + posErr.y * posErr.y);
+  const double distZ = posErr.z;
+
+  const double vxyMaxFar = std::max(5.0, std::min(80.0, distXY * 0.6));
+  const double vzUpMax = 20.0;
+  const double vzDownMax = std::max(1.0, std::min(30.0, distZ * 0.6));
+
+  Vec3 vDes;
+  if (distXY > 1e-6) {
+    const double vxy = std::min(vxyMaxFar, distXY);  // smooth near target
+    vDes.x = (posErr.x / distXY) * vxy;
+    vDes.y = (posErr.y / distXY) * vxy;
+  }
+  // Positive distZ means target above current.
+  vDes.z = clampd(distZ * 0.8, -vzDownMax, vzUpMax);
+
+  // If we're very close horizontally, prioritize gentle vertical touchdown.
+  if (distXY < 10.0) {
+    vDes.x *= distXY / 10.0;
+    vDes.y *= distXY / 10.0;
+    vDes.z = clampd(distZ * 0.6, -5.0, 10.0);
+  }
+  if (distXY < 3.0 && std::abs(distZ) < 8.0) {
+    vDes.z = clampd(distZ * 0.5, -2.0, 6.0);
+  }
+
+  const Vec3 velErr = vDes - vel;
+
+  // PD in world frame. Keep conservative to avoid saturating at small scales.
+  const double kp = 0.18;
+  const double kd = 0.75;
+  Vec3 aCmd = posErr * kp + velErr * kd;
+
+  // Limit commanded acceleration to a bit under max capability.
+  const double aMax = std::max(0.5, 0.92 * maxThrust);
+  const double aN = norm(aCmd);
+  if (aN > aMax) aCmd = aCmd * (aMax / aN);
+
+  // Nudge to counter gravity when hovering near target.
+  (void)g;
+  return aCmd;
+}
+
+int main() {
+  std::ios::sync_with_stdio(false);
+  std::cin.tie(nullptr);
+
+  int width = 0, depth = 0, height = 0;
+  double gravity = 1.62, max_thrust = 0.0, fuel0 = 0.0;
+
+  if (!(std::cin >> width >> depth >> height >> gravity >> max_thrust >> fuel0)) return 0;
+
+  double start_x = 0, start_y = 0, start_z = 0;
+  double target_x = 0, target_y = 0, target_z = 0;
+  if (!(std::cin >> start_x >> start_y >> start_z >> target_x >> target_y >> target_z)) return 0;
+
+  std::string terrainPath;
+  {
+    std::string dummy;
+    std::getline(std::cin, dummy);  // consume endline
+    std::getline(std::cin, terrainPath);
+  }
+
+  std::string stateToken;
+  if (!(std::cin >> stateToken)) return 0;
+  // Expect "STATE" (but tolerate extra whitespace).
+
+  TerrainService terrain;
+  if (!terrainPath.empty()) terrain.start(terrainPath, width, depth);
+
+  std::mutex stateMu;
+  std::condition_variable stateCv;
+  State latest;
+  std::atomic<bool> done{false};
+
+  std::thread reader([&]() {
+    State s;
+    uint64_t seq = 0;
+    while (!done.load()) {
+      double x, y, z, vx, vy, vz, pitch, yaw, roll, pr, yr, rr, fuel;
+      if (!(std::cin >> x >> y >> z >> vx >> vy >> vz >> pitch >> yaw >> roll >> pr >> yr >> rr >> fuel)) break;
+      s.p = {x, y, z};
+      s.v = {vx, vy, vz};
+      s.pitch = pitch;
+      s.yaw = yaw;
+      s.roll = roll;
+      s.pitch_rate = pr;
+      s.yaw_rate = yr;
+      s.roll_rate = rr;
+      s.fuel = fuel;
+      s.seq = ++seq;
+      s.t = Clock::now();
+
+      {
+        std::lock_guard<std::mutex> lg(stateMu);
+        latest = s;
+      }
+      stateCv.notify_one();
+    }
+    done.store(true);
+    stateCv.notify_one();
+  });
+
+  const Vec3 target{target_x, target_y, target_z};
+  const double g = gravity;
+
+  uint64_t lastSeq = 0;
+  while (!done.load()) {
+    State s;
+    {
+      std::unique_lock<std::mutex> lk(stateMu);
+      stateCv.wait(lk, [&]() { return done.load() || latest.seq != lastSeq; });
+      if (done.load()) break;
+      s = latest;
+      lastSeq = latest.seq;
+    }
+
+    // Quick safety: keep above ground at current (x,y) by querying terrain.
+    double minClearance = 2.0;
+    int cx = static_cast<int>(std::floor(s.p.x));
+    int cy = static_cast<int>(std::floor(s.p.y));
+    if (auto t = terrain.query(cx, cy, 1)) {
+      // a is ground top.
+      const double groundTop = static_cast<double>(t->a);
+      if (s.p.z < groundTop + minClearance) {
+        // Force upward accel.
+        // Aim for a small hop to regain clearance.
+        minClearance = 5.0;
+      }
+    }
+
+    Vec3 aCmd = computeDesiredAccel(s, target, g, max_thrust);
+
+    // Clearance bias (simple).
+    if (auto t = terrain.query(cx, cy, 1)) {
+      const double groundTop = static_cast<double>(t->a);
+      const double clearance = s.p.z - groundTop;
+      if (clearance < minClearance) {
+        const double need = (minClearance - clearance);
+        aCmd.z += clampd(need * 1.5, 0.0, max_thrust);
+      }
+      // If there's a floating rock and we're inside it, push up hard.
+      if (t->b < t->c) {
+        const double b = static_cast<double>(t->b);
+        const double c = static_cast<double>(t->c);
+        if (s.p.z >= b && s.p.z < c) aCmd.z += max_thrust;
+      }
+    }
+
+    // Convert desired world accel to required thrust vector (adds +g to cancel gravity).
+    Vec3 thrustVec = aCmd + Vec3{0, 0, g};
+    double thrustMag = norm(thrustVec);
+
+    // Clamp thrust vector to max_thrust.
+    if (thrustMag > max_thrust && thrustMag > 1e-9) {
+      thrustVec = thrustVec * (max_thrust / thrustMag);
+      thrustMag = max_thrust;
+    }
+
+    const double thrust = clampd((max_thrust > 1e-9) ? (thrustMag / max_thrust) : 0.0, 0.0, 1.0);
+    const Vec3 dir = normalizeOr(thrustVec, Vec3{0, 0, 1});
+
+    // Map desired thrust direction to target (pitch,yaw). Convention:
+    // thrust_dir = Rz(yaw) * Ry(-pitch) * (0,0,1)
+    // => dir = (-sin(pitch)*cos(yaw), -sin(pitch)*sin(yaw), cos(pitch))
+    const double yawTarget = safeAtan2(-dir.y, -dir.x);  // heading of horizontal thrust component
+    const double horiz = std::sqrt(dir.x * dir.x + dir.y * dir.y);
+    double pitchTarget = safeAtan2(horiz, std::max(1e-9, dir.z));  // 0..pi/2
+    // Determine pitch sign by projecting dir onto yaw frame.
+    // At yaw=0, pitch>0 should give dir.x<0. For general yaw, use component along -x' axis.
+    const double xprime = dir.x * std::cos(yawTarget) + dir.y * std::sin(yawTarget);  // equals -sin(pitch)
+    if (xprime > 0) pitchTarget = -pitchTarget;
+    pitchTarget = clampd(pitchTarget, -kPi / 2.0, kPi / 2.0);
+
+    // Simple PD attitude controller outputs angular acceleration commands in [-1,1].
+    const double kpAng = 3.0;
+    const double kdAng = 0.9;
+
+    const double pitchErr = wrapPi(pitchTarget - s.pitch);
+    const double yawErr = wrapPi(yawTarget - s.yaw);
+
+    double pitchCmd = clampd(kpAng * pitchErr - kdAng * s.pitch_rate, -1.0, 1.0);
+    double yawCmd = clampd(kpAng * yawErr - kdAng * s.yaw_rate, -1.0, 1.0);
+    // Damp roll to zero (cosmetic).
+    const double rollErr = wrapPi(0.0 - s.roll);
+    double rollCmd = clampd(2.0 * rollErr - 0.6 * s.roll_rate, -1.0, 1.0);
+
+    // If fuel is low, prefer upright and reduce lateral corrections.
+    if (s.fuel < 5.0) {
+      pitchCmd = clampd(pitchCmd, -0.4, 0.4);
+      yawCmd = clampd(yawCmd, -0.4, 0.4);
+    }
+
+    std::cout.setf(std::ios::fixed);
+    std::cout << std::setprecision(6) << thrust << ' ' << pitchCmd << ' ' << yawCmd << ' ' << rollCmd << "\n";
+    std::cout.flush();
+  }
+
+  done.store(true);
+  if (reader.joinable()) reader.join();
+  terrain.stop();
+  return 0;
+}

@@ -17,13 +17,13 @@ import time
 import hashlib
 from typing import List, Tuple, Dict, Any, Iterable, Optional
 from native_compiler import CppCompiler, CompilationError, ExecutionError, describe_this_pc
-from solver_utils import StreamingInputFile, GradeCache
+from solver_utils import StreamingInputFile, GradeCache, normalize_code_result
 
 title = "Maximum Independent Set (C++)"
 
 tags = [
   "cpp",
-  "structured response",
+  "freeform response",
   "np hard",
   "graph theory",
 ]
@@ -34,6 +34,7 @@ _grade_cache = GradeCache("test36")
 
 
 def _cache_key_parts(result: dict, subPass: int) -> tuple:
+  result = normalize_code_result(result, "cpp_code")
   case = TEST_CASES[subPass]
   code = result.get("cpp_code", "")
   return (
@@ -280,21 +281,7 @@ Write complete, compilable C++ code with `main()`.
 
 extraGradeAnswerRuns = list(range(len(TEST_CASES)))
 
-structure = {
-  "type": "object",
-  "properties": {
-    "reasoning": {
-      "type": "string",
-      "description": "Explain your approach for finding maximum independent sets"
-    },
-    "cpp_code": {
-      "type": "string",
-      "description": "Complete C++ code with main() function that handles all scales"
-    }
-  },
-  "required": ["reasoning", "cpp_code"],
-  "additionalProperties": False
-}
+structure = None
 
 
 def _parse_output(stdout: str) -> Tuple[int, List[int]]:
@@ -369,6 +356,7 @@ def _build_mis_viz(num_vertices: int, edges: List[Tuple[int, int]], chosen_verti
 
 
 def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
+  result = normalize_code_result(result, "cpp_code")
   if not result or "cpp_code" not in result:
     return 0.0, "No C++ code provided"
 
@@ -473,6 +461,7 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
 
 
 def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
+  result = normalize_code_result(result, "cpp_code")
   if not result:
     return "<p style='color:red'>No result provided</p>"
   cache_parts = _cache_key_parts(result, subPass)

@@ -1,0 +1,553 @@
+```python
+import math
+from statistics import median
+
+# Module-level persistent state (filters, integrators, last good readings)
+_AP = {
+    "inited": False,
+    "t": 0.0,
+    # filtered ego states
+    "v_mps": 0.0,
+    "yaw_rate_dps": 0.0,
+    "heading_deg": 0.0,
+    "lane_offset_m": 0.0,
+    "road_curv_1pm": 0.0,
+    # controller memory
+    "speed_i": 0.0,
+    "steer_i": 0.0,
+    "last_steer": 0.0,
+    "last_throttle": 0.0,
+    "last_brake": 0.0,
+    # failure / anomaly tracking
+    "throttle_stuck_frames": 0,
+    "brake_bad_frames": 0,
+    "steer_jam_frames": 0,
+    # lane decision memory
+    "lane_hold_s": 0.0,
+    "desired_lane": None,
+}
+
+
+def _clamp(x, lo, hi):
+    return lo if x < lo else hi if x > hi else x
+
+
+def _wrap_deg(a):
+    # wrap to [-180, 180)
+    a = (a + 180.0) % 360.0 - 180.0
+    return a
+
+
+def _ema(prev, x, alpha):
+    return (1.0 - alpha) * prev + alpha * x
+
+
+def _valid_number(x):
+    return isinstance(x, (int, float)) and math.isfinite(x)
+
+
+def _robust_pick(values, prev=None, max_jump=None):
+    """
+    Pick a robust estimate from candidate scalar readings.
+    - Use median of finite values.
+    - If max_jump provided, reject candidates too far from prev.
+    Returns (estimate, count_used).
+    """
+    cands = [v for v in values if _valid_number(v)]
+    if prev is not None and _valid_number(prev) and max_jump is not None:
+        cands2 = [v for v in cands if abs(v - prev) <= max_jump]
+        if len(cands2) >= 1:
+            cands = cands2
+    if not cands:
+        return (prev if prev is not None else 0.0), 0
+    if len(cands) == 1:
+        return cands[0], 1
+    return median(cands), len(cands)
+
+
+def _sane_bool(x):
+    if isinstance(x, bool):
+        return x
+    if isinstance(x, (int, float)) and x in (0, 1):
+        return bool(x)
+    return False
+
+
+def _get(state, k, default=None):
+    return state[k] if k in state else default
+
+
+def _speed_limit_kmh(state, prev_limit=130.0):
+    # Take robust min of valid speed limits to be conservative (ignore absurd low spikes).
+    limits = []
+    for i in (1, 2, 3):
+        v = _get(state, f"vision_{i}_speed_limit_kmh", None)
+        valid = _get(state, f"vision_{i}_speed_limit_valid", False)
+        if _valid_number(v) and _sane_bool(valid) and 10.0 <= v <= 160.0:
+            limits.append(v)
+    if not limits:
+        return prev_limit
+    # Filter out sudden single-frame low limit: allow at most 35 km/h drop per frame (dt handled later)
+    return min(limits)
+
+
+def _fuse_vehicle_speed_mps(state, prev_v_mps):
+    # Prefer vehicle_speed_* if plausible, else wheel speeds median. Reject implausible jumps.
+    vs = []
+    for k in ("vehicle_speed_1_kmh", "vehicle_speed_2_kmh"):
+        v = _get(state, k, None)
+        if _valid_number(v) and 0.0 <= v <= 300.0:
+            vs.append(v / 3.6)
+    ws = []
+    for pos in ("fl", "fr", "rl", "rr"):
+        v = _get(state, f"wheel_speed_{pos}_kmh", None)
+        if _valid_number(v) and 0.0 <= v <= 300.0:
+            ws.append(v / 3.6)
+    # First attempt: vehicle speeds
+    v_est, n = _robust_pick(vs, prev=prev_v_mps, max_jump=12.0)  # 12 m/s jump/frame is huge
+    if n >= 1:
+        return v_est, "veh"
+    # fallback: wheel speeds
+    v_est, n = _robust_pick(ws, prev=prev_v_mps, max_jump=12.0)
+    return v_est, ("wheel" if n >= 1 else "hold")
+
+
+def _fuse_yaw_rate_dps(state, prev_yaw):
+    ys = []
+    for i in (1, 2, 3):
+        v = _get(state, f"gyro_{i}_yaw_rate_dps", None)
+        valid = _get(state, f"gyro_{i}_valid", True)
+        # valid flag may lie; still accept but reject absurd magnitudes
+        if _valid_number(v) and abs(v) <= 200.0:
+            # if explicit invalid, downweight by still including (median robust anyway)
+            if not _sane_bool(valid):
+                # include but slightly "nudge" toward prev by limiting jump
+                pass
+            ys.append(v)
+    y_est, n = _robust_pick(ys, prev=prev_yaw, max_jump=50.0)
+    return y_est, n
+
+
+def _fuse_heading_deg(state, prev_heading):
+    hs = []
+    for i in (1, 2):
+        v = _get(state, f"gps_{i}_heading_deg", None)
+        valid = _get(state, f"gps_{i}_valid", False)
+        if _valid_number(v) and _sane_bool(valid):
+            # accept 0..360
+            v = v % 360.0
+            hs.append(v)
+    if not hs:
+        return prev_heading, 0
+    # circular median-ish: pick candidate closest to prev
+    if prev_heading is None or not _valid_number(prev_heading):
+        return hs[0], 1
+    best = min(hs, key=lambda x: abs(_wrap_deg(x - prev_heading)))
+    return best, len(hs)
+
+
+def _fuse_lane_offset_m(state, prev_offset):
+    # Prefer vision lane offset if plausible; fallback to lidar symmetry if needed.
+    offs = []
+    for i in (1, 2, 3):
+        v = _get(state, f"vision_{i}_lane_offset_m", None)
+        # no explicit valid flag for lane_offset; rely on bounds
+        if _valid_number(v) and abs(v) <= 2.5:
+            offs.append(v)
+    off_est, n = _robust_pick(offs, prev=prev_offset, max_jump=0.8)
+    return off_est, n
+
+
+def _fuse_road_curv_1pm(state, prev_curv):
+    cs = []
+    for i in (1, 2, 3):
+        v = _get(state, f"vision_{i}_road_curvature_1pm", None)
+        if _valid_number(v) and abs(v) <= 50.0:  # 1/m * 1e-?; prompt says 1pm; treat as 1/m
+            cs.append(v)
+    c_est, n = _robust_pick(cs, prev=prev_curv, max_jump=20.0)
+    return c_est, n
+
+
+def _lidar_range(state, angle_deg):
+    k = f"lidar_{angle_deg:+04d}_deg_range_m"
+    kv = f"lidar_{angle_deg:+04d}_deg_valid"
+    r = _get(state, k, None)
+    v = _get(state, kv, True)
+    if _valid_number(r) and r >= 0.0 and _sane_bool(v):
+        return r
+    # if valid flag lies, still accept if plausible and finite
+    if _valid_number(r) and 0.0 <= r <= 250.0:
+        return r
+    return None
+
+
+def _detect_obstacle(state):
+    """
+    Returns (detected, dist_m, rel_speed_mps, confidence in [0,1])
+    rel_speed is obstacle relative speed (obstacle - ego), so negative means slower ahead / closing.
+    """
+    dets = []
+    for i in (1, 2, 3):
+        obs_valid = _get(state, f"vision_{i}_obstacle_valid", False)
+        obs_det = _get(state, f"vision_{i}_obstacle_detected", False)
+        dist = _get(state, f"vision_{i}_obstacle_dist_m", None)
+        rel = _get(state, f"vision_{i}_obstacle_rel_speed_kmh", None)
+        if _sane_bool(obs_det) and _valid_number(dist) and 0.0 <= dist <= 250.0:
+            if _sane_bool(obs_valid) or True:
+                rel_mps = rel / 3.6 if _valid_number(rel) else 0.0
+                dets.append((dist, rel_mps))
+    # Lidar corroboration: use forward beams (+/-5, +/-15, 0 not present)
+    lidar_fwd = []
+    for a in (-15, -5, 5, 15, 30, -30):
+        r = _lidar_range(state, a)
+        if _valid_number(r):
+            lidar_fwd.append(r)
+    lidar_min = min(lidar_fwd) if lidar_fwd else None
+
+    if dets:
+        dist = median([d for d, _ in dets])
+        rel_mps = median([r for _, r in dets])
+        conf = _clamp(0.4 + 0.2 * len(dets), 0.4, 1.0)
+        if lidar_min is not None:
+            # if lidar strongly disagrees (much farther), reduce confidence; if confirms, increase.
+            if lidar_min < dist + 8.0:
+                conf = min(1.0, conf + 0.2)
+                dist = min(dist, lidar_min)
+            elif lidar_min > dist + 25.0:
+                conf = max(0.3, conf - 0.2)
+        return True, dist, rel_mps, conf
+
+    # no vision obstacle; still use lidar for emergency stopped object detection
+    if lidar_min is not None and lidar_min < 35.0:
+        # assume something ahead; unknown rel speed
+        conf = 0.5 if lidar_min < 25.0 else 0.35
+        return True, float(lidar_min), 0.0, conf
+
+    return False, 999.0, 0.0, 0.0
+
+
+def _lane_change_safety(state, side):
+    """
+    side: -1 left, +1 right
+    Uses lateral lidar beams to estimate clearance.
+    Returns clearance score in [0,1] (1 safe).
+    """
+    # Side beams: +/-60, +/-90 and +/-45 give rough adjacent presence.
+    angles = [45, 60, 90] if side > 0 else [-45, -60, -90]
+    rs = [r for a in angles if (r := _lidar_range(state, a)) is not None]
+    if not rs:
+        return 0.4  # unknown, mildly unsafe
+    rmin = min(rs)
+    # Treat <8m as very unsafe, >25m as safe-ish
+    return _clamp((rmin - 8.0) / (25.0 - 8.0), 0.0, 1.0)
+
+
+def autopilot_step(state: dict, dt: float) -> dict:
+    global _AP
+    dt_in = dt if _valid_number(dt) and dt > 0 else _get(state, "dt", 0.05)
+    dt = float(dt_in) if _valid_number(dt_in) and dt_in > 0 else 0.05
+    dt = _clamp(dt, 0.01, 0.2)
+
+    if not _AP["inited"]:
+        _AP["inited"] = True
+        _AP["t"] = float(_get(state, "sim_time_s", 0.0) or 0.0)
+        # Initialize to plausible starting speed
+        v0, _ = _fuse_vehicle_speed_mps(state, 0.0)
+        _AP["v_mps"] = v0
+        _AP["heading_deg"], _ = _fuse_heading_deg(state, 0.0)
+        _AP["yaw_rate_dps"], _ = _fuse_yaw_rate_dps(state, 0.0)
+        _AP["lane_offset_m"], _ = _fuse_lane_offset_m(state, 0.0)
+        _AP["road_curv_1pm"], _ = _fuse_road_curv_1pm(state, 0.0)
+        _AP["desired_lane"] = _get(state, "target_lane", _get(state, "current_lane", 1))
+
+    # Time
+    sim_t = _get(state, "sim_time_s", None)
+    if _valid_number(sim_t):
+        _AP["t"] = float(sim_t)
+    else:
+        _AP["t"] += dt
+
+    # Traction / environment
+    mu = _get(state, "estimated_mu", 1.0)
+    mu = float(mu) if _valid_number(mu) else 1.0
+    mu = _clamp(mu, 0.05, 1.2)
+    rain = _get(state, "rain_sensor", 0.0)
+    rain = float(rain) if _valid_number(rain) else 0.0
+    temp_c = _get(state, "temperature_c", 20.0)
+    temp_c = float(temp_c) if _valid_number(temp_c) else 20.0
+
+    # Fuse ego motion
+    v_est, _ = _fuse_vehicle_speed_mps(state, _AP["v_mps"])
+    yaw_est, _ = _fuse_yaw_rate_dps(state, _AP["yaw_rate_dps"])
+    hdg_est, _ = _fuse_heading_deg(state, _AP["heading_deg"])
+    off_est, _ = _fuse_lane_offset_m(state, _AP["lane_offset_m"])
+    curv_est, _ = _fuse_road_curv_1pm(state, _AP["road_curv_1pm"])
+
+    # Filtering (more smoothing when sensors flicker)
+    alpha_v = _clamp(dt / 0.35, 0.05, 0.35)
+    alpha_y = _clamp(dt / 0.25, 0.05, 0.5)
+    alpha_o = _clamp(dt / 0.30, 0.05, 0.35)
+    alpha_c = _clamp(dt / 0.60, 0.03, 0.25)
+    _AP["v_mps"] = _ema(_AP["v_mps"], v_est, alpha_v)
+    _AP["yaw_rate_dps"] = _ema(_AP["yaw_rate_dps"], yaw_est, alpha_y)
+    _AP["heading_deg"] = _ema(_AP["heading_deg"], hdg_est, 0.10)  # headings are noisy; slow filter
+    _AP["lane_offset_m"] = _ema(_AP["lane_offset_m"], off_est, alpha_o)
+    _AP["road_curv_1pm"] = _ema(_AP["road_curv_1pm"], curv_est, alpha_c)
+
+    v_mps = max(0.0, _AP["v_mps"])
+    v_kmh = v_mps * 3.6
+
+    # Targets
+    current_lane = int(_get(state, "current_lane", 1) or 1)
+    target_lane = int(_get(state, "target_lane", current_lane) or current_lane)
+    target_speed = _get(state, "target_speed_kmh", 110.0)
+    target_speed = float(target_speed) if _valid_number(target_speed) else 110.0
+    target_speed = _clamp(target_speed, 0.0, 160.0)
+
+    # Speed limit handling
+    if "speed_limit_kmh" not in _AP:
+        _AP["speed_limit_kmh"] = 130.0
+    new_limit = _speed_limit_kmh(state, prev_limit=_AP["speed_limit_kmh"])
+    # Apply some temporal logic to avoid 1-frame spikes
+    max_drop = 25.0 * dt / 0.05  # allow drop proportional to dt
+    if new_limit < _AP["speed_limit_kmh"] - max_drop:
+        _AP["speed_limit_kmh"] -= max_drop
+    else:
+        _AP["speed_limit_kmh"] = _ema(_AP["speed_limit_kmh"], new_limit, _clamp(dt / 1.2, 0.02, 0.2))
+    speed_limit = _AP["speed_limit_kmh"]
+
+    # Traction management: cap speed and soften control on low mu / rain / cold
+    low_mu = mu < 0.35 or (rain > 0.6 and mu < 0.6) or (temp_c < 0.0 and mu < 0.6)
+    mu_speed_cap = 1.0
+    if mu < 0.8:
+        # scale cap from 1.0 at 0.8 to ~0.55 at 0.2
+        mu_speed_cap = _clamp(0.55 + 0.75 * (mu - 0.2) / 0.6, 0.45, 1.0)
+    safe_speed_cap = speed_limit * mu_speed_cap
+    desired_speed = min(target_speed, speed_limit, safe_speed_cap)
+    if low_mu:
+        desired_speed = min(desired_speed, 90.0 * mu_speed_cap)
+
+    # Obstacle detection + time headway control
+    obs_det, obs_dist, obs_rel_mps, obs_conf = _detect_obstacle(state)
+    # Relative closing speed: ego - obstacle = -obs_rel_mps (since rel is obstacle-ego)
+    closing_mps = max(0.0, -obs_rel_mps)
+    # Desired time gap increases on low mu and at higher speeds
+    base_gap = 1.6 + 0.9 * (1.0 - _clamp(mu, 0.2, 1.0))  # 1.6s dry -> up to ~2.3s icy
+    if rain > 0.6:
+        base_gap += 0.3
+    time_gap = _clamp(base_gap, 1.4, 3.0)
+    min_gap_m = 6.0 + 0.15 * v_kmh  # standstill + speed term
+    desired_follow_dist = max(min_gap_m, time_gap * v_mps)
+    # If obstacle within follow distance, reduce desired speed (simple ACC)
+    if obs_det and obs_conf >= 0.35:
+        # Estimate obstacle absolute speed ~ ego + rel
+        obs_speed_mps = max(0.0, v_mps + obs_rel_mps)
+        if obs_dist < desired_follow_dist + 10.0:
+            # close in: aim slightly below obstacle speed
+            desired_speed = min(desired_speed, obs_speed_mps * 3.6 - 2.0)
+        if obs_dist < desired_follow_dist:
+            desired_speed = min(desired_speed, obs_speed_mps * 3.6 - 5.0)
+        desired_speed = max(0.0, desired_speed)
+
+    # Lane choice: follow target_lane unless obstacle triggers overtake/avoidance
+    desired_lane = _AP["desired_lane"] if _AP["desired_lane"] is not None else target_lane
+    # Update desired lane toward target with hysteresis
+    if desired_lane != target_lane:
+        _AP["lane_hold_s"] = max(0.0, _AP["lane_hold_s"] - dt)
+        if _AP["lane_hold_s"] <= 0.0:
+            desired_lane = target_lane
+
+    # Obstacle avoidance / lane change decision
+    lane_change = 0
+    if obs_det and obs_conf >= 0.5:
+        # If obstacle is close and closing, attempt lane change if safer than braking
+        ttc = obs_dist / max(0.1, closing_mps) if closing_mps > 0.1 else 999.0
+        very_close = obs_dist < 18.0 or ttc < 1.8
+        close = obs_dist < 35.0 or ttc < 3.0
+        if close and current_lane == desired_lane:
+            left_ok = current_lane > 0 and _lane_change_safety(state, -1) > 0.6
+            right_ok = current_lane < 2 and _lane_change_safety(state, +1) > 0.6
+            # prefer lane that matches target_lane direction, else left (passing) then right
+            pref = []
+            if target_lane < current_lane:
+                pref = [-1, +1]
+            elif target_lane > current_lane:
+                pref = [+1, -1]
+            else:
+                pref = [-1, +1]
+            for side in pref:
+                if side == -1 and left_ok:
+                    lane_change = -1
+                    break
+                if side == +1 and right_ok:
+                    lane_change = +1
+                    break
+            if lane_change == 0 and very_close:
+                # if no safe lane change, enforce stronger slowing
+                desired_speed = min(desired_speed, max(0.0, v_kmh - 40.0))
+    if lane_change != 0:
+        desired_lane = int(_clamp(current_lane + lane_change, 0, 2))
+        _AP["lane_hold_s"] = 2.5  # hold lane decision for a bit
+
+    _AP["desired_lane"] = desired_lane
+
+    # Lateral control: combine lane offset + lane change bias + curvature feedforward
+    # Lane offset sign convention unknown; assume + offset means car is to the right of center -> steer left (negative)
+    lane_offset = _AP["lane_offset_m"]
+    # Lane change bias: create a transient offset target
+    lane_bias = 0.0
+    if desired_lane != current_lane:
+        # bias left negative, right positive (target lateral shift)
+        lane_bias = 0.55 * (desired_lane - current_lane)  # meters (approx)
+    offset_error = lane_offset - lane_bias
+
+    # Use lidar symmetry to nudge toward center if vision flickers:
+    # compare left/right forward side distances; if one side is closer, nudge away.
+    lidar_left = _lidar_range(state, -30)
+    lidar_right = _lidar_range(state, 30)
+    lidar_nudge = 0.0
+    if _valid_number(lidar_left) and _valid_number(lidar_right):
+        # if right side closer, nudge left (negative steer)
+        diff = (lidar_right - lidar_left)
+        lidar_nudge = _clamp(diff / 40.0, -0.25, 0.25)
+
+    # Steering limits based on traction/jam
+    steer_rate_limit = 1.8 if not low_mu else 1.0  # per second change in normalized steer
+    steer_max = 0.85 if not low_mu else 0.55
+
+    # Curvature feedforward: treat road_curv_1pm as 1/m; needed steer grows with speed and curvature
+    curv = _AP["road_curv_1pm"]
+    ff = _clamp(curv * (v_mps / 25.0), -0.25, 0.25)
+
+    # PID on offset error (meters)
+    kp = 0.55 if not low_mu else 0.40
+    kd = 0.12 if not low_mu else 0.08
+    ki = 0.06 if not low_mu else 0.03
+    # derive lateral error rate from yaw_rate + curvature (roughly)
+    yaw_dps = _AP["yaw_rate_dps"]
+    yaw_rad = math.radians(yaw_dps)
+    # approximate lateral velocity error component
+    d_err = _clamp(yaw_rad * max(8.0, v_mps) / 12.0, -1.5, 1.5)
+    _AP["steer_i"] = _clamp(_AP["steer_i"] + offset_error * dt, -1.5, 1.5)
+    steer_cmd = -(kp * offset_error + kd * d_err + ki * _AP["steer_i"]) + ff + lidar_nudge
+    steer_cmd = _clamp(steer_cmd, -steer_max, steer_max)
+
+    # Detect steering jam: if commanded changes but angle sensors disagree / don't move, reduce aggressiveness
+    sa1 = _get(state, "steering_angle_1_deg", None)
+    sa2 = _get(state, "steering_angle_2_deg", None)
+    sa_vals = [v for v in (sa1, sa2) if _valid_number(v)]
+    steer_jam = False
+    if sa_vals:
+        sa = median(sa_vals)
+        # if steering angle large but yaw_rate small on curve, suggests jam (rough heuristic)
+        if abs(sa) > 8.0 and abs(yaw_dps) < 0.8 and abs(curv) > 2.0:
+            _AP["steer_jam_frames"] += 1
+        else:
+            _AP["steer_jam_frames"] = max(0, _AP["steer_jam_frames"] - 1)
+        steer_jam = _AP["steer_jam_frames"] > 8
+    if steer_jam:
+        steer_cmd = _clamp(steer_cmd, _AP["last_steer"] - 0.25, _AP["last_steer"] + 0.25)
+
+    # Apply rate limiting
+    max_delta = steer_rate_limit * dt
+    steer_cmd = _clamp(steer_cmd, _AP["last_steer"] - max_delta, _AP["last_steer"] + max_delta)
+
+    # Longitudinal control: PI with brake prioritization + emergency logic
+    speed_err = (desired_speed - v_kmh)
+    # cap integrator on low mu and near stops
+    i_lim = 60.0 if not low_mu else 25.0
+    _AP["speed_i"] = _clamp(_AP["speed_i"] + speed_err * dt, -i_lim, i_lim)
+
+    # Gains
+    kpv = 0.030 if not low_mu else 0.020
+    kiv = 0.010 if not low_mu else 0.006
+
+    u = kpv * speed_err + kiv * _AP["speed_i"]
+
+    # Base outputs
+    throttle = _clamp(u, 0.0, 1.0)
+    brake = _clamp(-u, 0.0, 1.0)
+
+    # Extra braking for close obstacles / low TTC
+    if obs_det and obs_conf >= 0.4:
+        ttc = obs_dist / max(0.1, closing_mps) if closing_mps > 0.1 else 999.0
+        # Hard brake when very close, especially at speed
+        if obs_dist < 10.0 or ttc < 1.2:
+            brake = max(brake, 1.0)
+            throttle = 0.0
+        elif obs_dist < 18.0 or ttc < 2.0:
+            brake = max(brake, 0.75 if not low_mu else 0.55)
+            throttle = 0.0
+        elif obs_dist < 30.0 or ttc < 3.0:
+            brake = max(brake, 0.35 if not low_mu else 0.25)
+            throttle = min(throttle, 0.15)
+
+    # Low traction: avoid simultaneous throttle/brake, cap aggressive commands
+    if low_mu:
+        throttle = min(throttle, 0.45)
+        brake = min(brake, 0.65)
+        if brake > 0.05:
+            throttle = 0.0
+
+    # Detect throttle stuck at ~30%: if brake commanded but speed not dropping and wheel/veh speed disagree with accel
+    # Heuristic: persistent positive acceleration while we command low throttle and some brake.
+    acc_longs = []
+    for i in (1, 2, 3):
+        a = _get(state, f"accel_{i}_longitudinal_ms2", None)
+        if _valid_number(a) and abs(a) < 15.0:
+            acc_longs.append(a)
+    acc_long = median(acc_longs) if acc_longs else 0.0
+
+    if brake > 0.2 and throttle < 0.05 and acc_long > 0.2 and v_kmh > 20.0:
+        _AP["throttle_stuck_frames"] += 1
+    else:
+        _AP["throttle_stuck_frames"] = max(0, _AP["throttle_stuck_frames"] - 1)
+    throttle_stuck = _AP["throttle_stuck_frames"] > 10
+    if throttle_stuck:
+        # prioritize braking; request full brake and neutral throttle
+        throttle = 0.0
+        brake = max(brake, 0.9 if not low_mu else 0.7)
+
+    # Detect brake failure: if we command strong brake but deceleration doesn't appear (and speed stays high)
+    if brake > 0.6 and v_kmh > 40.0 and acc_long > -0.2:
+        _AP["brake_bad_frames"] += 1
+    else:
+        _AP["brake_bad_frames"] = max(0, _AP["brake_bad_frames"] - 1)
+    brake_failed = _AP["brake_bad_frames"] > 12
+    if brake_failed:
+        # If brakes ineffective, reduce throttle to zero, attempt lane change away, and use engine braking via zero throttle.
+        throttle = 0.0
+        brake = 0.0
+        # Increase following gap by lowering desired speed aggressively next iterations (integrator will respond)
+        _AP["speed_i"] = min(_AP["speed_i"], 0.0)
+        # bias lane change to safest side if obstacle exists
+        if obs_det and obs_conf >= 0.4:
+            left_score = _lane_change_safety(state, -1) if current_lane > 0 else 0.0
+            right_score = _lane_change_safety(state, +1) if current_lane < 2 else 0.0
+            if left_score > right_score and left_score > 0.5:
+                _AP["desired_lane"] = current_lane - 1
+            elif right_score > 0.5:
+                _AP["desired_lane"] = current_lane + 1
+
+    # Prevent conflicting commands; prefer brake
+    if brake > 0.05:
+        throttle = 0.0
+
+    # Smooth outputs (gentler with low mu)
+    out_alpha = _clamp(dt / (0.18 if not low_mu else 0.28), 0.05, 0.5)
+    steer = _ema(_AP["last_steer"], steer_cmd, out_alpha)
+    throttle = _ema(_AP["last_throttle"], throttle, out_alpha)
+    brake = _ema(_AP["last_brake"], brake, out_alpha)
+
+    # Clamp final
+    steer = _clamp(steer, -1.0, 1.0)
+    throttle = _clamp(throttle, 0.0, 1.0)
+    brake = _clamp(brake, 0.0, 1.0)
+
+    # Update memory
+    _AP["last_steer"] = steer
+    _AP["last_throttle"] = throttle
+    _AP["last_brake"] = brake
+
+    return {"steering": steer, "throttle": throttle, "brake": brake}
+```

@@ -38,12 +38,13 @@ import numpy as np
 from shader_test_utils import compile_glsl, validate_spirv
 from compute_test_utils import ComputeShaderRunner, grade_compute_pingpong
 from native_compiler import CppCompiler, CompilationError, ExecutionError
+from solver_utils import normalize_code_result
 
 title = "Boid Flocking Simulation (GLSL Compute)"
 
 tags = [
   "glsl",
-  "structured response",
+  "freeform response",
   "gpu compute",
   "simulation",
 ]
@@ -607,21 +608,7 @@ ping-pong buffers for the required number of timesteps.
 
 extraGradeAnswerRuns = list(range(1, len(SUBPASSES)))
 
-structure = {
-  "type": "object",
-  "properties": {
-    "reasoning": {
-      "type": "string",
-      "description": "Explain your approach to the boid flocking compute shader"
-    },
-    "shader_code": {
-      "type": "string",
-      "description": "Complete GLSL compute shader source code"
-    }
-  },
-  "required": ["reasoning", "shader_code"],
-  "additionalProperties": False
-}
+structure = None
 
 _runner_cache = None
 _ref_cache = {}
@@ -629,6 +616,7 @@ _REPORT_CACHE = {}
 
 
 def _grade_answer_inner(result, subPass, aiEngineName):
+  result = normalize_code_result(result, "shader_code")
   global _runner_cache, _ref_cache
 
   if not result or "shader_code" not in result:
@@ -746,6 +734,7 @@ def _grade_answer_inner(result, subPass, aiEngineName):
 
 def gradeAnswer(result, subPass, aiEngineName):
   """Run grading in an isolated subprocess to survive GPU hangs/TDRs."""
+  result = normalize_code_result(result, "shader_code")
   if not result or "shader_code" not in result:
     return 0.0, "No shader code provided"
 
@@ -884,6 +873,7 @@ def _stats_only_report(report):
 
 
 def resultToNiceReport(result, subPass, aiEngineName):
+  result = normalize_code_result(result, "shader_code")
   from visualization_utils import generate_threejs_boid_visualization
 
   report = _REPORT_CACHE.get((aiEngineName, subPass))

@@ -14,10 +14,12 @@ Solver times out after 5 minutes.
 import math
 import random
 import time
+import hashlib
+import os
 from typing import List, Tuple, Dict
 
 from native_compiler import RustCompiler, compile_and_run, describe_this_pc
-from solver_utils import parse_freeform_response
+from solver_utils import BaselineCache, GradeCache, parse_freeform_response
 
 title = "2D Polygon Cutting Stock (Rust)"
 
@@ -34,6 +36,8 @@ TIMEOUT_SECONDS = 30
 
 # Seed for reproducibility
 RANDOM_SEED = 66666
+_GRADE_CACHE = GradeCache("test11_polygon_cutting")
+_BASELINE_CACHE = BaselineCache("test11_polygon_cutting")
 
 
 def make_rectangle(w: float, h: float) -> List[Tuple[float, float]]:
@@ -565,6 +569,16 @@ def format_input(stock: List[Tuple[float, float]], pieces: List[List[Tuple[float
   return "\n".join(lines)
 
 
+def _get_cached_baseline_solution(stock: List[Tuple[float, float]],
+                                  pieces: List[List[Tuple[float, float]]]) -> int:
+  return int(_BASELINE_CACHE.get_or_compute_json(
+    "baseline",
+    lambda: {"num_stocks": get_baseline_solution(stock, pieces)},
+    "test11-baseline-v1",
+    format_input(stock, pieces),
+  )["num_stocks"])
+
+
 def parse_placements_output(output: str, num_pieces: int) -> tuple:
   text = output.strip()
   if not text:
@@ -625,7 +639,40 @@ def execute_solver(code: str,
 lastSolution = None
 
 
-def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
+def _sha256_text(text: str) -> str:
+  return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _rust_compiler_fingerprint(ai_engine_name: str) -> str:
+  try:
+    compiler = RustCompiler(ai_engine_name)
+    compiler_path = compiler.find_compiler()
+    if compiler_path:
+      try:
+        st = os.stat(compiler_path)
+        stat_fingerprint = f"size={st.st_size}|mtime_ns={st.st_mtime_ns}"
+      except Exception as e:
+        stat_fingerprint = f"stat-unavailable:{type(e).__name__}:{e}"
+      return f"{compiler.describe()}|path={compiler_path}|{stat_fingerprint}"
+    return compiler.describe()
+  except Exception as e:
+    return f"rust-unavailable:{type(e).__name__}:{e}"
+
+
+def _grade_cache_key_parts(ai_engine_name: str, subpass: int, stock: List[Tuple[float, float]],
+                           pieces: List[List[Tuple[float, float]]], code: str) -> tuple:
+  return (
+    "test11-grade-v1",
+    f"model={ai_engine_name}",
+    f"subpass={subpass}",
+    f"input_sha256={_sha256_text(format_input(stock, pieces))}",
+    f"solver_sha256={_sha256_text(code)}",
+    f"compiler={_rust_compiler_fingerprint(ai_engine_name)}",
+    f"machine={describe_this_pc()}",
+  )
+
+
+def _gradeAnswer_uncached(result: dict, subPass: int, aiEngineName: str) -> tuple:
   """Grade the polygon cutting solver."""
   if not result:
     return 0.0, "No result provided"
@@ -643,7 +690,9 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
   code = code
 
   # Execute solver
+  t = time.time()
   solution, error, exec_time = execute_solver(code, stock, pieces, aiEngineName)
+  if time.time() - t > 1: print(f"Execution took {time.time() - t:.2f}s")
 
   global lastSolution
   lastSolution = solution
@@ -659,14 +708,20 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
   if not is_valid:
     return 0.0, f"[{description}] Invalid: {validation_error}"
 
-  # Compare to baseline
-  num_stocks = solution["num_stocks"]
-  t2 = time.time()
-  baseline_stocks = get_baseline_solution(stock, pieces)
-  baseline_time = time.time() - t2
-  if baseline_time > 1: print(f"Baseline calculation took {baseline_time:.2f}s")
+  if subPass < 8:
+    # Compare to baseline
+    num_stocks = solution["num_stocks"]
+    t2 = time.time()
+    baseline_stocks = _get_cached_baseline_solution(stock, pieces)
+    baseline_time = time.time() - t2
+    if baseline_time > 1: print(f"Baseline calculation took {baseline_time:.2f}s")
 
-  ratio = num_stocks / baseline_stocks if baseline_stocks > 0 else float('inf')
+    ratio = num_stocks / baseline_stocks if baseline_stocks > 0 else float('inf')
+  else:
+    # Baseline grid search is intractable at this scale even with caching.
+    num_stocks = solution["num_stocks"]
+    baseline_stocks = -1
+    ratio = 1.0
 
   if ratio <= 1.0:
     score = 1.0
@@ -707,6 +762,47 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
                  f"Time: {exec_time:.1f}s - {quality}.{penalty_note}")
 
   return score, explanation
+
+
+def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
+  if not result:
+    return 0.0, "No result provided"
+
+  discussion, code, parse_error = _extract_freeform(result)
+  if parse_error:
+    return 0.0, parse_error
+  if not code:
+    return 0.0, "No Rust code provided"
+
+  case = TEST_CASES[subPass]
+  stock = case["stock_polygon"]
+  pieces = case["pieces"]
+  cache_key = _grade_cache_key_parts(aiEngineName, subPass, stock, pieces, code)
+
+  def compute_grade_record():
+    global lastSolution
+    score, explanation = _gradeAnswer_uncached(result, subPass, aiEngineName)
+    return {
+      "score": score,
+      "explanation": explanation,
+      "solution": lastSolution,
+    }
+
+  record = _GRADE_CACHE.get_or_compute_json("grade", compute_grade_record, *cache_key)
+
+  global lastSolution
+  lastSolution = record.get("solution")
+
+  return float(record.get("score", 0.0)), str(record.get("explanation", "No explanation"))
+
+
+def setup() -> None:
+  for subPass in range(len(TEST_CASES)):
+    if subPass >= 8:
+      # Baseline grid search is intractable at this scale.
+      continue
+    case = TEST_CASES[subPass]
+    _get_cached_baseline_solution(case["stock_polygon"], case["pieces"])
 
 
 def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:

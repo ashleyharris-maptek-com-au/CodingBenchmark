@@ -13,13 +13,13 @@ import subprocess
 import time
 from typing import List, Tuple, Dict, Any, Iterable
 from native_compiler import CppCompiler, CompilationError, ExecutionError
-from solver_utils import StreamingInputFile
+from solver_utils import StreamingInputFile, normalize_code_result
 
 title = "Integer Linear Programming (C++)"
 
 tags = [
   "cpp",
-  "structured response",
+  "freeform response",
   "np hard",
   "optimization",
 ]
@@ -228,21 +228,7 @@ Write complete C++17 code with `main()` that reads stdin and writes stdout.
 
 extraGradeAnswerRuns = list(range(len(TEST_CASES)))
 
-structure = {
-  "type": "object",
-  "properties": {
-    "reasoning": {
-      "type": "string",
-      "description": "Explain your 0/1 ILP approach"
-    },
-    "cpp_code": {
-      "type": "string",
-      "description": "Complete C++ code with main() function that handles all scales"
-    }
-  },
-  "required": ["reasoning", "cpp_code"],
-  "additionalProperties": False
-}
+structure = None
 
 
 def _parse_output(stdout: str, num_vars: int) -> Tuple[int, List[int]]:
@@ -322,6 +308,7 @@ def _build_ilp_viz(c: List[int], pairs: List[Tuple[int, int]], expected_x: List[
 
 
 def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
+  result = normalize_code_result(result, "cpp_code")
   if not result or "cpp_code" not in result:
     return 0.0, "No C++ code provided"
 
@@ -403,6 +390,7 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
 
 
 def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
+  result = normalize_code_result(result, "cpp_code")
   if not result:
     return "<p style='color:red'>No result provided</p>"
   case = TEST_CASES[subPass]

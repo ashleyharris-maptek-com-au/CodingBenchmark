@@ -1,0 +1,482 @@
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Linq;
+
+public static class Program
+{
+    // Simple vector math (km, km/s)
+    private readonly struct Vec3
+    {
+        public readonly double X, Y, Z;
+        public Vec3(double x, double y, double z) { X = x; Y = y; Z = z; }
+        public static Vec3 operator +(Vec3 a, Vec3 b) => new Vec3(a.X + b.X, a.Y + b.Y, a.Z + b.Z);
+        public static Vec3 operator -(Vec3 a, Vec3 b) => new Vec3(a.X - b.X, a.Y - b.Y, a.Z - b.Z);
+        public static Vec3 operator *(Vec3 a, double k) => new Vec3(a.X * k, a.Y * k, a.Z * k);
+        public double Dot(in Vec3 b) => X * b.X + Y * b.Y + Z * b.Z;
+        public Vec3 Cross(in Vec3 b) => new Vec3(
+            Y * b.Z - Z * b.Y,
+            Z * b.X - X * b.Z,
+            X * b.Y - Y * b.X
+        );
+        public double Norm() => Math.Sqrt(Dot(this));
+        public Vec3 Unit()
+        {
+            double n = Norm();
+            if (n <= 0) return new Vec3(0, 0, 0);
+            return this * (1.0 / n);
+        }
+    }
+
+    private readonly struct State
+    {
+        public readonly Vec3 R;
+        public readonly Vec3 V;
+        public State(Vec3 r, Vec3 v) { R = r; V = v; }
+    }
+
+    // Classical orbital elements (some may be undefined for singular cases; we keep best-effort)
+    private readonly struct Elements
+    {
+        public readonly double A;     // semi-major axis (km)
+        public readonly double E;     // eccentricity
+        public readonly double I;     // inclination (rad)
+        public readonly double RAAN;  // right ascension of ascending node (rad)
+        public readonly double ArgP;  // argument of periapsis (rad)
+        public readonly double TA;    // true anomaly (rad)
+        public readonly double P;     // semilatus rectum (km)
+        public readonly double H;     // specific angular momentum magnitude (km^2/s)
+        public readonly double Vcirc; // characteristic circular speed at radius ~a (km/s)
+        public Elements(double a, double e, double inc, double raan, double argp, double ta, double p, double h, double vcirc)
+        {
+            A = a; E = e; I = inc; RAAN = raan; ArgP = argp; TA = ta; P = p; H = h; Vcirc = vcirc;
+        }
+    }
+
+    private static double Clamp(double x, double lo, double hi) => x < lo ? lo : (x > hi ? hi : x);
+    private static double NormAngle(double a)
+    {
+        a %= (2.0 * Math.PI);
+        if (a < 0) a += 2.0 * Math.PI;
+        return a;
+    }
+    private static double AngleDiff(double a, double b)
+    {
+        double d = Math.Abs(NormAngle(a) - NormAngle(b));
+        return d > Math.PI ? (2.0 * Math.PI - d) : d;
+    }
+
+    private static Elements ToElements(in State s, double mu)
+    {
+        Vec3 r = s.R;
+        Vec3 v = s.V;
+        double rmag = r.Norm();
+        double vmag = v.Norm();
+
+        Vec3 hvec = r.Cross(v);
+        double h = hvec.Norm();
+        Vec3 k = new Vec3(0, 0, 1);
+        Vec3 nvec = k.Cross(hvec);
+        double n = nvec.Norm();
+
+        // Eccentricity vector
+        Vec3 evec = (v.Cross(hvec) * (1.0 / mu)) - (r * (1.0 / rmag));
+        double e = evec.Norm();
+
+        double energy = (vmag * vmag) * 0.5 - mu / rmag;
+        double a;
+        if (Math.Abs(energy) < 1e-12) a = 1e18; // near-parabolic
+        else a = -mu / (2.0 * energy);
+
+        double inc = 0.0;
+        if (h > 0) inc = Math.Acos(Clamp(hvec.Z / h, -1.0, 1.0));
+
+        double raan = 0.0;
+        if (n > 1e-12)
+        {
+            raan = Math.Acos(Clamp(nvec.X / n, -1.0, 1.0));
+            if (nvec.Y < 0) raan = 2.0 * Math.PI - raan;
+        }
+
+        double argp = 0.0;
+        if (n > 1e-12 && e > 1e-12)
+        {
+            argp = Math.Acos(Clamp(nvec.Dot(evec) / (n * e), -1.0, 1.0));
+            if (evec.Z < 0) argp = 2.0 * Math.PI - argp;
+        }
+
+        double ta = 0.0;
+        if (e > 1e-12)
+        {
+            ta = Math.Acos(Clamp(evec.Dot(r) / (e * rmag), -1.0, 1.0));
+            if (r.Dot(v) < 0) ta = 2.0 * Math.PI - ta;
+        }
+        else
+        {
+            // near-circular: use argument of latitude from node vector
+            if (n > 1e-12)
+            {
+                ta = Math.Acos(Clamp(nvec.Dot(r) / (n * rmag), -1.0, 1.0));
+                if (r.Z < 0) ta = 2.0 * Math.PI - ta;
+            }
+            else
+            {
+                ta = Math.Atan2(r.Y, r.X);
+                if (ta < 0) ta += 2.0 * Math.PI;
+            }
+        }
+
+        double p = (h * h) / mu;
+
+        // characteristic speed (for scaling plane-change)
+        double vcirc;
+        if (a > 1e16 || a <= 0) vcirc = Math.Sqrt(mu / Math.Max(1.0, rmag));
+        else vcirc = Math.Sqrt(mu / Math.Max(1.0, a));
+
+        return new Elements(a, e, inc, NormAngle(raan), NormAngle(argp), NormAngle(ta), p, h, vcirc);
+    }
+
+    // A fast, heuristic "delta-v like" cost between two osculating orbits at epoch.
+    private static double TransferCost(in Elements from, in Elements to, in State sf, in State st, double mu)
+    {
+        // Semi-major axis / size difference (Hohmann-ish, for near-circular): scale by local circular speeds.
+        double af = from.A;
+        double at = to.A;
+        if (af <= 0 || af > 1e16) af = sf.R.Norm();
+        if (at <= 0 || at > 1e16) at = st.R.Norm();
+
+        double rf = Math.Max(1.0, Math.Abs(af));
+        double rt = Math.Max(1.0, Math.Abs(at));
+        double v1 = Math.Sqrt(mu / rf);
+        double v2 = Math.Sqrt(mu / rt);
+        double aTrans = 0.5 * (rf + rt);
+        double vP = Math.Sqrt(mu * (2.0 / rf - 1.0 / aTrans));
+        double vA = Math.Sqrt(mu * (2.0 / rt - 1.0 / aTrans));
+        double dvSize = Math.Abs(vP - v1) + Math.Abs(v2 - vA);
+
+        // Plane difference: approximate with combined inclination/RAAN mismatch via angular momentum direction
+        Vec3 hf = sf.R.Cross(sf.V).Unit();
+        Vec3 ht = st.R.Cross(st.V).Unit();
+        double cosAng = Clamp(hf.Dot(ht), -1.0, 1.0);
+        double dPlane = Math.Acos(cosAng);
+        double vPlane = 0.5 * (from.Vcirc + to.Vcirc);
+        double dvPlane = 2.0 * vPlane * Math.Sin(0.5 * dPlane);
+
+        // Shape mismatch (eccentricity): modest penalty
+        double dvEcc = 0.75 * Math.Abs(from.E - to.E);
+
+        // Phase / argument mismatch: encourage visiting nearby anomalies/angles (cheap-to-evaluate proxy)
+        double dRaan = AngleDiff(from.RAAN, to.RAAN);
+        double dArgLat = AngleDiff(NormAngle(from.ArgP + from.TA), NormAngle(to.ArgP + to.TA));
+        double dvPhase = 0.15 * (dRaan + dArgLat); // rad-scaled
+
+        // Position/velocity proximity at epoch helps for very small N
+        double dr = (sf.R - st.R).Norm();
+        double dv = (sf.V - st.V).Norm();
+        double dvEpoch = 0.0004 * dr + 0.35 * dv;
+
+        return dvSize + 1.15 * dvPlane + dvEcc + dvPhase + dvEpoch;
+    }
+
+    private static int[] SolveBrute(double[,] cost)
+    {
+        int n = cost.GetLength(0);
+        int[] best = Enumerable.Range(0, n).ToArray();
+        double bestCost = double.PositiveInfinity;
+
+        int[] perm = Enumerable.Range(0, n).ToArray();
+        // Heap's algorithm iterates permutations; n<=8 keeps it tiny.
+        int[] c = new int[n];
+        Evaluate(perm);
+        int i = 0;
+        while (i < n)
+        {
+            if (c[i] < i)
+            {
+                if ((i & 1) == 0) Swap(ref perm[0], ref perm[i]);
+                else Swap(ref perm[c[i]], ref perm[i]);
+                Evaluate(perm);
+                c[i]++;
+                i = 0;
+            }
+            else
+            {
+                c[i] = 0;
+                i++;
+            }
+        }
+        return best;
+
+        void Evaluate(int[] p)
+        {
+            double s = 0;
+            for (int k = 0; k < n - 1; k++) s += cost[p[k], p[k + 1]];
+            // open tour; no return-to-start requirement in prompt
+            if (s < bestCost)
+            {
+                bestCost = s;
+                Array.Copy(p, best, n);
+            }
+        }
+    }
+
+    private static void Swap(ref int a, ref int b) { int t = a; a = b; b = t; }
+
+    private static int[] NearestNeighbor(double[,] cost, int startNode)
+    {
+        int n = cost.GetLength(0);
+        bool[] used = new bool[n];
+        int[] tour = new int[n];
+        int cur = startNode;
+        for (int i = 0; i < n; i++)
+        {
+            tour[i] = cur;
+            used[cur] = true;
+            if (i == n - 1) break;
+            double best = double.PositiveInfinity;
+            int bestJ = -1;
+            for (int j = 0; j < n; j++)
+            {
+                if (used[j]) continue;
+                double c = cost[cur, j];
+                if (c < best) { best = c; bestJ = j; }
+            }
+            cur = bestJ < 0 ? 0 : bestJ;
+        }
+        return tour;
+    }
+
+    private static double TourCost(int[] tour, double[,] cost)
+    {
+        double s = 0;
+        for (int i = 0; i < tour.Length - 1; i++) s += cost[tour[i], tour[i + 1]];
+        return s;
+    }
+
+    private static void TwoOpt(int[] tour, double[,] cost, int[][] candidates, int maxPasses)
+    {
+        int n = tour.Length;
+        // position lookup
+        int[] pos = new int[n];
+        for (int i = 0; i < n; i++) pos[tour[i]] = i;
+
+        bool improved = true;
+        int passes = 0;
+        while (improved && passes++ < maxPasses)
+        {
+            improved = false;
+            for (int i = 0; i < n - 3; i++)
+            {
+                int a = tour[i];
+                int b = tour[i + 1];
+                // only consider swaps where the second edge starts from a candidate of a/b (keeps it fast)
+                var cand = candidates[b];
+                for (int ci = 0; ci < cand.Length; ci++)
+                {
+                    int cNode = cand[ci];
+                    int k = pos[cNode];
+                    if (k <= i + 1 || k >= n - 1) continue; // ensure (b..c) is a proper segment, and has a successor
+                    int c = tour[k];
+                    int d = tour[k + 1];
+
+                    double before = cost[a, b] + cost[c, d];
+                    double after = cost[a, c] + cost[b, d];
+                    if (after + 1e-12 < before)
+                    {
+                        // reverse segment [i+1..k]
+                        Array.Reverse(tour, i + 1, k - i);
+                        // update positions for affected range
+                        for (int t = i + 1; t <= k; t++) pos[tour[t]] = t;
+                        improved = true;
+                    }
+                }
+            }
+        }
+    }
+
+    private static int[][] BuildCandidates(double[,] cost, int k)
+    {
+        int n = cost.GetLength(0);
+        int[][] cand = new int[n][];
+        for (int i = 0; i < n; i++)
+        {
+            // get k cheapest neighbors
+            var list = new List<(double c, int j)>(n - 1);
+            for (int j = 0; j < n; j++)
+            {
+                if (i == j) continue;
+                list.Add((cost[i, j], j));
+            }
+            list.Sort((a, b) => a.c.CompareTo(b.c));
+            int take = Math.Min(k, list.Count);
+            int[] arr = new int[take];
+            for (int t = 0; t < take; t++) arr[t] = list[t].j;
+            cand[i] = arr;
+        }
+        return cand;
+    }
+
+    public static void Main()
+    {
+        CultureInfo.CurrentCulture = CultureInfo.InvariantCulture;
+        CultureInfo.CurrentUICulture = CultureInfo.InvariantCulture;
+
+        // Robust token scanner
+        var scanner = new FastScanner();
+        int n = scanner.NextInt();
+        double mu = scanner.NextDouble();
+
+        // Start orbit (not part of output indices)
+        State start = new State(
+            new Vec3(scanner.NextDouble(), scanner.NextDouble(), scanner.NextDouble()),
+            new Vec3(scanner.NextDouble(), scanner.NextDouble(), scanner.NextDouble())
+        );
+
+        State[] st = new State[n];
+        Elements[] el = new Elements[n];
+        for (int i = 0; i < n; i++)
+        {
+            st[i] = new State(
+                new Vec3(scanner.NextDouble(), scanner.NextDouble(), scanner.NextDouble()),
+                new Vec3(scanner.NextDouble(), scanner.NextDouble(), scanner.NextDouble())
+            );
+            el[i] = ToElements(st[i], mu);
+        }
+
+        // Build cost matrix as heuristic delta-v proxy, anchored to start state to pick a good first node.
+        var startEl = ToElements(start, mu);
+        double[] startCost = new double[n];
+        for (int i = 0; i < n; i++) startCost[i] = TransferCost(startEl, el[i], start, st[i], mu);
+
+        double[,] cost = new double[n, n];
+        for (int i = 0; i < n; i++)
+        {
+            cost[i, i] = 0;
+            for (int j = i + 1; j < n; j++)
+            {
+                double cij = TransferCost(el[i], el[j], st[i], st[j], mu);
+                double cji = TransferCost(el[j], el[i], st[j], st[i], mu);
+                cost[i, j] = cij;
+                cost[j, i] = cji;
+            }
+        }
+
+        int[] tour;
+        if (n <= 1)
+        {
+            tour = new int[n];
+            if (n == 1) tour[0] = 0;
+        }
+        else if (n <= 8)
+        {
+            tour = SolveBrute(cost);
+            // rotate so we start near the best first node from actual start state
+            int bestFirst = 0;
+            double bestSC = startCost[tour[0]];
+            for (int i = 1; i < n; i++)
+            {
+                double sc = startCost[tour[i]];
+                if (sc < bestSC) { bestSC = sc; bestFirst = i; }
+            }
+            if (bestFirst != 0)
+            {
+                int[] rot = new int[n];
+                for (int i = 0; i < n; i++) rot[i] = tour[(bestFirst + i) % n];
+                tour = rot;
+            }
+        }
+        else
+        {
+            // Choose first node as nearest to start, then NN + 2-opt.
+            int first = 0;
+            for (int i = 1; i < n; i++) if (startCost[i] < startCost[first]) first = i;
+            tour = NearestNeighbor(cost, first);
+
+            int candK = n <= 20 ? 32 : 20;
+            int[][] candidates = BuildCandidates(cost, candK);
+            int passes = n <= 20 ? 30 : 12;
+            TwoOpt(tour, cost, candidates, passes);
+
+            // A tiny multi-start improvement for medium sizes
+            if (n <= 20)
+            {
+                double best = TourCost(tour, cost);
+                int[] bestTour = (int[])tour.Clone();
+                // try a few alternative starts (best few by startCost)
+                int tries = Math.Min(6, n);
+                int[] starts = Enumerable.Range(0, n).OrderBy(i => startCost[i]).Take(tries).ToArray();
+                for (int t = 0; t < starts.Length; t++)
+                {
+                    var candTour = NearestNeighbor(cost, starts[t]);
+                    TwoOpt(candTour, cost, candidates, 30);
+                    double sc = TourCost(candTour, cost);
+                    if (sc < best)
+                    {
+                        best = sc;
+                        bestTour = candTour;
+                    }
+                }
+                tour = bestTour;
+            }
+        }
+
+        // Output: visitation order of station indices (0..N-1)
+        // Keep it space-separated
+        if (n == 0)
+        {
+            Console.WriteLine();
+            return;
+        }
+        for (int i = 0; i < n; i++)
+        {
+            if (i > 0) Console.Write(' ');
+            Console.Write(tour[i]);
+        }
+        Console.WriteLine();
+    }
+
+    private sealed class FastScanner
+    {
+        private readonly string[] _buf = new string[1 << 16];
+        private int _len = 0, _idx = 0;
+
+        private string NextToken()
+        {
+            while (true)
+            {
+                if (_idx < _len) return _buf[_idx++];
+                string? line = Console.ReadLine();
+                if (line == null) return "";
+                _len = 0;
+                _idx = 0;
+                int start = 0;
+                for (int i = 0; i <= line.Length; i++)
+                {
+                    if (i == line.Length || char.IsWhiteSpace(line[i]))
+                    {
+                        if (i > start)
+                        {
+                            _buf[_len++] = line.Substring(start, i - start);
+                            if (_len == _buf.Length) break;
+                        }
+                        start = i + 1;
+                    }
+                }
+            }
+        }
+
+        public int NextInt()
+        {
+            string s = NextToken();
+            while (s.Length == 0) s = NextToken();
+            return int.Parse(s, CultureInfo.InvariantCulture);
+        }
+
+        public double NextDouble()
+        {
+            string s = NextToken();
+            while (s.Length == 0) s = NextToken();
+            return double.Parse(s, CultureInfo.InvariantCulture);
+        }
+    }
+}

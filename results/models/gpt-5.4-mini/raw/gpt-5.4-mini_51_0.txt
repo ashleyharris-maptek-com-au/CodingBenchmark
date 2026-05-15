@@ -1,0 +1,349 @@
+import math
+from collections import defaultdict
+
+_state = {
+    'prev_alt': None,
+    'prev_hdg': None,
+    'prev_ias': None,
+    'prev_track': None,
+    'alt_int': 0.0,
+    'ias_int': 0.0,
+    'hdg_int': 0.0,
+    'vs_int': 0.0,
+    'trim': 0.0,
+    'last_out': {},
+}
+
+
+def _finite(x):
+    return isinstance(x, (int, float)) and math.isfinite(x)
+
+
+def _wrap_deg(a):
+    if not _finite(a):
+        return None
+    return (a + 180.0) % 360.0 - 180.0
+
+
+def _ang_diff(a, b):
+    if a is None or b is None:
+        return 0.0
+    return _wrap_deg(a - b)
+
+
+def _clip(x, lo, hi):
+    return max(lo, min(hi, x))
+
+
+def _median(vals):
+    vals = [v for v in vals if _finite(v)]
+    if not vals:
+        return None
+    vals.sort()
+    m = len(vals) // 2
+    return vals[m] if len(vals) % 2 else 0.5 * (vals[m - 1] + vals[m])
+
+
+def _vote_numeric(values, tol):
+    vals = [v for v in values if _finite(v)]
+    if not vals:
+        return None
+    best = None
+    best_score = -1
+    for v in vals:
+        score = sum(1 for u in vals if abs(u - v) <= tol)
+        if score > best_score:
+            best_score = score
+            best = v
+    close = [u for u in vals if abs(u - best) <= tol]
+    return sum(close) / len(close)
+
+
+def _vote_angle(values, tol):
+    vals = [v for v in values if _finite(v)]
+    if not vals:
+        return None
+    best = None
+    best_score = -1
+    for v in vals:
+        score = sum(1 for u in vals if abs(_ang_diff(u, v)) <= tol)
+        if score > best_score:
+            best_score = score
+            best = v
+    close = [u for u in vals if abs(_ang_diff(u, best)) <= tol]
+    s = sum(math.sin(math.radians(v)) for v in close)
+    c = sum(math.cos(math.radians(v)) for v in close)
+    return math.degrees(math.atan2(s, c)) % 360.0
+
+
+def _safe_get(state, key, default=None):
+    v = state.get(key, default)
+    return v if _finite(v) else default
+
+
+def _sensor_triplet(state, prefix, suffix):
+    return [state.get(f'{prefix}_1_{suffix}'), state.get(f'{prefix}_2_{suffix}'), state.get(f'{prefix}_3_{suffix}')]
+
+
+def _choose_altitude(state):
+    baro = []
+    for i in (1, 2, 3):
+        alt = state.get(f'baro_alt_{i}_ft')
+        if _finite(alt):
+            setting = _safe_get(state, f'baro_setting_{i}_inhg', 29.92)
+            # Small correction to reduce disagreement across altimeters.
+            alt = alt + (29.92 - setting) * 1000.0
+            baro.append(alt)
+    radar = [state.get(f'radar_alt_{i}_ft') for i in (1, 2, 3) if _finite(state.get(f'radar_alt_{i}_ft')) and state.get(f'radar_alt_{i}_ft') >= 0]
+    gps = [state.get(f'gps_{i}_alt_ft') for i in (1, 2, 3) if _finite(state.get(f'gps_{i}_alt_ft'))]
+    irs = [state.get(f'irs_{i}_lat') for i in (1, 2, 3)]  # placeholder to detect availability
+
+    baro_v = _median(baro)
+    radar_v = _median(radar)
+    gps_v = _median(gps)
+    pressure_alt_v = None
+    adc_vals = [state.get(f'adc_{i}_pressure_alt_ft') for i in (1, 2, 3)]
+    pressure_alt_v = _median(adc_vals)
+
+    candidates = []
+    if baro_v is not None:
+        candidates.append(('baro', baro_v, 3))
+    if pressure_alt_v is not None:
+        candidates.append(('adc', pressure_alt_v, 2))
+    if gps_v is not None:
+        candidates.append(('gps', gps_v, 1))
+    if radar_v is not None:
+        candidates.append(('radar', radar_v, 1))
+
+    if not candidates:
+        return 0.0, 'none'
+
+    # Pairwise consistency score with physics-based preference.
+    scored = []
+    for name, val, prior in candidates:
+        score = prior * 10.0
+        for _, other, _ in candidates:
+            if other is val:
+                continue
+            d = abs(other - val)
+            score -= min(d / 200.0, 20.0)
+        if name == 'radar':
+            score += 3.0 if val < 2500.0 else 0.0
+        scored.append((score, name, val))
+    scored.sort(reverse=True)
+    return scored[0][2], scored[0][1]
+
+
+def _choose_ias(state):
+    vals = []
+    for i in (1, 2, 3):
+        v = state.get(f'ias_{i}_kt')
+        if _finite(v) and v > 0:
+            vals.append(v)
+    adc = []
+    for i in (1, 2, 3):
+        v = state.get(f'tas_{i}_kt')
+        if _finite(v) and v > 0:
+            adc.append(v)
+    ias = _vote_numeric(vals, 15.0)
+    tas = _median(adc)
+    machs = [state.get(f'mach_{i}') for i in (1, 2, 3) if _finite(state.get(f'mach_{i}'))]
+    mach = _median(machs)
+    if ias is None and tas is not None:
+        ias = tas * 0.9
+    if ias is None and mach is not None:
+        ias = max(100.0, mach * 600.0)
+    return ias if ias is not None else 250.0
+
+
+def _choose_heading_track(state):
+    heads = [state.get(f'irs_{i}_heading_deg') for i in (1, 2, 3) if _finite(state.get(f'irs_{i}_heading_deg'))]
+    tracks = [state.get(f'track_deg')]
+    for i in (1, 2, 3):
+        t = state.get(f'irs_{i}_track_deg')
+        if _finite(t):
+            tracks.append(t)
+    gps_tracks = [state.get(f'gps_{i}_track_deg') for i in (1, 2, 3) if _finite(state.get(f'gps_{i}_track_deg'))]
+    heading = _vote_angle(heads, 10.0)
+    track = _vote_angle(tracks + gps_tracks, 12.0)
+    if heading is None and track is not None:
+        heading = track
+    if track is None and heading is not None:
+        track = heading
+    return heading, track
+
+
+def _vertical_speed(state):
+    vals = [state.get(f'irs_{i}_vs_fpm') for i in (1, 2, 3) if _finite(state.get(f'irs_{i}_vs_fpm'))]
+    if vals:
+        return _median(vals)
+    return _safe_get(state, 'vertical_speed_fpm', 0.0)
+
+
+def _pitch(state):
+    vals = [state.get(f'irs_{i}_pitch_deg') for i in (1, 2, 3) if _finite(state.get(f'irs_{i}_pitch_deg'))]
+    return _median(vals)
+
+
+def _roll(state):
+    vals = [state.get(f'irs_{i}_roll_deg') for i in (1, 2, 3) if _finite(state.get(f'irs_{i}_roll_deg'))]
+    return _median(vals)
+
+
+def autopilot_step(state: dict, dt: float) -> dict:
+    alt, alt_src = _choose_altitude(state)
+    ias = _choose_ias(state)
+    hdg, track = _choose_heading_track(state)
+    vs = _vertical_speed(state)
+    pitch = _pitch(state)
+    roll = _roll(state)
+
+    target_alt = _safe_get(state, 'target_alt_ft', alt)
+    target_hdg = _safe_get(state, 'target_hdg_deg', hdg if hdg is not None else 0.0)
+    target_ias = _safe_get(state, 'target_ias_kt', ias)
+    target_vs = _safe_get(state, 'target_vs_fpm', 0.0)
+
+    # Speed protection: approximate stall and overspeed envelopes.
+    aoa_vals = [state.get(f'aoa_{i}_deg') for i in (1, 2, 3) if _finite(state.get(f'aoa_{i}_deg'))]
+    aoa = _median(aoa_vals)
+    flap = _safe_get(state, 'flap_pos_left_deg', 0.0)
+    gear_down = 1 if _safe_get(state, 'gear_handle_down', 0.0) > 0.5 else 0
+    vne = 365.0
+    if _finite(state.get('mach_1')) or _finite(state.get('mach_2')) or _finite(state.get('mach_3')):
+        mach = _median([state.get('mach_1'), state.get('mach_2'), state.get('mach_3')])
+        if _finite(mach) and mach > 0.82:
+            target_ias = min(target_ias, 290.0)
+            vne = 340.0
+
+    # Altitude controller.
+    alt_err = target_alt - alt
+    vs_cmd = _clip(target_vs + alt_err * 0.8, -2500.0, 2500.0)
+    if abs(alt_err) < 200.0:
+        vs_cmd = _clip(target_vs + alt_err * 0.3, -1200.0, 1200.0)
+    if alt_err > 2500.0:
+        vs_cmd = 2500.0
+    if alt_err < -2500.0:
+        vs_cmd = -2500.0
+
+    vs_err = vs_cmd - vs
+    _state['vs_int'] = _clip(_state['vs_int'] + vs_err * dt, -8000.0, 8000.0)
+    pitch_cmd = _clip(vs_err / 500.0 + _state['vs_int'] / 25000.0, -10.0, 10.0)
+    if _finite(pitch):
+        pitch_err = pitch_cmd - pitch
+    else:
+        pitch_err = pitch_cmd
+    elev = _clip(0.08 * pitch_err - 0.015 * vs / 1000.0, -1.0, 1.0)
+
+    # IAS / thrust control with speed protection and gentle trim adaptation.
+    ias_err = target_ias - ias
+    _state['ias_int'] = _clip(_state['ias_int'] + ias_err * dt, -6000.0, 6000.0)
+    thrust_base = 0.55 + 0.0025 * ias_err + 0.00002 * _state['ias_int']
+
+    if ias > vne + 15.0:
+        thrust_base = min(thrust_base, 0.15)
+        elev = min(elev, 0.0)
+    elif ias > vne:
+        thrust_base = min(thrust_base, 0.30)
+
+    if aoa is not None and aoa > 12.0:
+        thrust_base = max(thrust_base, 0.78)
+        elev = _clip(elev + 0.2, -1.0, 1.0)
+    if aoa is not None and aoa > 15.0:
+        thrust_base = 0.92
+        elev = 0.35
+
+    trim = _state['trim']
+    trim += _clip(-0.0005 * vs_err - 0.0002 * alt_err / 100.0, -0.02, 0.02)
+    trim = _clip(trim, -1.0, 1.0)
+    _state['trim'] = trim
+
+    # Heading/roll control. Prefer track if heading data is noisy.
+    hdg_ref = target_hdg
+    if hdg is not None and track is not None:
+        # If drift is large, lean toward track hold.
+        drift = _ang_diff(track, hdg)
+        hdg_ref = target_hdg - drift * 0.5
+    hdg_err = _ang_diff(hdg_ref, hdg if hdg is not None else track)
+    _state['hdg_int'] = _clip(_state['hdg_int'] + hdg_err * dt, -500.0, 500.0)
+    roll_cmd = _clip(hdg_err * 0.15 + _state['hdg_int'] * 0.01, -25.0, 25.0)
+    if _finite(roll):
+        roll_err = roll_cmd - roll
+    else:
+        roll_err = roll_cmd
+    ail = _clip(roll_err / 25.0 - _clip(roll or 0.0, -45.0, 45.0) / 60.0, -1.0, 1.0)
+
+    # Rudder coordinates turns and damps asymmetry / crosswind.
+    yaw_damp = 0.0
+    if _finite(state.get('gyro_1_yaw_rate_dps')):
+        yaw_damp = _median([state.get('gyro_1_yaw_rate_dps'), state.get('gyro_2_yaw_rate_dps'), state.get('gyro_3_yaw_rate_dps')]) or 0.0
+    rud = _clip(0.01 * hdg_err + 0.03 * _ang_diff(track, hdg if hdg is not None else track) - 0.004 * yaw_damp, -1.0, 1.0)
+
+    # Engine management.
+    left_thrust = _clip(thrust_base, 0.0, 1.0)
+    right_thrust = _clip(thrust_base, 0.0, 1.0)
+    e1 = _safe_get(state, 'engine_1_thrust_pct', None)
+    e2 = _safe_get(state, 'engine_2_thrust_pct', None)
+    if e1 is not None and e2 is not None:
+        asym = (e1 - e2) / 100.0
+        rud += _clip(-0.3 * asym, -0.2, 0.2)
+    if _safe_get(state, 'engine_1_fire', 0.0) > 0.5:
+        left_thrust = 0.0
+        right_thrust = max(right_thrust, 0.7)
+        rud += 0.15
+    if _safe_get(state, 'engine_2_fire', 0.0) > 0.5:
+        right_thrust = 0.0
+        left_thrust = max(left_thrust, 0.7)
+        rud -= 0.15
+
+    # Configuration logic.
+    gear = 1 if target_alt < 1500.0 or alt < 800.0 else 0
+    if target_alt > 2000.0 and alt > 1200.0:
+        gear = 0
+
+    if target_alt < 1000.0:
+        flaps = 20
+    elif target_alt < 3000.0:
+        flaps = 10
+    else:
+        flaps = 0
+    if ias < 140.0 and alt < 2500.0:
+        flaps = max(flaps, 20)
+    if ias < 120.0:
+        flaps = max(flaps, 30)
+    if ias > 210.0:
+        flaps = 0
+
+    speedbrake = 0.0
+    if ias > target_ias + 25.0 or ias > vne - 10.0:
+        speedbrake = 0.25
+    if ias > vne + 20.0:
+        speedbrake = 0.7
+    if alt_err < -800.0 and ias > target_ias + 10.0:
+        speedbrake = max(speedbrake, 0.2)
+
+    # If close to target, hold it steady.
+    if abs(alt_err) < 80.0 and abs(ias_err) < 8.0:
+        elev *= 0.6
+        ail *= 0.7
+        rud *= 0.7
+
+    out = dict(_state['last_out'])
+    out.update({
+        'elevator': _clip(elev - trim, -1.0, 1.0),
+        'aileron': _clip(ail, -1.0, 1.0),
+        'rudder': _clip(rud, -1.0, 1.0),
+        'throttle_1': left_thrust,
+        'throttle_2': right_thrust,
+        'elevator_trim': _clip(trim, -1.0, 1.0),
+        'flaps': int(_clip(flaps, 0, 40)),
+        'speedbrake': _clip(speedbrake, 0.0, 1.0),
+        'gear': int(gear),
+    })
+
+    # Preserve only last known valid values for omitted keys, but keep output stable.
+    _state['last_out'] = out.copy()
+    _state['prev_alt'] = alt
+    _state['prev_hdg'] = hdg
+    _state['prev_ias'] = ias
+    _state['prev_track'] = track
+    return out

@@ -1,0 +1,313 @@
+from math import sqrt, atan2, pi
+
+# Module-level state for smoothing and bias estimation.
+_S = {
+    "last_t": None,
+    "pos": None,
+    "vel": None,
+    "att": {"roll": 0.0, "pitch": 0.0, "yaw": 0.0},
+    "thr": {"x": 0.0, "y": 0.0, "z": 0.0},
+    "acc_bias": [0.0, 0.0, 0.0],
+    "gyro_bias": [0.0, 0.0, 0.0],
+}
+
+
+def _v(state, key, default=0.0):
+    v = state.get(key, default)
+    return default if v is None else v
+
+
+def _valid(state, key):
+    return bool(state.get(key, False))
+
+
+def _clamp(x, lo, hi):
+    return lo if x < lo else hi if x > hi else x
+
+
+def _sat1(x):
+    return _clamp(x, -1.0, 1.0)
+
+
+def _mix(vals):
+    s = 0.0
+    n = 0
+    for v, ok in vals:
+        if ok:
+            s += float(v)
+            n += 1
+    return (s / n) if n else None
+
+
+def _vec_norm(x, y, z):
+    return sqrt(x * x + y * y + z * z)
+
+
+def _estimate_rel(state):
+    # Primary 3D sensors.
+    radar_pos = [
+        (_v(state, "radar_rel_pos_x_m"), _valid(state, "radar_rel_x_valid")),
+        (_v(state, "radar_rel_pos_y_m"), _valid(state, "radar_rel_y_valid")),
+        (_v(state, "radar_rel_pos_z_m"), _valid(state, "radar_rel_z_valid")),
+    ]
+    radar_vel = [
+        (_v(state, "radar_rel_vel_x_ms"), _valid(state, "radar_relv_x_valid")),
+        (_v(state, "radar_rel_vel_y_ms"), _valid(state, "radar_relv_y_valid")),
+        (_v(state, "radar_rel_vel_z_ms"), _valid(state, "radar_relv_z_valid")),
+    ]
+    lidar_pos = [
+        (_v(state, "lidar_rel_pos_x_m"), _valid(state, "lidar_rel_x_valid")),
+        (_v(state, "lidar_rel_pos_y_m"), _valid(state, "lidar_rel_y_valid")),
+        (_v(state, "lidar_rel_pos_z_m"), _valid(state, "lidar_rel_z_valid")),
+    ]
+    lidar_vel = [
+        (_v(state, "lidar_rel_vel_x_ms"), _valid(state, "lidar_relv_x_valid")),
+        (_v(state, "lidar_rel_vel_y_ms"), _valid(state, "lidar_relv_y_valid")),
+        (_v(state, "lidar_rel_vel_z_ms"), _valid(state, "lidar_relv_z_valid")),
+    ]
+
+    pos = []
+    vel = []
+    for i in range(3):
+        vals = []
+        if radar_pos[i][1]:
+            vals.append((radar_pos[i][0], 1.0))
+        if lidar_pos[i][1]:
+            vals.append((lidar_pos[i][0], 1.2))
+        # Range finders only help with scalar distance; use them to stabilize if axis data missing.
+        if not vals:
+            rf = []
+            for k in (1, 2, 3):
+                if _valid(state, f"range_{k}_valid"):
+                    rf.append((_v(state, f"range_{k}_m"), 1.0))
+            if rf:
+                # Assign sign from previous estimate if possible, otherwise assume along-track dominant.
+                r = sum(v for v, _ in rf) / len(rf)
+                prev = _S["pos"] or [0.0, 0.0, 0.0]
+                axis = max(range(3), key=lambda a: abs(prev[a]))
+                signed = r if prev[axis] >= 0 else -r
+                vals.append((signed, 0.4))
+        pos.append(_mix(vals))
+
+        vvals = []
+        if radar_vel[i][1]:
+            vvals.append((radar_vel[i][0], 1.0))
+        if lidar_vel[i][1]:
+            vvals.append((lidar_vel[i][0], 1.2))
+        vel.append(_mix(vvals))
+
+    # Fill missing from last state with light decay.
+    if _S["pos"] is not None:
+        for i in range(3):
+            if pos[i] is None:
+                pos[i] = 0.85 * _S["pos"][i]
+    if _S["vel"] is not None:
+        for i in range(3):
+            if vel[i] is None:
+                vel[i] = 0.85 * _S["vel"][i]
+
+    if pos[0] is None:
+        pos[0] = 0.0
+    if pos[1] is None:
+        pos[1] = 0.0
+    if pos[2] is None:
+        pos[2] = 0.0
+    if vel[0] is None:
+        vel[0] = 0.0
+    if vel[1] is None:
+        vel[1] = 0.0
+    if vel[2] is None:
+        vel[2] = 0.0
+
+    # Camera bearing: when available, nudge lateral error toward the port line of sight.
+    cam_active = bool(_v(state, "dock_camera_active", 0.0))
+    if cam_active:
+        bx_ok = _valid(state, "dock_camera_bearing_x_valid")
+        by_ok = _valid(state, "dock_camera_bearing_y_valid")
+        bz_ok = _valid(state, "dock_camera_bearing_z_valid")
+        if bx_ok and by_ok and bz_ok:
+            bx = _v(state, "dock_camera_bearing_x")
+            by = _v(state, "dock_camera_bearing_y")
+            bz = _v(state, "dock_camera_bearing_z")
+            # Treat bearing as a direction vector to the docking port.
+            rng = _v(state, "dock_camera_range_m", 0.0)
+            if rng > 0.1:
+                pos[0] = 0.6 * pos[0] + 0.4 * (bx * rng)
+                pos[1] = 0.6 * pos[1] + 0.4 * (by * rng)
+                pos[2] = 0.6 * pos[2] + 0.4 * (bz * rng)
+
+    return pos, vel
+
+
+def _estimate_att(state, dt):
+    # Fuse available attitude sensors; use gyro rates for damping and star tracker for absolute attitude.
+    gyro = []
+    for idx in (1, 2, 3):
+        gyro.append([
+            (_v(state, f"gyro_{idx}_roll_dps"), _valid(state, f"gyro_{idx}_roll_valid")),
+            (_v(state, f"gyro_{idx}_pitch_dps"), _valid(state, f"gyro_{idx}_pitch_valid")),
+            (_v(state, f"gyro_{idx}_yaw_dps"), _valid(state, f"gyro_{idx}_yaw_valid")),
+        ])
+    rates = []
+    for axis in range(3):
+        vals = []
+        for i in range(3):
+            v, ok = gyro[i][axis]
+            if ok:
+                vals.append((v, 1.0))
+        rates.append(_mix(vals) or 0.0)
+
+    star = []
+    for axis_name in ("roll", "pitch", "yaw"):
+        vals = []
+        for i in (1, 2):
+            ok = _valid(state, f"star_tracker_{i}_{axis_name}_valid")
+            if ok:
+                vals.append((_v(state, f"star_tracker_{i}_{axis_name}_deg"), 1.0))
+        star.append(_mix(vals))
+
+    if _S["att"]["roll"] == 0.0 and _S["att"]["pitch"] == 0.0 and _S["att"]["yaw"] == 0.0:
+        _S["att"] = {
+            "roll": (star[0] or 0.0) * pi / 180.0,
+            "pitch": (star[1] or 0.0) * pi / 180.0,
+            "yaw": (star[2] or 0.0) * pi / 180.0,
+        }
+    else:
+        # Integrate gyro, correct gently with stars when valid.
+        _S["att"]["roll"] += (rates[0] * pi / 180.0 - _S["gyro_bias"][0]) * dt
+        _S["att"]["pitch"] += (rates[1] * pi / 180.0 - _S["gyro_bias"][1]) * dt
+        _S["att"]["yaw"] += (rates[2] * pi / 180.0 - _S["gyro_bias"][2]) * dt
+        for i, st in enumerate(star):
+            if st is not None:
+                err = st * pi / 180.0 - _S["att"][("roll", "pitch", "yaw")[i]]
+                _S["att"][("roll", "pitch", "yaw")[i]] += 0.02 * err
+    return rates
+
+
+def autopilot_step(state: dict, dt: float) -> dict:
+    pos, vel = _estimate_rel(state)
+    rates = _estimate_att(state, dt)
+
+    x, y, z = pos
+    vx, vy, vz = vel
+    rng = _vec_norm(x, y, z)
+    spd = _vec_norm(vx, vy, vz)
+    fuel = _v(state, "fuel_remaining_kg", 500.0)
+    fuel_pct = _v(state, "fuel_remaining_pct", 100.0)
+    low_fuel = fuel < 80.0 or fuel_pct < 20.0
+
+    # Adaptive gains.
+    if rng > 2000.0:
+        kp_p, kd_p = 0.0008, 0.020
+    elif rng > 200.0:
+        kp_p, kd_p = 0.0018, 0.030
+    elif rng > 50.0:
+        kp_p, kd_p = 0.0035, 0.045
+    elif rng > 10.0:
+        kp_p, kd_p = 0.0080, 0.070
+    else:
+        kp_p, kd_p = 0.0150, 0.100
+
+    # Primary translational control in LVLH.
+    # y-axis: if behind (negative y), thrust negative/prograde? In orbital rendezvous, 
+    # to catch up from behind we lower orbit with retrograde thrust, which is negative y.
+    # Here we use the sign directly in control: desired accel drives velocity reduction on position error.
+    ax = -kp_p * x - kd_p * vx
+    ay = -kp_p * y - kd_p * vy
+    az = -kp_p * z - kd_p * vz
+
+    # For large along-track separations, bias toward the counter-intuitive orbital rule:
+    # behind => retrograde, ahead => prograde.
+    if abs(y) > 50.0:
+        ay += -0.0015 * y
+    if abs(y) > 200.0:
+        ay += -0.0025 * y
+
+    # Cross-track is generally best handled with gentle damping.
+    az += -0.0010 * z
+
+    # Closing speed protection near target.
+    if rng < 20.0:
+        ax *= 0.5
+        ay *= 0.5
+        az *= 0.5
+    if spd > 0.3 and rng < 10.0:
+        ax -= 0.4 * vx
+        ay -= 0.4 * vy
+        az -= 0.4 * vz
+
+    # If drifting away, fight velocity first.
+    if x * vx + y * vy + z * vz > 0.0:
+        ax -= 0.15 * vx
+        ay -= 0.15 * vy
+        az -= 0.15 * vz
+
+    # Range sensor fallback and smoothing.
+    if rng < 1e-6:
+        rng = 1.0
+    scale = 1.0
+    if low_fuel:
+        scale = 0.45
+        kp_p *= 0.6
+        kd_p *= 0.6
+
+    # Convert to thrust commands. Assume ~220N per axis unit is sufficient; 
+    # the simulation likely maps command to acceleration, so use bounded normalized values.
+    thrust_x = _sat1(scale * (0.9 * ax))
+    thrust_y = _sat1(scale * (0.9 * ay))
+    thrust_z = _sat1(scale * (0.9 * az))
+
+    # Reduce wasteful radial thrust far away unless needed for braking/cleanup.
+    if rng > 200.0:
+        thrust_x *= 0.6
+        thrust_z *= 0.7
+
+    # Attitude: point thrusters mostly along desired delta-v vector; keep rates low.
+    # Map commanded thrust vector to a gentle body rate request.
+    mag = _vec_norm(thrust_x, thrust_y, thrust_z)
+    if mag < 1e-6:
+        desired_roll = 0.0
+        desired_pitch = 0.0
+        desired_yaw = 0.0
+    else:
+        desired_yaw = atan2(thrust_y, max(1e-6, thrust_x))
+        desired_pitch = atan2(-thrust_x, max(1e-6, abs(thrust_y) + abs(thrust_z) + 1e-6))
+        desired_roll = atan2(thrust_z, max(1e-6, thrust_y if abs(thrust_y) > 1e-6 else 1e-6))
+
+    # Simple rate damping and disturbance rejection.
+    roll_err = desired_roll - _S["att"]["roll"]
+    pitch_err = desired_pitch - _S["att"]["pitch"]
+    yaw_err = desired_yaw - _S["att"]["yaw"]
+
+    att_rate_roll = _clamp(0.08 * roll_err - 0.03 * rates[0] * pi / 180.0, -0.035, 0.035)
+    att_rate_pitch = _clamp(0.08 * pitch_err - 0.03 * rates[1] * pi / 180.0, -0.035, 0.035)
+    att_rate_yaw = _clamp(0.08 * yaw_err - 0.03 * rates[2] * pi / 180.0, -0.035, 0.035)
+
+    # Bias rejection for small uncommanded thrusts and noisy sensors.
+    if _S["thr"] is not None:
+        thrust_x = 0.7 * _S["thr"]["x"] + 0.3 * thrust_x
+        thrust_y = 0.7 * _S["thr"]["y"] + 0.3 * thrust_y
+        thrust_z = 0.7 * _S["thr"]["z"] + 0.3 * thrust_z
+
+    # If very close, prioritize straight-line braking to final capture.
+    if rng < 10.0:
+        thrust_x = _sat1(-0.8 * x - 0.9 * vx)
+        thrust_y = _sat1(-0.8 * y - 0.9 * vy)
+        thrust_z = _sat1(-0.8 * z - 0.9 * vz)
+        thrust_x *= 0.4
+        thrust_y *= 0.4
+        thrust_z *= 0.4
+
+    # Save filtered state.
+    _S["pos"] = pos[:]
+    _S["vel"] = vel[:]
+    _S["thr"] = {"x": thrust_x, "y": thrust_y, "z": thrust_z}
+
+    return {
+        "thrust_x": float(_clamp(thrust_x, -1.0, 1.0)),
+        "thrust_y": float(_clamp(thrust_y, -1.0, 1.0)),
+        "thrust_z": float(_clamp(thrust_z, -1.0, 1.0)),
+        "att_rate_roll": float(att_rate_roll),
+        "att_rate_pitch": float(att_rate_pitch),
+        "att_rate_yaw": float(att_rate_yaw),
+    }

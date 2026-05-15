@@ -1,0 +1,360 @@
+import math
+import math
+
+# Module-level persistent state (per scenario run)
+_ap = {
+    "init": False,
+    "pos": [0.0, 0.0, 0.0],
+    "vel": [0.0, 0.0, 0.0],
+    "last_t": None,
+    "cam_bearing": [0.0, 0.0, 0.0],
+    "cam_active": False,
+    "stale_count": 0,
+    "bias_a": [0.0, 0.0, 0.0],
+}
+
+
+def _clamp(x, lo, hi):
+    if x < lo:
+        return lo
+    if x > hi:
+        return hi
+    return x
+
+
+def _norm(v):
+    return math.sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2])
+
+
+def _add(a, b):
+    return [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
+
+
+def _sub(a, b):
+    return [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+
+
+def _mul(a, s):
+    return [a[0] * s, a[1] * s, a[2] * s]
+
+
+def _valid(state, key):
+    v = state.get(key)
+    return bool(v) if v is not None else False
+
+
+def _get_vec(state, prefix, kind):
+    # kind in {"radar", "lidar"}
+    px = f"{kind}_rel_pos_x_m"
+    py = f"{kind}_rel_pos_y_m"
+    pz = f"{kind}_rel_pos_z_m"
+    vx = f"{kind}_rel_vel_x_ms"
+    vy = f"{kind}_rel_vel_y_ms"
+    vz = f"{kind}_rel_vel_z_ms"
+
+    pv = (
+        _valid(state, f"{kind}_rel_x_valid")
+        and _valid(state, f"{kind}_rel_y_valid")
+        and _valid(state, f"{kind}_rel_z_valid")
+    )
+    vv = (
+        _valid(state, f"{kind}_relv_x_valid")
+        and _valid(state, f"{kind}_relv_y_valid")
+        and _valid(state, f"{kind}_relv_z_valid")
+    )
+
+    pos = [state.get(px, 0.0), state.get(py, 0.0), state.get(pz, 0.0)]
+    vel = [state.get(vx, 0.0), state.get(vy, 0.0), state.get(vz, 0.0)]
+    return (pos, vel, pv, vv)
+
+
+def _range_estimate(state):
+    # Use camera range if active (often best close-in), else median of valid range finders,
+    # else norm of any valid 3D pos.
+    if state.get("dock_camera_active") and state.get("dock_camera_range_m") is not None:
+        r = float(state.get("dock_camera_range_m", 0.0))
+        if r > 0:
+            return r, True
+
+    rs = []
+    for i in (1, 2, 3):
+        if _valid(state, f"range_{i}_valid"):
+            rv = state.get(f"range_{i}_m")
+            if rv is not None:
+                rv = float(rv)
+                if rv > 0:
+                    rs.append(rv)
+    if rs:
+        rs.sort()
+        return rs[len(rs) // 2], True
+
+    for kind in ("lidar", "radar"):
+        pos, _vel, pv, _vv = _get_vec(state, "", kind)
+        if pv:
+            return _norm(pos), True
+    return 0.0, False
+
+
+def _pick_rel(state):
+    # Prefer lidar when close, else radar, else whichever is valid.
+    r, r_ok = _range_estimate(state)
+    lidar_p, lidar_v, lp_ok, lv_ok = _get_vec(state, "", "lidar")
+    radar_p, radar_v, rp_ok, rv_ok = _get_vec(state, "", "radar")
+
+    # Choose position source
+    pos = None
+    vel = None
+    pos_ok = False
+    vel_ok = False
+
+    if r_ok and r < 120.0:
+        if lp_ok:
+            pos, pos_ok = lidar_p, True
+        elif rp_ok:
+            pos, pos_ok = radar_p, True
+    else:
+        if rp_ok:
+            pos, pos_ok = radar_p, True
+        elif lp_ok:
+            pos, pos_ok = lidar_p, True
+
+    # Choose velocity source to match if possible
+    if pos_ok and pos is lidar_p:
+        if lv_ok:
+            vel, vel_ok = lidar_v, True
+        elif rv_ok:
+            vel, vel_ok = radar_v, True
+    elif pos_ok and pos is radar_p:
+        if rv_ok:
+            vel, vel_ok = radar_v, True
+        elif lv_ok:
+            vel, vel_ok = lidar_v, True
+    else:
+        if rv_ok:
+            vel, vel_ok = radar_v, True
+        elif lv_ok:
+            vel, vel_ok = lidar_v, True
+
+    if not pos_ok:
+        pos = _ap["pos"]
+    if not vel_ok:
+        vel = _ap["vel"]
+
+    return pos, vel, pos_ok, vel_ok, r, r_ok
+
+
+def _lowpass(old, new, a):
+    return [old[0] * (1 - a) + new[0] * a, old[1] * (1 - a) + new[1] * a, old[2] * (1 - a) + new[2] * a]
+
+
+def autopilot_step(state: dict, dt: float) -> dict:
+    # Defensive dt
+    if dt is None or not (dt > 0):
+        dt = 0.1
+    dt = float(_clamp(dt, 0.02, 2.0))
+
+    # Initialize / reset heuristics when scenario likely restarts (fuel jumps up or time reset absent)
+    if not _ap["init"]:
+        _ap["init"] = True
+        _ap["pos"] = [0.0, 0.0, 0.0]
+        _ap["vel"] = [0.0, 0.0, 0.0]
+        _ap["stale_count"] = 0
+
+    # Sensor fusion (simple, robust)
+    meas_pos, meas_vel, pos_ok, vel_ok, rng, rng_ok = _pick_rel(state)
+
+    # Staleness detection: if both pos/vel invalid for a while, trust propagation (hold)
+    if not pos_ok and not vel_ok:
+        _ap["stale_count"] += 1
+    else:
+        _ap["stale_count"] = 0
+
+    # Filter to reduce flicker/noise
+    alpha = 0.25 if rng_ok and rng < 80 else 0.15
+    if pos_ok:
+        _ap["pos"] = _lowpass(_ap["pos"], meas_pos, alpha)
+    else:
+        _ap["pos"] = _add(_ap["pos"], _mul(_ap["vel"], dt))
+
+    if vel_ok:
+        _ap["vel"] = _lowpass(_ap["vel"], meas_vel, alpha)
+    # else keep last vel
+
+    pos = _ap["pos"]
+    vel = _ap["vel"]
+
+    # Docking camera (bearing helps align approach direction close-in)
+    cam_active = bool(state.get("dock_camera_active"))
+    if cam_active:
+        bxv = _valid(state, "dock_camera_bearing_x_valid")
+        byv = _valid(state, "dock_camera_bearing_y_valid")
+        bzv = _valid(state, "dock_camera_bearing_z_valid")
+        if bxv and byv and bzv:
+            b = [
+                float(state.get("dock_camera_bearing_x", 0.0)),
+                float(state.get("dock_camera_bearing_y", 0.0)),
+                float(state.get("dock_camera_bearing_z", 0.0)),
+            ]
+            nb = _norm(b)
+            if nb > 1e-6:
+                b = _mul(b, 1.0 / nb)
+            _ap["cam_bearing"] = _lowpass(_ap["cam_bearing"], b, 0.35)
+            _ap["cam_active"] = True
+    else:
+        _ap["cam_active"] = False
+
+    # Guidance: piecewise by range with orbital-mechanics-aware along-track logic.
+    r = rng if rng_ok else _norm(pos)
+
+    # Targets (fallback defaults if absent)
+    target_range = float(state.get("target_dock_range_m", 2.0) or 2.0)
+    target_speed = float(state.get("target_dock_speed_ms", 0.3) or 0.3)
+
+    # Fuel-aware throttle scaling
+    fuel_pct = state.get("fuel_remaining_pct")
+    fuel_kg = state.get("fuel_remaining_kg")
+    if fuel_pct is not None:
+        fp = float(fuel_pct)
+    elif fuel_kg is not None:
+        fp = _clamp(float(fuel_kg) / 500.0 * 100.0, 0.0, 100.0)
+    else:
+        fp = 100.0
+    fuel_scale = 0.55 if fp < 15.0 else (0.75 if fp < 35.0 else 1.0)
+
+    # Desired closing speed schedule (m/s) based on range
+    if r > 500:
+        v_close = 1.2
+    elif r > 200:
+        v_close = 0.8
+    elif r > 50:
+        v_close = 0.35
+    elif r > 10:
+        v_close = 0.18
+    else:
+        v_close = 0.08
+    v_close = min(v_close, max(0.05, target_speed))
+
+    # Keep cross-track and radial bounded (small deadbands)
+    x, y, z = pos[0], pos[1], pos[2]
+    vx, vy, vz = vel[0], vel[1], vel[2]
+
+    # Far-field: primarily fix along-track with "counter-intuitive" rule.
+    # Convention: y negative = behind station. To reduce |y| when behind, thrust retrograde (negative y thrust).
+    # If ahead (y positive), thrust prograde (positive y thrust) to raise orbit and fall back.
+    # This is a heuristic stand-in for a phasing maneuver.
+    if r > 200.0:
+        # Along-track phasing thrust (counter-intuitive orbital rule):
+        # behind (y<0): thrust retrograde (negative y) to drop orbit and speed up
+        # ahead  (y>0): thrust prograde  (positive y) to raise orbit and slow down
+        ty = 0.0
+        if y < -30.0:
+            ty = -_clamp(abs(y) / 1200.0, 0.04, 0.28)
+        elif y > 30.0:
+            ty = _clamp(abs(y) / 1200.0, 0.04, 0.28)
+        else:
+            ty = -_clamp(vy / 6.0, -0.15, 0.15)
+
+        # Keep radial/cross-track relatively small in far field to avoid wasting fuel
+        tx = -_clamp(x / 600.0 + vx / 12.0, -0.18, 0.18)
+        tz = -_clamp(z / 600.0 + vz / 12.0, -0.18, 0.18)
+
+        # Reduce thrust if already not drifting away too fast
+        thrust = [tx, ty, tz]
+
+    elif r > 50.0:
+        # Mid-field: transition to gentle V-bar-ish approach (mainly along-track closing), damp velocities
+        # Aim to bring x,z to ~0 while closing y.
+        # Desired velocity points toward reducing y magnitude with limited closing rate.
+        # If behind (y<0): want +vy (closing) but small; if ahead: want -vy.
+        sign_to_station = -1.0 if y > 0 else 1.0  # direction toward y=0
+        vy_des = sign_to_station * _clamp(abs(y) / 250.0, 0.05, v_close)
+        vx_des = -_clamp(x / 120.0, -0.25, 0.25)
+        vz_des = -_clamp(z / 120.0, -0.25, 0.25)
+
+        ax = _clamp((vx_des - vx) / 1.8, -0.6, 0.6)
+        ay = _clamp((vy_des - vy) / 2.2, -0.6, 0.6)
+        az = _clamp((vz_des - vz) / 1.8, -0.6, 0.6)
+
+        thrust = [_clamp(ax, -0.5, 0.5), _clamp(ay, -0.5, 0.5), _clamp(az, -0.5, 0.5)]
+
+    else:
+        # Close-in linear control: PD on position with velocity damping, plus camera-bearing alignment
+        # Use smaller gains as we get very close.
+        k_p = 0.10 if r > 20 else (0.07 if r > 10 else 0.05)
+        k_d = 0.35 if r > 20 else (0.45 if r > 10 else 0.55)
+
+        # Desired relative velocity: point toward origin but capped by v_close
+        if r > 1e-3:
+            dir_to_target = _mul(pos, -1.0 / r)
+        else:
+            dir_to_target = [0.0, 0.0, 0.0]
+        v_des = _mul(dir_to_target, v_close)
+
+        # If camera active, bias direction to camera bearing near final approach (<20m)
+        if _ap["cam_active"] and r < 20.0:
+            b = _ap["cam_bearing"]
+            # bearing points from craft to port; we want to move along bearing toward port
+            v_cam = _mul(b, v_close)
+            v_des = _add(_mul(v_des, 0.5), _mul(v_cam, 0.5))
+
+        ex = pos[0]
+        ey = pos[1]
+        ez = pos[2]
+        evx = vel[0] - v_des[0]
+        evy = vel[1] - v_des[1]
+        evz = vel[2] - v_des[2]
+
+        ax = -k_p * ex - k_d * evx
+        ay = -k_p * ey - k_d * evy
+        az = -k_p * ez - k_d * evz
+
+        # Extra gentle in final meters
+        lim = 0.22 if r > 10 else (0.14 if r > 3 else 0.09)
+        thrust = [_clamp(ax, -lim, lim), _clamp(ay, -lim, lim), _clamp(az, -lim, lim)]
+
+    # Avoid commanding thrust when already within success criteria and slow
+    spd = _norm(vel)
+    if r < max(2.0, target_range) and spd < max(0.3, target_speed):
+        thrust = [0.0, 0.0, 0.0]
+
+    # Fuel scaling + clamp to [-1,1]
+    thrust = [_clamp(thrust[0] * fuel_scale, -1.0, 1.0), _clamp(thrust[1] * fuel_scale, -1.0, 1.0), _clamp(thrust[2] * fuel_scale, -1.0, 1.0)]
+
+    # Attitude rate command: keep it simple & stable (rate-hold). Use gyros if available to damp.
+    # We don't have an explicit attitude target; docking is mostly translational here.
+    # Compute average gyro rates (rad/s) and command opposite to reduce rotation.
+    gr = []
+    gp = []
+    gy = []
+    for i in (1, 2, 3):
+        if _valid(state, f"gyro_{i}_roll_valid"):
+            gr.append(float(state.get(f"gyro_{i}_roll_dps", 0.0)) * math.pi / 180.0)
+        if _valid(state, f"gyro_{i}_pitch_valid"):
+            gp.append(float(state.get(f"gyro_{i}_pitch_dps", 0.0)) * math.pi / 180.0)
+        if _valid(state, f"gyro_{i}_yaw_valid"):
+            gy.append(float(state.get(f"gyro_{i}_yaw_dps", 0.0)) * math.pi / 180.0)
+
+    def _avg(xs):
+        if not xs:
+            return 0.0
+        xs = sorted(xs)
+        return xs[len(xs) // 2]  # median for robustness
+
+    roll_rate = _avg(gr)
+    pitch_rate = _avg(gp)
+    yaw_rate = _avg(gy)
+
+    # Dampen rates with a small gain; saturate to max +/-0.035 rad/s
+    k_rate = 0.6
+    att_rate_roll = _clamp(-k_rate * roll_rate, -0.035, 0.035)
+    att_rate_pitch = _clamp(-k_rate * pitch_rate, -0.035, 0.035)
+    att_rate_yaw = _clamp(-k_rate * yaw_rate, -0.035, 0.035)
+
+    return {
+        "thrust_x": float(thrust[0]),
+        "thrust_y": float(thrust[1]),
+        "thrust_z": float(thrust[2]),
+        "att_rate_roll": float(att_rate_roll),
+        "att_rate_pitch": float(att_rate_pitch),
+        "att_rate_yaw": float(att_rate_yaw),
+    }

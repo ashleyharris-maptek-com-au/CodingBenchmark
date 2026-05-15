@@ -22,6 +22,7 @@ import traceback
 from typing import Tuple
 
 from visualization_utils import generate_threejs_flight_path
+from solver_utils import normalize_code_result
 
 from autopilot_sim import (
   make_truth,
@@ -46,7 +47,7 @@ title = "Airliner Autopilot (Python)"
 
 tags = [
   "python",
-  "structured response",
+  "freeform response",
   "control systems",
   "simulation",
 ]
@@ -717,21 +718,7 @@ historical aviation accidents. The same code is tested against every scenario.
 
 extraGradeAnswerRuns = list(range(1, len(SCENARIOS)))
 
-structure = {
-  "type": "object",
-  "properties": {
-    "reasoning": {
-      "type": "string",
-      "description": "Explain your autopilot design approach"
-    },
-    "python_code": {
-      "type": "string",
-      "description": "Complete Python code defining autopilot_step(state, dt)"
-    }
-  },
-  "required": ["reasoning", "python_code"],
-  "additionalProperties": False
-}
+structure = None
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Grading
@@ -777,6 +764,7 @@ def _setup_scenario(idx):
 
 
 def gradeAnswer(result, subPass, aiEngineName):
+  result = normalize_code_result(result, "python_code")
   if not result or 'python_code' not in result:
     return 0.0, 'No Python code provided'
 
@@ -907,6 +895,7 @@ def _history_to_path(history):
 
 
 def resultToNiceReport(result, subPass, aiEngineName):
+  result = normalize_code_result(result, "python_code")
   sc_idx = subPass
   if sc_idx >= len(SCENARIOS):
     return ''

@@ -1,0 +1,336 @@
+from statistics import median
+import math
+
+
+# Persistent controller state
+_S = {
+    "speed_i": 0.0,
+    "steer_i": 0.0,
+    "last_speed": 0.0,
+    "last_lane": None,
+    "last_heading": 0.0,
+    "last_lane_offset": 0.0,
+    "lane_bias": 0.0,
+    "throttle_hold": 0.0,
+}
+
+
+def _clamp(x, lo, hi):
+    return lo if x < lo else hi if x > hi else x
+
+
+def _ang_wrap_deg(a):
+    while a > 180:
+        a -= 360
+    while a < -180:
+        a += 360
+    return a
+
+
+def _safe_num(v):
+    return isinstance(v, (int, float)) and math.isfinite(v)
+
+
+def _robust_median(vals, default=None):
+    vals = [v for v in vals if _safe_num(v)]
+    if not vals:
+        return default
+    return median(vals)
+
+
+def _valid(state, key, default=None):
+    v = state.get(key, default)
+    return v if _safe_num(v) else default
+
+
+def _sensor_value(state, value_key, valid_key=None, default=None):
+    v = state.get(value_key, default)
+    if not _safe_num(v):
+        return default
+    if valid_key is not None and valid_key in state and state[valid_key] is False:
+        return default
+    return v
+
+
+def _fused_speed_kmh(state):
+    speeds = []
+    for k, vk in [
+        ("wheel_speed_fl_kmh", "wheel_speed_fl_valid"),
+        ("wheel_speed_fr_kmh", "wheel_speed_fr_valid"),
+        ("wheel_speed_rl_kmh", "wheel_speed_rl_valid"),
+        ("wheel_speed_rr_kmh", "wheel_speed_rr_valid"),
+        ("vehicle_speed_1_kmh", None),
+        ("vehicle_speed_2_kmh", None),
+        ("gps_1_speed_kmh", "gps_1_valid"),
+        ("gps_2_speed_kmh", "gps_2_valid"),
+    ]:
+        v = _sensor_value(state, k, vk)
+        if v is not None:
+            speeds.append(v)
+    spd = _robust_median(speeds, _S["last_speed"])
+    if spd is None:
+        spd = _S["last_speed"]
+    # Reject implausible spikes using a simple rate limiter.
+    max_jump = 40.0
+    spd = _clamp(spd, max(0.0, _S["last_speed"] - max_jump), _S["last_speed"] + max_jump)
+    _S["last_speed"] = max(0.0, spd)
+    return _S["last_speed"]
+
+
+def _fused_yaw_rate_dps(state):
+    vals = []
+    for k, vk in [
+        ("gyro_1_yaw_rate_dps", "gyro_1_valid"),
+        ("gyro_2_yaw_rate_dps", "gyro_2_valid"),
+        ("gyro_3_yaw_rate_dps", "gyro_3_valid"),
+    ]:
+        v = _sensor_value(state, k, vk)
+        if v is not None:
+            vals.append(v)
+    return _robust_median(vals, 0.0) or 0.0
+
+
+def _fused_heading_deg(state):
+    vals = []
+    for k in ["gps_1_heading_deg", "gps_2_heading_deg"]:
+        v = state.get(k)
+        if _safe_num(v):
+            vals.append(v)
+    if vals:
+        # If headings straddle wrap-around, use circular mean.
+        xs = sum(math.cos(math.radians(v)) for v in vals)
+        ys = sum(math.sin(math.radians(v)) for v in vals)
+        if xs or ys:
+            return math.degrees(math.atan2(ys, xs))
+    return _S["last_heading"]
+
+
+def _fused_lane_offset(state):
+    vals = []
+    for i in (1, 2, 3):
+        v = _sensor_value(state, f"vision_{i}_lane_offset_m", f"vision_{i}_left_line_valid")
+        if v is not None:
+            vals.append(v)
+    off = _robust_median(vals, _S["last_lane_offset"])
+    if off is None:
+        off = _S["last_lane_offset"]
+    _S["last_lane_offset"] = off
+    return off
+
+
+def _lane_geometry(state):
+    lefts, rights = [], []
+    lane_types = []
+    for i in (1, 2, 3):
+        lv = _sensor_value(state, f"vision_{i}_left_line_dist_m", f"vision_{i}_left_line_valid")
+        rv = _sensor_value(state, f"vision_{i}_right_line_dist_m", f"vision_{i}_right_line_valid")
+        lt = state.get(f"vision_{i}_left_line_type")
+        rt = state.get(f"vision_{i}_right_line_type")
+        if lv is not None:
+            lefts.append(lv)
+        if rv is not None:
+            rights.append(rv)
+        if isinstance(lt, str):
+            lane_types.append(lt)
+        if isinstance(rt, str):
+            lane_types.append(rt)
+    left = _robust_median(lefts)
+    right = _robust_median(rights)
+    width = None
+    if left is not None and right is not None and right > left:
+        width = right - left
+    if width is None or width < 2.5 or width > 5.0:
+        width = 3.7
+    lane_offset = _fused_lane_offset(state)
+    return left, right, width, lane_offset, lane_types
+
+
+def _obstacle_ahead(state):
+    obs = []
+    for i in (1, 2, 3):
+        detected = state.get(f"vision_{i}_obstacle_detected")
+        dist = _sensor_value(state, f"vision_{i}_obstacle_dist_m", f"vision_{i}_obstacle_valid")
+        rel = _sensor_value(state, f"vision_{i}_obstacle_rel_speed_kmh", f"vision_{i}_obstacle_valid")
+        if detected or dist is not None:
+            obs.append((dist if dist is not None else 999.0, rel if rel is not None else 0.0))
+    # Lidar front beams
+    front = []
+    for ang in ["+005", "+015", "+030", "-005", "-015", "-030"]:
+        d = _sensor_value(state, f"lidar_{ang}_deg_range_m", f"lidar_{ang}_deg_valid")
+        if d is not None:
+            front.append(d)
+    lidar_front = _robust_median(front, None)
+    dist = None
+    rel = 0.0
+    if obs:
+        dist = min(d for d, _ in obs if d is not None)
+        rel = min((r for d, r in obs if d is not None), default=0.0)
+    if lidar_front is not None:
+        dist = lidar_front if dist is None else min(dist, lidar_front)
+    return dist, rel
+
+
+def _free_space_side(state, side):
+    angs = ["+045", "+060", "+090"] if side == "right" else ["-045", "-060", "-090"]
+    vals = []
+    for ang in angs:
+        d = _sensor_value(state, f"lidar_{ang}_deg_range_m", f"lidar_{ang}_deg_valid")
+        if d is not None:
+            vals.append(d)
+    return _robust_median(vals, 50.0)
+
+
+def autopilot_step(state: dict, dt: float) -> dict:
+    dt = dt if _safe_num(dt) and dt > 0 else 0.05
+    speed = _fused_speed_kmh(state)
+    yaw_rate = _fused_yaw_rate_dps(state)
+    heading = _fused_heading_deg(state)
+    left, right, lane_width, lane_offset, lane_types = _lane_geometry(state)
+    target_lane = int(_clamp(state.get("target_lane", 1) if _safe_num(state.get("target_lane", 1)) else 1, 0, 2))
+    current_lane = int(_clamp(state.get("current_lane", target_lane) if _safe_num(state.get("current_lane", target_lane)) else target_lane, 0, 2))
+    target_speed = state.get("target_speed_kmh", 80.0)
+    target_speed = target_speed if _safe_num(target_speed) else 80.0
+    mu = state.get("estimated_mu", 1.0)
+    mu = mu if _safe_num(mu) else 1.0
+    mu = _clamp(mu, 0.05, 1.2)
+
+    # Speed limit consensus
+    limits = []
+    for i in (1, 2, 3):
+        v = state.get(f"vision_{i}_speed_limit_kmh")
+        if _safe_num(v) and state.get(f"vision_{i}_speed_limit_valid", True):
+            limits.append(v)
+    speed_limit = _robust_median(limits, None)
+    if speed_limit is not None:
+        target_speed = min(target_speed, speed_limit)
+
+    # Traction-aware cap and gentle control under bad conditions.
+    traction_cap = 130.0 * math.sqrt(mu)
+    target_speed = min(target_speed, traction_cap)
+    if state.get("rain_sensor") or mu < 0.5:
+        target_speed = min(target_speed, 90.0 if mu >= 0.35 else 60.0 if mu >= 0.2 else 35.0)
+
+    obs_dist, obs_rel = _obstacle_ahead(state)
+    obstacle_ahead = obs_dist is not None and obs_dist < 80.0
+    emergency_obstacle = obs_dist is not None and obs_dist < max(8.0, speed * 0.25 / 3.6)
+
+    # Estimate lane-center error. Positive steer means right.
+    # If both lines are known, use center offset; otherwise vision offset and road curvature.
+    center_error = lane_offset
+    if left is not None and right is not None:
+        center_error = ((left + right) * 0.5 - 0.5 * lane_width)
+    curvature = 0.0
+    curvs = []
+    for i in (1, 2, 3):
+        v = _valid(state, f"vision_{i}_road_curvature_1pm")
+        if v is not None:
+            curvs.append(v)
+    curvature = _robust_median(curvs, 0.0) or 0.0
+
+    # Lane change intent and bias from target lane.
+    lane_error = target_lane - current_lane
+    lane_bias = 0.0
+    if lane_error != 0:
+        lane_bias = 0.18 * (1 if lane_error > 0 else -1)
+        far_side = _free_space_side(state, "right" if lane_error > 0 else "left")
+        near_side = _free_space_side(state, "left" if lane_error > 0 else "right")
+        if far_side - near_side > 2.0:
+            lane_bias *= 1.5
+
+    # Obstacle avoidance: prefer lane change if adjacent side is open.
+    if obstacle_ahead:
+        left_space = _free_space_side(state, "left")
+        right_space = _free_space_side(state, "right")
+        if left_space > right_space + 1.5:
+            lane_bias -= 0.25
+        elif right_space > left_space + 1.5:
+            lane_bias += 0.25
+        else:
+            lane_bias += 0.0
+
+    # Steering control
+    steer_err = (-0.9 * center_error) + (1.4 * curvature * speed / 100.0) + lane_bias
+    steer_rate_term = -0.015 * yaw_rate
+    steer_p = 0.75 * steer_err + steer_rate_term
+    steer_d = 0.0
+    if abs(steer_err) < 0.05:
+        _S["steer_i"] *= 0.98
+    else:
+        _S["steer_i"] += steer_err * dt * (0.08 if mu > 0.5 else 0.04)
+    _S["steer_i"] = _clamp(_S["steer_i"], -0.35, 0.35)
+    steer = steer_p + _S["steer_i"] + steer_d
+    if mu < 0.3:
+        steer = _clamp(steer, -0.45, 0.45)
+    else:
+        steer = _clamp(steer, -1.0, 1.0)
+
+    # Speed control with brake/throttle arbitration.
+    speed_err = target_speed - speed
+    if speed < 1.0 and target_speed > 0:
+        speed_err = max(speed_err, 10.0)
+    _S["speed_i"] += speed_err * dt * (0.02 if mu > 0.5 else 0.01)
+    _S["speed_i"] = _clamp(_S["speed_i"], -20.0, 20.0)
+
+    desired_acc = 0.04 * speed_err + 0.01 * _S["speed_i"]
+    throttle = 0.0
+    brake = 0.0
+
+    if emergency_obstacle:
+        brake = 1.0
+        throttle = 0.0
+    elif obstacle_ahead:
+        # Blend braking based on distance and closing speed.
+        urgency = 1.0 - _clamp((obs_dist - 8.0) / 45.0, 0.0, 1.0)
+        if obs_rel < 0:
+            urgency = min(1.0, urgency + _clamp((-obs_rel) / 60.0, 0.0, 0.4))
+        brake = _clamp(urgency * (0.35 + (0.25 if mu < 0.4 else 0.0)), 0.0, 1.0)
+        throttle = 0.0 if brake > 0.15 else _clamp(desired_acc, 0.0, 1.0)
+    else:
+        if desired_acc >= 0:
+            throttle = _clamp(desired_acc, 0.0, 1.0)
+            brake = 0.0
+        else:
+            brake = _clamp(-desired_acc * 1.4, 0.0, 1.0)
+            throttle = 0.0
+
+    # Traction limiting and actuator fault-style handling.
+    if mu < 0.35:
+        throttle *= 0.65 if mu >= 0.2 else 0.4
+        brake = max(brake, 0.05 if speed > target_speed + 5 else brake)
+    if speed > target_speed + 15:
+        brake = max(brake, _clamp((speed - target_speed - 15) / 40.0, 0.0, 0.6))
+        throttle = 0.0
+
+    # If a sign of brake failure or stuck throttle exists, compensate by requesting both and favor brake.
+    brake_pressures = []
+    for k in ["brake_pressure_1_pct", "brake_pressure_2_pct"]:
+        v = state.get(k)
+        if _safe_num(v):
+            brake_pressures.append(v)
+    if brake_pressures:
+        bp = median(brake_pressures)
+        if bp < 5.0 and (speed_err < -2.0 or emergency_obstacle):
+            brake = max(brake, 0.9)
+            throttle = 0.0
+
+    # Gentle steering at high speed.
+    if speed > 110:
+        steer *= 0.65
+    elif speed > 80:
+        steer *= 0.8
+
+    # If line detection is weak, rely more on lane offset and reduce aggression.
+    if left is None or right is None:
+        steer *= 0.85
+    if not lane_types:
+        steer *= 0.95
+
+    _S["last_heading"] = heading
+    _S["last_lane"] = current_lane
+
+    out = {
+        "steering": _clamp(steer, -1.0, 1.0),
+        "throttle": _clamp(throttle, 0.0, 1.0),
+        "brake": _clamp(brake, 0.0, 1.0),
+    }
+    return out

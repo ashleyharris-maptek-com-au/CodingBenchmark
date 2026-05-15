@@ -1,0 +1,381 @@
+import math
+
+
+def autopilot_step(state: dict, dt: float) -> dict:
+    """
+    Spacecraft docking autopilot.
+
+    Notes:
+    - LVLH frame: x=radial (outward), y=along-track (velocity direction), z=cross-track.
+    - For large along-track separations, orbit phasing dominates:
+        * behind station (y<0): command RETROGRADE (negative y) to lower orbit and catch up
+        * ahead of station (y>0): command PROGRADE (positive y) to raise orbit and let station catch up
+    - For close range (<50m), approximate as linear and use PD guidance.
+    """
+
+    # -------------------------
+    # Helpers (robust fusion)
+    # -------------------------
+    def _clamp(x: float, lo: float, hi: float) -> float:
+        return lo if x < lo else hi if x > hi else x
+
+    def _is_valid(name: str) -> bool:
+        v = state.get(name, None)
+        return bool(v) if v is not None else False
+
+    def _maybe(name: str, valid_name: str):
+        if _is_valid(valid_name):
+            val = state.get(name, None)
+            if isinstance(val, (int, float)) and math.isfinite(val):
+                return float(val)
+        return None
+
+    def _median(values):
+        values = [v for v in values if v is not None and math.isfinite(v)]
+        if not values:
+            return None
+        values.sort()
+        n = len(values)
+        m = n // 2
+        return values[m] if (n % 2) else 0.5 * (values[m - 1] + values[m])
+
+    def _fuse_rel_vec(prefix_a: str, prefix_b: str, suffix: str):
+        # Example: prefix_a="lidar_rel_pos_", suffix="x_m"
+        ax = _maybe(f"{prefix_a}x_{suffix}", f"{prefix_a.replace('rel_', 'rel_')}x_valid")
+        ay = _maybe(f"{prefix_a}y_{suffix}", f"{prefix_a.replace('rel_', 'rel_')}y_valid")
+        az = _maybe(f"{prefix_a}z_{suffix}", f"{prefix_a.replace('rel_', 'rel_')}z_valid")
+
+        bx = _maybe(f"{prefix_b}x_{suffix}", f"{prefix_b.replace('rel_', 'rel_')}x_valid")
+        by = _maybe(f"{prefix_b}y_{suffix}", f"{prefix_b.replace('rel_', 'rel_')}y_valid")
+        bz = _maybe(f"{prefix_b}z_{suffix}", f"{prefix_b.replace('rel_', 'rel_')}z_valid")
+
+        return (
+            _median([ax, bx]),
+            _median([ay, by]),
+            _median([az, bz]),
+        )
+
+    def _fuse_rel_pos():
+        # lidar + radar, per-axis median
+        lx = _maybe("lidar_rel_pos_x_m", "lidar_rel_x_valid")
+        ly = _maybe("lidar_rel_pos_y_m", "lidar_rel_y_valid")
+        lz = _maybe("lidar_rel_pos_z_m", "lidar_rel_z_valid")
+        rx = _maybe("radar_rel_pos_x_m", "radar_rel_x_valid")
+        ry = _maybe("radar_rel_pos_y_m", "radar_rel_y_valid")
+        rz = _maybe("radar_rel_pos_z_m", "radar_rel_z_valid")
+        return (_median([lx, rx]), _median([ly, ry]), _median([lz, rz]))
+
+    def _fuse_rel_vel():
+        lvx = _maybe("lidar_rel_vel_x_ms", "lidar_relv_x_valid")
+        lvy = _maybe("lidar_rel_vel_y_ms", "lidar_relv_y_valid")
+        lvz = _maybe("lidar_rel_vel_z_ms", "lidar_relv_z_valid")
+        rvx = _maybe("radar_rel_vel_x_ms", "radar_relv_x_valid")
+        rvy = _maybe("radar_rel_vel_y_ms", "radar_relv_y_valid")
+        rvz = _maybe("radar_rel_vel_z_ms", "radar_relv_z_valid")
+        return (_median([lvx, rvx]), _median([lvy, rvy]), _median([lvz, rvz]))
+
+    def _fuse_range(pos_xyz):
+        r = state.get("dock_camera_range_m", None)
+        if isinstance(r, (int, float)) and math.isfinite(r) and state.get("dock_camera_active", False):
+            return float(r)
+        # Rangefinders
+        r1 = _maybe("range_1_m", "range_1_valid")
+        r2 = _maybe("range_2_m", "range_2_valid")
+        r3 = _maybe("range_3_m", "range_3_valid")
+        rr = _median([r1, r2, r3])
+        if rr is not None:
+            return rr
+        # Fallback: norm of fused pos if available
+        x, y, z = pos_xyz
+        if x is not None and y is not None and z is not None:
+            return math.sqrt(x * x + y * y + z * z)
+        return None
+
+    def _fuse_gyro_dps():
+        def g(axis):
+            return _median(
+                [
+                    _maybe(f"gyro_1_{axis}_dps", f"gyro_1_{axis}_valid"),
+                    _maybe(f"gyro_2_{axis}_dps", f"gyro_2_{axis}_valid"),
+                    _maybe(f"gyro_3_{axis}_dps", f"gyro_3_{axis}_valid"),
+                ]
+            )
+
+        return (g("roll"), g("pitch"), g("yaw"))
+
+    # -------------------------
+    # Persistent memory
+    # -------------------------
+    mem = autopilot_step.__dict__.setdefault(
+        "_mem",
+        {
+            "init": False,
+            "t": 0.0,
+            "phase": "far",
+            "prev_pos": None,
+            "prev_vel": None,
+            "phasing_timer": 0.0,
+            "phasing_dir": 0.0,
+            "last_cmd": (0.0, 0.0, 0.0),
+        },
+    )
+
+    dt = float(dt) if isinstance(dt, (int, float)) and dt > 0 and math.isfinite(dt) else 0.1
+    mem["t"] += dt
+
+    # -------------------------
+    # State estimation
+    # -------------------------
+    x, y, z = _fuse_rel_pos()
+    vx, vy, vz = _fuse_rel_vel()
+
+    # If vel missing, estimate from position differencing.
+    if (vx is None or vy is None or vz is None) and (x is not None and y is not None and z is not None):
+        prev = mem.get("prev_pos", None)
+        if prev is not None and dt > 1e-6:
+            px, py, pz = prev
+            if vx is None and px is not None:
+                vx = (x - px) / dt
+            if vy is None and py is not None:
+                vy = (y - py) / dt
+            if vz is None and pz is not None:
+                vz = (z - pz) / dt
+
+    # Default any missing to 0 with "unknown" pos handled via range/camera logic.
+    vx = 0.0 if vx is None else vx
+    vy = 0.0 if vy is None else vy
+    vz = 0.0 if vz is None else vz
+
+    mem["prev_pos"] = (x, y, z)
+    mem["prev_vel"] = (vx, vy, vz)
+
+    r = _fuse_range((x, y, z))
+    if r is None:
+        # No usable sensors: do no harm.
+        thrust_x = thrust_y = thrust_z = 0.0
+        gx, gp, gy = _fuse_gyro_dps()
+        att_rate_roll = _clamp(-(gx or 0.0) * math.pi / 180.0, -0.035, 0.035)
+        att_rate_pitch = _clamp(-(gp or 0.0) * math.pi / 180.0, -0.035, 0.035)
+        att_rate_yaw = _clamp(-(gy or 0.0) * math.pi / 180.0, -0.035, 0.035)
+        return {
+            "thrust_x": 0.0,
+            "thrust_y": 0.0,
+            "thrust_z": 0.0,
+            "att_rate_roll": att_rate_roll,
+            "att_rate_pitch": att_rate_pitch,
+            "att_rate_yaw": att_rate_yaw,
+        }
+
+    # If we don't have full 3D position, try to reconstruct direction from docking camera.
+    cam_active = bool(state.get("dock_camera_active", False))
+    if (x is None or y is None or z is None) and cam_active:
+        bx = _maybe("dock_camera_bearing_x", "dock_camera_bearing_x_valid")
+        by = _maybe("dock_camera_bearing_y", "dock_camera_bearing_y_valid")
+        bz = _maybe("dock_camera_bearing_z", "dock_camera_bearing_z_valid")
+        if bx is not None and by is not None and bz is not None:
+            n = math.sqrt(bx * bx + by * by + bz * bz)
+            if n > 1e-6:
+                # Bearing points from chaser to port in LVLH axes.
+                x = (bx / n) * r
+                y = (by / n) * r
+                z = (bz / n) * r
+
+    # If still missing, be conservative.
+    if x is None:
+        x = 0.0
+    if y is None:
+        y = 0.0
+    if z is None:
+        z = 0.0
+
+    # Relative speed magnitude
+    vmag = math.sqrt(vx * vx + vy * vy + vz * vz)
+
+    # Fuel awareness: reduce aggressiveness if low.
+    fuel_pct = state.get("fuel_remaining_pct", 100.0)
+    fuel_kg = state.get("fuel_remaining_kg", 500.0)
+    fuel_pct = float(fuel_pct) if isinstance(fuel_pct, (int, float)) and math.isfinite(fuel_pct) else 100.0
+    fuel_kg = float(fuel_kg) if isinstance(fuel_kg, (int, float)) and math.isfinite(fuel_kg) else 500.0
+    fuel_scale = 1.0
+    if fuel_kg < 80.0 or fuel_pct < 15.0:
+        fuel_scale = 0.45
+    elif fuel_kg < 150.0 or fuel_pct < 30.0:
+        fuel_scale = 0.7
+
+    # -------------------------
+    # Phase selection
+    # -------------------------
+    if r > 200.0:
+        phase = "far"
+    elif r > 50.0:
+        phase = "medium"
+    elif r > 10.0:
+        phase = "close"
+    else:
+        phase = "final"
+    mem["phase"] = phase
+
+    # -------------------------
+    # Guidance laws
+    # -------------------------
+    target_range = state.get("target_dock_range_m", 2.0)
+    target_speed = state.get("target_dock_speed_ms", 0.3)
+    try:
+        target_range = float(target_range)
+    except Exception:
+        target_range = 2.0
+    try:
+        target_speed = float(target_speed)
+    except Exception:
+        target_speed = 0.3
+
+    # Gains per phase (tuned for smoothness + fuel)
+    if phase == "far":
+        kp = 0.003
+        kd = 0.010
+        max_cmd = 0.35
+    elif phase == "medium":
+        kp = 0.010
+        kd = 0.060
+        max_cmd = 0.45
+    elif phase == "close":
+        kp = 0.040
+        kd = 0.160
+        max_cmd = 0.35
+    else:  # final
+        kp = 0.080
+        kd = 0.240
+        max_cmd = 0.22
+
+    max_cmd *= fuel_scale
+
+    # Desired closing speeds (m/s) by range, with a hard cap in final approach.
+    def desired_speed(range_m: float) -> float:
+        if range_m > 200.0:
+            return 0.6
+        if range_m > 50.0:
+            return 0.35
+        if range_m > 10.0:
+            return 0.18
+        return 0.08
+
+    v_des = min(desired_speed(r), max(0.05, 0.7 * target_speed))
+
+    # Unit vector toward target
+    if r > 1e-6:
+        ux, uy, uz = x / r, y / r, z / r
+    else:
+        ux = uy = uz = 0.0
+
+    # Projected approach rate (positive = moving away; negative = closing if along u)
+    v_rad = vx * ux + vy * uy + vz * uz
+
+    # -------------------------
+    # Far-range orbital phasing controller
+    # -------------------------
+    thrust_x = thrust_y = thrust_z = 0.0
+
+    if phase == "far":
+        # Dominant component is usually along-track y. Use counter-intuitive rule:
+        # behind (y<0) -> retrograde (thrust_y negative), ahead -> prograde.
+        y_err = y
+        ph_dir = -1.0 if y_err < 0.0 else (1.0 if y_err > 0.0 else 0.0)
+
+        # Use a slow "phasing burn then coast" pattern to avoid wasting fuel fighting CW oscillations.
+        # Re-evaluate every few tens of seconds based on sign of y and whether closing is happening.
+        mem["phasing_timer"] += dt
+        if mem["phasing_timer"] > 25.0 or mem.get("phasing_dir", 0.0) == 0.0:
+            mem["phasing_timer"] = 0.0
+            mem["phasing_dir"] = ph_dir
+
+        # If already closing fast enough in along-track, stop burning.
+        # (For behind case, we want vy positive; for ahead, we want vy negative.)
+        closing_ok = (y < 0.0 and vy > 0.08) or (y > 0.0 and vy < -0.08) or abs(y) < 150.0
+        burn = not closing_ok
+
+        if burn and abs(y) > 120.0:
+            # Command magnitude based on separation, but small.
+            mag = _clamp(0.08 + 0.00012 * abs(y), 0.08, 0.22) * fuel_scale
+            thrust_y = _clamp(mem["phasing_dir"] * mag, -max_cmd, max_cmd)
+
+        # Only lightly correct cross-track/radial in far range, and mostly when not burning.
+        if not burn or abs(y) < 350.0:
+            thrust_z = _clamp(-(kp * z + kd * vz), -0.10 * fuel_scale, 0.10 * fuel_scale)
+            # Radial corrections can cause oscillation; keep tiny.
+            thrust_x = _clamp(-(0.6 * kp * x + 0.6 * kd * vx), -0.08 * fuel_scale, 0.08 * fuel_scale)
+
+        # If drifting away rapidly (range increasing), bias toward damping velocity.
+        if v_rad > 0.25:
+            thrust_x += _clamp(-0.02 * ux, -0.05, 0.05)
+            thrust_y += _clamp(-0.02 * uy, -0.05, 0.05)
+            thrust_z += _clamp(-0.02 * uz, -0.05, 0.05)
+
+    else:
+        # -------------------------
+        # Medium/close/final: PD + speed shaping
+        # -------------------------
+        # Approach direction: drive position to zero.
+        ax = -(kp * x + kd * vx)
+        ay = -(kp * y + kd * vy)
+        az = -(kp * z + kd * vz)
+
+        # Enforce gentle approach rate by adding braking/boost along line-of-sight.
+        # Want v_rad ~ -v_des (closing). If too fast (more negative), brake; if too slow/away, push.
+        v_err = v_rad - (-v_des)
+        # Convert to acceleration-like correction along u (scaled to avoid oscillation).
+        corr = _clamp(0.35 * v_err, -0.25, 0.25)
+        ax -= corr * ux
+        ay -= corr * uy
+        az -= corr * uz
+
+        thrust_x = _clamp(ax, -max_cmd, max_cmd)
+        thrust_y = _clamp(ay, -max_cmd, max_cmd)
+        thrust_z = _clamp(az, -max_cmd, max_cmd)
+
+        # Extra safety: if very close and still fast, prioritize braking.
+        if r < 12.0 and vmag > 0.35:
+            bx = -0.20 * vx
+            by = -0.20 * vy
+            bz = -0.20 * vz
+            thrust_x = _clamp(thrust_x + bx, -max_cmd, max_cmd)
+            thrust_y = _clamp(thrust_y + by, -max_cmd, max_cmd)
+            thrust_z = _clamp(thrust_z + bz, -max_cmd, max_cmd)
+
+        # Final approach corridor preference: keep x,z small first, then close y.
+        if phase in ("close", "final"):
+            # If off-axis, reduce along-track pushing.
+            offaxis = math.sqrt(x * x + z * z)
+            if offaxis > 1.5 and abs(y) < 20.0:
+                thrust_y *= 0.6
+
+    # Deadband to avoid chattering (also helps uncommanded tiny thrust scenarios).
+    def deadband(u, db):
+        return 0.0 if abs(u) < db else u
+
+    thrust_x = deadband(thrust_x, 0.015)
+    thrust_y = deadband(thrust_y, 0.015)
+    thrust_z = deadband(thrust_z, 0.015)
+
+    thrust_x = _clamp(thrust_x, -1.0, 1.0)
+    thrust_y = _clamp(thrust_y, -1.0, 1.0)
+    thrust_z = _clamp(thrust_z, -1.0, 1.0)
+
+    mem["last_cmd"] = (thrust_x, thrust_y, thrust_z)
+
+    # -------------------------
+    # Attitude rate command: rate damping using gyros (if present)
+    # -------------------------
+    gx, gp, gy = _fuse_gyro_dps()  # roll,pitch,yaw in deg/s
+    # Convert to rad/s and command opposite with saturation.
+    att_rate_roll = _clamp(-(gx or 0.0) * math.pi / 180.0, -0.035, 0.035)
+    att_rate_pitch = _clamp(-(gp or 0.0) * math.pi / 180.0, -0.035, 0.035)
+    att_rate_yaw = _clamp(-(gy or 0.0) * math.pi / 180.0, -0.035, 0.035)
+
+    return {
+        "thrust_x": float(thrust_x),
+        "thrust_y": float(thrust_y),
+        "thrust_z": float(thrust_z),
+        "att_rate_roll": float(att_rate_roll),
+        "att_rate_pitch": float(att_rate_pitch),
+        "att_rate_yaw": float(att_rate_yaw),
+    }

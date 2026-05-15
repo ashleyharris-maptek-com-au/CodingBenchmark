@@ -22,12 +22,13 @@ import tempfile
 from pathlib import Path
 
 from native_compiler import CppCompiler, compile_and_run, describe_this_pc
+from solver_utils import normalize_code_result
 
 title = "Job-Shop Scheduling (C++)"
 
 tags = [
   "cpp",
-  "structured response",
+  "freeform response",
   "np hard",
   "optimization",
 ]
@@ -289,23 +290,7 @@ Include adaptive logic that chooses different strategies based on problem scale.
 # List of subpasses to grade the single answer against all difficulty levels
 extraGradeAnswerRuns = list(range(len(TEST_CASES)))
 
-structure = {
-  "type": "object",
-  "properties": {
-    "reasoning": {
-      "type":
-      "string",
-      "description":
-      "Explain your scheduling algorithm and how it adapts to different problem complexities"
-    },
-    "cpp_code": {
-      "type": "string",
-      "description": "Complete C++ code with main() that handles all scales"
-    }
-  },
-  "required": ["reasoning", "cpp_code"],
-  "additionalProperties": False
-}
+structure = None
 
 
 def validate_schedule(schedule: List[List[Tuple]], jobs: List[List[Dict]],
@@ -486,6 +471,7 @@ def execute_solver(code: str,
 
 
 def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
+  result = normalize_code_result(result, "cpp_code")
   if not result:
     return 0.0, "No result provided"
 
@@ -553,6 +539,7 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
 
 def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
   """Generate HTML report."""
+  result = normalize_code_result(result, "cpp_code")
   if not result:
     return "<p style='color:red'>No result provided</p>"
 

@@ -35,6 +35,7 @@ import tempfile
 from typing import Tuple, Optional, Dict
 from PIL import Image
 
+from solver_utils import normalize_code_result
 from shader_test_utils import (
     ShaderRenderer, validate_spirv,
     compare_images, load_reference, save_reference, get_reference_path,
@@ -45,7 +46,7 @@ title = "Fragment Shaders (SPIRV)"
 
 tags = [
   "spirv",
-  "structured response",
+  "freeform response",
   "shader",
   "gpu",
 ]
@@ -261,21 +262,7 @@ SUBPASSES = [
 # Test interface
 # ---------------------------------------------------------------------------
 
-structure = {
-    "type": "object",
-    "properties": {
-        "reasoning": {
-            "type": "string",
-            "description": "Explain your approach to constructing this SPIR-V binary"
-        },
-        "spirv_hex": {
-            "type": "string",
-            "description": "Complete SPIR-V binary as a hex-encoded string (no spaces)"
-        }
-    },
-    "required": ["reasoning", "spirv_hex"],
-    "additionalProperties": False
-}
+structure = None
 
 
 def prepareSubpassPrompt(subPass: int) -> str:
@@ -298,6 +285,7 @@ def _get_renderer():
 
 
 def _grade_answer_inner(result: dict, subPass: int, aiEngineName: str) -> tuple:
+    result = normalize_code_result(result, "spirv_hex")
     if not result:
         return 0.0, "No result provided", {"error": "no_result"}
     if "spirv_hex" not in result:
@@ -353,6 +341,7 @@ def _grade_answer_inner(result: dict, subPass: int, aiEngineName: str) -> tuple:
 
 def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
     """Run grading in an isolated subprocess to survive GPU hangs/TDRs."""
+    result = normalize_code_result(result, "spirv_hex")
     if not result or "spirv_hex" not in result:
         return 0.0, "No SPIR-V hex data provided"
 
@@ -425,6 +414,7 @@ if __name__ == "__main__":
 
 
 def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
+    result = normalize_code_result(result, "spirv_hex")
     if not result:
         return "<p style='color:red'>No result provided</p>"
     desc = SUBPASSES[subPass]["description"]

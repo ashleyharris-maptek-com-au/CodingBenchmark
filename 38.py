@@ -12,13 +12,13 @@ import random
 import subprocess
 import time
 from typing import List, Set, Tuple, Dict, Any, Iterable
-from solver_utils import StreamingInputFile
+from solver_utils import StreamingInputFile, normalize_code_result
 
 title = "Exact Cover (Python)"
 
 tags = [
   "python",
-  "structured response",
+  "freeform response",
   "np hard",
   "constraint satisfaction",
 ]
@@ -309,21 +309,7 @@ Write complete Python code that reads stdin and writes stdout.
 
 extraGradeAnswerRuns = list(range(len(TEST_CASES)))
 
-structure = {
-  "type": "object",
-  "properties": {
-    "reasoning": {
-      "type": "string",
-      "description": "Explain your exact cover approach"
-    },
-    "python_code": {
-      "type": "string",
-      "description": "Complete Python code with solver function that handles all scales"
-    }
-  },
-  "required": ["reasoning", "python_code"],
-  "additionalProperties": False
-}
+structure = None
 
 
 def _parse_solution_output(stdout: str) -> Tuple[str, List[int]]:
@@ -364,6 +350,7 @@ def _build_exact_cover_viz(universe_size: int, sets: List[List[int]], solution_s
 
 
 def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
+  result = normalize_code_result(result, "python_code")
   if not result or "python_code" not in result:
     return 0.0, "No Python code provided"
 
@@ -462,6 +449,7 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
 
 
 def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
+  result = normalize_code_result(result, "python_code")
   if not result:
     return "<p style='color:red'>No result provided</p>"
   case = TEST_CASES[subPass]

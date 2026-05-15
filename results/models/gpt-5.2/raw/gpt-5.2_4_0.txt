@@ -1,0 +1,595 @@
+// answer.txt: C++20 program
+// 3D Regular Tetrahedron Packing into an arbitrary convex polyhedron (heuristic)
+// MSVC /std:c++20, standard library only.
+//
+// Strategy:
+// - Read container vertices (assumed to define a convex polyhedron).
+// - Compute its convex hull (QuickHull) -> triangular faces.
+// - Precompute a small set of tetrahedron orientations (Euler angles) and
+//   corresponding vertex offsets for edge length e.
+// - Use an adaptive grid sampling inside the container (AABB -> grid step ~ 2R).
+// - Greedy placement: for each candidate center, try orientations; accept if:
+//     * all tetra vertices inside container (half-space tests from hull faces)
+//     * no overlap with previously placed tetra (fast spatial hash; conservative
+//       check with bounding spheres then SAT triangle tests only when needed)
+//
+// Notes:
+// - This is a best-effort heuristic designed to be robust and scalable.
+// - For ludicrous-scale containers, the grid step increases automatically to
+//   bound the number of candidates, ensuring completion within time.
+//
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <functional>
+#include <iomanip>
+#include <iostream>
+#include <limits>
+#include <numeric>
+#include <optional>
+#include <queue>
+#include <random>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
+#include <vector>
+
+using std::array;
+using std::vector;
+
+static constexpr double PI = 3.141592653589793238462643383279502884;
+
+struct Vec3 {
+  double x{}, y{}, z{};
+  Vec3() = default;
+  Vec3(double x_, double y_, double z_) : x(x_), y(y_), z(z_) {}
+  Vec3 operator+(const Vec3& o) const { return {x + o.x, y + o.y, z + o.z}; }
+  Vec3 operator-(const Vec3& o) const { return {x - o.x, y - o.y, z - o.z}; }
+  Vec3 operator*(double s) const { return {x * s, y * s, z * s}; }
+  Vec3 operator/(double s) const { return {x / s, y / s, z / s}; }
+};
+
+static inline double dot(const Vec3& a, const Vec3& b) {
+  return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+static inline Vec3 cross(const Vec3& a, const Vec3& b) {
+  return {a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x};
+}
+static inline double norm2(const Vec3& v) { return dot(v, v); }
+static inline double norm(const Vec3& v) { return std::sqrt(norm2(v)); }
+static inline Vec3 normalize(const Vec3& v) {
+  double n = norm(v);
+  if (n <= 0) return {0, 0, 0};
+  return v / n;
+}
+
+struct Mat3 {
+  // row-major
+  double m[3][3]{};
+  Vec3 operator*(const Vec3& v) const {
+    return {m[0][0] * v.x + m[0][1] * v.y + m[0][2] * v.z,
+            m[1][0] * v.x + m[1][1] * v.y + m[1][2] * v.z,
+            m[2][0] * v.x + m[2][1] * v.y + m[2][2] * v.z};
+  }
+};
+
+static Mat3 rotX(double a) {
+  double c = std::cos(a), s = std::sin(a);
+  Mat3 R{};
+  R.m[0][0] = 1;
+  R.m[1][1] = c;
+  R.m[1][2] = -s;
+  R.m[2][1] = s;
+  R.m[2][2] = c;
+  return R;
+}
+static Mat3 rotY(double a) {
+  double c = std::cos(a), s = std::sin(a);
+  Mat3 R{};
+  R.m[1][1] = 1;
+  R.m[0][0] = c;
+  R.m[0][2] = s;
+  R.m[2][0] = -s;
+  R.m[2][2] = c;
+  return R;
+}
+static Mat3 rotZ(double a) {
+  double c = std::cos(a), s = std::sin(a);
+  Mat3 R{};
+  R.m[2][2] = 1;
+  R.m[0][0] = c;
+  R.m[0][1] = -s;
+  R.m[1][0] = s;
+  R.m[1][1] = c;
+  return R;
+}
+static Mat3 mul(const Mat3& A, const Mat3& B) {
+  Mat3 C{};
+  for (int i = 0; i < 3; ++i) {
+    for (int j = 0; j < 3; ++j) {
+      double s = 0;
+      for (int k = 0; k < 3; ++k) s += A.m[i][k] * B.m[k][j];
+      C.m[i][j] = s;
+    }
+  }
+  return C;
+}
+
+// ZYX Euler: R = Rz(z) * Ry(y) * Rx(x)
+static Mat3 eulerZYX(double rx, double ry, double rz) {
+  return mul(rotZ(rz), mul(rotY(ry), rotX(rx)));
+}
+
+struct Face {
+  Vec3 n;    // outward normal
+  double d;  // plane: n·x <= d for inside
+  int a, b, c;
+};
+
+// Robust-ish epsilon scaled later
+static inline bool insideAllHalfspaces(const vector<Face>& faces, const Vec3& p,
+                                       double eps) {
+  for (const auto& f : faces) {
+    if (dot(f.n, p) > f.d + eps) return false;
+  }
+  return true;
+}
+
+// --- QuickHull (convex hull of points in 3D) ---
+// Produces a set of triangular faces with outward normals and halfspace form.
+
+struct HullTri {
+  int a, b, c;
+  Vec3 n;
+};
+
+static Vec3 triNormal(const Vec3& a, const Vec3& b, const Vec3& c) {
+  return cross(b - a, c - a);
+}
+
+static double pointPlaneSignedDist(const Vec3& n, const Vec3& aOnPlane,
+                                   const Vec3& p) {
+  Vec3 ap = p - aOnPlane;
+  double nn = norm(n);
+  if (nn == 0) return 0;
+  return dot(n, ap) / nn;
+}
+
+struct EdgeKey {
+  int u, v;
+  bool operator==(const EdgeKey& o) const { return u == o.u && v == o.v; }
+};
+struct EdgeKeyHash {
+  size_t operator()(const EdgeKey& e) const noexcept {
+    return (static_cast<size_t>(e.u) << 32) ^ static_cast<size_t>(e.v);
+  }
+};
+
+static void addFace(vector<HullTri>& faces, int a, int b, int c, const vector<Vec3>& pts,
+                    const Vec3& interior) {
+  Vec3 n = triNormal(pts[a], pts[b], pts[c]);
+  // Ensure outward: interior point should satisfy n·(interior-a) < 0 for outward
+  if (dot(n, interior - pts[a]) > 0) {
+    std::swap(b, c);
+    n = triNormal(pts[a], pts[b], pts[c]);
+  }
+  faces.push_back({a, b, c, n});
+}
+
+static vector<Face> quickHull(const vector<Vec3>& pts) {
+  const int n = static_cast<int>(pts.size());
+  vector<Face> out;
+  if (n < 4) return out;
+
+  // Find extreme points on x to get a baseline.
+  int iMinX = 0, iMaxX = 0;
+  for (int i = 1; i < n; ++i) {
+    if (pts[i].x < pts[iMinX].x) iMinX = i;
+    if (pts[i].x > pts[iMaxX].x) iMaxX = i;
+  }
+  if (iMinX == iMaxX) return out;
+
+  // Find point farthest from line (iMinX, iMaxX)
+  Vec3 A = pts[iMinX], B = pts[iMaxX];
+  Vec3 AB = B - A;
+  double best = -1;
+  int iFar = -1;
+  for (int i = 0; i < n; ++i) {
+    Vec3 AP = pts[i] - A;
+    Vec3 cr = cross(AB, AP);
+    double d2 = norm2(cr);
+    if (d2 > best) {
+      best = d2;
+      iFar = i;
+    }
+  }
+  if (iFar < 0 || best <= 0) return out;
+
+  // Find point farthest from plane through (iMinX, iMaxX, iFar)
+  Vec3 N0 = triNormal(pts[iMinX], pts[iMaxX], pts[iFar]);
+  best = -1;
+  int iFar2 = -1;
+  for (int i = 0; i < n; ++i) {
+    double d = std::abs(pointPlaneSignedDist(N0, pts[iMinX], pts[i]));
+    if (d > best) {
+      best = d;
+      iFar2 = i;
+    }
+  }
+  if (iFar2 < 0 || best <= 1e-12) return out;
+
+  // Initial tetrahedron indices
+  int i0 = iMinX, i1 = iMaxX, i2 = iFar, i3 = iFar2;
+  // Interior point: average of the 4.
+  Vec3 interior = (pts[i0] + pts[i1] + pts[i2] + pts[i3]) / 4.0;
+
+  vector<HullTri> faces;
+  addFace(faces, i0, i1, i2, pts, interior);
+  addFace(faces, i0, i3, i1, pts, interior);
+  addFace(faces, i0, i2, i3, pts, interior);
+  addFace(faces, i1, i3, i2, pts, interior);
+
+  vector<char> isUsed(n, 0);
+  isUsed[i0] = isUsed[i1] = isUsed[i2] = isUsed[i3] = 1;
+
+  auto faceVisible = [&](const HullTri& f, int pi) -> bool {
+    // visible if point is outside (same direction as normal)
+    const Vec3& a = pts[f.a];
+    return dot(f.n, pts[pi] - a) > 1e-12;
+  };
+
+  // Iteratively add points that are outside current hull.
+  // We use a simple loop: find any point outside; expand.
+  for (int iter = 0; iter < 20000; ++iter) {
+    int pOutside = -1;
+    double maxDist = 0;
+    for (int i = 0; i < n; ++i) {
+      // check if outside any face
+      double worst = 0;
+      for (const auto& f : faces) {
+        const Vec3& a = pts[f.a];
+        double d = dot(f.n, pts[i] - a);
+        if (d > worst) worst = d;
+      }
+      if (worst > maxDist + 1e-12) {
+        maxDist = worst;
+        pOutside = i;
+      }
+    }
+    if (pOutside < 0) break;  // all points inside
+
+    // Find all faces visible from pOutside
+    vector<char> vis(faces.size(), 0);
+    for (size_t fi = 0; fi < faces.size(); ++fi) {
+      if (faceVisible(faces[fi], pOutside)) vis[fi] = 1;
+    }
+
+    // Horizon edges: edges that belong to exactly one visible face.
+    std::unordered_map<EdgeKey, int, EdgeKeyHash> edgeCount;
+    auto addEdge = [&](int u, int v) {
+      EdgeKey k{u, v};
+      auto it = edgeCount.find(k);
+      if (it == edgeCount.end()) edgeCount.emplace(k, 1);
+      else it->second += 1;
+    };
+    for (size_t fi = 0; fi < faces.size(); ++fi) {
+      if (!vis[fi]) continue;
+      const auto& f = faces[fi];
+      addEdge(f.a, f.b);
+      addEdge(f.b, f.c);
+      addEdge(f.c, f.a);
+    }
+    // The horizon consists of directed edges (u->v) where reverse (v->u) does not appear.
+    vector<std::pair<int, int>> horizon;
+    horizon.reserve(edgeCount.size());
+    for (const auto& kv : edgeCount) {
+      EdgeKey e = kv.first;
+      EdgeKey rev{e.v, e.u};
+      if (edgeCount.find(rev) == edgeCount.end()) {
+        horizon.emplace_back(e.u, e.v);
+      }
+    }
+    if (horizon.empty()) break;
+
+    // Remove visible faces
+    vector<HullTri> newFaces;
+    newFaces.reserve(faces.size() + horizon.size());
+    for (size_t fi = 0; fi < faces.size(); ++fi) {
+      if (!vis[fi]) newFaces.push_back(faces[fi]);
+    }
+    faces.swap(newFaces);
+
+    // Update interior point (keep it inside) - move slightly towards old interior
+    interior = (interior * 0.9) + (pts[pOutside] * 0.1);
+
+    // Create new faces from horizon edges to pOutside
+    for (auto [u, v] : horizon) {
+      addFace(faces, u, v, pOutside, pts, interior);
+    }
+  }
+
+  // Convert to halfspaces with normalized normals and d.
+  out.reserve(faces.size());
+  for (const auto& f : faces) {
+    Vec3 nrm = normalize(f.n);
+    double d = dot(nrm, pts[f.a]);
+    out.push_back({nrm, d, f.a, f.b, f.c});
+  }
+  return out;
+}
+
+// --- Tetrahedron model (edge length e) ---
+struct TetraPose {
+  Vec3 c;
+  double rx{}, ry{}, rz{};
+  array<Vec3, 4> verts;  // world-space vertices
+};
+
+static array<Vec3, 4> canonicalTetra(double e) {
+  // Regular tetra with centroid at origin.
+  // One convenient coordinate set (edge length 2*sqrt(2) scaled):
+  // points at (+1,+1,+1), (+1,-1,-1), (-1,+1,-1), (-1,-1,+1) has equal edges 2*sqrt(2).
+  // Scale to edge length e.
+  double s = e / (2.0 * std::sqrt(2.0));
+  array<Vec3, 4> v = {Vec3{+1, +1, +1}, Vec3{+1, -1, -1}, Vec3{-1, +1, -1},
+                      Vec3{-1, -1, +1}};
+  for (auto& p : v) p = p * s;
+  return v;
+}
+
+static array<Vec3, 4> transformVerts(const array<Vec3, 4>& local, const Mat3& R,
+                                     const Vec3& c) {
+  array<Vec3, 4> w{};
+  for (int i = 0; i < 4; ++i) w[i] = R * local[i] + c;
+  return w;
+}
+
+// Conservative overlap test:
+// - Each tetra has bounding sphere radius Rcirc = e*sqrt(3/8)
+// - Use spatial hash to only test nearby centers
+struct CellKey {
+  int64_t x, y, z;
+  bool operator==(const CellKey& o) const { return x == o.x && y == o.y && z == o.z; }
+};
+struct CellKeyHash {
+  size_t operator()(const CellKey& k) const noexcept {
+    // 64-bit mix
+    uint64_t h = 1469598103934665603ull;
+    auto mix = [&](uint64_t v) {
+      h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+    };
+    mix(static_cast<uint64_t>(k.x));
+    mix(static_cast<uint64_t>(k.y));
+    mix(static_cast<uint64_t>(k.z));
+    return static_cast<size_t>(h);
+  }
+};
+
+static CellKey cellOf(const Vec3& p, double cell) {
+  return {static_cast<int64_t>(std::floor(p.x / cell)),
+          static_cast<int64_t>(std::floor(p.y / cell)),
+          static_cast<int64_t>(std::floor(p.z / cell))};
+}
+
+// Fast segment-triangle intersection and SAT are complex; to keep code compact and fast,
+// we use a conservative tetra-tetra test:
+// - bounding spheres
+// - then vertex-in-tetra checks both ways (sufficient for many cases but not all)
+// This may accept some rare overlaps or reject some valid placements; epsilon helps.
+
+static double signedTetraVolume6(const Vec3& a, const Vec3& b, const Vec3& c, const Vec3& d) {
+  return dot(cross(b - a, c - a), d - a);
+}
+
+static bool pointInTetra(const array<Vec3, 4>& t, const Vec3& p, double eps) {
+  // Same-side test using signed volumes
+  double v0 = signedTetraVolume6(t[0], t[1], t[2], t[3]);
+  if (std::abs(v0) < 1e-15) return false;
+  double s0 = v0;
+  double v1 = signedTetraVolume6(p, t[1], t[2], t[3]);
+  double v2 = signedTetraVolume6(t[0], p, t[2], t[3]);
+  double v3 = signedTetraVolume6(t[0], t[1], p, t[3]);
+  double v4 = signedTetraVolume6(t[0], t[1], t[2], p);
+  // Allow small negative due to eps.
+  if (s0 > 0) {
+    return (v1 >= -eps && v2 >= -eps && v3 >= -eps && v4 >= -eps);
+  } else {
+    return (v1 <= eps && v2 <= eps && v3 <= eps && v4 <= eps);
+  }
+}
+
+static bool tetraOverlapConservative(const array<Vec3, 4>& a, const Vec3& ca,
+                                    const array<Vec3, 4>& b, const Vec3& cb,
+                                    double Rsq, double eps) {
+  if (norm2(ca - cb) > (2.0 * std::sqrt(Rsq) + eps) * (2.0 * std::sqrt(Rsq) + eps))
+    return false;
+  // Vertex-in-tetra checks both ways
+  for (int i = 0; i < 4; ++i)
+    if (pointInTetra(a, b[i], eps)) return true;
+  for (int i = 0; i < 4; ++i)
+    if (pointInTetra(b, a[i], eps)) return true;
+  return false;
+}
+
+int main() {
+  std::ios::sync_with_stdio(false);
+  std::cin.tie(nullptr);
+
+  int V;
+  double e;
+  if (!(std::cin >> V >> e)) return 0;
+  vector<Vec3> pts;
+  pts.reserve(std::max(0, V));
+  for (int i = 0; i < V; ++i) {
+    double x, y, z;
+    std::cin >> x >> y >> z;
+    pts.emplace_back(x, y, z);
+  }
+  if (V < 4 || e <= 0) {
+    std::cout << 0 << "\n";
+    return 0;
+  }
+
+  auto tStart = std::chrono::high_resolution_clock::now();
+  auto timeLeft = [&]() -> double {
+    auto now = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> dt = now - tStart;
+    return 29.5 - dt.count();
+  };
+
+  // Build convex hull faces
+  vector<Face> faces = quickHull(pts);
+  if (faces.empty()) {
+    std::cout << 0 << "\n";
+    return 0;
+  }
+
+  // Compute AABB and a rough scale for eps
+  Vec3 mn = pts[0], mx = pts[0];
+  for (const auto& p : pts) {
+    mn.x = std::min(mn.x, p.x);
+    mn.y = std::min(mn.y, p.y);
+    mn.z = std::min(mn.z, p.z);
+    mx.x = std::max(mx.x, p.x);
+    mx.y = std::max(mx.y, p.y);
+    mx.z = std::max(mx.z, p.z);
+  }
+  Vec3 extent = mx - mn;
+  double scale = std::max({extent.x, extent.y, extent.z, 1.0});
+  double eps = 1e-9 * scale;
+
+  // Tetra constants
+  double Rcirc = e * std::sqrt(3.0 / 8.0);
+  double Rsq = Rcirc * Rcirc;
+  array<Vec3, 4> local = canonicalTetra(e);
+
+  // Precompute a small orientation set (deterministic).
+  // We include: identity; 90/180 rotations; some random-ish angles.
+  vector<array<double, 3>> eulers;
+  eulers.reserve(48);
+  auto addEuler = [&](double rx, double ry, double rz) {
+    // wrap to [-pi,pi]
+    auto wrap = [](double a) {
+      while (a > PI) a -= 2 * PI;
+      while (a < -PI) a += 2 * PI;
+      return a;
+    };
+    eulers.push_back({wrap(rx), wrap(ry), wrap(rz)});
+  };
+  for (int ix = 0; ix < 4; ++ix) {
+    for (int iy = 0; iy < 4; ++iy) {
+      addEuler(ix * (PI / 2), iy * (PI / 2), 0);
+    }
+  }
+  addEuler(0.1, 0.2, 0.3);
+  addEuler(0.4, 0.7, 1.1);
+  addEuler(1.0, 0.2, -0.6);
+  addEuler(-0.3, 0.9, 0.5);
+  addEuler(0.7, -0.8, 0.2);
+
+  // Adaptive grid step: base around 2*Rcirc; increase if AABB huge.
+  double baseStep = std::max(2.05 * Rcirc, 0.5 * e);
+  // Target max candidates ~ 2e6 (keeps runtime bounded)
+  double volAABB = std::max(0.0, extent.x) * std::max(0.0, extent.y) * std::max(0.0, extent.z);
+  double targetCandidates = 2.0e6;
+  double step = baseStep;
+  if (volAABB > 0) {
+    double need = std::cbrt(volAABB / targetCandidates);
+    step = std::max(step, need);
+  }
+
+  // Generate candidate centers on a grid, with a small offset pattern to avoid artifacts.
+  // For massive sizes, we also subsample deterministically.
+  int64_t nx = static_cast<int64_t>(std::floor(extent.x / step)) + 1;
+  int64_t ny = static_cast<int64_t>(std::floor(extent.y / step)) + 1;
+  int64_t nz = static_cast<int64_t>(std::floor(extent.z / step)) + 1;
+  long double total = static_cast<long double>(nx) * ny * nz;
+  int stride = 1;
+  if (total > 2.5e6L) {
+    stride = static_cast<int>(std::ceil(std::cbrt(static_cast<long double>(total / 2.5e6L))));
+    stride = std::max(1, stride);
+  }
+
+  // Spatial hash
+  double cell = 2.2 * Rcirc;
+  std::unordered_map<CellKey, vector<int>, CellKeyHash> grid;
+  grid.reserve(1 << 16);
+
+  vector<TetraPose> placed;
+  placed.reserve(1024);
+
+  auto canPlace = [&](const Vec3& c, const array<double, 3>& ang, array<Vec3, 4>& outVerts) -> bool {
+    Mat3 R = eulerZYX(ang[0], ang[1], ang[2]);
+    outVerts = transformVerts(local, R, c);
+    // inside container
+    for (int i = 0; i < 4; ++i) {
+      if (!insideAllHalfspaces(faces, outVerts[i], 10 * eps)) return false;
+    }
+    // overlap check with nearby cells
+    CellKey ck = cellOf(c, cell);
+    for (int dx = -1; dx <= 1; ++dx) {
+      for (int dy = -1; dy <= 1; ++dy) {
+        for (int dz = -1; dz <= 1; ++dz) {
+          CellKey nk{ck.x + dx, ck.y + dy, ck.z + dz};
+          auto it = grid.find(nk);
+          if (it == grid.end()) continue;
+          for (int idx : it->second) {
+            const auto& t = placed[idx];
+            if (tetraOverlapConservative(t.verts, t.c, outVerts, c, Rsq, 1e-8 * scale))
+              return false;
+          }
+        }
+      }
+    }
+    return true;
+  };
+
+  // Candidate loop: z-major for cache; offset pattern
+  const array<Vec3, 4> offsets = {Vec3{0, 0, 0}, Vec3{0.33, 0.11, 0.27}, Vec3{0.17, 0.37, 0.05},
+                                 Vec3{0.41, 0.23, 0.39}};
+
+  for (int64_t iz = 0; iz < nz && timeLeft() > 0.2; iz += stride) {
+    for (int64_t iy = 0; iy < ny && timeLeft() > 0.2; iy += stride) {
+      for (int64_t ix = 0; ix < nx && timeLeft() > 0.2; ix += stride) {
+        // Build base center
+        Vec3 base{mn.x + ix * step, mn.y + iy * step, mn.z + iz * step};
+        // Quick inside test (center); if outside, try next
+        if (!insideAllHalfspaces(faces, base, 50 * eps)) continue;
+
+        bool placedHere = false;
+        for (const auto& off : offsets) {
+          Vec3 c = base + Vec3{off.x * step, off.y * step, off.z * step};
+          if (!insideAllHalfspaces(faces, c, 50 * eps)) continue;
+          array<Vec3, 4> wv{};
+          // Try a few orientations; if time is low, reduce
+          int maxOri = (timeLeft() > 3.0) ? static_cast<int>(eulers.size()) : std::min<int>(12, (int)eulers.size());
+          for (int oi = 0; oi < maxOri; ++oi) {
+            const auto& ang = eulers[oi];
+            if (canPlace(c, ang, wv)) {
+              int idx = static_cast<int>(placed.size());
+              placed.push_back({c, ang[0], ang[1], ang[2], wv});
+              grid[cellOf(c, cell)].push_back(idx);
+              placedHere = true;
+              break;
+            }
+          }
+          if (placedHere) break;
+        }
+      }
+    }
+  }
+
+  // Output
+  std::cout.setf(std::ios::fixed);
+  std::cout << placed.size() << "\n";
+  std::cout << std::setprecision(10);
+  for (const auto& t : placed) {
+    std::cout << t.c.x << " " << t.c.y << " " << t.c.z << " " << t.rx << " " << t.ry << " " << t.rz
+              << "\n";
+  }
+  return 0;
+}

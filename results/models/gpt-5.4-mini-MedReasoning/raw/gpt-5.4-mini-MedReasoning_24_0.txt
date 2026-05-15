@@ -1,0 +1,252 @@
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <condition_variable>
+#include <cctype>
+#include <iomanip>
+#include <iostream>
+#include <mutex>
+#include <sstream>
+#include <string>
+#include <thread>
+
+using namespace std;
+
+constexpr double PI = 3.141592653589793238462643383279502884;
+
+static double clampd(double v, double lo, double hi) {
+    return std::max(lo, std::min(v, hi));
+}
+
+static double wrap_pi(double a) {
+    while (a > PI) a -= 2.0 * PI;
+    while (a < -PI) a += 2.0 * PI;
+    return a;
+}
+
+static string trim_copy(const string& s) {
+    size_t b = 0;
+    while (b < s.size() && std::isspace(static_cast<unsigned char>(s[b]))) ++b;
+    size_t e = s.size();
+    while (e > b && std::isspace(static_cast<unsigned char>(s[e - 1]))) --e;
+    return s.substr(b, e - b);
+}
+
+struct State {
+    double x = 0, y = 0, z = 0;
+    double vx = 0, vy = 0, vz = 0;
+    double pitch = 0, yaw = 0, roll = 0;
+    double pitch_rate = 0, yaw_rate = 0, roll_rate = 0;
+    double fuel_remaining = 0;
+    bool valid = false;
+    unsigned long long seq = 0;
+};
+
+struct Command {
+    double thrust = 0;
+    double pitch_cmd = 0;
+    double yaw_cmd = 0;
+    double roll_cmd = 0;
+};
+
+static bool parse_state_line(const string& line, State& s) {
+    std::stringstream ss(line);
+    return static_cast<bool>(
+        ss >> s.x >> s.y >> s.z
+           >> s.vx >> s.vy >> s.vz
+           >> s.pitch >> s.yaw >> s.roll
+           >> s.pitch_rate >> s.yaw_rate >> s.roll_rate
+           >> s.fuel_remaining
+    );
+}
+
+struct Params {
+    double width = 0;
+    double depth = 0;
+    double height = 0;
+    double gravity = 0;
+    double max_thrust = 0;
+    double target_x = 0;
+    double target_y = 0;
+    double target_z = 0;
+    double landing_radius = 5.0;
+    double cruise_z = 0;
+};
+
+struct Controller {
+    Params p;
+    mutable double last_yaw_target = 0.0;
+    mutable bool have_last_yaw_target = false;
+
+    Command compute(const State& s) const {
+        if (p.max_thrust <= 1e-9) {
+            return Command{};
+        }
+
+        const double dx = p.target_x - s.x;
+        const double dy = p.target_y - s.y;
+        const double horiz = std::hypot(dx, dy);
+        const double speed_xy = std::hypot(s.vx, s.vy);
+        const double speed = std::sqrt(s.vx * s.vx + s.vy * s.vy + s.vz * s.vz);
+
+        double z_goal = std::clamp(p.target_z + 12.0 + 0.10 * horiz, p.target_z + 1.0, p.cruise_z);
+        if (horiz < p.landing_radius * 1.5 && speed_xy < 2.0 && std::abs(s.vz) < 2.0 && s.z < p.target_z + 8.0) {
+            z_goal = (speed < 2.5 && s.z < p.target_z + 1.5) ? (p.target_z - 0.25) : (p.target_z + 0.75);
+        }
+        z_goal = std::clamp(z_goal, p.target_z - 0.5, p.cruise_z);
+
+        // Horizontal guidance is deliberately soft so vertical authority is preserved.
+        const double k_pos_xy = 0.004;
+        const double k_vel_xy = 0.50;
+        const double k_pos_z = 0.030;
+        const double k_vel_z = 0.80;
+
+        double desired_vert = p.gravity + k_pos_z * (z_goal - s.z) - k_vel_z * s.vz;
+        desired_vert = clampd(desired_vert, 0.0, p.max_thrust);
+
+        const double horiz_budget_sq = std::max(0.0, p.max_thrust * p.max_thrust - desired_vert * desired_vert);
+        const double horiz_budget = std::sqrt(horiz_budget_sq);
+
+        double hx = k_pos_xy * dx - k_vel_xy * s.vx;
+        double hy = k_pos_xy * dy - k_vel_xy * s.vy;
+        double hmag = std::hypot(hx, hy);
+        if (hmag > horiz_budget && hmag > 1e-9) {
+            const double scale = horiz_budget / hmag;
+            hx *= scale;
+            hy *= scale;
+            hmag = horiz_budget;
+        }
+
+        const double thrust_mag = std::sqrt(hx * hx + hy * hy + desired_vert * desired_vert);
+        Command cmd;
+        cmd.thrust = clampd(thrust_mag / p.max_thrust, 0.0, 1.0);
+
+        double pitch_des = 0.0;
+        double yaw_des = s.yaw;
+        if (hmag > 1e-8) {
+            pitch_des = std::atan2(hmag, desired_vert);
+            yaw_des = std::atan2(-hy, -hx);
+            last_yaw_target = yaw_des;
+            have_last_yaw_target = true;
+        } else if (have_last_yaw_target) {
+            yaw_des = last_yaw_target;
+        }
+
+        const double pitch_err = pitch_des - s.pitch;
+        const double yaw_err = wrap_pi(yaw_des - s.yaw);
+        const double roll_err = wrap_pi(0.0 - s.roll);
+
+        cmd.pitch_cmd = clampd(1.8 * pitch_err - 0.65 * s.pitch_rate, -1.0, 1.0);
+        cmd.yaw_cmd = clampd(1.6 * yaw_err - 0.65 * s.yaw_rate, -1.0, 1.0);
+        cmd.roll_cmd = clampd(1.0 * roll_err - 0.35 * s.roll_rate, -1.0, 1.0);
+        return cmd;
+    }
+};
+
+int main() {
+    ios::sync_with_stdio(false);
+    cin.tie(nullptr);
+
+    Params p;
+    double initial_fuel = 0.0;
+    double start_x = 0.0, start_y = 0.0, start_z = 0.0;
+    string terrain_path;
+
+    if (!(cin >> p.width >> p.depth >> p.height >> p.gravity >> p.max_thrust >> initial_fuel)) {
+        return 0;
+    }
+    if (!(cin >> start_x >> start_y >> start_z >> p.target_x >> p.target_y >> p.target_z)) {
+        return 0;
+    }
+
+    getline(cin, terrain_path); // consume rest of line
+    getline(cin, terrain_path); // terrain file path line
+
+    const double cruise_floor = p.target_z + 2.0;
+    double cruise_ceiling = p.height - 5.0;
+    if (cruise_ceiling < cruise_floor) cruise_ceiling = cruise_floor;
+    p.cruise_z = std::clamp(std::max(p.target_z + 50.0, p.height * 0.85), cruise_floor, cruise_ceiling);
+    p.landing_radius = std::max(5.0, std::min(p.width, p.depth) * 0.02);
+
+    // Optional marker line or first state line.
+    State bootstrap_state;
+    bool have_bootstrap_state = false;
+    string line;
+    while (getline(cin, line)) {
+        line = trim_copy(line);
+        if (line.empty()) continue;
+        if (line == "STATE") break;
+        if (parse_state_line(line, bootstrap_state)) {
+            have_bootstrap_state = true;
+        }
+        break;
+    }
+
+    mutex mtx;
+    condition_variable cv;
+    State latest;
+    atomic<bool> running{true};
+
+    if (have_bootstrap_state) {
+        lock_guard<mutex> lk(mtx);
+        bootstrap_state.valid = true;
+        bootstrap_state.seq = 1;
+        latest = bootstrap_state;
+    }
+
+    thread reader([&] {
+        State s;
+        while (true) {
+            if (!(cin >> s.x >> s.y >> s.z
+                      >> s.vx >> s.vy >> s.vz
+                      >> s.pitch >> s.yaw >> s.roll
+                      >> s.pitch_rate >> s.yaw_rate >> s.roll_rate
+                      >> s.fuel_remaining)) {
+                break;
+            }
+            {
+                lock_guard<mutex> lk(mtx);
+                s.valid = true;
+                s.seq = latest.seq + 1;
+                latest = s;
+            }
+            cv.notify_one();
+        }
+        running = false;
+        cv.notify_all();
+    });
+
+    Controller controller{p};
+    unsigned long long last_seq = have_bootstrap_state ? 1ULL : 0ULL;
+    bool have_state = have_bootstrap_state;
+
+    cout.setf(std::ios::fixed);
+    cout << setprecision(6);
+
+    while (true) {
+        State s;
+        {
+            unique_lock<mutex> lk(mtx);
+            if (!have_state) {
+                cv.wait(lk, [&] { return latest.valid || !running.load(); });
+                if (!latest.valid && !running.load()) break;
+            } else {
+                cv.wait_for(lk, chrono::milliseconds(50), [&] {
+                    return latest.seq != last_seq || !running.load();
+                });
+                if (!running.load() && latest.seq == last_seq) break;
+            }
+            if (!latest.valid) continue;
+            s = latest;
+            last_seq = latest.seq;
+            have_state = true;
+        }
+
+        Command cmd = controller.compute(s);
+        cout << cmd.thrust << ' ' << cmd.pitch_cmd << ' ' << cmd.yaw_cmd << ' ' << cmd.roll_cmd << '\n' << flush;
+    }
+
+    if (reader.joinable()) reader.join();
+    return 0;
+}

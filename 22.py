@@ -10,12 +10,13 @@ from pathlib import Path
 
 # Import our native compiler helper
 from native_compiler import CSharpCompiler, CompilationError, ExecutionError, describe_this_pc
+from solver_utils import normalize_code_result
 
 title = "Tetris Game (C#)"
 
 tags = [
   "csharp",
-  "structured response",
+  "freeform response",
   "game ai",
   "algorithm design",
 ]
@@ -447,21 +448,7 @@ Write complete, compilable C# code with a Main method.
 Include adaptive logic that chooses different strategies based on game complexity.
 """
 
-structure = {
-  "type": "object",
-  "properties": {
-    "reasoning": {
-      "type": "string",
-      "description": "Explain your strategy"
-    },
-    "csharp_code": {
-      "type": "string",
-      "description": "Complete C# code with Main method and processes each tetris block."
-    }
-  },
-  "required": ["reasoning", "csharp_code"],
-  "additionalProperties": False
-}
+structure = None
 
 
 
@@ -625,6 +612,7 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
     - Pieces placed / total pieces
     - Bonus for lines cleared
     """
+  result = normalize_code_result(result, "csharp_code")
   if not result:
     return 0.0, "No result provided"
 
@@ -659,6 +647,7 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
 
 
 def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
+  result = normalize_code_result(result, "csharp_code")
   if not result:
     return "<p style='color:red'>No result provided</p>"
   case = TEST_CASES[subPass]

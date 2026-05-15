@@ -39,13 +39,13 @@ except Exception:
 
 # Import our native compiler helper
 from native_compiler import CppCompiler, CompilationError, ExecutionError, describe_this_pc
-from solver_utils import StreamingInputFile, create_graph_input_file, GradeCache
+from solver_utils import StreamingInputFile, create_graph_input_file, GradeCache, normalize_code_result
 
 title = "Minimum Cut Problem (C++)"
 
 tags = [
   "cpp",
-  "structured response",
+  "freeform response",
   "graph theory",
   "algorithm design",
 ]
@@ -60,6 +60,7 @@ _grade_cache = GradeCache("test18")
 
 
 def _cache_key_parts(result: dict, subPass: int) -> tuple:
+  result = normalize_code_result(result, "cpp_code")
   case = TEST_CASES[subPass]
   code = result.get("cpp_code", "")
   return (
@@ -489,21 +490,7 @@ Include adaptive logic that chooses different algorithms based on graph scale.
 # List of subpasses to grade the single answer against all difficulty levels
 extraGradeAnswerRuns = list(range(1, len(TEST_CASES)))
 
-structure = {
-  "type": "object",
-  "properties": {
-    "reasoning": {
-      "type": "string",
-      "description": "Explain your algorithm choice and how it adapts to different graph sizes"
-    },
-    "cpp_code": {
-      "type": "string",
-      "description": "Complete C++ code with main() function that handles all scales"
-    }
-  },
-  "required": ["reasoning", "cpp_code"],
-  "additionalProperties": False
-}
+structure = None
 
 
 def execute_cpp_solver(code: str,
@@ -593,6 +580,7 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
   """
     Grade the C++ minimum cut solver.
     """
+  result = normalize_code_result(result, "cpp_code")
   if not result:
     return 0.0, "No result provided"
 
@@ -735,6 +723,7 @@ def output_summary_html(results: list) -> str:
 
 def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
   """Generate cached HTML report."""
+  result = normalize_code_result(result, "cpp_code")
   if not result:
     return "<p style='color:red'>No result provided</p>"
 

@@ -1,1 +1,581 @@
-{'reasoning': "Approach (robust across simple → huge maps):\n\n1) Real‑time I/O safety:\n- Use two threads.\n  - Reader thread continuously reads stdin, parses numbers/lines, and sends the latest state over a bounded channel (keeping only newest).\n  - Control loop thread runs at ~50 Hz and always outputs a command even if no new state arrives (prevents 100ms gaps).\n- Output is line‑buffered via BufWriter and flushed each tick.\n\n2) Map handling (supports multi‑GB maps):\n- Do NOT store the full voxel map.\n- While reading map rows, only extract what matters:\n  - landing zone extents on the target row (continuous run of 'L'/'T'), and\n  - a conservative “ground height” estimate under/near the target column by scanning the target row only.\nThis keeps memory O(width) at worst, but here it’s O(1).\n\n3) Control policy (works without path planning):\n- A cascaded PD controller aiming at a “hover point” above the target, then a vertical soft landing.\n- Compute desired accelerations ax, ay from position/velocity errors.\n- Convert desired acceleration to desired thrust magnitude and desired angle:\n  - thrust direction is along lander’s facing axis.\n  - With angle measured relative to +x (assumed), and y down, thrust produces acceleration:\n      ax =  a_thrust * cos(angle)\n      ay =  a_thrust * sin(angle)  (negative ay means upward if sin(angle) < 0)\n  - We compensate gravity by adding +g to desired ay.\n- Angle command: PD on (angle error) to produce turn rate in [-1, 1].\n- Thrust command: clamp to [0,1], reduce near touchdown to meet |v|<2.\n\n4) Phase logic:\n- Phase A (approach): steer toward target_x and a hover altitude above target_y.\n- Phase B (final): when close in x and low altitude, prioritize killing vx and reducing descent rate.\n\nThis controller is simple but stable and fast, and avoids heavy map processing (critical for huge maps).", 'rust_code': 'use std::f64::consts::PI;\nuse std::io::{self, Read, Write, BufWriter};\nuse std::sync::mpsc::{self, SyncSender, Receiver, TrySendError};\nuse std::thread;\nuse std::time::{Duration, Instant};\n\n#[derive(Clone, Copy, Debug, Default)]\nstruct State {\n    x: f64,\n    y: f64,\n    vx: f64,\n    vy: f64,\n    angle: f64,\n    ang_vel: f64,\n    fuel: f64,\n}\n\n#[derive(Clone, Copy, Debug)]\nstruct Init {\n    width: usize,\n    height: usize,\n    g: f64,\n    max_thrust: f64,\n    fuel0: f64,\n    start_x: f64,\n    start_y: f64,\n    target_x: f64,\n    target_y: f64,\n    // landing zone extents (inclusive) in world x coordinates (cell centers assumed at integer coords)\n    lz_xmin: f64,\n    lz_xmax: f64,\n}\n\nfn clamp(x: f64, lo: f64, hi: f64) -> f64 {\n    if x < lo { lo } else if x > hi { hi } else { x }\n}\n\nfn wrap_pi(mut a: f64) -> f64 {\n    while a > PI { a -= 2.0 * PI; }\n    while a < -PI { a += 2.0 * PI; }\n    a\n}\n\n/// Parse initial header and map from a whitespace stream.\n/// Map rows are read as tokens (strings without whitespace). We do not store the map.\nfn read_initial_from_tokens(tokens: &mut dyn Iterator<Item = String>) -> Init {\n    let width: usize = tokens.next().unwrap().parse().unwrap();\n    let height: usize = tokens.next().unwrap().parse().unwrap();\n    let g: f64 = tokens.next().unwrap().parse().unwrap();\n    let max_thrust: f64 = tokens.next().unwrap().parse().unwrap();\n    let fuel0: f64 = tokens.next().unwrap().parse().unwrap();\n\n    let start_x: f64 = tokens.next().unwrap().parse().unwrap();\n    let start_y: f64 = tokens.next().unwrap().parse().unwrap();\n    let target_x: f64 = tokens.next().unwrap().parse().unwrap();\n    let target_y: f64 = tokens.next().unwrap().parse().unwrap();\n\n    // Determine landing zone extent by scanning for \'L\' and \'T\' characters.\n    // We assume landing zone is contiguous on some row including \'T\'.\n    // We pick the row that contains \'T\' as the landing row.\n    let mut lz_min: Option<usize> = None;\n    let mut lz_max: Option<usize> = None;\n\n    for _ in 0..height {\n        let row = tokens.next().unwrap_or_default();\n        if row.is_empty() { continue; }\n        if row.contains(\'T\') {\n            let bytes = row.as_bytes();\n            for (i, &b) in bytes.iter().enumerate() {\n                if b == b\'L\' || b == b\'T\' {\n                    lz_min = Some(lz_min.map(|m| m.min(i)).unwrap_or(i));\n                    lz_max = Some(lz_max.map(|m| m.max(i)).unwrap_or(i));\n                }\n            }\n        }\n    }\n\n    let (lz_xmin, lz_xmax) = if let (Some(a), Some(b)) = (lz_min, lz_max) {\n        (a as f64, b as f64)\n    } else {\n        // Fallback if map lacks explicit zone: use a small pad around target.\n        (target_x - 2.0, target_x + 2.0)\n    };\n\n    Init {\n        width,\n        height,\n        g,\n        max_thrust,\n        fuel0,\n        start_x,\n        start_y,\n        target_x,\n        target_y,\n        lz_xmin,\n        lz_xmax,\n    }\n}\n\nfn compute_control(init: &Init, s: &State) -> (f64, f64) {\n    // Phases based on distance to target and altitude above target.\n    let dx = init.target_x - s.x;\n    let dy = init.target_y - s.y; // Note: y increases downward; target_y likely ground. If s.y < target_y, dy>0 means below? Actually dy = target - current.\n\n    let alt_above_target = (init.target_y - s.y); // positive if we are above the pad.\n\n    // Desired hover height above target for approach.\n    let hover_h = 25.0;\n    let desired_y = if alt_above_target > hover_h { init.target_y - hover_h } else { init.target_y - 2.0 };\n\n    // Tighten lateral control near ground.\n    let near_ground = alt_above_target < 18.0;\n    let very_near = alt_above_target < 6.0;\n\n    // Keep within landing zone x when close.\n    let target_x = if near_ground {\n        clamp(init.target_x, init.lz_xmin + 0.5, init.lz_xmax - 0.5)\n    } else {\n        init.target_x\n    };\n\n    let ex = target_x - s.x;\n    let ey = desired_y - s.y;\n\n    // PD gains (tuned to be stable across many g/thrust settings).\n    let kp_x = if near_ground { 0.12 } else { 0.06 };\n    let kd_x = if near_ground { 0.35 } else { 0.25 };\n\n    let kp_y = if near_ground { 0.20 } else { 0.10 };\n    let kd_y = if near_ground { 0.55 } else { 0.35 };\n\n    // Desired accelerations (world frame). y down.\n    let mut ax = kp_x * ex - kd_x * s.vx;\n\n    // Vertical: aim for gentle descent near pad.\n    // If very near, directly regulate vy to about +0.5..+1.0 m/s down, and kill vx.\n    let desired_vy = if very_near {\n        0.8\n    } else if near_ground {\n        1.5\n    } else {\n        // allow faster descent when high\n        6.0\n    };\n\n    let mut ay = kp_y * ey - kd_y * (s.vy - desired_vy);\n\n    // Kill lateral harder when very near.\n    if very_near {\n        ax = 0.0 * ex - 0.8 * s.vx;\n    }\n\n    // Convert desired accel to thrust vector requirement.\n    // Net acceleration = thrust_accel + gravity (down +g).\n    // So thrust_accel_y should be (ay - g) ???\n    // If we want net ay (down positive), and gravity contributes +g,\n    // then thrust contribution in y is (ay - g).\n    let thrust_ay = ay - init.g;\n    let thrust_ax = ax;\n\n    let desired_thrust_acc = (thrust_ax * thrust_ax + thrust_ay * thrust_ay).sqrt();\n\n    // Desired angle points in direction of thrust acceleration.\n    // angle=0 => thrust along +x, angle=PI/2 => along +y (down).\n    // We generally want thrust upward => negative y => angle around -PI/2.\n    let desired_angle = thrust_ay.atan2(thrust_ax);\n\n    // Convert thrust accel to throttle.\n    let mut throttle = if init.max_thrust > 1e-6 {\n        desired_thrust_acc / init.max_thrust\n    } else {\n        0.0\n    };\n\n    // Fuel safety: if out of fuel, throttle = 0.\n    if s.fuel <= 0.0 {\n        throttle = 0.0;\n    }\n\n    // Clamp throttle.\n    throttle = clamp(throttle, 0.0, 1.0);\n\n    // Angle control (PD) to turn rate.\n    let ang_err = wrap_pi(desired_angle - s.angle);\n    let kp_ang = 3.2;\n    let kd_ang = 0.6;\n    let mut turn = kp_ang * ang_err - kd_ang * s.ang_vel;\n    turn = clamp(turn, -1.0, 1.0);\n\n    // Touchdown guard: if extremely close to target height, reduce thrust to avoid bouncing,\n    // but keep enough to keep vy small.\n    if alt_above_target < 1.2 {\n        // If descending too fast, burn hard.\n        if s.vy > 2.0 {\n            throttle = throttle.max(0.6);\n        } else {\n            throttle = throttle.min(0.25);\n        }\n        // Prefer upright-ish (thrust up) by limiting angle magnitude.\n        // We can only request turn rate, but bias desired to -PI/2.\n        let desired = -PI / 2.0;\n        let e = wrap_pi(desired - s.angle);\n        turn = clamp(2.5 * e - 0.5 * s.ang_vel, -1.0, 1.0);\n    }\n\n    (throttle, turn)\n}\n\nfn main() {\n    // Read all initial data + then stream states.\n    // To avoid blocking the control loop, we spawn a reader thread that reads stdin.\n\n    let (tx, rx): (SyncSender<State>, Receiver<State>) = mpsc::sync_channel(1);\n\n    // Reader thread: reads stdin into a String buffer incrementally.\n    let reader = thread::spawn(move || {\n        let mut input = String::new();\n        io::stdin().read_to_string(&mut input).ok();\n        let mut it = input.split_whitespace().map(|s| s.to_string());\n\n        // Parse init and map.\n        let init = read_initial_from_tokens(&mut it);\n\n        // Send init via a hack: first state packet encodes init? No.\n        // Instead, print init to stderr? Can\'t rely.\n        // We\'ll store init in a global? Not allowed.\n        // Solution: after parsing init, we start parsing states and send them; \n        // the control thread will parse init itself by reading from stdin in main.\n        // But we already consumed stdin here.\n        // Therefore: we must parse init in main BEFORE spawning reader.\n        drop(init);\n\n        // Not used.\n        let _ = it;\n    });\n\n    // The above approach is wrong because it consumes stdin.\n    // We need: main thread reads init synchronously (small), then spawn a streaming reader\n    // that continues reading states.\n    // Implement that properly below.\n\n    let _ = reader;\n\n    // --- Proper implementation ---\n\n    // Rewind not possible; so we must do it properly from the start.\n}\n\n// The real program is below (kept separate to avoid half-consumed stdin).\n\n#[allow(dead_code)]\nfn _real_main() {\n    // Read initial header + map rows using a small buffered reader.\n    // Then spawn a dedicated streaming reader for subsequent numeric state updates.\n\n    // We will read from stdin in one thread only; to still avoid control stalls,\n    // we move stdin reading to the reader thread after extracting init.\n\n    let mut stdin = io::stdin().lock();\n    let mut buf = String::new();\n\n    // Helper: read next token (whitespace separated) from stdin.\n    fn next_token<R: io::BufRead>(r: &mut R, buf: &mut String) -> Option<String> {\n        loop {\n            if let Some(tok) = buf.split_whitespace().next() {\n                // Can\'t easily advance without re-buffering.\n            }\n            break;\n        }\n        None\n    }\n\n    // This dead_code placeholder exists only because Rust requires a single main.\n    // The full working version is provided below in `main_working()`.\n}\n\n// --- Full working version ---\n\nfn main_working() {\n    // Single stdin reader thread; main thread becomes controller.\n    // To parse init in controller thread without risking long stalls, we do it quickly:\n    //  - read first few lines and the map rows; then hand the locked stdin to reader thread is not possible.\n    // So we instead parse init+map in the reader thread, and send Init to controller via a channel.\n\n    let (init_tx, init_rx) = mpsc::sync_channel::<Init>(1);\n    let (state_tx, state_rx) = mpsc::sync_channel::<State>(1);\n\n    let reader = thread::spawn(move || {\n        // Use BufRead for streaming tokens.\n        let stdin = io::stdin();\n        let mut reader = io::BufReader::new(stdin.lock());\n        let mut bytes = Vec::<u8>::with_capacity(1 << 16);\n        let mut tmp = [0u8; 8192];\n\n        // Tokenizer: reads bytes and yields tokens without allocating per-char.\n        // We implement a simple pull tokenizer with an internal buffer.\n        struct Tok {\n            buf: Vec<u8>,\n            i: usize,\n        }\n        impl Tok {\n            fn new() -> Self { Self { buf: Vec::new(), i: 0 } }\n            fn refill<R: Read>(&mut self, r: &mut R, tmp: &mut [u8]) -> bool {\n                let n = match r.read(tmp) { Ok(0) | Err(_) => 0, Ok(n) => n };\n                if n == 0 { return false; }\n                if self.i > 0 {\n                    self.buf.drain(0..self.i);\n                    self.i = 0;\n                }\n                self.buf.extend_from_slice(&tmp[..n]);\n                true\n            }\n            fn next_token<R: Read>(&mut self, r: &mut R, tmp: &mut [u8]) -> Option<Vec<u8>> {\n                loop {\n                    // skip whitespace\n                    while self.i < self.buf.len() && self.buf[self.i].is_ascii_whitespace() {\n                        self.i += 1;\n                    }\n                    if self.i < self.buf.len() {\n                        break;\n                    }\n                    if !self.refill(r, tmp) {\n                        return None;\n                    }\n                }\n                let start = self.i;\n                while self.i < self.buf.len() && !self.buf[self.i].is_ascii_whitespace() {\n                    self.i += 1;\n                }\n                Some(self.buf[start..self.i].to_vec())\n            }\n            fn next_f64<R: Read>(&mut self, r: &mut R, tmp: &mut [u8]) -> Option<f64> {\n                let t = self.next_token(r, tmp)?;\n                let s = unsafe { std::str::from_utf8_unchecked(&t) };\n                s.parse::<f64>().ok()\n            }\n            fn next_usize<R: Read>(&mut self, r: &mut R, tmp: &mut [u8]) -> Option<usize> {\n                let t = self.next_token(r, tmp)?;\n                let s = unsafe { std::str::from_utf8_unchecked(&t) };\n                s.parse::<usize>().ok()\n            }\n        }\n\n        let mut tok = Tok::new();\n\n        // Parse init\n        let width = tok.next_usize(&mut reader, &mut tmp).unwrap();\n        let height = tok.next_usize(&mut reader, &mut tmp).unwrap();\n        let g = tok.next_f64(&mut reader, &mut tmp).unwrap();\n        let max_thrust = tok.next_f64(&mut reader, &mut tmp).unwrap();\n        let fuel0 = tok.next_f64(&mut reader, &mut tmp).unwrap();\n\n        let start_x = tok.next_f64(&mut reader, &mut tmp).unwrap();\n        let start_y = tok.next_f64(&mut reader, &mut tmp).unwrap();\n        let target_x = tok.next_f64(&mut reader, &mut tmp).unwrap();\n        let target_y = tok.next_f64(&mut reader, &mut tmp).unwrap();\n\n        let mut lz_min: Option<usize> = None;\n        let mut lz_max: Option<usize> = None;\n\n        for _ in 0..height {\n            let row_bytes = tok.next_token(&mut reader, &mut tmp).unwrap_or_default();\n            if row_bytes.is_empty() { continue; }\n            let row = row_bytes;\n            let has_t = row.iter().any(|&b| b == b\'T\');\n            if has_t {\n                for (i, &b) in row.iter().enumerate() {\n                    if b == b\'L\' || b == b\'T\' {\n                        lz_min = Some(lz_min.map(|m| m.min(i)).unwrap_or(i));\n                        lz_max = Some(lz_max.map(|m| m.max(i)).unwrap_or(i));\n                    }\n                }\n            }\n        }\n\n        let (lz_xmin, lz_xmax) = if let (Some(a), Some(b)) = (lz_min, lz_max) {\n            (a as f64, b as f64)\n        } else {\n            (target_x - 2.0, target_x + 2.0)\n        };\n\n        let init = Init {\n            width,\n            height,\n            g,\n            max_thrust,\n            fuel0,\n            start_x,\n            start_y,\n            target_x,\n            target_y,\n            lz_xmin,\n            lz_xmax,\n        };\n\n        let _ = init_tx.send(init);\n\n        // Stream states\n        loop {\n            let x = match tok.next_f64(&mut reader, &mut tmp) { Some(v) => v, None => break };\n            let y = match tok.next_f64(&mut reader, &mut tmp) { Some(v) => v, None => break };\n            let vx = match tok.next_f64(&mut reader, &mut tmp) { Some(v) => v, None => break };\n            let vy = match tok.next_f64(&mut reader, &mut tmp) { Some(v) => v, None => break };\n            let angle = match tok.next_f64(&mut reader, &mut tmp) { Some(v) => v, None => break };\n            let ang_vel = match tok.next_f64(&mut reader, &mut tmp) { Some(v) => v, None => break };\n            let fuel = match tok.next_f64(&mut reader, &mut tmp) { Some(v) => v, None => break };\n\n            let s = State { x, y, vx, vy, angle, ang_vel, fuel };\n\n            match state_tx.try_send(s) {\n                Ok(_) => {}\n                Err(TrySendError::Full(_)) => {\n                    // Drop oldest by receiving once, then send.\n                    let _ = state_rx.recv_timeout(Duration::from_millis(0));\n                    let _ = state_tx.try_send(s);\n                }\n                Err(TrySendError::Disconnected(_)) => break,\n            }\n        }\n    });\n\n    let init = init_rx.recv().unwrap();\n\n    let mut out = BufWriter::new(io::stdout().lock());\n\n    // Control loop at 50 Hz to satisfy >=20 Hz output even if inputs come at 10 Hz.\n    let dt = Duration::from_millis(20);\n    let mut next_tick = Instant::now();\n    let mut last_state: State = State { x: init.start_x, y: init.start_y, ..State::default() };\n\n    loop {\n        // Drain newest state if available.\n        while let Ok(s) = state_rx.try_recv() {\n            last_state = s;\n        }\n\n        let (thrust, turn) = compute_control(&init, &last_state);\n        let _ = writeln!(out, "{:.6} {:.6}", thrust, turn);\n        let _ = out.flush();\n\n        next_tick += dt;\n        let now = Instant::now();\n        if next_tick > now {\n            thread::sleep(next_tick - now);\n        } else {\n            // If we fell behind, resync quickly.\n            next_tick = now;\n        }\n    }\n\n    let _ = reader.join();\n}\n\n// Ensure the correct entry point uses the working implementation.\n#[allow(dead_code)]\nfn _force() {\n    // no-op\n}\n\n// Override the earlier stub main by calling main_working.\n// (We keep this as the actual main body.)\n#[cfg(not(test))]\nfn main() {\n    main_working();\n}\n'}
+use std::f64::consts::PI;
+use std::io::{self, Read, Write};
+use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::thread;
+use std::time::{Duration, Instant};
+
+#[derive(Clone, Copy, Debug, Default)]
+struct State {
+    x: f64,
+    y: f64,
+    vx: f64,
+    vy: f64,
+    angle: f64,
+    angular_vel: f64,
+    fuel: f64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct MapInfo {
+    width: usize,
+    height: usize,
+    gravity: f64,
+    max_thrust: f64,
+    fuel: f64,
+    start_x: f64,
+    start_y: f64,
+    target_x: f64,
+    target_y: f64,
+}
+
+fn clamp(v: f64, lo: f64, hi: f64) -> f64 {
+    if v < lo {
+        lo
+    } else if v > hi {
+        hi
+    } else {
+        v
+    }
+}
+
+fn wrap_pi(mut a: f64) -> f64 {
+    while a > PI {
+        a -= 2.0 * PI;
+    }
+    while a < -PI {
+        a += 2.0 * PI;
+    }
+    a
+}
+
+fn parse_f64(s: &str) -> Option<f64> {
+    s.parse::<f64>().ok()
+}
+
+fn parse_usize(s: &str) -> Option<usize> {
+    s.parse::<usize>().ok()
+}
+
+fn reader_thread(tx: SyncSender<State>) {
+    // Read stdin in a tight loop and push parsed states through a bounded channel.
+    // We intentionally keep parsing simple and allocation-light.
+    let mut input = String::new();
+    let mut stdin = io::stdin();
+    // Read all available first; but stdin is streaming. Use Read::read_to_string blocks.
+    // Instead, read in chunks and split whitespace manually.
+    let mut buf = [0u8; 1 << 16];
+    let mut carry = String::new();
+
+    loop {
+        match stdin.read(&mut buf) {
+            Ok(0) => {
+                // EOF
+                break;
+            }
+            Ok(n) => {
+                let chunk = String::from_utf8_lossy(&buf[..n]);
+                input.clear();
+                input.push_str(&carry);
+                input.push_str(&chunk);
+
+                // Split by whitespace; keep tail if it ends mid-token.
+                let mut last_is_ws = false;
+                if let Some(ch) = input.chars().last() {
+                    last_is_ws = ch.is_whitespace();
+                }
+
+                let mut it = input.split_whitespace();
+                // We don't know where initial map parsing ended; the controller thread does that.
+                // Here, we only parse state updates: 7 floats at a time.
+                // If initial map lines are still in stream, controller will have already consumed them
+                // before starting this thread in main.
+                let mut vals: [f64; 7] = [0.0; 7];
+                loop {
+                    let mut ok = true;
+                    for i in 0..7 {
+                        if let Some(tok) = it.next() {
+                            if let Some(v) = parse_f64(tok) {
+                                vals[i] = v;
+                            } else {
+                                ok = false;
+                                break;
+                            }
+                        } else {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if !ok {
+                        break;
+                    }
+                    let s = State {
+                        x: vals[0],
+                        y: vals[1],
+                        vx: vals[2],
+                        vy: vals[3],
+                        angle: vals[4],
+                        angular_vel: vals[5],
+                        fuel: vals[6],
+                    };
+                    // If channel is full, drop oldest by trying a send; if it blocks, we can
+                    // just skip (best-effort). Use try_send behavior by bounded + blocking send
+                    // with short timeout is not available; so we use send which may block.
+                    // To avoid reader stalling, we try a non-blocking pattern by first draining
+                    // receiver is not possible here. So we accept occasional blocking but keep
+                    // buffer small and controller fast.
+                    if tx.send(s).is_err() {
+                        return;
+                    }
+                }
+
+                if last_is_ws {
+                    carry.clear();
+                } else {
+                    // Save the last partial token: find last whitespace boundary.
+                    if let Some(pos) = input.rfind(|c: char| c.is_whitespace()) {
+                        carry.clear();
+                        carry.push_str(&input[pos + 1..]);
+                    } else {
+                        carry = input.clone();
+                    }
+                }
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+fn parse_initial_map(mut raw: String) -> Option<(MapInfo, Vec<(i32, i32)>, (i32, i32, i32, i32))> {
+    // Returns (info, landing_zone_cells, bbox)
+    // bbox = (min_x, max_x, min_y, max_y) of solid/ground (# or L or T) for basic height inference.
+
+    // We cannot assume map is small; but the benchmark says it can be huge.
+    // We therefore only parse header tokens from the beginning and then scan rows line-by-line,
+    // keeping only L cells near the target and tracking ground height by column around target.
+
+    // However, we were given the entire raw initial map string here, so use it directly.
+    // In the real judge, initial map will likely be moderate; but still keep memory modest.
+
+    let mut it = raw.split_whitespace();
+
+    let width = parse_usize(it.next()?)?;
+    let height = parse_usize(it.next()?)?;
+    let gravity = parse_f64(it.next()?)?;
+    let max_thrust = parse_f64(it.next()?)?;
+    let fuel = parse_f64(it.next()?)?;
+
+    let start_x = parse_f64(it.next()?)?;
+    let start_y = parse_f64(it.next()?)?;
+    let target_x = parse_f64(it.next()?)?;
+    let target_y = parse_f64(it.next()?)?;
+
+    let mut landing_cells: Vec<(i32, i32)> = Vec::new();
+
+    // Basic bbox for solids
+    let mut min_x = i32::MAX;
+    let mut max_x = i32::MIN;
+    let mut min_y = i32::MAX;
+    let mut max_y = i32::MIN;
+
+    // Remaining tokens are row strings (may contain no whitespace). Because split_whitespace will
+    // treat each row as a token, we can iterate height rows.
+    for y in 0..height {
+        let row = it.next().unwrap_or("");
+        // If row is shorter, treat missing as '.'
+        for (x, ch) in row.chars().take(width).enumerate() {
+            if ch == 'L' {
+                landing_cells.push((x as i32, y as i32));
+            }
+            if ch == '#' || ch == 'L' || ch == 'T' {
+                let xi = x as i32;
+                let yi = y as i32;
+                if xi < min_x {
+                    min_x = xi;
+                }
+                if xi > max_x {
+                    max_x = xi;
+                }
+                if yi < min_y {
+                    min_y = yi;
+                }
+                if yi > max_y {
+                    max_y = yi;
+                }
+            }
+        }
+    }
+
+    if min_x == i32::MAX {
+        min_x = 0;
+        max_x = (width as i32).saturating_sub(1);
+        min_y = 0;
+        max_y = (height as i32).saturating_sub(1);
+    }
+
+    let info = MapInfo {
+        width,
+        height,
+        gravity,
+        max_thrust,
+        fuel,
+        start_x,
+        start_y,
+        target_x,
+        target_y,
+    };
+
+    Some((info, landing_cells, (min_x, max_x, min_y, max_y)))
+}
+
+fn compute_landing_zone(landing_cells: &[(i32, i32)], info: &MapInfo) -> (f64, f64, f64) {
+    // Returns (zone_left, zone_right, zone_y) in meters. If missing, fallback around target.
+    if landing_cells.is_empty() {
+        let half = 2.0;
+        return (info.target_x - half, info.target_x + half, info.target_y);
+    }
+    let mut min_x = i32::MAX;
+    let mut max_x = i32::MIN;
+    let mut sum_y = 0i64;
+    for &(x, y) in landing_cells {
+        if x < min_x {
+            min_x = x;
+        }
+        if x > max_x {
+            max_x = x;
+        }
+        sum_y += y as i64;
+    }
+    let zone_y = (sum_y as f64) / (landing_cells.len() as f64);
+    (min_x as f64, (max_x as f64) + 1.0, zone_y)
+}
+
+fn controller(info: MapInfo, zone_left: f64, zone_right: f64, zone_y: f64, rx: Receiver<State>) {
+    let mut out = io::BufWriter::new(io::stdout());
+
+    // Control gains / heuristics
+    let g = info.gravity;
+    let amax = info.max_thrust;
+
+    let dt_out = Duration::from_millis(20); // 50 Hz output
+    let mut last_out = Instant::now();
+
+    let mut cur = State::default();
+    let mut have = false;
+
+    // Keep a short-term estimate of time since last state update to avoid stalling.
+    let mut last_state_time = Instant::now();
+
+    loop {
+        // Drain latest state if available
+        while let Ok(s) = rx.try_recv() {
+            cur = s;
+            have = true;
+            last_state_time = Instant::now();
+        }
+
+        if !have {
+            // Before first state, output safe neutral
+            writeln!(out, "0 0").ok();
+            out.flush().ok();
+            thread::sleep(dt_out);
+            continue;
+        }
+
+        // If state stream stalls, still output something to keep 20Hz.
+        let now = Instant::now();
+        if now.duration_since(last_out) < dt_out {
+            // Yield a bit
+            thread::sleep(Duration::from_millis(1));
+            continue;
+        }
+        last_out = now;
+
+        // Position errors
+        let pad_x = info.target_x;
+        let pad_y = zone_y.max(info.target_y);
+        let ex = pad_x - cur.x;
+        let ey = pad_y - cur.y;
+
+        // Desired horizontal speed: proportional, but limited. If outside zone, aim to enter.
+        let zone_center = 0.5 * (zone_left + zone_right);
+        let zone_half = 0.5 * (zone_right - zone_left).max(1.0);
+
+        let x_goal = if cur.x < zone_left {
+            zone_left + 0.25 * zone_half
+        } else if cur.x > zone_right {
+            zone_right - 0.25 * zone_half
+        } else {
+            zone_center
+        };
+        let ex2 = x_goal - cur.x;
+
+        let mut vx_des = clamp(0.7 * ex2, -8.0, 8.0);
+        // As we get close to ground, reduce lateral motion
+        let altitude = (pad_y - cur.y).max(0.0);
+        if altitude < 20.0 {
+            vx_des = clamp(vx_des, -2.0, 2.0);
+        }
+        if altitude < 8.0 {
+            vx_des = clamp(vx_des, -0.8, 0.8);
+        }
+
+        // Desired vertical speed: descend faster when high, slow near pad.
+        let mut vy_des = if altitude > 60.0 {
+            18.0
+        } else if altitude > 25.0 {
+            10.0
+        } else if altitude > 12.0 {
+            6.0
+        } else if altitude > 6.0 {
+            3.0
+        } else {
+            1.0
+        };
+        // If we are above target (negative ey because y increases down), keep descending.
+        // vy positive is downward.
+        if ey < 0.0 {
+            vy_des = vy_des.max(2.0);
+        }
+
+        // Acceleration commands (world frame)
+        let ax_cmd = clamp(0.9 * (vx_des - cur.vx), -amax * 0.6, amax * 0.6);
+        let ay_cmd = clamp(0.9 * (vy_des - cur.vy), -amax * 0.8, amax * 0.8);
+
+        // We want thrust to achieve (-ax_cmd, -ay_cmd - g)?? Careful with axes:
+        // World y positive down. Gravity adds +g to vy.
+        // Thrust accel components:
+        // a_tx = thrust_acc * sin(angle)
+        // a_ty = -thrust_acc * cos(angle)  (since angle=0 facing up => thrust upward = negative y)
+        // Total accel: ax = a_tx; ay = g + a_ty
+        // We want ax -> ax_cmd, ay -> ay_cmd.
+        // So desired thrust vector in world:
+        // ax_des = ax_cmd
+        // ay_des = ay_cmd - g  (because thrust must provide ay - g)
+        let ax_des = ax_cmd;
+        let ay_des = ay_cmd - g;
+
+        // Convert desired vector to desired angle and thrust magnitude.
+        // thrust_acc * [sin(a), -cos(a)] = [ax_des, ay_des]
+        // => sin(a)=ax_des/t, -cos(a)=ay_des/t
+        // Let t = sqrt(ax_des^2 + ay_des^2)
+        let t_acc = (ax_des * ax_des + ay_des * ay_des).sqrt();
+        let t_acc_clamped = clamp(t_acc, 0.0, amax);
+        let thrust = if amax > 1e-9 {
+            clamp(t_acc_clamped / amax, 0.0, 1.0)
+        } else {
+            0.0
+        };
+
+        // Desired angle from components: a = atan2(ax_des, -ay_des)
+        // because sin(a)=ax/t, cos(a)=? from -cos(a)=ay/t => cos(a)=-ay/t
+        let angle_des = if t_acc > 1e-9 {
+            (ax_des).atan2(-ay_des)
+        } else {
+            0.0
+        };
+
+        // Limit aggressive tilts near landing
+        let mut angle_des_limited = angle_des;
+        if altitude < 15.0 {
+            angle_des_limited = clamp(angle_des_limited, -0.35, 0.35);
+        } else if altitude < 40.0 {
+            angle_des_limited = clamp(angle_des_limited, -0.7, 0.7);
+        } else {
+            angle_des_limited = clamp(angle_des_limited, -1.1, 1.1);
+        }
+
+        // PD on angle to produce turn rate command [-1,1]
+        let ang_err = wrap_pi(angle_des_limited - cur.angle);
+        let ang_rate_des = 6.0 * ang_err - 1.5 * cur.angular_vel;
+        let turn = clamp(ang_rate_des / 6.0, -1.0, 1.0);
+
+        // Fuel-aware: if low altitude and still fast downward, prioritize vertical braking.
+        let mut thrust_adj = thrust;
+        if altitude < 8.0 {
+            // Ensure we don't smash: target vy near 1, if vy too high, boost.
+            let vy_err = cur.vy - 1.0;
+            if vy_err > 0.0 {
+                thrust_adj = clamp(thrust_adj + 0.25 + 0.05 * vy_err, 0.0, 1.0);
+            }
+        }
+
+        // If nearly on pad and lateral speed small, force upright.
+        if altitude < 6.0 && cur.vx.abs() < 1.0 {
+            let ang_err2 = wrap_pi(0.0 - cur.angle);
+            let ang_rate_des2 = 7.0 * ang_err2 - 2.0 * cur.angular_vel;
+            let turn2 = clamp(ang_rate_des2 / 6.0, -1.0, 1.0);
+            writeln!(out, "{:.6} {:.6}", thrust_adj, turn2).ok();
+        } else {
+            writeln!(out, "{:.6} {:.6}", thrust_adj, turn).ok();
+        }
+        out.flush().ok();
+
+        // If we haven't received a state update in a while, back off CPU.
+        if Instant::now().duration_since(last_state_time) > Duration::from_millis(200) {
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+
+fn main() {
+    // Read initial map synchronously first (it can be large, but the judge provides it once).
+    // We read enough to parse the map and then spawn the streaming reader.
+    // Since stdin is a stream, the simplest approach: read the entire stdin into memory would be
+    // unsafe; instead we read header and map rows line-wise.
+
+    let mut stdin = io::stdin().lock();
+
+    // Read first 2 lines of numbers + then height rows.
+    // But input format is whitespace-separated, so rows may be provided with newlines.
+    // We'll read tokens using a simple scanner that can read lines but avoid gigabyte buffering.
+
+    struct Scanner<R: Read> {
+        r: R,
+        buf: Vec<u8>,
+        idx: usize,
+    }
+    impl<R: Read> Scanner<R> {
+        fn new(r: R) -> Self {
+            Self {
+                r,
+                buf: vec![0u8; 1 << 16],
+                idx: 0,
+            }
+        }
+        fn next_token(&mut self) -> Option<String> {
+            let mut out = Vec::new();
+            loop {
+                if self.idx >= self.buf.len() {
+                    self.buf.resize(1 << 16, 0);
+                    self.idx = 0;
+                }
+                // Fill buffer by reading into it, but keep a separate temp.
+                // Simpler: read byte-by-byte with internal refill.
+                break;
+            }
+            drop(out);
+            None
+        }
+    }
+
+    // Implement a robust streaming whitespace scanner.
+    struct FastScanner<R: Read> {
+        r: R,
+        buf: [u8; 1 << 16],
+        len: usize,
+        pos: usize,
+    }
+    impl<R: Read> FastScanner<R> {
+        fn new(r: R) -> Self {
+            Self {
+                r,
+                buf: [0u8; 1 << 16],
+                len: 0,
+                pos: 0,
+            }
+        }
+        fn refill(&mut self) -> bool {
+            match self.r.read(&mut self.buf) {
+                Ok(0) => false,
+                Ok(n) => {
+                    self.len = n;
+                    self.pos = 0;
+                    true
+                }
+                Err(_) => false,
+            }
+        }
+        fn next(&mut self) -> Option<String> {
+            let mut s = Vec::new();
+            loop {
+                if self.pos >= self.len {
+                    if !self.refill() {
+                        break;
+                    }
+                }
+                while self.pos < self.len && self.buf[self.pos].is_ascii_whitespace() {
+                    self.pos += 1;
+                }
+                if self.pos < self.len {
+                    break;
+                }
+            }
+            loop {
+                if self.pos >= self.len {
+                    if !self.refill() {
+                        break;
+                    }
+                }
+                if self.pos >= self.len {
+                    break;
+                }
+                let b = self.buf[self.pos];
+                if b.is_ascii_whitespace() {
+                    break;
+                }
+                s.push(b);
+                self.pos += 1;
+            }
+            if s.is_empty() {
+                None
+            } else {
+                Some(String::from_utf8_lossy(&s).to_string())
+            }
+        }
+    }
+
+    let mut fs = FastScanner::new(&mut stdin);
+
+    let width: usize = fs.next().and_then(|t| parse_usize(&t)).unwrap_or(0);
+    let height: usize = fs.next().and_then(|t| parse_usize(&t)).unwrap_or(0);
+    let gravity: f64 = fs.next().and_then(|t| parse_f64(&t)).unwrap_or(1.62);
+    let max_thrust: f64 = fs.next().and_then(|t| parse_f64(&t)).unwrap_or(20.0);
+    let fuel: f64 = fs.next().and_then(|t| parse_f64(&t)).unwrap_or(10.0);
+
+    let start_x: f64 = fs.next().and_then(|t| parse_f64(&t)).unwrap_or(0.0);
+    let start_y: f64 = fs.next().and_then(|t| parse_f64(&t)).unwrap_or(0.0);
+    let target_x: f64 = fs.next().and_then(|t| parse_f64(&t)).unwrap_or(0.0);
+    let target_y: f64 = fs.next().and_then(|t| parse_f64(&t)).unwrap_or(0.0);
+
+    let info = MapInfo {
+        width,
+        height,
+        gravity,
+        max_thrust,
+        fuel,
+        start_x,
+        start_y,
+        target_x,
+        target_y,
+    };
+
+    // Parse map rows, but keep only landing zone extents (L cells). If missing, fallback.
+    let mut landing_cells: Vec<(i32, i32)> = Vec::new();
+    for y in 0..height {
+        if let Some(row) = fs.next() {
+            for (x, ch) in row.chars().take(width).enumerate() {
+                if ch == 'L' {
+                    landing_cells.push((x as i32, y as i32));
+                }
+            }
+        } else {
+            break;
+        }
+    }
+
+    let (zone_left, zone_right, zone_y) = compute_landing_zone(&landing_cells, &info);
+
+    // Spawn reader thread for state updates using stdin handle.
+    // We already borrowed stdin; release borrow by dropping fs and stdin lock.
+    drop(fs);
+    drop(stdin);
+
+    let (tx, rx) = mpsc::sync_channel::<State>(64);
+
+    // Reader uses raw stdin (unlocked) now.
+    thread::spawn(move || {
+        reader_thread(tx);
+    });
+
+    controller(info, zone_left, zone_right, zone_y, rx);
+}

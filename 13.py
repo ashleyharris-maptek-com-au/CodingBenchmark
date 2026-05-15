@@ -16,13 +16,13 @@ import time
 from typing import List, Tuple, Optional
 
 from native_compiler import CppCompiler, compile_and_run, describe_this_pc
-from solver_utils import StreamingInputFile
+from solver_utils import StreamingInputFile, normalize_code_result
 
 title = "Longest Common Substring (C++)"
 
 tags = [
   "cpp",
-  "structured response",
+  "freeform response",
   "string algorithms",
   "algorithm design",
 ]
@@ -213,21 +213,7 @@ Include adaptive logic that chooses different strategies based on problem scale.
 # List of subpasses to grade the single answer against all difficulty levels
 extraGradeAnswerRuns = list(range(len(TEST_CASES)))
 
-structure = {
-  "type": "object",
-  "properties": {
-    "reasoning": {
-      "type": "string",
-      "description": "Explain your substring algorithm and how it adapts to different problem sizes"
-    },
-    "cpp_code": {
-      "type": "string",
-      "description": "Complete C++ code with main() that handles all scales"
-    }
-  },
-  "required": ["reasoning", "cpp_code"],
-  "additionalProperties": False
-}
+structure = None
 
 
 def is_common_substring(sub: str, strings: List[str]) -> bool:
@@ -254,6 +240,7 @@ def find_lcs_naive(strings: List[str]) -> str:
 
 def validate_solution(result: str, strings: List[str], expected: str) -> Tuple[bool, str, int]:
   """Validate LCS solution. Returns (is_valid, error, length)."""
+  result = normalize_code_result(result, "cpp_code")
   if not isinstance(result, str):
     return False, f"Result must be string, got {type(result).__name__}", 0
 
@@ -316,6 +303,7 @@ def execute_solver(code: str,
 
 def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
   """Grade the LCS solver."""
+  result = normalize_code_result(result, "cpp_code")
   if not result:
     return 0.0, "No result provided"
 
@@ -367,6 +355,7 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
 
 def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
   """Generate HTML report."""
+  result = normalize_code_result(result, "cpp_code")
   if not result:
     return "<p style='color:red'>No result provided</p>"
 

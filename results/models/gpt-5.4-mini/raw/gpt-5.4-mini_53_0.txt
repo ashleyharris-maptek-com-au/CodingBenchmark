@@ -1,0 +1,258 @@
+import math
+
+# Module-level memory for smoothing and failure handling.
+_last = {
+    "pos": [0.0, 0.0, 0.0],
+    "vel": [0.0, 0.0, 0.0],
+    "att": [0.0, 0.0, 0.0],
+    "yaw_bias": 0.0,
+    "pitch_bias": 0.0,
+    "roll_bias": 0.0,
+}
+
+
+def _clip(x, lo, hi):
+    return lo if x < lo else hi if x > hi else x
+
+
+def _choose_valid(state, value_keys, valid_keys, default=0.0):
+    vals = []
+    for vk, kk in zip(valid_keys, value_keys):
+        if state.get(vk, False):
+            v = state.get(kk, None)
+            if v is not None:
+                vals.append(float(v))
+    if not vals:
+        return default, 0
+    return sum(vals) / len(vals), len(vals)
+
+
+def _sensor_vec(state, prefix):
+    p = []
+    v = []
+    pc = 0
+    vc = 0
+    for axis in "xyz":
+        k = f"{prefix}_rel_pos_{axis}_m"
+        vk = f"{prefix}_rel_{axis}_valid"
+        if state.get(vk, False) and state.get(k) is not None:
+            p.append(float(state[k]))
+            pc += 1
+        else:
+            p.append(None)
+        kk = f"{prefix}_rel_vel_{axis}_ms"
+        vk2 = f"{prefix}_relv_{axis}_valid"
+        if state.get(vk2, False) and state.get(kk) is not None:
+            v.append(float(state[kk]))
+            vc += 1
+        else:
+            v.append(None)
+    return p, v, pc, vc
+
+
+def _fuse_vec(items, fallback):
+    out = []
+    for i in range(3):
+        vals = [vec[i] for vec, w in items if vec[i] is not None]
+        if vals:
+            out.append(sum(vals) / len(vals))
+        else:
+            out.append(fallback[i])
+    return out
+
+
+def _estimate_from_range(state):
+    rs = []
+    for i in range(1, 4):
+        rk = f"range_{i}_m"
+        vk = f"range_{i}_valid"
+        if state.get(vk, False) and state.get(rk) is not None:
+            rs.append(float(state[rk]))
+    if not rs:
+        return None
+    return sum(rs) / len(rs)
+
+
+def _estimate_from_gps(state):
+    p = [None, None, None]
+    counts = [0, 0, 0]
+    for i in range(1, 3):
+        for j, axis in enumerate("xyz"):
+            k = f"gps_{i}_pos_{axis}_m"
+            vk = f"gps_{i}_{axis}_valid"
+            if state.get(vk, False) and state.get(k) is not None:
+                p[j] = (p[j] or 0.0) + float(state[k])
+                counts[j] += 1
+    for i in range(3):
+        if counts[i]:
+            p[i] /= counts[i]
+    return p
+
+
+def _attitude_from_stars(state):
+    vals = {"pitch": [], "roll": [], "yaw": []}
+    for i in range(1, 3):
+        for a in vals:
+            k = f"star_tracker_{i}_{a}_deg"
+            vk = f"star_tracker_{i}_{a}_valid"
+            if state.get(vk, False) and state.get(k) is not None:
+                vals[a].append(math.radians(float(state[k])))
+    out = []
+    for a in ("roll", "pitch", "yaw"):
+        arr = vals[a]
+        out.append(sum(arr) / len(arr) if arr else None)
+    return out
+
+
+def autopilot_step(state: dict, dt: float) -> dict:
+    # Sensor fusion for relative state.
+    radar_p, radar_v, radar_pc, radar_vc = _sensor_vec(state, "radar")
+    lidar_p, lidar_v, lidar_pc, lidar_vc = _sensor_vec(state, "lidar")
+
+    pos = _fuse_vec([(radar_p, radar_pc), (lidar_p, lidar_pc)], _last["pos"])
+    vel = _fuse_vec([(radar_v, radar_vc), (lidar_v, lidar_vc)], _last["vel"])
+
+    rng = _estimate_from_range(state)
+    if rng is not None:
+        # Use range as a consistency check and to bound the fused position norm.
+        norm = math.sqrt(pos[0] * pos[0] + pos[1] * pos[1] + pos[2] * pos[2])
+        if norm > 1e-6:
+            scale = min(1.0, rng / norm)
+            pos = [p * scale for p in pos]
+
+    gps = _estimate_from_gps(state)
+    if gps is not None and any(v is not None for v in gps):
+        # GPS is mostly for far-range magnitude stabilization if relative sensors fail.
+        for i in range(3):
+            if gps[i] is not None and abs(pos[i]) < 1e-6:
+                pos[i] = gps[i]
+
+    # Preserve last valid state to smooth sensor dropouts.
+    for i in range(3):
+        if abs(pos[i]) < 1e9:
+            _last["pos"][i] = 0.7 * _last["pos"][i] + 0.3 * pos[i]
+            _last["vel"][i] = 0.7 * _last["vel"][i] + 0.3 * vel[i]
+    pos = _last["pos"][:]
+    vel = _last["vel"][:]
+
+    distance = math.sqrt(pos[0] * pos[0] + pos[1] * pos[1] + pos[2] * pos[2])
+    speed = math.sqrt(vel[0] * vel[0] + vel[1] * vel[1] + vel[2] * vel[2])
+
+    # Estimate attitude from star trackers, then gyros if needed.
+    att = _attitude_from_stars(state)
+    if any(a is None for a in att):
+        gyro = []
+        for axis in ("roll", "pitch", "yaw"):
+            vals = []
+            for i in range(1, 4):
+                k = f"gyro_{i}_{axis}_dps"
+                vk = f"gyro_{i}_{axis}_valid"
+                if state.get(vk, False) and state.get(k) is not None:
+                    vals.append(math.radians(float(state[k])))
+            gyro.append(sum(vals) / len(vals) if vals else 0.0)
+        # Integrate approximate attitude if star trackers are unavailable.
+        for i in range(3):
+            _last["att"][i] += gyro[i] * dt
+        att = _last["att"][:]
+    else:
+        _last["att"] = [0.7 * _last["att"][i] + 0.3 * att[i] for i in range(3)]
+        att = _last["att"][:]
+
+    # Guidance law: V-bar when behind, keep closure gentle near target, avoid radial overcontrol.
+    x, y, z = pos
+    vx, vy, vz = vel
+
+    # Priority: arrest closing speed near target.
+    desired_vx = desired_vy = desired_vz = 0.0
+
+    if distance > 200.0:
+        # Far-range phasing: if behind, speed up/lower orbit by retrograde/prograde logic.
+        # In LVLH, closing along-track is mostly controlled by y-velocity.
+        desired_vy = _clip(-0.0035 * y - 0.8 * vy, -0.8, 0.8)
+        desired_vx = _clip(-0.0015 * x - 0.5 * vx, -0.35, 0.35)
+        desired_vz = _clip(-0.0018 * z - 0.5 * vz, -0.35, 0.35)
+    elif distance > 50.0:
+        desired_vy = _clip(-0.010 * y - 0.9 * vy, -0.5, 0.5)
+        desired_vx = _clip(-0.018 * x - 0.8 * vx, -0.25, 0.25)
+        desired_vz = _clip(-0.018 * z - 0.8 * vz, -0.25, 0.25)
+    elif distance > 10.0:
+        desired_vy = _clip(-0.030 * y - 1.0 * vy, -0.25, 0.25)
+        desired_vx = _clip(-0.045 * x - 1.0 * vx, -0.15, 0.15)
+        desired_vz = _clip(-0.045 * z - 1.0 * vz, -0.15, 0.15)
+    else:
+        desired_vy = _clip(-0.060 * y - 1.2 * vy, -0.08, 0.08)
+        desired_vx = _clip(-0.080 * x - 1.2 * vx, -0.05, 0.05)
+        desired_vz = _clip(-0.080 * z - 1.2 * vz, -0.05, 0.05)
+
+    # If we are approaching too fast, brake aggressively on the dominant axis.
+    if speed > 0.3:
+        scale = _clip((speed - 0.3) / 1.7, 0.0, 1.0)
+        desired_vx -= 0.6 * scale * vx
+        desired_vy -= 0.6 * scale * vy
+        desired_vz -= 0.6 * scale * vz
+
+    # Convert desired relative velocity to thrust commands with damping.
+    k = 0.9
+    tx = _clip(k * (desired_vx - vx), -1.0, 1.0)
+    ty = _clip(k * (desired_vy - vy), -1.0, 1.0)
+    tz = _clip(k * (desired_vz - vz), -1.0, 1.0)
+
+    # Docking camera refinement within 500m: align with port bearing if available.
+    if state.get("dock_camera_active", False):
+        bx = state.get("dock_camera_bearing_x", 0.0) if state.get("dock_camera_bearing_x_valid", False) else 0.0
+        by = state.get("dock_camera_bearing_y", 0.0) if state.get("dock_camera_bearing_y_valid", False) else 0.0
+        bz = state.get("dock_camera_bearing_z", 0.0) if state.get("dock_camera_bearing_z_valid", False) else 0.0
+        br = state.get("dock_camera_range_m", distance)
+        if br is not None and br < 500.0:
+            tx = _clip(tx + 0.35 * bx, -1.0, 1.0)
+            ty = _clip(ty + 0.35 * by, -1.0, 1.0)
+            tz = _clip(tz + 0.35 * bz, -1.0, 1.0)
+            # Reduce speed as we get close to the port.
+            if br < 20.0:
+                tx *= 0.4
+                ty *= 0.4
+                tz *= 0.4
+
+    # Fuel conservation: taper thrust when low fuel, but keep enough authority for aborts.
+    fuel_pct = float(state.get("fuel_remaining_pct", 100.0) or 100.0)
+    fuel_kg = float(state.get("fuel_remaining_kg", 0.0) or 0.0)
+    if fuel_kg > 0.0 and fuel_kg < 80.0:
+        limit = 0.25 + 0.75 * _clip(fuel_kg / 80.0, 0.0, 1.0)
+        tx *= limit
+        ty *= limit
+        tz *= limit
+    elif fuel_pct < 20.0:
+        limit = 0.35 + 0.65 * _clip(fuel_pct / 20.0, 0.0, 1.0)
+        tx *= limit
+        ty *= limit
+        tz *= limit
+
+    # Attitude control: keep small rates; stable default if sensors fail.
+    # Roll/pitch/yaw correspond to keeping docking axis aligned with relative velocity/port vector.
+    att_rate_roll = _clip(-0.8 * att[0] - 0.15 * _last["att"][0], -0.035, 0.035)
+    att_rate_pitch = _clip(-0.8 * att[1] - 0.15 * _last["att"][1], -0.035, 0.035)
+    att_rate_yaw = _clip(-0.8 * att[2] - 0.15 * _last["att"][2], -0.035, 0.035)
+
+    # Bias against persistent uncommanded thrust by nudging opposite of residual velocity.
+    tx = _clip(tx - 0.08 * vx, -1.0, 1.0)
+    ty = _clip(ty - 0.08 * vy, -1.0, 1.0)
+    tz = _clip(tz - 0.08 * vz, -1.0, 1.0)
+
+    # Final close-range safety: never exceed gentle approach near the port.
+    if distance < 10.0:
+        tx = _clip(tx, -0.18, 0.18)
+        ty = _clip(ty, -0.18, 0.18)
+        tz = _clip(tz, -0.18, 0.18)
+        if speed < 0.15:
+            tx *= 0.5
+            ty *= 0.5
+            tz *= 0.5
+
+    return {
+        "thrust_x": float(_clip(tx, -1.0, 1.0)),
+        "thrust_y": float(_clip(ty, -1.0, 1.0)),
+        "thrust_z": float(_clip(tz, -1.0, 1.0)),
+        "att_rate_roll": float(att_rate_roll),
+        "att_rate_pitch": float(att_rate_pitch),
+        "att_rate_yaw": float(att_rate_yaw),
+    }

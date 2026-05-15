@@ -21,7 +21,7 @@ import tempfile
 from pathlib import Path
 from typing import List, Tuple, Set, Dict, Any
 from native_compiler import CSharpCompiler, CompilationError, ExecutionError, describe_this_pc
-from solver_utils import StreamingInputFile, GradeCache
+from solver_utils import StreamingInputFile, GradeCache, normalize_code_result
 
 _grade_cache = GradeCache('test29')
 
@@ -29,7 +29,7 @@ title = "Maximum Clique (C#)"
 
 tags = [
   "csharp",
-  "structured response",
+  "freeform response",
   "np hard",
   "graph theory",
 ]
@@ -479,23 +479,7 @@ Write complete, compilable C# code with a Main method.
 
 extraGradeAnswerRuns = list(range(len(TEST_CASES)))
 
-structure = {
-  "type": "object",
-  "properties": {
-    "reasoning": {
-      "type":
-      "string",
-      "description":
-      "Explain your algorithm approach and how it adapts to different clique complexities"
-    },
-    "csharp_code": {
-      "type": "string",
-      "description": "Complete C# code with Main method that handles all scales"
-    }
-  },
-  "required": ["reasoning", "csharp_code"],
-  "additionalProperties": False
-}
+structure = None
 
 
 def verify_clique(num_vertices: int, edges: List[Tuple[int, int]],
@@ -533,6 +517,7 @@ def greedy_clique_size(num_vertices: int, edges: List[Tuple[int, int]]) -> int:
 
 def _cache_key_parts(result: dict, subPass: int) -> tuple:
   """Build cache key parts from code hash + test case params."""
+  result = normalize_code_result(result, "csharp_code")
   case = TEST_CASES[subPass]
   code = result.get("csharp_code", "")
   return (
@@ -542,6 +527,7 @@ def _cache_key_parts(result: dict, subPass: int) -> tuple:
 
 
 def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
+  result = normalize_code_result(result, "csharp_code")
   if not result or "csharp_code" not in result:
     return 0.0, "No C# code provided"
 
@@ -621,6 +607,7 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
 
 
 def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
+  result = normalize_code_result(result, "csharp_code")
   if not result:
     return "<p style='color:red'>No result provided</p>"
 

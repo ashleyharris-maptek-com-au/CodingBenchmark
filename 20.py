@@ -34,18 +34,19 @@ import os
 import time
 import math
 import json
+import hashlib
 from typing import List, Tuple, Dict, Set, Optional, Any
 from pathlib import Path
 
 # Import our native compiler helper
-from native_compiler import RustCompiler, compile_and_run, describe_this_pc
-from solver_utils import StreamingInputFile
+from native_compiler import RustCompiler, CompilationError, ExecutionError, compile_and_run, describe_this_pc
+from solver_utils import GradeCache, StreamingInputFile, normalize_code_result
 
 title = "Drillhole Data Validation (Rust)"
 
 tags = [
   "rust",
-  "structured response",
+  "freeform response",
   "algorithm design",
 ]
 
@@ -54,6 +55,7 @@ TIMEOUT_SECONDS = 300
 
 # Seed for reproducibility
 RANDOM_SEED = 20202020
+_GRADE_CACHE = GradeCache("test20_drillhole_validation")
 
 
 class DrillHole:
@@ -421,23 +423,7 @@ The program should be robust enough to handle edge cases like missing data, dupl
 # List of subpasses to grade the single answer against all difficulty levels
 extraGradeAnswerRuns = list(range(len(TEST_CASES)))
 
-structure = {
-  "type": "object",
-  "properties": {
-    "reasoning": {
-      "type":
-      "string",
-      "description":
-      "Explain your algorithm choice and how it adapts to different dataset complexities"
-    },
-    "rust_code": {
-      "type": "string",
-      "description": "Complete Rust code with main function that handles all scales"
-    }
-  },
-  "required": ["reasoning", "rust_code"],
-  "additionalProperties": False
-}
+structure = None
 
 
 def execute_rust_solver(code: str,
@@ -509,7 +495,49 @@ def parse_output(output: str) -> Tuple[List[Tuple[int, int, str, float]], str]:
     return [], f"Parse error: {str(e)}"
 
 
-def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
+def _sha256_text(text: str) -> str:
+  return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _rust_compiler_fingerprint(ai_engine_name: str) -> str:
+  try:
+    compiler = RustCompiler(ai_engine_name)
+    compiler_path = compiler.find_compiler()
+    if compiler_path:
+      try:
+        st = os.stat(compiler_path)
+        stat_fingerprint = f"size={st.st_size}|mtime_ns={st.st_mtime_ns}"
+      except Exception as e:
+        stat_fingerprint = f"stat-unavailable:{type(e).__name__}:{e}"
+      return f"{compiler.describe()}|path={compiler_path}|{stat_fingerprint}"
+    return compiler.describe()
+  except Exception as e:
+    return f"rust-unavailable:{type(e).__name__}:{e}"
+
+
+def _case_cache_identity(subpass: int, case: dict) -> str:
+  return json.dumps(
+    {
+      "version": "test20-input-v1",
+      "subpass": subpass,
+      "seed": RANDOM_SEED + subpass,
+      "case": case,
+    },
+    sort_keys=True)
+
+
+def _grade_cache_key_parts(ai_engine_name: str, subpass: int, case: dict, code: str) -> tuple:
+  return (
+    "test20-grade-v1",
+    f"model={ai_engine_name}",
+    f"input_sha256={_sha256_text(_case_cache_identity(subpass, case))}",
+    f"solver_sha256={_sha256_text(code)}",
+    f"compiler={_rust_compiler_fingerprint(ai_engine_name)}",
+    f"machine={describe_this_pc()}",
+  )
+
+
+def _gradeAnswer_uncached(result: dict, subPass: int, aiEngineName: str) -> tuple:
   """
     Grade the Rust drillhole validator.
     
@@ -518,6 +546,7 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
     - Recall: What fraction of actual errors were found
     - F1 score combining both
     """
+  result = normalize_code_result(result, "rust_code")
   if not result:
     return 0.0, "No result provided", "No result provided"
 
@@ -622,6 +651,31 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
   )
 
   return score, explanation, html
+
+
+def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
+  result = normalize_code_result(result, "rust_code")
+  if not result:
+    return 0.0, "No result provided", "No result provided"
+
+  if "rust_code" not in result:
+    return 0.0, "No Rust code provided", "No result provided"
+
+  case = TEST_CASES[subPass]
+  code = result["rust_code"]
+  cache_key = _grade_cache_key_parts(aiEngineName, subPass, case, code)
+
+  def compute_grade_record():
+    score, explanation, html = _gradeAnswer_uncached(result, subPass, aiEngineName)
+    return {
+      "score": score,
+      "explanation": explanation,
+      "html": html,
+    }
+
+  record = _GRADE_CACHE.get_or_compute_json("grade", compute_grade_record, *cache_key)
+  return (float(record.get("score", 0.0)), str(record.get("explanation", "No explanation")),
+          str(record.get("html", "")))
 
 
 def _generate_drillhole_visualization(

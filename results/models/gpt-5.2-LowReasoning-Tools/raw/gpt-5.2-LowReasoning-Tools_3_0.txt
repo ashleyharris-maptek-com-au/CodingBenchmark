@@ -1,0 +1,539 @@
+use std::cmp::Reverse;
+use std::collections::VecDeque;
+use std::io::{self, Read};
+
+// A scalable, robust graph layout solver with adaptive strategies:
+// - Small components: fast Fruchterman-Reingold using a spatial hash grid (approx repulsion).
+// - Large components: BFS-based concentric-circle layout (linear time).
+// - Extreme sizes: degree-sorted circle with deterministic jitter (linear time, very fast).
+//
+// Goal: produce reasonable layouts quickly for N up to ~200k within tight time.
+
+#[derive(Clone, Copy, Debug)]
+struct P {
+    x: f32,
+    y: f32,
+}
+
+impl P {
+    #[inline]
+    fn add(self, o: P) -> P {
+        P {
+            x: self.x + o.x,
+            y: self.y + o.y,
+        }
+    }
+    #[inline]
+    fn sub(self, o: P) -> P {
+        P {
+            x: self.x - o.x,
+            y: self.y - o.y,
+        }
+    }
+    #[inline]
+    fn mul(self, s: f32) -> P {
+        P {
+            x: self.x * s,
+            y: self.y * s,
+        }
+    }
+    #[inline]
+    fn norm2(self) -> f32 {
+        self.x * self.x + self.y * self.y
+    }
+}
+
+// Deterministic xorshift RNG (fast, sufficient for jitter / init).
+#[derive(Clone)]
+struct Rng64 {
+    s: u64,
+}
+impl Rng64 {
+    fn new(seed: u64) -> Self {
+        let mut s = seed;
+        if s == 0 {
+            s = 0x9e3779b97f4a7c15;
+        }
+        Self { s }
+    }
+    #[inline]
+    fn next_u64(&mut self) -> u64 {
+        // xorshift64*
+        let mut x = self.s;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.s = x;
+        x.wrapping_mul(2685821657736338717)
+    }
+    #[inline]
+    fn next_f32(&mut self) -> f32 {
+        // [0,1)
+        let u = self.next_u64() >> 40; // 24 bits
+        (u as f32) * (1.0 / ((1u32 << 24) as f32))
+    }
+    #[inline]
+    fn next_signed_f32(&mut self) -> f32 {
+        self.next_f32() * 2.0 - 1.0
+    }
+}
+
+fn main() {
+    // Read all input.
+    let mut input = String::new();
+    io::stdin().read_to_string(&mut input).unwrap();
+    if input.trim().is_empty() {
+        return;
+    }
+    let mut it = input.split_whitespace();
+    let n: usize = match it.next() {
+        Some(v) => v.parse().unwrap(),
+        None => return,
+    };
+    let m: usize = match it.next() {
+        Some(v) => v.parse().unwrap(),
+        None => 0,
+    };
+
+    // Build adjacency. Keep self-loops out of adjacency (they don't help forces),
+    // but keep degree counts for them implicitly by ignoring: stable, robust.
+    let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut edges: Vec<(usize, usize)> = Vec::with_capacity(m);
+    for _ in 0..m {
+        let u: usize = match it.next() {
+            Some(v) => v.parse().unwrap(),
+            None => break,
+        };
+        let v: usize = match it.next() {
+            Some(v) => v.parse().unwrap(),
+            None => break,
+        };
+        if u >= n || v >= n {
+            continue;
+        }
+        if u == v {
+            continue; // self-loop: ignore for layout forces
+        }
+        // Keep parallel edges; they simply strengthen attraction a bit.
+        adj[u].push(v);
+        adj[v].push(u);
+        edges.push((u, v));
+    }
+
+    // Connected components.
+    let mut comp_id = vec![usize::MAX; n];
+    let mut comps: Vec<Vec<usize>> = Vec::new();
+    let mut q = VecDeque::new();
+    for s in 0..n {
+        if comp_id[s] != usize::MAX {
+            continue;
+        }
+        comp_id[s] = comps.len();
+        q.clear();
+        q.push_back(s);
+        let mut nodes = Vec::new();
+        nodes.push(s);
+        while let Some(u) = q.pop_front() {
+            for &v in &adj[u] {
+                if comp_id[v] == usize::MAX {
+                    comp_id[v] = comp_id[s];
+                    q.push_back(v);
+                    nodes.push(v);
+                }
+            }
+        }
+        comps.push(nodes);
+    }
+
+    // Output positions (global index).
+    let mut pos = vec![P { x: 0.0, y: 0.0 }; n];
+
+    // Layout each component in its own local coordinate system, then pack.
+    // Sort components by size descending (pack large first).
+    let mut comp_order: Vec<usize> = (0..comps.len()).collect();
+    comp_order.sort_by_key(|&cid| Reverse(comps[cid].len()));
+
+    // Precompute edge lists per component (for small force-directed components).
+    let mut comp_edges: Vec<Vec<(usize, usize)>> = vec![Vec::new(); comps.len()];
+    for &(u, v) in &edges {
+        let cu = comp_id[u];
+        let cv = comp_id[v];
+        if cu == cv && cu != usize::MAX {
+            comp_edges[cu].push((u, v));
+        }
+    }
+
+    // Component packing: place each component in a grid; cell size based on sqrt(size).
+    // Deterministic packing based on order.
+    let mut cursor_x = 0.0f32;
+    let mut cursor_y = 0.0f32;
+    let mut row_h = 0.0f32;
+    let pack_limit = 2000.0f32; // wrap row around this width in output coords
+
+    for (idx, &cid) in comp_order.iter().enumerate() {
+        let nodes = &comps[cid];
+        let csz = nodes.len();
+
+        // Derive a deterministic seed from component id and size.
+        let mut rng = Rng64::new(((cid as u64) << 32) ^ (csz as u64).wrapping_mul(0x9e3779b97f4a7c15));
+
+        // Choose strategy based on component size and density proxy.
+        // For small: FR iterations ~ 80..200.
+        // For medium: fewer iterations.
+        // For large: BFS concentric.
+        // For extreme: degree circle.
+        let ecount = comp_edges[cid].len();
+        let density = if csz <= 1 {
+            0.0
+        } else {
+            (2.0 * ecount as f64) / (csz as f64 * (csz as f64 - 1.0))
+        };
+
+        // Compute local positions.
+        let (local, bbox) = if csz <= 2 {
+            // Trivial: put on a line.
+            let mut p = Vec::with_capacity(csz);
+            for (i, _) in nodes.iter().enumerate() {
+                p.push(P {
+                    x: i as f32,
+                    y: 0.0,
+                });
+            }
+            (p, (0.0f32, 0.0f32, (csz as f32).max(1.0), 1.0f32))
+        } else if csz <= 2500 {
+            let iters = if csz <= 400 {
+                140
+            } else if csz <= 1200 {
+                90
+            } else {
+                55
+            };
+            let use_edges = &comp_edges[cid];
+            fr_layout_grid(nodes, &adj, use_edges, iters, &mut rng)
+        } else if csz <= 60000 && density < 0.08 {
+            bfs_concentric(nodes, &adj)
+        } else {
+            degree_circle(nodes, &adj, &mut rng)
+        };
+
+        // Translate local positions into global, with padding.
+        let (minx, miny, maxx, maxy) = bbox;
+        let w = (maxx - minx).max(1.0);
+        let h = (maxy - miny).max(1.0);
+        let pad = 2.0f32;
+        let cell_w = w + pad;
+        let cell_h = h + pad;
+
+        if idx == 0 {
+            cursor_x = 0.0;
+            cursor_y = 0.0;
+            row_h = 0.0;
+        }
+        if cursor_x + cell_w > pack_limit && cursor_x > 0.0 {
+            cursor_x = 0.0;
+            cursor_y += row_h + pad;
+            row_h = 0.0;
+        }
+        row_h = row_h.max(cell_h);
+
+        let ox = cursor_x - minx + pad * 0.5;
+        let oy = cursor_y - miny + pad * 0.5;
+        cursor_x += cell_w;
+
+        for (i, &u) in nodes.iter().enumerate() {
+            let p = local[i];
+            pos[u] = P {
+                x: p.x + ox,
+                y: p.y + oy,
+            };
+        }
+    }
+
+    // Emit output: N lines of floats.
+    // (Optional leading N is allowed; we omit for simplicity.)
+    let mut out = String::new();
+    out.reserve(n * 24);
+    for i in 0..n {
+        let p = pos[i];
+        out.push_str(&format!("{:.6} {:.6}\n", p.x as f64, p.y as f64));
+    }
+    print!("{out}");
+}
+
+fn bbox(points: &[P]) -> (f32, f32, f32, f32) {
+    let mut minx = f32::INFINITY;
+    let mut miny = f32::INFINITY;
+    let mut maxx = f32::NEG_INFINITY;
+    let mut maxy = f32::NEG_INFINITY;
+    for &p in points {
+        minx = minx.min(p.x);
+        miny = miny.min(p.y);
+        maxx = maxx.max(p.x);
+        maxy = maxy.max(p.y);
+    }
+    if !minx.is_finite() {
+        (0.0, 0.0, 1.0, 1.0)
+    } else {
+        (minx, miny, maxx, maxy)
+    }
+}
+
+// Fast approximate Fruchterman-Reingold with spatial hash grid for repulsion.
+fn fr_layout_grid(
+    nodes: &[usize],
+    adj: &[Vec<usize>],
+    edges: &[(usize, usize)],
+    iters: usize,
+    rng: &mut Rng64,
+) -> (Vec<P>, (f32, f32, f32, f32)) {
+    let n = nodes.len();
+    // Map global node id -> local index.
+    let mut lid = vec![usize::MAX; adj.len()];
+    for (i, &u) in nodes.iter().enumerate() {
+        lid[u] = i;
+    }
+
+    // Initial positions: jittered circle (good start, reduces early overlaps).
+    let mut pos = vec![P { x: 0.0, y: 0.0 }; n];
+    let r0 = (n as f32).sqrt().max(2.0);
+    for i in 0..n {
+        let t = (i as f32) * (2.0 * std::f32::consts::PI / (n as f32));
+        let jitter = 0.25 * rng.next_signed_f32();
+        pos[i] = P {
+            x: (r0 + jitter) * t.cos() + 0.1 * rng.next_signed_f32(),
+            y: (r0 + jitter) * t.sin() + 0.1 * rng.next_signed_f32(),
+        };
+    }
+
+    // Typical FR parameters.
+    let area = (n as f32).max(1.0) * 10.0;
+    let k = (area / (n as f32)).sqrt().max(0.1);
+    let mut temperature = 2.5 * k;
+
+    // Grid sizing and hash.
+    let cell = (2.0 * k).max(0.5);
+    // hash map via sorting key buckets to avoid std HashMap overhead.
+    // We'll bucket into a Vec<Vec<usize>> by a 2D key compressed to i64.
+    let mut buckets: Vec<(i64, usize)> = Vec::with_capacity(n);
+    let mut disp = vec![P { x: 0.0, y: 0.0 }; n];
+
+    for _ in 0..iters {
+        // Reset displacement.
+        for d in &mut disp {
+            *d = P { x: 0.0, y: 0.0 };
+        }
+
+        // Build bucket keys for each node.
+        buckets.clear();
+        buckets.reserve(n);
+        for (i, &p) in pos.iter().enumerate() {
+            let gx = (p.x / cell).floor() as i64;
+            let gy = (p.y / cell).floor() as i64;
+            // Pack into i64 key (shift with bias).
+            let key = (gx << 32) ^ (gy & 0xffffffff);
+            buckets.push((key, i));
+        }
+        buckets.sort_unstable_by_key(|&(k, _)| k);
+
+        // Repulsive forces: only within neighbor buckets (3x3).
+        // Iterate bucket runs.
+        let mut run_start = 0usize;
+        while run_start < n {
+            let key = buckets[run_start].0;
+            let mut run_end = run_start + 1;
+            while run_end < n && buckets[run_end].0 == key {
+                run_end += 1;
+            }
+            let gx = key >> 32;
+            let gy = (key as i32) as i64;
+
+            for nx in (gx - 1)..=(gx + 1) {
+                for ny in (gy - 1)..=(gy + 1) {
+                    let nkey = (nx << 32) ^ (ny & 0xffffffff);
+                    // binary search range in buckets (since sorted by key)
+                    let lo = lower_bound_key(&buckets, nkey);
+                    if lo >= n || buckets[lo].0 != nkey {
+                        continue;
+                    }
+                    let mut hi = lo + 1;
+                    while hi < n && buckets[hi].0 == nkey {
+                        hi += 1;
+                    }
+
+                    // For each pair (i in run, j in neighbor), apply repulsion.
+                    for a in run_start..run_end {
+                        let i = buckets[a].1;
+                        for b in lo..hi {
+                            let j = buckets[b].1;
+                            if i == j {
+                                continue;
+                            }
+                            let delta = pos[i].sub(pos[j]);
+                            let dist2 = delta.norm2() + 1e-4;
+                            let dist = dist2.sqrt();
+                            // repulsive: k^2 / dist
+                            let f = (k * k) / dist;
+                            disp[i] = disp[i].add(delta.mul(f / dist));
+                        }
+                    }
+                }
+            }
+
+            run_start = run_end;
+        }
+
+        // Attractive forces along edges.
+        for &(u, v) in edges {
+            let iu = lid[u];
+            let iv = lid[v];
+            if iu == usize::MAX || iv == usize::MAX || iu == iv {
+                continue;
+            }
+            let delta = pos[iu].sub(pos[iv]);
+            let dist2 = delta.norm2() + 1e-4;
+            let dist = dist2.sqrt();
+            // attractive: dist^2 / k
+            let f = (dist2) / k;
+            let dir = delta.mul(1.0 / dist);
+            disp[iu] = disp[iu].sub(dir.mul(f));
+            disp[iv] = disp[iv].add(dir.mul(f));
+        }
+
+        // Limit maximum displacement by temperature, update positions.
+        for i in 0..n {
+            let d = disp[i];
+            let d2 = d.norm2();
+            if d2 > 1e-12 {
+                let dist = d2.sqrt();
+                let step = (dist).min(temperature);
+                pos[i] = pos[i].add(d.mul(step / dist));
+            }
+        }
+        temperature *= 0.92;
+        if temperature < 1e-3 {
+            break;
+        }
+    }
+
+    (pos.clone(), bbox(&pos))
+}
+
+fn lower_bound_key(a: &[(i64, usize)], key: i64) -> usize {
+    let mut l = 0usize;
+    let mut r = a.len();
+    while l < r {
+        let mid = (l + r) >> 1;
+        if a[mid].0 < key {
+            l = mid + 1;
+        } else {
+            r = mid;
+        }
+    }
+    l
+}
+
+// Linear-time layout: BFS levels -> concentric circles.
+fn bfs_concentric(nodes: &[usize], adj: &[Vec<usize>]) -> (Vec<P>, (f32, f32, f32, f32)) {
+    let n = nodes.len();
+    let mut lid = vec![usize::MAX; adj.len()];
+    for (i, &u) in nodes.iter().enumerate() {
+        lid[u] = i;
+    }
+
+    // pick root as max-degree node in component
+    let mut root = nodes[0];
+    let mut best_deg = 0usize;
+    for &u in nodes {
+        let d = adj[u].len();
+        if d > best_deg {
+            best_deg = d;
+            root = u;
+        }
+    }
+
+    let mut dist = vec![i32::MAX; n];
+    let mut q = VecDeque::new();
+    let rli = lid[root];
+    dist[rli] = 0;
+    q.push_back(root);
+    while let Some(u) = q.pop_front() {
+        let du = dist[lid[u]];
+        for &v in &adj[u] {
+            let li = lid[v];
+            if li == usize::MAX {
+                continue;
+            }
+            if dist[li] == i32::MAX {
+                dist[li] = du + 1;
+                q.push_back(v);
+            }
+        }
+    }
+    // For disconnected within component due to self-loop-only nodes etc, fill.
+    for i in 0..n {
+        if dist[i] == i32::MAX {
+            dist[i] = 0;
+        }
+    }
+
+    let mut maxd = 0i32;
+    for &d in &dist {
+        maxd = maxd.max(d);
+    }
+    let levels = (maxd as usize) + 1;
+    let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); levels.max(1)];
+    for i in 0..n {
+        buckets[dist[i] as usize].push(i);
+    }
+
+    let mut pos = vec![P { x: 0.0, y: 0.0 }; n];
+    let dr = 1.5f32;
+    for (lvl, b) in buckets.iter().enumerate() {
+        if b.is_empty() {
+            continue;
+        }
+        let radius = dr * (lvl as f32);
+        let cnt = b.len();
+        // Spread nodes evenly around circle; for lvl=0, keep at origin.
+        if lvl == 0 {
+            pos[b[0]] = P { x: 0.0, y: 0.0 };
+            for &i in b.iter().skip(1) {
+                pos[i] = P { x: 0.1, y: 0.1 };
+            }
+        } else {
+            for (j, &i) in b.iter().enumerate() {
+                let t = (j as f32) * (2.0 * std::f32::consts::PI / (cnt as f32));
+                pos[i] = P {
+                    x: radius * t.cos(),
+                    y: radius * t.sin(),
+                };
+            }
+        }
+    }
+
+    (pos.clone(), bbox(&pos))
+}
+
+// Very fast: nodes on a circle ordered by degree, with deterministic jitter.
+fn degree_circle(nodes: &[usize], adj: &[Vec<usize>], rng: &mut Rng64) -> (Vec<P>, (f32, f32, f32, f32)) {
+    let n = nodes.len();
+    let mut lid = vec![usize::MAX; adj.len()];
+    for (i, &u) in nodes.iter().enumerate() {
+        lid[u] = i;
+    }
+
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_unstable_by_key(|&i| Reverse(adj[nodes[i]].len()));
+
+    let r = (n as f32).sqrt().max(5.0);
+    let mut pos = vec![P { x: 0.0, y: 0.0 }; n];
+    for (k, &i) in order.iter().enumerate() {
+        let t = (k as f32) * (2.0 * std::f32::consts::PI / (n as f32));
+        let jitter = 0.05 * rng.next_signed_f32();
+        pos[i] = P {
+            x: (r + jitter) * t.cos(),
+            y: (r + jitter) * t.sin(),
+        };
+    }
+    (pos.clone(), bbox(&pos))
+}

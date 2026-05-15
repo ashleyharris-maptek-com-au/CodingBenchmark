@@ -1,0 +1,474 @@
+import math
+from typing import Any, Dict, Optional, Tuple, List
+
+
+# Module-level persistence across calls within a scenario.
+_ap = {
+    "t": 0.0,
+    "go_around": False,
+    "ga_time": 0.0,
+    "loc_int": 0.0,
+    "gs_int": 0.0,
+    "spd_int": 0.0,
+    "rollout_int": 0.0,
+    "last_loc": 0.0,
+    "last_gs": 0.0,
+    "last_spd": 0.0,
+    "last_ra": None,
+    "flare_started": False,
+    "touchdown": False,
+}
+
+
+def _clamp(x: float, lo: float, hi: float) -> float:
+    return lo if x < lo else hi if x > hi else x
+
+
+def _isfinite(x: Any) -> bool:
+    try:
+        return x is not None and math.isfinite(float(x))
+    except Exception:
+        return False
+
+
+def _median(xs: List[float]) -> Optional[float]:
+    xs = [float(x) for x in xs if _isfinite(x)]
+    if not xs:
+        return None
+    xs.sort()
+    n = len(xs)
+    mid = n // 2
+    if n % 2 == 1:
+        return xs[mid]
+    return 0.5 * (xs[mid - 1] + xs[mid])
+
+
+def _robust_vote(values: List[Tuple[float, bool]], max_spread: float) -> Optional[float]:
+    """
+    Take values with validity flags. If multiple valid, use median after rejecting
+    obvious outliers (stuck/bias) based on distance from initial median.
+    max_spread is in same units as value; typical: dots or degrees.
+    """
+    valid = [float(v) for (v, ok) in values if ok and _isfinite(v)]
+    if not valid:
+        return None
+    if len(valid) == 1:
+        return valid[0]
+    med = _median(valid)
+    if med is None:
+        return None
+    filtered = [v for v in valid if abs(v - med) <= max_spread]
+    if not filtered:
+        return med
+    return _median(filtered) or med
+
+
+def _get_bool(state: Dict[str, Any], key: str, default: bool = False) -> bool:
+    v = state.get(key, default)
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)) and _isfinite(v):
+        return bool(int(v))
+    return default
+
+
+def _get_float(state: Dict[str, Any], key: str, default: Optional[float] = None) -> Optional[float]:
+    v = state.get(key, default)
+    return float(v) if _isfinite(v) else default
+
+
+def _pid(
+    err: float,
+    dt: float,
+    k_p: float,
+    k_i: float,
+    k_d: float,
+    integ_key: str,
+    last_key: str,
+    integ_limit: float,
+    deriv_limit: float,
+) -> float:
+    if dt <= 0:
+        dt = 0.02
+    # Integrator
+    _ap[integ_key] = _clamp(_ap.get(integ_key, 0.0) + err * dt, -integ_limit, integ_limit)
+    # Derivative
+    last = float(_ap.get(last_key, err))
+    d = (err - last) / dt
+    d = _clamp(d, -deriv_limit, deriv_limit)
+    _ap[last_key] = err
+    return k_p * err + k_i * _ap[integ_key] + k_d * d
+
+
+def _engine_status(state: Dict[str, Any]) -> Tuple[bool, bool]:
+    e1 = _get_bool(state, "engine_1_running", True) and not _get_bool(state, "engine_1_fire", False)
+    e2 = _get_bool(state, "engine_2_running", True) and not _get_bool(state, "engine_2_fire", False)
+    return e1, e2
+
+
+def _radio_alt(state: Dict[str, Any]) -> Optional[float]:
+    ra = _get_float(state, "radio_alt_ft", None)
+    if ra is None:
+        return None
+    # Scenario includes "all radar altimeters failed"; treat nonsense as failed.
+    if ra < -20 or ra > 6000:
+        return None
+    return ra
+
+
+def _baro_alt(state: Dict[str, Any]) -> Optional[float]:
+    alts = []
+    for i in (1, 2, 3):
+        a = _get_float(state, f"baro_alt_{i}_ft", None)
+        ok = _get_bool(state, f"baro_alt_{i}_valid", False)
+        if ok and a is not None:
+            alts.append(a)
+    return _median(alts) if alts else None
+
+
+def _irs_vs(state: Dict[str, Any]) -> Optional[float]:
+    vss = []
+    for i in (1, 2, 3):
+        ok = _get_bool(state, f"irs_{i}_valid", False)
+        vs = _get_float(state, f"irs_{i}_vs_fpm", None)
+        if ok and vs is not None:
+            vss.append(vs)
+    return _median(vss) if vss else None
+
+
+def _ias(state: Dict[str, Any]) -> Optional[float]:
+    vals = []
+    for i in (1, 2, 3):
+        ok = _get_bool(state, f"ias_{i}_valid", False)
+        v = _get_float(state, f"ias_{i}_kt", None)
+        if ok and v is not None:
+            vals.append(v)
+    if vals:
+        return _median(vals)
+    # Fallback to target if sensors gone
+    return _get_float(state, "target_ias_kt", None)
+
+
+def _dme(state: Dict[str, Any]) -> Optional[float]:
+    d1 = _get_float(state, "dme_1_nm", None)
+    d2 = _get_float(state, "dme_2_nm", None)
+    vals = [v for v in (d1, d2) if v is not None and v >= 0]
+    return _median(vals) if vals else None
+
+
+def _ils_loc_gs(state: Dict[str, Any]) -> Tuple[Optional[float], Optional[float]]:
+    loc = _robust_vote(
+        [
+            (_get_float(state, "localizer_1_dots", 0.0) or 0.0, _get_bool(state, "localizer_1_valid", False)),
+            (_get_float(state, "localizer_2_dots", 0.0) or 0.0, _get_bool(state, "localizer_2_valid", False)),
+            (_get_float(state, "localizer_3_dots", 0.0) or 0.0, _get_bool(state, "localizer_3_valid", False)),
+        ],
+        max_spread=1.5,
+    )
+    gs = _robust_vote(
+        [
+            (_get_float(state, "glideslope_1_dots", 0.0) or 0.0, _get_bool(state, "glideslope_1_valid", False)),
+            (_get_float(state, "glideslope_2_dots", 0.0) or 0.0, _get_bool(state, "glideslope_2_valid", False)),
+            (_get_float(state, "glideslope_3_dots", 0.0) or 0.0, _get_bool(state, "glideslope_3_valid", False)),
+        ],
+        max_spread=1.5,
+    )
+    return loc, gs
+
+
+def autopilot_step(state: dict, dt: float) -> dict:
+    """
+    Autopilot control step for ILS approach + flare + rollout.
+    Returns control surface / engine / configuration commands.
+    """
+    global _ap
+    if not _isfinite(dt) or dt <= 0:
+        dt = 0.02
+    dt = float(_clamp(dt, 0.01, 0.2))
+    _ap["t"] = float(_ap.get("t", 0.0)) + dt
+
+    on_ground = _get_bool(state, "on_ground", False) or _get_bool(state, "weight_on_wheels", False)
+    wow = _get_bool(state, "weight_on_wheels", False)
+
+    e1_ok, e2_ok = _engine_status(state)
+    ra = _radio_alt(state)
+    baro = _baro_alt(state)
+    dme = _dme(state)
+    ias = _ias(state)
+    vs = _irs_vs(state)
+    target_vref = _get_float(state, "target_vref_kt", 137.0) or 137.0
+
+    # ILS deviations (positive loc: right of centerline; positive gs: above glide).
+    loc_dots, gs_dots = _ils_loc_gs(state)
+
+    # Phase determination.
+    # Use radio alt when available; else baro relative to target_alt (if set) and DME.
+    target_alt = _get_float(state, "target_alt_ft", None)
+    agl_est = ra
+    if agl_est is None and baro is not None and target_alt is not None:
+        # When target_alt roughly tracks glideslope, use difference as a proxy.
+        agl_est = max(0.0, baro - (target_alt - 800.0))  # heuristic
+
+    if on_ground:
+        phase = "rollout"
+    elif agl_est is not None and agl_est < 50.0:
+        phase = "flare"
+    elif agl_est is not None and agl_est < 200.0:
+        phase = "approach_low"
+    elif agl_est is not None and agl_est < 1000.0:
+        phase = "approach"
+    else:
+        phase = "intercept"
+
+    # Configuration schedule (simple, robust).
+    flaps_cmd = None
+    gear_cmd = None
+    spdbrk_cmd = 0.0
+
+    if phase == "intercept":
+        # Early config; keep speed up slightly.
+        if dme is not None and dme < 10:
+            flaps_cmd = 5
+        if dme is not None and dme < 8:
+            flaps_cmd = 10
+        if dme is not None and dme < 6:
+            gear_cmd = 1.0
+            flaps_cmd = 20
+        if dme is not None and dme < 5:
+            flaps_cmd = 30
+    else:
+        gear_cmd = 1.0
+        if dme is not None:
+            if dme < 6:
+                flaps_cmd = 20
+            if dme < 5:
+                flaps_cmd = 30
+            if dme < 4:
+                flaps_cmd = 35
+        # Without DME, use altitude proxy.
+        if dme is None and agl_est is not None:
+            if agl_est < 1200:
+                flaps_cmd = 20
+            if agl_est < 800:
+                flaps_cmd = 30
+            if agl_est < 500:
+                flaps_cmd = 35
+
+    # Target speed schedule.
+    # If scenario says "too fast", aggressively pull to Vref+5 by 1000ft.
+    if ias is None:
+        ias = target_vref + 10
+    if phase == "intercept":
+        spd_target = max(target_vref + 20.0, 160.0)
+    elif phase in ("approach",):
+        spd_target = target_vref + 10.0
+    elif phase in ("approach_low", "flare"):
+        spd_target = target_vref + 5.0
+    else:
+        spd_target = target_vref
+
+    # Unstable approach detection (for go-around).
+    # Be conservative: allow some deviation in gusty crosswind, but protect below DH.
+    below_dh = _get_bool(state, "below_decision_height", False)
+    loc_abs = abs(loc_dots) if loc_dots is not None else 0.0
+    gs_abs = abs(gs_dots) if gs_dots is not None else 0.0
+    spd_err = ias - spd_target
+    vs_abs = abs(vs) if vs is not None else 0.0
+
+    unstable = False
+    if below_dh:
+        if loc_dots is None or gs_dots is None:
+            unstable = True
+        if loc_abs > 2.0 or gs_abs > 2.0:
+            unstable = True
+        if spd_err > 20.0:
+            unstable = True
+        if vs is not None and vs < -1200.0:
+            unstable = True
+
+    # Also go around if very low and not tracking runway.
+    if (agl_est is not None and agl_est < 80.0) and (loc_abs > 2.5 or gs_abs > 2.5):
+        unstable = True
+
+    # Manage go-around latch.
+    if _ap.get("go_around", False):
+        _ap["ga_time"] = float(_ap.get("ga_time", 0.0)) + dt
+        # Reset flare/touchdown state while going around.
+        _ap["flare_started"] = False
+        _ap["touchdown"] = False
+        # End go-around after reaching ~1500ft AGL proxy or after some time.
+        if agl_est is not None and agl_est > 1400.0:
+            _ap["go_around"] = False
+            _ap["ga_time"] = 0.0
+            _ap["loc_int"] = 0.0
+            _ap["gs_int"] = 0.0
+            _ap["spd_int"] = 0.0
+    elif unstable:
+        _ap["go_around"] = True
+        _ap["ga_time"] = 0.0
+        # Dump integrators for a clean retry.
+        _ap["loc_int"] = 0.0
+        _ap["gs_int"] = 0.0
+        _ap["spd_int"] = 0.0
+        _ap["flare_started"] = False
+
+    out: Dict[str, float] = {}
+
+    # If on the ground, focus on stopping and tracking centerline.
+    if on_ground or wow:
+        _ap["touchdown"] = True
+        out["gear"] = 1.0
+        out["speedbrake"] = 1.0
+        out["spoiler"] = 1.0
+        # Rollout steering: use localizer if available; else keep wings level.
+        if loc_dots is not None:
+            # Convert dots to rudder/aileron for centerline; mild integrator to remove bias.
+            roll_cmd = _pid(loc_dots, dt, k_p=0.12, k_i=0.02, k_d=0.05, integ_key="rollout_int", last_key="last_loc", integ_limit=5.0, deriv_limit=10.0)
+            out["rudder"] = _clamp(roll_cmd, -0.6, 0.6)
+            out["aileron"] = _clamp(0.5 * roll_cmd, -0.4, 0.4)
+        else:
+            out["rudder"] = 0.0
+            out["aileron"] = 0.0
+        out["elevator"] = -0.05
+        # Braking / reverse.
+        gs = _get_float(state, "groundspeed_kt", None)
+        if gs is None:
+            gs = ias
+        if gs is None:
+            gs = 120.0
+        # Stronger braking on wet/icy assumed by scenario; keep within [0,1].
+        if gs > 80:
+            out["autobrake"] = 0.9
+        elif gs > 50:
+            out["autobrake"] = 0.7
+        else:
+            out["autobrake"] = 0.4
+        if gs > 60 and (e1_ok or e2_ok):
+            out["reverse_1"] = 1.0 if e1_ok else 0.0
+            out["reverse_2"] = 1.0 if e2_ok else 0.0
+        else:
+            out["reverse_1"] = 0.0
+            out["reverse_2"] = 0.0
+        out["throttle_1"] = 0.0
+        out["throttle_2"] = 0.0
+        if flaps_cmd is not None:
+            out["flaps"] = float(flaps_cmd)
+        return out
+
+    # Go-around mode: TOGA thrust, positive pitch, wings level / track LOC gently.
+    if _ap.get("go_around", False):
+        out["speedbrake"] = 0.0
+        out["spoiler"] = 0.0
+        out["gear"] = 1.0 if (agl_est is not None and agl_est < 400.0) else 0.0
+        out["flaps"] = 20.0
+        # Pitch up ~10 deg equivalent: elevator command positive.
+        out["elevator"] = 0.45
+        if loc_dots is not None:
+            bank_cmd = _pid(loc_dots, dt, k_p=0.18, k_i=0.02, k_d=0.06, integ_key="loc_int", last_key="last_loc", integ_limit=3.0, deriv_limit=10.0)
+            out["aileron"] = _clamp(0.6 * bank_cmd, -0.5, 0.5)
+            out["rudder"] = _clamp(0.3 * bank_cmd, -0.4, 0.4)
+        else:
+            out["aileron"] = 0.0
+            out["rudder"] = 0.0
+        # Thrust: asymmetric if engine out.
+        if e1_ok:
+            out["throttle_1"] = 1.0
+        else:
+            out["throttle_1"] = 0.0
+        if e2_ok:
+            out["throttle_2"] = 1.0
+        else:
+            out["throttle_2"] = 0.0
+        return out
+
+    # Normal approach/flare controls.
+    # Lateral: track localizer with aileron, coordinate with rudder.
+    if loc_dots is not None:
+        # More authority near ground for gusty crosswind; keep bounded.
+        lat_kp = 0.22 if phase in ("approach_low", "flare") else 0.18
+        lat_cmd = _pid(loc_dots, dt, k_p=lat_kp, k_i=0.03, k_d=0.08, integ_key="loc_int", last_key="last_loc", integ_limit=2.5, deriv_limit=10.0)
+        out["aileron"] = _clamp(0.7 * lat_cmd, -0.7, 0.7)
+        out["rudder"] = _clamp(0.35 * lat_cmd, -0.6, 0.6)
+    else:
+        out["aileron"] = 0.0
+        out["rudder"] = 0.0
+
+    # Vertical: glideslope with elevator; flare transitions at low RA.
+    if phase == "flare":
+        if not _ap.get("flare_started", False):
+            _ap["flare_started"] = True
+            _ap["gs_int"] = 0.0
+        # Aim to reduce sink; target vs approaches -100 fpm.
+        if vs is None:
+            vs = -500.0
+        flare_err = (-100.0 - vs) / 700.0  # normalize
+        flare_cmd = _pid(flare_err, dt, k_p=0.6, k_i=0.15, k_d=0.2, integ_key="gs_int", last_key="last_gs", integ_limit=1.0, deriv_limit=3.0)
+        # Also counter if we are low/high on GS right at flare entrance.
+        if gs_dots is not None:
+            flare_cmd += _clamp(-0.10 * gs_dots, -0.15, 0.15)
+        out["elevator"] = _clamp(flare_cmd, -0.2, 0.65)
+    else:
+        _ap["flare_started"] = False
+        if gs_dots is not None:
+            # Positive gs means above glide -> need pitch down (negative elevator).
+            vert_cmd = _pid(gs_dots, dt, k_p=-0.28, k_i=-0.06, k_d=-0.12, integ_key="gs_int", last_key="last_gs", integ_limit=2.0, deriv_limit=10.0)
+            out["elevator"] = _clamp(vert_cmd, -0.7, 0.5)
+        else:
+            # No glideslope: hold a modest descent; use VS if available.
+            if vs is None:
+                out["elevator"] = 0.02
+            else:
+                vs_err = (-700.0 - vs) / 1200.0
+                vs_cmd = _pid(vs_err, dt, k_p=0.35, k_i=0.05, k_d=0.12, integ_key="gs_int", last_key="last_gs", integ_limit=1.5, deriv_limit=5.0)
+                out["elevator"] = _clamp(vs_cmd, -0.5, 0.45)
+
+    # Throttle: track target speed; manage dual/single engine failures.
+    spd_err = (spd_target - ias) if ias is not None else 0.0
+    # If both engines out, throttle stays 0.
+    if not e1_ok and not e2_ok:
+        out["throttle_1"] = 0.0
+        out["throttle_2"] = 0.0
+    else:
+        # PID on speed error (kt). Positive error means too slow -> more thrust.
+        thr = _pid(spd_err, dt, k_p=0.015, k_i=0.004, k_d=0.008, integ_key="spd_int", last_key="last_spd", integ_limit=80.0, deriv_limit=200.0)
+        # Base thrust in approach; reduce in flare.
+        base = 0.48 if phase in ("intercept", "approach") else 0.42
+        if phase == "approach_low":
+            base = 0.38
+        if phase == "flare":
+            base = 0.15
+        # If very low (RA<30), go to idle quickly.
+        if ra is not None and ra < 30.0:
+            base = 0.05
+        cmd = _clamp(base + thr, 0.0, 1.0)
+        if e1_ok and e2_ok:
+            out["throttle_1"] = cmd
+            out["throttle_2"] = cmd
+        else:
+            # Single engine: apply more thrust on live engine and rudder bias is handled by sim,
+            # but we add slight rudder toward live engine if loc unavailable.
+            if e1_ok:
+                out["throttle_1"] = cmd
+                out["throttle_2"] = 0.0
+                if loc_dots is None:
+                    out["rudder"] = _clamp(out.get("rudder", 0.0) + 0.15, -0.6, 0.6)
+            else:
+                out["throttle_1"] = 0.0
+                out["throttle_2"] = cmd
+                if loc_dots is None:
+                    out["rudder"] = _clamp(out.get("rudder", 0.0) - 0.15, -0.6, 0.6)
+
+    # Config outputs.
+    if gear_cmd is not None:
+        out["gear"] = float(gear_cmd)
+    if flaps_cmd is not None:
+        out["flaps"] = float(flaps_cmd)
+
+    # Speedbrake: keep retracted in the air; may extend slightly if too fast and stable.
+    if phase in ("intercept", "approach") and spd_err < -15.0 and (not below_dh):
+        spdbrk_cmd = 0.2
+    if phase in ("approach_low", "flare"):
+        spdbrk_cmd = 0.0
+    out["speedbrake"] = float(_clamp(spdbrk_cmd, 0.0, 1.0))
+
+    return out

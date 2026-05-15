@@ -15,13 +15,13 @@ import subprocess
 import time
 import math
 from typing import List, Tuple, Dict, Any
-from solver_utils import StreamingInputFile
+from solver_utils import StreamingInputFile, normalize_code_result
 
 title = "Vehicle Routing Problem (Python)"
 
 tags = [
   "python",
-  "structured response",
+  "freeform response",
   "np hard",
   "optimization",
 ]
@@ -248,21 +248,7 @@ Write complete, runnable Python code.
 
 extraGradeAnswerRuns = list(range(len(TEST_CASES)))
 
-structure = {
-  "type": "object",
-  "properties": {
-    "reasoning": {
-      "type": "string",
-      "description": "Explain your algorithm approach and how it adapts to different problem sizes"
-    },
-    "python_code": {
-      "type": "string",
-      "description": "Complete Python code with solver function that handles all scales"
-    }
-  },
-  "required": ["reasoning", "python_code"],
-  "additionalProperties": False
-}
+structure = None
 
 
 def verify_routes(customers: List[Tuple[float, float]], demands: List[int],
@@ -337,6 +323,7 @@ def nearest_neighbor_distance(customers: List[Tuple[float, float]], demands: Lis
 
 
 def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
+  result = normalize_code_result(result, "python_code")
   if not result or "python_code" not in result:
     return 0.0, "No Python code provided"
 
@@ -431,6 +418,7 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
 
 
 def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
+  result = normalize_code_result(result, "python_code")
   if not result:
     return "<p style='color:red'>No result provided</p>"
   case = TEST_CASES[subPass]

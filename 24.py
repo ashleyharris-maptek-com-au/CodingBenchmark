@@ -22,13 +22,13 @@ from pathlib import Path
 
 # Import our native compiler helper
 from native_compiler import CppCompiler, CompilationError, ExecutionError, describe_this_pc
-from solver_utils import GradeCache
+from solver_utils import GradeCache, normalize_code_result
 
 title = "3D Lunar Lander Game (C++)"
 
 tags = [
   "cpp",
-  "structured response",
+  "freeform response",
   "game ai",
   "simulation",
 ]
@@ -46,6 +46,7 @@ _grade_cache = GradeCache("test24")
 
 
 def _cache_key_parts(result: dict, subPass: int) -> tuple:
+  result = normalize_code_result(result, "cpp_code")
   case = TEST_CASES[subPass]
   code = result.get("cpp_code", "")
   return (
@@ -1006,23 +1007,7 @@ as referencing the wrong intrinsics or non-standard header like 'bits/stdc++.h' 
 
 extraGradeAnswerRuns = list(range(len(TEST_CASES)))
 
-structure = {
-  "type": "object",
-  "properties": {
-    "reasoning": {
-      "type":
-      "string",
-      "description":
-      "Explain your algorithm approach and how it adapts to different 3D landing complexities"
-    },
-    "cpp_code": {
-      "type": "string",
-      "description": "Complete C++ code with main() function that handles all scales"
-    }
-  },
-  "required": ["reasoning", "cpp_code"],
-  "additionalProperties": False
-}
+structure = None
 
 
 def run_lander_simulation(code: str, case: dict, subpass: int,
@@ -1259,6 +1244,7 @@ def run_lander_simulation(code: str, case: dict, subpass: int,
 
 def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
   """Grade the C++ 3D lander controller."""
+  result = normalize_code_result(result, "cpp_code")
   if not result:
     return 0.0, "No result provided"
 
@@ -1302,6 +1288,7 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
 
 
 def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
+  result = normalize_code_result(result, "cpp_code")
   if not result:
     return "<p style='color:red'>No result provided</p>"
   cache_parts = _cache_key_parts(result, subPass)

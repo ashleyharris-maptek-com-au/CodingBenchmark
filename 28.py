@@ -9,20 +9,24 @@ import subprocess
 import time
 import math
 import itertools
+import hashlib
+import os
+import json
 from typing import List, Tuple, Set, Dict, Any, Optional
 from native_compiler import RustCompiler, CompilationError, ExecutionError,describe_this_pc
-from solver_utils import StreamingInputFile
+from solver_utils import GradeCache, StreamingInputFile, normalize_code_result
 
 title = "Minimum Vertex Cover (Rust)"
 
 tags = [
   "rust",
-  "structured response",
+  "freeform response",
   "np hard",
   "graph theory",
 ]
 TIMEOUT_SECONDS = 30
 RANDOM_SEED = 28282828
+_GRADE_CACHE = GradeCache("test28_minimum_vertex_cover")
 
 
 def generate_graph(num_vertices: int, num_edges: int, seed: int) -> List[Tuple[int, int]]:
@@ -226,23 +230,7 @@ Write complete, compilable Rust code with a main() function.
 
 extraGradeAnswerRuns = list(range(len(TEST_CASES)))
 
-structure = {
-  "type": "object",
-  "properties": {
-    "reasoning": {
-      "type":
-      "string",
-      "description":
-      "Explain your algorithm approach and how it adapts to different vertex cover complexities"
-    },
-    "rust_code": {
-      "type": "string",
-      "description": "Complete Rust code with main function that handles all scales"
-    }
-  },
-  "required": ["reasoning", "rust_code"],
-  "additionalProperties": False
-}
+structure = None
 
 
 def verify_cover(num_vertices: int, edges: List[Tuple[int, int]],
@@ -331,7 +319,50 @@ def estimate_cover_size(num_vertices: int, num_edges: int) -> int:
   return int(cover_est)
 
 
-def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
+def _sha256_text(text: str) -> str:
+  return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _rust_compiler_fingerprint(ai_engine_name: str) -> str:
+  try:
+    compiler = RustCompiler(ai_engine_name)
+    compiler_path = compiler.find_compiler()
+    if compiler_path:
+      try:
+        st = os.stat(compiler_path)
+        stat_fingerprint = f"size={st.st_size}|mtime_ns={st.st_mtime_ns}"
+      except Exception as e:
+        stat_fingerprint = f"stat-unavailable:{type(e).__name__}:{e}"
+      return f"{compiler.describe()}|path={compiler_path}|{stat_fingerprint}"
+    return compiler.describe()
+  except Exception as e:
+    return f"rust-unavailable:{type(e).__name__}:{e}"
+
+
+def _case_cache_identity(subpass: int, case: dict) -> str:
+  return json.dumps(
+    {
+      "version": "test28-input-v1",
+      "subpass": subpass,
+      "seed": _case_seed(case, subpass),
+      "case": case,
+    },
+    sort_keys=True)
+
+
+def _grade_cache_key_parts(ai_engine_name: str, subpass: int, case: dict, code: str) -> tuple:
+  return (
+    "test28-grade-v1",
+    f"model={ai_engine_name}",
+    f"input_sha256={_sha256_text(_case_cache_identity(subpass, case))}",
+    f"solver_sha256={_sha256_text(code)}",
+    f"compiler={_rust_compiler_fingerprint(ai_engine_name)}",
+    f"machine={describe_this_pc()}",
+  )
+
+
+def _gradeAnswer_uncached(result: dict, subPass: int, aiEngineName: str) -> tuple:
+  result = normalize_code_result(result, "rust_code")
   if not result or "rust_code" not in result:
     return 0.0, "No Rust code provided"
 
@@ -450,7 +481,39 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
     return 0.0, f"[{case['desc']}] Error: {str(e)[:100]}"
 
 
+def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
+  result = normalize_code_result(result, "rust_code")
+  if not result or "rust_code" not in result:
+    return 0.0, "No Rust code provided"
+
+  case = TEST_CASES[subPass]
+  code = result["rust_code"]
+  cache_key = _grade_cache_key_parts(aiEngineName, subPass, case, code)
+
+  def compute_grade_record():
+    LAST_COVER_VIZ.pop((subPass, aiEngineName), None)
+    score, explanation = _gradeAnswer_uncached(result, subPass, aiEngineName)
+    record = {
+      "score": score,
+      "explanation": explanation,
+    }
+    viz = LAST_COVER_VIZ.get((subPass, aiEngineName))
+    if isinstance(viz, dict):
+      record["viz"] = viz
+    return record
+
+  record = _GRADE_CACHE.get_or_compute_json("grade", compute_grade_record, *cache_key)
+  viz = record.get("viz")
+  if isinstance(viz, dict):
+    LAST_COVER_VIZ[(subPass, aiEngineName)] = viz
+  else:
+    LAST_COVER_VIZ.pop((subPass, aiEngineName), None)
+
+  return float(record.get("score", 0.0)), str(record.get("explanation", "No explanation"))
+
+
 def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
+  result = normalize_code_result(result, "rust_code")
   if not result:
     return "<p style='color:red'>No result provided</p>"
   case = TEST_CASES[subPass]

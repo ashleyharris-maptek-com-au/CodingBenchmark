@@ -18,6 +18,7 @@ import platform
 import json
 import signal
 import hashlib
+import threading
 from pathlib import Path
 from typing import Generator, Callable, Optional, Union, Any, Iterator
 
@@ -31,6 +32,9 @@ STREAMING_CACHE_DIR = Path(tempfile.gettempdir()) / "codingbenchmark_streaming_c
 
 # Directory for cached grade/report results
 GRADE_CACHE_DIR = Path(tempfile.gettempdir()) / "codingbenchmark_grade_cache"
+
+# Directory for cached baseline/reference computations
+BASELINE_CACHE_DIR = Path(tempfile.gettempdir()) / "codingbenchmark_baseline_cache"
 
 
 def _strip_comment_prefix(line: str) -> str:
@@ -89,11 +93,11 @@ def parse_freeform_response(response_text: str) -> dict:
     return {"discussion": "", "code": ""}
 
   text = response_text.strip()
-  fence_re = re.compile(r"```(?:[a-zA-Z0-9_+-]*)\n([\s\S]*?)```", re.MULTILINE)
+  fence_re = re.compile(r"```(?:[a-zA-Z0-9_+-]*)[ \t]*\r?\n([\s\S]*?)```", re.MULTILINE)
   match = fence_re.search(text)
   if match:
     discussion = text[:match.start()].strip()
-    code = match.group(1).strip("\n")
+    code = match.group(1).strip("\r\n")
     if not discussion:
       discussion = _extract_leading_comment(code)
     return {"discussion": discussion, "code": code}
@@ -102,7 +106,48 @@ def parse_freeform_response(response_text: str) -> dict:
   if discussion is None:
     discussion = ""
     code = text
-  return {"discussion": discussion, "code": code.strip("\n")}
+  return {"discussion": discussion, "code": code.strip("\r\n")}
+
+
+def normalize_code_result(result: Any, code_key: str) -> dict:
+  """Return a legacy-shaped dict for graders from structured or freeform output."""
+  if isinstance(result, dict):
+    normalized = dict(result)
+    if code_key not in normalized:
+      for fallback_key in (
+          "code",
+          "cpp_code",
+          "csharp_code",
+          "rust_code",
+          "python_code",
+          "shader_code",
+          "spirv_code",
+          "spirv_hex",
+      ):
+        value = normalized.get(fallback_key)
+        if isinstance(value, str) and value.strip():
+          normalized[code_key] = value
+          break
+    if "reasoning" not in normalized:
+      discussion = normalized.get("discussion") or normalized.get("reasoningAndDiscussion")
+      if isinstance(discussion, str) and discussion:
+        normalized["reasoning"] = discussion
+    return normalized
+
+  if isinstance(result, str):
+    parsed = parse_freeform_response(result)
+    code = parsed.get("code", "")
+    discussion = parsed.get("discussion", "")
+    if not code and not discussion:
+      return {}
+    normalized = {}
+    if code:
+      normalized[code_key] = code
+    if discussion:
+      normalized["reasoning"] = discussion
+    return normalized
+
+  return {}
 
 
 class GradeCache:
@@ -124,15 +169,270 @@ class GradeCache:
     return h.hexdigest()[:32]
 
   def _path(self, key_hash: str, kind: str) -> Path:
+    kind = re.sub(r"[^A-Za-z0-9_.-]", "_", kind)
     return self.cache_dir / f"{key_hash}_{kind}.json"
+
+  def _lock_path(self, key_hash: str, kind: str) -> Path:
+    kind = re.sub(r"[^A-Za-z0-9_.-]", "_", kind)
+    return self.cache_dir / f"{key_hash}_{kind}.lock"
+
+  @staticmethod
+  def _read_json_path(path: Path):
+    if path.exists():
+      try:
+        return json.loads(path.read_text(encoding='utf-8'))
+      except Exception:
+        pass
+    return None
+
+  @staticmethod
+  def _write_json_atomic(path: Path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = None
+    try:
+      with tempfile.NamedTemporaryFile(mode='w',
+                                       encoding='utf-8',
+                                       dir=path.parent,
+                                       prefix=path.name + ".",
+                                       suffix=".tmp",
+                                       delete=False) as f:
+        tmp_path = Path(f.name)
+        json.dump(data, f)
+        f.flush()
+        try:
+          os.fsync(f.fileno())
+        except Exception:
+          pass
+      os.replace(tmp_path, path)
+    finally:
+      if tmp_path is not None:
+        try:
+          tmp_path.unlink(missing_ok=True)
+        except Exception:
+          pass
+
+  @staticmethod
+  def _read_lock_info(lock_path: Path) -> dict:
+    try:
+      text = lock_path.read_text(encoding='utf-8', errors='replace')
+    except Exception as e:
+      return {"pid": None, "time": None, "raw": "", "read_error": repr(e)}
+
+    pid = None
+    created_at = None
+    pid_match = re.search(r"\bpid=(\d+)\b", text)
+    time_match = re.search(r"\btime=([0-9.]+)\b", text)
+    if pid_match:
+      try:
+        pid = int(pid_match.group(1))
+      except ValueError:
+        pid = None
+    if time_match:
+      try:
+        created_at = float(time_match.group(1))
+      except ValueError:
+        created_at = None
+    return {"pid": pid, "time": created_at, "raw": text.strip()}
+
+  @staticmethod
+  def _pid_is_running(pid: Optional[int]) -> Optional[bool]:
+    if pid is None or pid <= 0:
+      return None
+    if pid == os.getpid():
+      return True
+
+    if platform.system() == 'Windows':
+      try:
+        import ctypes
+        import ctypes.wintypes
+        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        kernel32.OpenProcess.argtypes = [
+            ctypes.wintypes.DWORD, ctypes.wintypes.BOOL, ctypes.wintypes.DWORD
+        ]
+        kernel32.OpenProcess.restype = ctypes.wintypes.HANDLE
+        kernel32.CloseHandle.argtypes = [ctypes.wintypes.HANDLE]
+        kernel32.CloseHandle.restype = ctypes.wintypes.BOOL
+        process_query_limited_information = 0x1000
+        handle = kernel32.OpenProcess(process_query_limited_information, False, int(pid))
+        if handle:
+          kernel32.CloseHandle(handle)
+          return True
+        error = ctypes.get_last_error()
+        if error == 87:  # ERROR_INVALID_PARAMETER: no such PID.
+          return False
+        if error == 5:  # ERROR_ACCESS_DENIED: PID exists, but we cannot inspect it.
+          return True
+      except Exception:
+        return None
+      return None
+
+    try:
+      os.kill(pid, 0)
+      return True
+    except ProcessLookupError:
+      return False
+    except PermissionError:
+      return True
+    except OSError:
+      return None
+
+  class _LockToken:
+
+    def __init__(self, lock_path: Path, heartbeat_interval: float):
+      self.lock_path = lock_path
+      self._stop_event = threading.Event()
+      self._thread = threading.Thread(target=self._heartbeat,
+                                      args=(heartbeat_interval,),
+                                      daemon=True)
+      self._thread.start()
+
+    def _heartbeat(self, heartbeat_interval: float):
+      while not self._stop_event.wait(heartbeat_interval):
+        try:
+          os.utime(self.lock_path, None)
+        except FileNotFoundError:
+          return
+        except Exception:
+          pass
+
+    def close(self):
+      self._stop_event.set()
+      self._thread.join(timeout=1.0)
+
+  @staticmethod
+  def _acquire_lock(lock_path: Path,
+                    poll_interval: float = 0.1,
+                    stale_seconds: float = 12 * 60 * 60,
+                    malformed_stale_seconds: float = 60,
+                    reclaim_grace_seconds: float = 30):
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    reclaimable_since = None
+    last_reclaim_error = None
+
+    while True:
+      try:
+        stat = lock_path.stat()
+      except FileNotFoundError:
+        fd = None
+        try:
+          fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+          os.write(fd, f"pid={os.getpid()} time={time.time()}\n".encode("utf-8"))
+          try:
+            os.fsync(fd)
+          except Exception:
+            pass
+          heartbeat_interval = max(1.0, min(60.0, stale_seconds / 4.0))
+          return GradeCache._LockToken(lock_path, heartbeat_interval)
+        except FileExistsError:
+          pass
+        except Exception:
+          if fd is not None:
+            try:
+              lock_path.unlink(missing_ok=True)
+            except Exception:
+              pass
+          raise
+        finally:
+          if fd is not None:
+            try:
+              os.close(fd)
+            except Exception:
+              pass
+      else:
+        now = time.time()
+        age = max(0.0, now - stat.st_mtime)
+        info = GradeCache._read_lock_info(lock_path)
+        owner_running = GradeCache._pid_is_running(info.get("pid"))
+        malformed = info.get("pid") is None
+        should_reclaim = (
+            owner_running is False
+            or age > stale_seconds
+            or (malformed and age > malformed_stale_seconds)
+        )
+
+        if should_reclaim:
+          if reclaimable_since is None:
+            reclaimable_since = now
+          try:
+            lock_path.unlink()
+            reclaimable_since = None
+            last_reclaim_error = None
+            continue
+          except FileNotFoundError:
+            reclaimable_since = None
+            last_reclaim_error = None
+            continue
+          except Exception as e:
+            last_reclaim_error = e
+            if now - reclaimable_since >= reclaim_grace_seconds:
+              owner_desc = f"pid={info.get('pid')}"
+              if owner_running is False:
+                owner_desc += " (not running)"
+              elif owner_running is True:
+                owner_desc += " (running)"
+              else:
+                owner_desc += " (unknown)"
+              raise RuntimeError(
+                  f"Unable to reclaim cache lock {lock_path} after "
+                  f"{now - reclaimable_since:.1f}s; {owner_desc}, "
+                  f"age={age:.1f}s, raw={info.get('raw')!r}, "
+                  f"delete_error={last_reclaim_error!r}") from e
+        else:
+          reclaimable_since = None
+          last_reclaim_error = None
+
+      time.sleep(poll_interval)
+
+  @staticmethod
+  def _release_lock(lock_path: Path, lock_token):
+    if hasattr(lock_token, "close"):
+      try:
+        lock_token.close()
+      except Exception:
+        pass
+    else:
+      try:
+        os.close(lock_token)
+      except Exception:
+        pass
+    try:
+      lock_path.unlink(missing_ok=True)
+    except Exception:
+      pass
+
+  def get_json(self, kind: str, *key_parts: str):
+    h = self._hash_key(*key_parts)
+    return self._read_json_path(self._path(h, kind))
+
+  def put_json(self, kind: str, data, *key_parts: str):
+    h = self._hash_key(*key_parts)
+    self._write_json_atomic(self._path(h, kind), data)
+
+  def get_or_compute_json(self, kind: str, compute: Callable[[], Any], *key_parts: str):
+    h = self._hash_key(*key_parts)
+    path = self._path(h, kind)
+    cached = self._read_json_path(path)
+    if cached is not None:
+      return cached
+
+    lock_path = self._lock_path(h, kind)
+    lock_token = self._acquire_lock(lock_path)
+    try:
+      cached = self._read_json_path(path)
+      if cached is not None:
+        return cached
+      data = compute()
+      self._write_json_atomic(path, data)
+      return data
+    finally:
+      self._release_lock(lock_path, lock_token)
 
   def get_grade(self, *key_parts: str):
     """Return cached (score, details) or None."""
     h = self._hash_key(*key_parts)
-    p = self._path(h, "grade")
-    if p.exists():
+    data = self._read_json_path(self._path(h, "grade"))
+    if data is not None:
       try:
-        data = json.loads(p.read_text(encoding='utf-8'))
         return (data["score"], data["details"])
       except Exception:
         pass
@@ -141,10 +441,8 @@ class GradeCache:
   def put_grade(self, result, *key_parts: str):
     """Cache a (score, details) tuple."""
     h = self._hash_key(*key_parts)
-    p = self._path(h, "grade")
     try:
-      p.write_text(json.dumps({"score": result[0], "details": result[1]}),
-                    encoding='utf-8')
+      self._write_json_atomic(self._path(h, "grade"), {"score": result[0], "details": result[1]})
     except Exception:
       pass
 
@@ -167,6 +465,14 @@ class GradeCache:
       p.write_text(html, encoding='utf-8')
     except Exception:
       pass
+
+
+class BaselineCache(GradeCache):
+  """Disk-based cache for expensive baseline/reference computations."""
+
+  def __init__(self, test_name: str):
+    self.cache_dir = BASELINE_CACHE_DIR / test_name
+    self.cache_dir.mkdir(parents=True, exist_ok=True)
 
 
 class StreamingInputFile:

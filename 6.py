@@ -21,18 +21,20 @@ import uuid
 from typing import List, Tuple, Dict, Optional
 
 from native_compiler import CSharpCompiler, compile_and_run, describe_this_pc
+from solver_utils import BaselineCache, normalize_code_result
 
 title = "Orbital TSP - Space Station Route Planning (C#)"
 
 tags = [
   "csharp",
-  "structured response",
+  "freeform response",
   "np hard",
   "optimization",
 ]
 
 # Timeout in seconds (5 minutes)
 TIMEOUT_SECONDS = 30
+_BASELINE_CACHE = BaselineCache("test6_orbital_tsp")
 
 # Standard gravitational parameter for Earth (km^3/s^2)
 MU = 398600.4418
@@ -275,23 +277,7 @@ Write complete, compilable C# code with a static void Main method.
 # List of subpasses to grade the single answer against all difficulty levels
 extraGradeAnswerRuns = list(range(len(STATION_COUNTS)))
 
-structure = {
-  "type": "object",
-  "properties": {
-    "reasoning": {
-      "type":
-      "string",
-      "description":
-      "Explain your orbital mechanics approach and how it adapts to different station counts"
-    },
-    "csharp_code": {
-      "type": "string",
-      "description": "Complete C# code with Main method that handles all scales"
-    }
-  },
-  "required": ["reasoning", "csharp_code"],
-  "additionalProperties": False
-}
+structure = None
 
 
 def estimate_transfer_delta_v(orbit1: List[float], orbit2: List[float]) -> float:
@@ -666,6 +652,7 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
     - 0.5: Valid solution but poor
     - 0.0: Invalid or error
     """
+  result = normalize_code_result(result, "csharp_code")
   if not result:
     return 0.0, "No result provided"
 
@@ -692,7 +679,7 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
   solution_dv = evaluate_order(order, start_orbit, orbits)
 
   # Get baseline
-  baseline_order, baseline_dv = get_baseline_solution(num_stations, start_orbit, orbits)
+  baseline_order, baseline_dv = _get_cached_baseline_solution(num_stations, start_orbit, orbits)
 
   # Score
   ratio = solution_dv / baseline_dv if baseline_dv > 0 else float('inf')
@@ -715,6 +702,27 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
                  f"Time: {exec_time:.1f}s - {quality}")
 
   return score, explanation
+
+
+def _get_cached_baseline_solution(num_stations: int, start_orbit: List[float],
+                                  orbits: List[List[float]]) -> Tuple[List[int], float]:
+  record = _BASELINE_CACHE.get_or_compute_json(
+    "baseline",
+    lambda: {
+      "order": get_baseline_solution(num_stations, start_orbit, orbits)[0],
+      "delta_v": get_baseline_solution(num_stations, start_orbit, orbits)[1],
+    },
+    "test6-baseline-v1",
+    format_input(num_stations, start_orbit, orbits),
+  )
+  return list(record["order"]), float(record["delta_v"])
+
+
+def setup() -> None:
+  for subpass in range(len(STATION_COUNTS)):
+    num_stations = STATION_COUNTS[subpass]
+    start_orbit, orbits = _get_dataset_for_subpass(subpass)
+    _get_cached_baseline_solution(num_stations, start_orbit, orbits)
 
 
 def _state_to_elements(sv):
@@ -1153,6 +1161,7 @@ def _generate_orbital_viz_html(viz_data, name="Orbital TSP"):
 
 def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
   """Generate HTML report with 3D orbital visualization."""
+  result = normalize_code_result(result, "csharp_code")
   if not result:
     return "<p style='color:red'>No result provided</p>"
 

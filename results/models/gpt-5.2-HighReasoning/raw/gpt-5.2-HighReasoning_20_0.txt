@@ -1,0 +1,417 @@
+use std::cmp::Ordering;
+use std::collections::HashMap;
+use std::f32;
+use std::hash::{BuildHasherDefault, Hasher};
+use std::io::{self, Read};
+
+// Fast non-cryptographic hasher for HashMap keys.
+// (SipHash is secure but slower; this workload benefits from speed.)
+#[derive(Default)]
+struct FastHasher(u64);
+impl Hasher for FastHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        // FNV-1a style mixing + xorshift; good enough for voxel keys.
+        let mut hash = self.0 ^ 0x9E37_79B9_7F4A_7C15u64;
+        for &b in bytes {
+            hash ^= b as u64;
+            hash = hash.wrapping_mul(0x100_0000_01B3u64);
+        }
+        // final scramble
+        hash ^= hash >> 33;
+        hash = hash.wrapping_mul(0xff51afd7ed558ccdu64);
+        hash ^= hash >> 33;
+        self.0 = hash;
+    }
+
+    fn write_u32(&mut self, i: u32) {
+        self.write(&i.to_le_bytes());
+    }
+    fn write_i32(&mut self, i: i32) {
+        self.write(&i.to_le_bytes());
+    }
+    fn write_u64(&mut self, i: u64) {
+        self.write(&i.to_le_bytes());
+    }
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+type FastBuildHasher = BuildHasherDefault<FastHasher>;
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct VoxelKey {
+    x: i32,
+    y: i32,
+    z: i32,
+}
+
+struct Scanner {
+    buf: Vec<u8>,
+    idx: usize,
+}
+
+impl Scanner {
+    fn new() -> Self {
+        let mut input = String::new();
+        io::stdin().read_to_string(&mut input).unwrap();
+        Self {
+            buf: input.into_bytes(),
+            idx: 0,
+        }
+    }
+
+    fn skip_ws(&mut self) {
+        while self.idx < self.buf.len() && self.buf[self.idx].is_ascii_whitespace() {
+            self.idx += 1;
+        }
+    }
+
+    fn next_token(&mut self) -> Option<&[u8]> {
+        self.skip_ws();
+        if self.idx >= self.buf.len() {
+            return None;
+        }
+        let start = self.idx;
+        while self.idx < self.buf.len() && !self.buf[self.idx].is_ascii_whitespace() {
+            self.idx += 1;
+        }
+        Some(&self.buf[start..self.idx])
+    }
+
+    fn next_string(&mut self) -> Option<String> {
+        self.next_token().map(|t| String::from_utf8_lossy(t).to_string())
+    }
+
+    fn next_usize(&mut self) -> Option<usize> {
+        let t = self.next_token()?;
+        parse_usize(t)
+    }
+
+    fn next_f64(&mut self) -> Option<f64> {
+        let t = self.next_token()?;
+        parse_f64(t)
+    }
+}
+
+fn parse_usize(t: &[u8]) -> Option<usize> {
+    if t.is_empty() {
+        return None;
+    }
+    let mut v: usize = 0;
+    for &c in t {
+        if c < b'0' || c > b'9' {
+            return None;
+        }
+        v = v.checked_mul(10)? + (c - b'0') as usize;
+    }
+    Some(v)
+}
+
+fn parse_f64(t: &[u8]) -> Option<f64> {
+    // Accept common missing markers as None.
+    if t.is_empty() {
+        return None;
+    }
+    match t {
+        b"NA" | b"NaN" | b"nan" | b"null" | b"NULL" | b"-" => return None,
+        _ => {}
+    }
+    // Use Rust's parser on a lossless conversion; fast enough compared to overall work.
+    std::str::from_utf8(t).ok()?.parse::<f64>().ok()
+}
+
+fn median_in_place(vals: &mut [f32]) -> f32 {
+    if vals.is_empty() {
+        return f32::NAN;
+    }
+    vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+    let mid = vals.len() / 2;
+    if vals.len() % 2 == 1 {
+        vals[mid]
+    } else {
+        0.5 * (vals[mid - 1] + vals[mid])
+    }
+}
+
+fn mad(vals: &[f32], med: f32, scratch: &mut Vec<f32>) -> f32 {
+    scratch.clear();
+    scratch.reserve(vals.len());
+    for &v in vals {
+        scratch.push((v - med).abs());
+    }
+    median_in_place(scratch)
+}
+
+#[derive(Clone)]
+struct Suspect {
+    conf: f32,
+    hole_idx: u32,
+    sample_idx: u32,
+    prop_idx: usize,
+}
+
+fn main() {
+    let mut sc = Scanner::new();
+
+    let num_holes = match sc.next_usize() {
+        Some(v) => v,
+        None => {
+            // Empty input.
+            println!("0");
+            return;
+        }
+    };
+    let num_props = match sc.next_usize() {
+        Some(v) => v,
+        None => {
+            println!("0");
+            return;
+        }
+    };
+
+    let mut prop_names: Vec<String> = Vec::with_capacity(num_props);
+    for _ in 0..num_props {
+        prop_names.push(sc.next_string().unwrap_or_else(|| "prop".to_string()));
+    }
+
+    let mut hole_ids: Vec<String> = Vec::with_capacity(num_holes);
+
+    let mut sample_hole: Vec<u32> = Vec::new();
+    let mut sample_in_hole: Vec<u32> = Vec::new();
+    let mut pos: Vec<[f32; 3]> = Vec::new();
+    let mut values: Vec<f32> = Vec::new(); // flat N * P
+
+    // Bounding box for adaptive voxel sizing.
+    let mut bb_min = [f64::INFINITY; 3];
+    let mut bb_max = [f64::NEG_INFINITY; 3];
+
+    for hole_i in 0..num_holes {
+        let hole_id = sc.next_string().unwrap_or_else(|| format!("H{}", hole_i));
+        hole_ids.push(hole_id);
+
+        let sx = sc.next_f64().unwrap_or(0.0);
+        let sy = sc.next_f64().unwrap_or(0.0);
+        let sz = sc.next_f64().unwrap_or(0.0);
+        let dx = sc.next_f64().unwrap_or(0.0);
+        let dy = sc.next_f64().unwrap_or(0.0);
+        let dz = sc.next_f64().unwrap_or(1.0);
+        let length = sc.next_f64().unwrap_or(0.0).max(0.0);
+        let num_samples = sc.next_usize().unwrap_or(0);
+
+        let dlen = (dx * dx + dy * dy + dz * dz).sqrt();
+        let (ux, uy, uz) = if dlen > 0.0 {
+            (dx / dlen, dy / dlen, dz / dlen)
+        } else {
+            (0.0, 0.0, 1.0)
+        };
+
+        for sidx in 0..num_samples {
+            let depth = sc.next_f64().unwrap_or(f64::NAN);
+            // If depth missing/NaN, treat as 0 (still ingest values).
+            let mut t = if depth.is_finite() { depth } else { 0.0 };
+            if length > 0.0 {
+                if t < 0.0 {
+                    t = 0.0;
+                } else if t > length {
+                    t = length;
+                }
+            }
+
+            let x = sx + ux * t;
+            let y = sy + uy * t;
+            let z = sz + uz * t;
+
+            for k in 0..3 {
+                let v = [x, y, z][k];
+                if v < bb_min[k] {
+                    bb_min[k] = v;
+                }
+                if v > bb_max[k] {
+                    bb_max[k] = v;
+                }
+            }
+
+            sample_hole.push(hole_i as u32);
+            sample_in_hole.push(sidx as u32);
+            pos.push([x as f32, y as f32, z as f32]);
+
+            // Properties: allow missing tokens by treating unparsable as NaN.
+            for _p in 0..num_props {
+                let v = match sc.next_token() {
+                    Some(tok) => parse_f64(tok).map(|f| f as f32).unwrap_or(f32::NAN),
+                    None => f32::NAN,
+                };
+                values.push(v);
+            }
+        }
+    }
+
+    let n_samples = pos.len();
+    if n_samples == 0 || num_props == 0 {
+        println!("0");
+        return;
+    }
+
+    // Adaptive strategy based on dataset scale.
+    let n = n_samples as f64;
+    let span_x = (bb_max[0] - bb_min[0]).abs();
+    let span_y = (bb_max[1] - bb_min[1]).abs();
+    let span_z = (bb_max[2] - bb_min[2]).abs();
+    let span = span_x.max(span_y).max(span_z).max(1e-6);
+
+    // Heuristic: aim for ~20 samples/cell on average.
+    let target_cells = (n / 20.0).max(1.0);
+    let cells_per_axis = target_cells.cbrt().max(1.0);
+    let mut voxel = (span / cells_per_axis) as f32;
+    voxel = voxel.clamp(0.25, 250.0);
+
+    let (search_r, max_neighbors, min_neighbors, z_threshold) = if n_samples <= 50_000 {
+        (2i32, 128usize, 4usize, 4.0f32)
+    } else if n_samples <= 2_000_000 {
+        (1i32, 64usize, 6usize, 4.5f32)
+    } else {
+        // Very large: keep it cheap, report only the most obvious.
+        voxel = (voxel * 1.5).clamp(0.5, 500.0);
+        (1i32, 32usize, 8usize, 5.0f32)
+    };
+
+    // Build voxel grid.
+    let origin = [bb_min[0] as f32, bb_min[1] as f32, bb_min[2] as f32];
+    let inv_voxel = 1.0f32 / voxel;
+
+    let mut grid: HashMap<VoxelKey, Vec<u32>, FastBuildHasher> =
+        HashMap::with_capacity_and_hasher((n_samples / 10).max(1024), Default::default());
+
+    for (i, p) in pos.iter().enumerate() {
+        let ix = ((p[0] - origin[0]) * inv_voxel).floor() as i32;
+        let iy = ((p[1] - origin[1]) * inv_voxel).floor() as i32;
+        let iz = ((p[2] - origin[2]) * inv_voxel).floor() as i32;
+        let key = VoxelKey { x: ix, y: iy, z: iz };
+        grid.entry(key).or_default().push(i as u32);
+    }
+
+    let mut suspects: Vec<Suspect> = Vec::new();
+    // Keep runtime bounded: cap worst-case suspect list.
+    let suspect_cap = (n_samples / 50).max(10_000).min(500_000);
+
+    let mut neigh_indices: Vec<u32> = Vec::with_capacity(max_neighbors);
+    let mut neigh_vals: Vec<f32> = Vec::with_capacity(max_neighbors);
+    let mut scratch: Vec<f32> = Vec::with_capacity(max_neighbors);
+
+    for i in 0..n_samples {
+        neigh_indices.clear();
+        let p = pos[i];
+        let ix = ((p[0] - origin[0]) * inv_voxel).floor() as i32;
+        let iy = ((p[1] - origin[1]) * inv_voxel).floor() as i32;
+        let iz = ((p[2] - origin[2]) * inv_voxel).floor() as i32;
+
+        'cell: for dz in -search_r..=search_r {
+            for dy in -search_r..=search_r {
+                for dx in -search_r..=search_r {
+                    let key = VoxelKey {
+                        x: ix + dx,
+                        y: iy + dy,
+                        z: iz + dz,
+                    };
+                    if let Some(v) = grid.get(&key) {
+                        // If cell is huge, stride to sample it.
+                        let mut stride = 1usize;
+                        if v.len() > max_neighbors {
+                            stride = (v.len() / max_neighbors).max(1);
+                        }
+                        let mut j = 0usize;
+                        while j < v.len() {
+                            let idx = v[j];
+                            if idx as usize != i {
+                                neigh_indices.push(idx);
+                                if neigh_indices.len() >= max_neighbors {
+                                    break 'cell;
+                                }
+                            }
+                            j += stride;
+                        }
+                    }
+                }
+            }
+        }
+
+        if neigh_indices.len() < min_neighbors {
+            continue;
+        }
+
+        let base = i * num_props;
+        for prop in 0..num_props {
+            let x = values[base + prop];
+            if !x.is_finite() {
+                continue;
+            }
+
+            neigh_vals.clear();
+            for &ni in &neigh_indices {
+                let v = values[ni as usize * num_props + prop];
+                if v.is_finite() {
+                    neigh_vals.push(v);
+                }
+            }
+
+            if neigh_vals.len() < min_neighbors {
+                continue;
+            }
+
+            let med = median_in_place(&mut neigh_vals);
+            if !med.is_finite() {
+                continue;
+            }
+            let mad_v = mad(&neigh_vals, med, &mut scratch);
+            let scale = (1.4826 * mad_v).max(1e-6);
+            let z = ((x - med).abs()) / scale;
+
+            if z >= z_threshold {
+                // Map z-score to [0,1) confidence.
+                let conf = 1.0 - (-z / 3.0).exp();
+                suspects.push(Suspect {
+                    conf,
+                    hole_idx: sample_hole[i],
+                    sample_idx: sample_in_hole[i],
+                    prop_idx: prop,
+                });
+                if suspects.len() >= suspect_cap {
+                    break;
+                }
+            }
+        }
+    }
+
+    // Sort by confidence desc, then stable identifiers.
+    suspects.sort_by(|a, b| {
+        b.conf
+            .partial_cmp(&a.conf)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| a.hole_idx.cmp(&b.hole_idx))
+            .then_with(|| a.sample_idx.cmp(&b.sample_idx))
+            .then_with(|| a.prop_idx.cmp(&b.prop_idx))
+    });
+
+    // Optional: keep output bounded for huge inputs.
+    let max_out = if n_samples > 2_000_000 { 200_000 } else { 1_000_000 };
+    if suspects.len() > max_out {
+        suspects.truncate(max_out);
+    }
+
+    let mut out = String::new();
+    out.push_str(&format!("{}\n", suspects.len()));
+    for s in suspects {
+        let hid = &hole_ids[s.hole_idx as usize];
+        let pname = &prop_names[s.prop_idx];
+        out.push_str(hid);
+        out.push(' ');
+        out.push_str(&s.sample_idx.to_string());
+        out.push(' ');
+        out.push_str(pname);
+        out.push(' ');
+        out.push_str(&format!("{:.6}\n", s.conf));
+    }
+
+    print!("{}", out);
+}

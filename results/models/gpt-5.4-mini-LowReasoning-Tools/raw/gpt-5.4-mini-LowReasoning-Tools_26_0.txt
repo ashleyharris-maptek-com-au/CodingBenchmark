@@ -1,0 +1,311 @@
+use std::cmp::min;
+use std::env;
+use std::fs::{remove_file, File};
+use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+#[derive(Clone, Copy, Default)]
+struct Point {
+    x: f32,
+    y: f32,
+    z: f32,
+}
+
+#[derive(Clone, Copy, Default)]
+struct Centroid {
+    x: f64,
+    y: f64,
+    z: f64,
+}
+
+impl Centroid {
+    fn from_point(p: Point) -> Self {
+        Self {
+            x: p.x as f64,
+            y: p.y as f64,
+            z: p.z as f64,
+        }
+    }
+
+    fn distance2_point(&self, p: Point) -> f64 {
+        let dx = self.x - p.x as f64;
+        let dy = self.y - p.y as f64;
+        let dz = self.z - p.z as f64;
+        dx * dx + dy * dy + dz * dz
+    }
+}
+
+struct XorShift64 {
+    state: u64,
+}
+
+impl XorShift64 {
+    fn new(seed: u64) -> Self {
+        Self {
+            state: if seed == 0 { 0x9E3779B97F4A7C15 } else { seed },
+        }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.state = x;
+        x
+    }
+
+    fn next_usize(&mut self, upper: usize) -> usize {
+        if upper <= 1 {
+            0
+        } else {
+            (self.next_u64() as usize) % upper
+        }
+    }
+}
+
+fn parse_header_and_spool(mut input: impl Read) -> io::Result<(usize, usize, PathBuf)> {
+    let mut buf = [0u8; 1];
+    let mut token = Vec::new();
+    let mut numbers = Vec::with_capacity(2);
+
+    loop {
+        let n = input.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        let b = buf[0];
+        if b.is_ascii_whitespace() {
+            if !token.is_empty() {
+                let s = std::str::from_utf8(&token).unwrap_or("0");
+                numbers.push(s.parse::<usize>().unwrap_or(0));
+                token.clear();
+                if numbers.len() == 2 {
+                    break;
+                }
+            }
+        } else {
+            token.push(b);
+        }
+    }
+
+    if numbers.len() < 2 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "missing header",
+        ));
+    }
+
+    let mut path = env::temp_dir();
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    path.push(format!("llmbench_points_{}_{}.bin", std::process::id(), stamp));
+    let mut tmp = File::create(&path)?;
+
+    let mut rest = Vec::new();
+    input.read_to_end(&mut rest)?;
+    tmp.write_all(&rest)?;
+    tmp.flush()?;
+    Ok((numbers[0], numbers[1], path))
+}
+
+fn read_points(path: &PathBuf, n: usize) -> io::Result<Vec<Point>> {
+    let mut f = File::open(path)?;
+    let mut points = Vec::with_capacity(n);
+    let mut bytes = [0u8; 12];
+    for _ in 0..n {
+        f.read_exact(&mut bytes)?;
+        let x = f32::from_le_bytes(bytes[0..4].try_into().unwrap());
+        let y = f32::from_le_bytes(bytes[4..8].try_into().unwrap());
+        let z = f32::from_le_bytes(bytes[8..12].try_into().unwrap());
+        points.push(Point { x, y, z });
+    }
+    Ok(points)
+}
+
+fn reservoir_sample(path: &PathBuf, n: usize, cap: usize, seed: u64) -> io::Result<Vec<Point>> {
+    let mut f = File::open(path)?;
+    let mut sample = Vec::with_capacity(min(n, cap));
+    let mut rng = XorShift64::new(seed);
+    let mut bytes = [0u8; 12];
+    for i in 0..n {
+        f.read_exact(&mut bytes)?;
+        let p = Point {
+            x: f32::from_le_bytes(bytes[0..4].try_into().unwrap()),
+            y: f32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+            z: f32::from_le_bytes(bytes[8..12].try_into().unwrap()),
+        };
+        if sample.len() < cap {
+            sample.push(p);
+        } else {
+            let j = rng.next_usize(i + 1);
+            if j < cap {
+                sample[j] = p;
+            }
+        }
+    }
+    Ok(sample)
+}
+
+fn assign_points(points: &[Point], centroids: &[Centroid], out: &mut [u32]) {
+    for (i, p) in points.iter().enumerate() {
+        let mut best = 0usize;
+        let mut best_d = centroids[0].distance2_point(*p);
+        for (j, c) in centroids.iter().enumerate().skip(1) {
+            let d = c.distance2_point(*p);
+            if d < best_d {
+                best_d = d;
+                best = j;
+            }
+        }
+        out[i] = best as u32;
+    }
+}
+
+fn lloyd(points: &[Point], k: usize, iters: usize) -> Vec<Centroid> {
+    let mut centroids = Vec::with_capacity(k);
+    for i in 0..k {
+        centroids.push(Centroid::from_point(points[i % points.len()]));
+    }
+    let mut labels = vec![0usize; points.len()];
+    for _ in 0..iters {
+        let mut sums = vec![(0f64, 0f64, 0f64, 0u64); k];
+        for (idx, p) in points.iter().enumerate() {
+            let mut best = 0usize;
+            let mut best_d = centroids[0].distance2_point(*p);
+            for (j, c) in centroids.iter().enumerate().skip(1) {
+                let d = c.distance2_point(*p);
+                if d < best_d {
+                    best_d = d;
+                    best = j;
+                }
+            }
+            labels[idx] = best;
+            let s = &mut sums[best];
+            s.0 += p.x as f64;
+            s.1 += p.y as f64;
+            s.2 += p.z as f64;
+            s.3 += 1;
+        }
+        for (i, c) in centroids.iter_mut().enumerate() {
+            let s = sums[i];
+            if s.3 > 0 {
+                let inv = 1.0 / s.3 as f64;
+                c.x = s.0 * inv;
+                c.y = s.1 * inv;
+                c.z = s.2 * inv;
+            } else {
+                c.x = points[i % points.len()].x as f64;
+                c.y = points[i % points.len()].y as f64;
+                c.z = points[i % points.len()].z as f64;
+            }
+        }
+    }
+    centroids
+}
+
+fn build_sample_centroids(sample: &[Point], k: usize) -> Vec<Centroid> {
+    let mut rng = XorShift64::new(sample.len() as u64 * 0x9E3779B97F4A7C15);
+    let mut centroids = Vec::with_capacity(k);
+    centroids.push(Centroid::from_point(sample[rng.next_usize(sample.len())]));
+    while centroids.len() < k {
+        let mut best_idx = 0usize;
+        let mut best_score = -1.0f64;
+        for (i, p) in sample.iter().enumerate() {
+            let mut d = f64::INFINITY;
+            for c in &centroids {
+                d = d.min(c.distance2_point(*p));
+            }
+            if d > best_score {
+                best_score = d;
+                best_idx = i;
+            }
+        }
+        centroids.push(Centroid::from_point(sample[best_idx]));
+    }
+    lloyd(sample, k, 3)
+}
+
+fn main() -> io::Result<()> {
+    let stdin = io::stdin();
+    let (n, k, path) = parse_header_and_spool(stdin.lock())?;
+    let result = (|| -> io::Result<()> {
+        let stdout = io::stdout();
+        let mut out = BufWriter::new(stdout.lock());
+        if n == 0 {
+            out.flush()?;
+            return Ok(());
+        }
+        let k_eff = min(k.max(1), n);
+
+        if n <= 10_000_000 {
+            let points = read_points(&path, n)?;
+            let iters = if n <= 250_000 {
+                12
+            } else if n <= 2_000_000 {
+                8
+            } else {
+                5
+            };
+            let centroids = lloyd(&points, k_eff, iters);
+            let mut labels = vec![0u32; n];
+            assign_points(&points, &centroids, &mut labels);
+            for v in labels {
+                out.write_all(&v.to_le_bytes())?;
+            }
+            out.flush()?;
+            return Ok(());
+        }
+
+        let sample_cap = min(200_000usize, n);
+        let sample = reservoir_sample(&path, n, sample_cap, 0x1234_5678_9ABC_DEF0)?;
+        let centroids = if sample.len() >= k_eff && !sample.is_empty() {
+            build_sample_centroids(&sample, k_eff)
+        } else if !sample.is_empty() {
+            let mut c = Vec::with_capacity(k_eff);
+            for i in 0..k_eff {
+                c.push(Centroid::from_point(sample[i % sample.len()]));
+            }
+            c
+        } else {
+            vec![Centroid::default(); k_eff]
+        };
+
+        let mut f = File::open(&path)?;
+        let mut bytes = [0u8; 12];
+        let mut labels = Vec::with_capacity(4096);
+        for _ in 0..n {
+            f.read_exact(&mut bytes)?;
+            let p = Point {
+                x: f32::from_le_bytes(bytes[0..4].try_into().unwrap()),
+                y: f32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+                z: f32::from_le_bytes(bytes[8..12].try_into().unwrap()),
+            };
+            let mut best = 0usize;
+            let mut best_d = centroids[0].distance2_point(p);
+            for (j, c) in centroids.iter().enumerate().skip(1) {
+                let d = c.distance2_point(p);
+                if d < best_d {
+                    best_d = d;
+                    best = j;
+                }
+            }
+            labels.push(best as u32);
+            if labels.len() >= 1024 {
+                for v in labels.drain(..) {
+                    out.write_all(&v.to_le_bytes())?;
+                }
+            }
+        }
+        for v in labels.drain(..) {
+            out.write_all(&v.to_le_bytes())?;
+        }
+        out.flush()?;
+        Ok(())
+    })();
+    let _ = remove_file(path);
+    result
+}

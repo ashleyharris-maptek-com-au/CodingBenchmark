@@ -5,13 +5,13 @@ from collections import defaultdict
 from pathlib import Path
 
 from native_compiler import RustCompiler, compile_and_run, describe_this_pc
-from solver_utils import StreamingInputFile
+from solver_utils import StreamingInputFile, normalize_code_result
 
 title = "Graph Layout - Edge Crossing Minimization (Rust)"
 
 tags = [
   "rust",
-  "structured response",
+  "freeform response",
   "graph theory",
   "optimization",
 ]
@@ -231,21 +231,7 @@ Write complete, compilable Rust code with a main() function.
 # List of subpasses to grade the single answer against all difficulty levels
 extraGradeAnswerRuns = list(range(1, len(GRAPH_CONFIGS)))
 
-structure = {
-  "type": "object",
-  "properties": {
-    "reasoning": {
-      "type": "string",
-      "description": "Explain your layout approach and how it adapts to different graph sizes"
-    },
-    "rust_code": {
-      "type": "string",
-      "description": "Complete Rust code with main() that handles all scales"
-    }
-  },
-  "required": ["reasoning", "rust_code"],
-  "additionalProperties": False
-}
+structure = None
 
 
 def segments_intersect(p1, p2, p3, p4) -> bool:
@@ -458,6 +444,7 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
     - 0.5: > baseline but valid layout
     - 0.0: Invalid layout or error
     """
+  result = normalize_code_result(result, "rust_code")
   global lastPositions, GRAPHS_CACHE
   if not result:
     return 0.0, "No result provided"
@@ -523,8 +510,12 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
 
 def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
   """Generate HTML report for result."""
+  result = normalize_code_result(result, "rust_code")
   if not result:
     return "<p style='color:red'>No result provided</p>"
+
+  if subPass not in GRAPHS_CACHE:
+    return "<p style='color:red'>No graph data available</p>"
 
   num_nodes, edges = GRAPHS_CACHE[subPass]
   _, graph_type, is_planar = GRAPH_CONFIGS[subPass]

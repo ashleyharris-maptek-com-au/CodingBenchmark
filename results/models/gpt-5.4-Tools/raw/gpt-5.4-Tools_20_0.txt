@@ -1,0 +1,455 @@
+use std::cmp::Ordering;
+use std::collections::HashMap;
+use std::io::{self, Read};
+
+const MAX_SMALL_POINTS: usize = 20_000;
+const MAX_MEDIUM_POINTS: usize = 200_000;
+const MAX_RESULTS: usize = 20_000;
+const SMALL_WINDOW: usize = 18;
+const MEDIUM_WINDOW: usize = 12;
+const GRID_LIMIT: usize = 6;
+const EPS: f64 = 1e-12;
+
+#[derive(Clone)]
+struct Hole {
+    id: String,
+    sample_indices: Vec<usize>,
+}
+
+#[derive(Clone)]
+struct SamplePoint {
+    sample_idx: usize,
+    pos: [f64; 3],
+    values: Vec<f64>,
+}
+
+#[derive(Clone)]
+struct Suspect {
+    hole_id: String,
+    sample_idx: usize,
+    prop_name: String,
+    confidence: f64,
+}
+
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum Strategy {
+    Small,
+    Medium,
+    Large,
+}
+
+struct Tokens<'a> {
+    data: Vec<&'a str>,
+    idx: usize,
+}
+
+impl<'a> Tokens<'a> {
+    fn new(s: &'a str) -> Self {
+        Self {
+            data: s.split_whitespace().collect(),
+            idx: 0,
+        }
+    }
+
+    fn next(&mut self) -> Option<&'a str> {
+        if self.idx < self.data.len() {
+            let out = self.data[self.idx];
+            self.idx += 1;
+            Some(out)
+        } else {
+            None
+        }
+    }
+
+    fn next_usize(&mut self) -> usize {
+        self.next().and_then(|t| t.parse::<usize>().ok()).unwrap_or(0)
+    }
+
+    fn next_f64(&mut self) -> f64 {
+        self.next().and_then(|t| t.parse::<f64>().ok()).unwrap_or(f64::NAN)
+    }
+}
+
+fn median(values: &mut [f64]) -> f64 {
+    if values.is_empty() {
+        return f64::NAN;
+    }
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+    let mid = values.len() / 2;
+    if values.len() % 2 == 1 {
+        values[mid]
+    } else {
+        (values[mid - 1] + values[mid]) * 0.5
+    }
+}
+
+fn robust_z(value: f64, neighbors: &[f64]) -> Option<f64> {
+    if !value.is_finite() {
+        return Some(12.0);
+    }
+    if neighbors.len() < 4 {
+        return None;
+    }
+    let mut vals = neighbors.to_vec();
+    let med = median(&mut vals);
+    if !med.is_finite() {
+        return None;
+    }
+    let mut deviations = Vec::with_capacity(neighbors.len());
+    for &v in neighbors {
+        if v.is_finite() {
+            deviations.push((v - med).abs());
+        }
+    }
+    if deviations.len() < 4 {
+        return None;
+    }
+    let mad = median(&mut deviations);
+    let scale = (1.4826 * mad).max(1e-9);
+    Some((value - med).abs() / scale)
+}
+
+fn distance2(a: [f64; 3], b: [f64; 3]) -> f64 {
+    let dx = a[0] - b[0];
+    let dy = a[1] - b[1];
+    let dz = a[2] - b[2];
+    dx * dx + dy * dy + dz * dz
+}
+
+fn choose_strategy(total_points: usize) -> Strategy {
+    if total_points <= MAX_SMALL_POINTS {
+        Strategy::Small
+    } else if total_points <= MAX_MEDIUM_POINTS {
+        Strategy::Medium
+    } else {
+        Strategy::Large
+    }
+}
+
+fn estimate_cell_size(points: &[SamplePoint]) -> f64 {
+    if points.len() < 2 {
+        return 10.0;
+    }
+    let step = (points.len() / 1024).max(1);
+    let mut dists = Vec::new();
+    let mut i = 0usize;
+    while i + 1 < points.len() && dists.len() < 4096 {
+        let d = distance2(points[i].pos, points[i + 1].pos).sqrt();
+        if d.is_finite() && d > 0.0 {
+            dists.push(d);
+        }
+        i += step;
+    }
+    if dists.is_empty() {
+        return 10.0;
+    }
+    let mut copy = dists;
+    let med = median(&mut copy);
+    med.max(1.0)
+}
+
+fn cell_key(pos: [f64; 3], cell: f64) -> (i32, i32, i32) {
+    let inv = 1.0 / cell.max(1e-6);
+    (
+        (pos[0] * inv).floor() as i32,
+        (pos[1] * inv).floor() as i32,
+        (pos[2] * inv).floor() as i32,
+    )
+}
+
+fn build_grid(points: &[SamplePoint], cell: f64) -> HashMap<(i32, i32, i32), Vec<usize>> {
+    let mut grid: HashMap<(i32, i32, i32), Vec<usize>> = HashMap::new();
+    for (idx, p) in points.iter().enumerate() {
+        grid.entry(cell_key(p.pos, cell)).or_default().push(idx);
+    }
+    grid
+}
+
+fn collect_neighbors_small(points: &[SamplePoint], idx: usize, limit: usize) -> Vec<usize> {
+    let mut scored = Vec::with_capacity(points.len().saturating_sub(1));
+    let origin = points[idx].pos;
+    for (j, other) in points.iter().enumerate() {
+        if j == idx {
+            continue;
+        }
+        let d2 = distance2(origin, other.pos);
+        if d2.is_finite() {
+            scored.push((d2, j));
+        }
+    }
+    scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
+    scored.into_iter().take(limit).map(|(_, j)| j).collect()
+}
+
+fn collect_neighbors_medium(hole_samples: &[usize], offset: usize, total_points: usize) -> Vec<usize> {
+    let radius = MEDIUM_WINDOW;
+    let start = offset.saturating_sub(radius);
+    let end = (offset + radius + 1).min(hole_samples.len());
+    let mut result = Vec::with_capacity(end - start);
+    for &idx in &hole_samples[start..end] {
+        if idx < total_points {
+            result.push(idx);
+        }
+    }
+    result
+}
+
+fn collect_neighbors_large(
+    points: &[SamplePoint],
+    idx: usize,
+    cell: f64,
+    grid: &HashMap<(i32, i32, i32), Vec<usize>>,
+    limit: usize,
+) -> Vec<usize> {
+    let base = cell_key(points[idx].pos, cell);
+    let mut candidates = Vec::new();
+    for dx in -1..=1 {
+        for dy in -1..=1 {
+            for dz in -1..=1 {
+                let key = (base.0 + dx, base.1 + dy, base.2 + dz);
+                if let Some(bucket) = grid.get(&key) {
+                    candidates.extend(bucket.iter().copied().filter(|&j| j != idx));
+                }
+            }
+        }
+    }
+    if candidates.len() > limit {
+        candidates.sort_by(|&a, &b| {
+            let da = distance2(points[idx].pos, points[a].pos);
+            let db = distance2(points[idx].pos, points[b].pos);
+            da.partial_cmp(&db).unwrap_or(Ordering::Equal)
+        });
+        candidates.truncate(limit);
+    }
+    candidates
+}
+
+fn sample_dup_penalty(point: &SamplePoint, dup_count: usize) -> f64 {
+    let mut penalty = 1.0;
+    if dup_count > 1 {
+        penalty *= 0.85;
+    }
+    let finite = point.values.iter().filter(|v| v.is_finite()).count();
+    if finite == 0 {
+        penalty *= 0.5;
+    }
+    penalty
+}
+
+fn main() {
+    let mut input = String::new();
+    io::stdin().read_to_string(&mut input).unwrap();
+    let mut tok = Tokens::new(&input);
+
+    let num_holes = tok.next_usize();
+    let num_props = tok.next_usize();
+    let mut prop_names = Vec::with_capacity(num_props);
+    for i in 0..num_props {
+        let fallback = format!("prop{}", i + 1);
+        prop_names.push(tok.next().unwrap_or(&fallback).to_string());
+    }
+
+    let mut holes = Vec::with_capacity(num_holes);
+    let mut points: Vec<SamplePoint> = Vec::new();
+    let mut duplicate_counter: HashMap<String, usize> = HashMap::new();
+
+    for _ in 0..num_holes {
+        let hole_id = match tok.next() {
+            Some(s) => s.to_string(),
+            None => break,
+        };
+        let start_x = tok.next_f64();
+        let start_y = tok.next_f64();
+        let start_z = tok.next_f64();
+        let dir_x = tok.next_f64();
+        let dir_y = tok.next_f64();
+        let dir_z = tok.next_f64();
+        let _length = tok.next_f64();
+        let num_samples = tok.next_usize();
+
+        let norm = (dir_x * dir_x + dir_y * dir_y + dir_z * dir_z).sqrt();
+        let dir = if norm.is_finite() && norm > 0.0 {
+            [dir_x / norm, dir_y / norm, dir_z / norm]
+        } else {
+            [0.0, 0.0, -1.0]
+        };
+
+        let mut sample_indices = Vec::with_capacity(num_samples);
+        for sample_idx in 0..num_samples {
+            let depth = tok.next_f64();
+            let pos = if depth.is_finite() {
+                [
+                    start_x + dir[0] * depth,
+                    start_y + dir[1] * depth,
+                    start_z + dir[2] * depth,
+                ]
+            } else {
+                [start_x, start_y, start_z]
+            };
+
+            let mut values = Vec::with_capacity(num_props);
+            for _ in 0..num_props {
+                values.push(tok.next_f64());
+            }
+
+            let point_idx = points.len();
+            points.push(SamplePoint {
+                sample_idx,
+                pos,
+                values,
+            });
+            sample_indices.push(point_idx);
+
+            let dup_key = format!(
+                "{}|{}|{:.6}|{:.6}|{:.6}",
+                hole_id, sample_idx, pos[0], pos[1], pos[2]
+            );
+            *duplicate_counter.entry(dup_key).or_insert(0) += 1;
+        }
+
+        holes.push(Hole { id: hole_id, sample_indices });
+    }
+
+    let total_points = points.len();
+    if total_points == 0 || num_props == 0 || holes.is_empty() {
+        println!("0");
+        return;
+    }
+
+    let strategy = choose_strategy(total_points);
+    let cell_size = if strategy == Strategy::Large {
+        estimate_cell_size(&points)
+    } else {
+        0.0
+    };
+    let grid = if strategy == Strategy::Large {
+        build_grid(&points, cell_size)
+    } else {
+        HashMap::new()
+    };
+
+    let mut suspects = Vec::new();
+
+    for hole in &holes {
+        for (offset, &point_idx) in hole.sample_indices.iter().enumerate() {
+            let point = &points[point_idx];
+            let neighbors = match strategy {
+                Strategy::Small => collect_neighbors_small(&points, point_idx, SMALL_WINDOW),
+                Strategy::Medium => collect_neighbors_medium(&hole.sample_indices, offset, total_points),
+                Strategy::Large => collect_neighbors_large(&points, point_idx, cell_size, &grid, GRID_LIMIT * 8),
+            };
+
+            let dup_key = format!(
+                "{}|{}|{:.6}|{:.6}|{:.6}",
+                hole.id, point.sample_idx, point.pos[0], point.pos[1], point.pos[2]
+            );
+            let dup_count = *duplicate_counter.get(&dup_key).unwrap_or(&1);
+            let penalty = sample_dup_penalty(point, dup_count);
+
+            for prop_idx in 0..num_props {
+                let value = point.values[prop_idx];
+                let mut local_vals = Vec::new();
+
+                for &n_idx in &neighbors {
+                    if n_idx == point_idx {
+                        continue;
+                    }
+                    let v = points[n_idx].values[prop_idx];
+                    if v.is_finite() {
+                        local_vals.push(v);
+                    }
+                }
+
+                let Some(mut z) = robust_z(value, &local_vals) else {
+                    continue;
+                };
+
+                if !value.is_finite() {
+                    z += 4.0;
+                }
+
+                if strategy == Strategy::Medium && offset > 0 && offset + 1 < hole.sample_indices.len() {
+                    let prev = points[hole.sample_indices[offset - 1]].values[prop_idx];
+                    let next = points[hole.sample_indices[offset + 1]].values[prop_idx];
+                    if prev.is_finite() && next.is_finite() && value.is_finite() {
+                        let interp = 0.5 * (prev + next);
+                        let jump = (value - interp).abs();
+                        let baseline = ((prev - next).abs() * 0.5).max(1e-6);
+                        z = z.max(jump / baseline);
+                    }
+                }
+
+                let confidence = (z * penalty).min(999.0);
+                let threshold = match strategy {
+                    Strategy::Small => 4.5,
+                    Strategy::Medium => 5.0,
+                    Strategy::Large => 5.5,
+                };
+
+                if confidence >= threshold {
+                    suspects.push(Suspect {
+                        hole_id: hole.id.clone(),
+                        sample_idx: point.sample_idx,
+                        prop_name: prop_names[prop_idx].clone(),
+                        confidence,
+                    });
+                }
+            }
+        }
+    }
+
+    suspects.sort_by(|a, b| {
+        b.confidence
+            .partial_cmp(&a.confidence)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| a.hole_id.cmp(&b.hole_id))
+            .then_with(|| a.sample_idx.cmp(&b.sample_idx))
+            .then_with(|| a.prop_name.cmp(&b.prop_name))
+    });
+
+    if suspects.len() > MAX_RESULTS {
+        suspects.truncate(MAX_RESULTS);
+    }
+
+    let mut dedup: HashMap<(String, usize, String), f64> = HashMap::new();
+    for s in suspects {
+        let key = (s.hole_id.clone(), s.sample_idx, s.prop_name.clone());
+        dedup
+            .entry(key)
+            .and_modify(|c| {
+                if s.confidence > *c {
+                    *c = s.confidence;
+                }
+            })
+            .or_insert(s.confidence);
+    }
+
+    let mut final_suspects: Vec<Suspect> = dedup
+        .into_iter()
+        .map(|((hole_id, sample_idx, prop_name), confidence)| Suspect {
+            hole_id,
+            sample_idx,
+            prop_name,
+            confidence,
+        })
+        .collect();
+
+    final_suspects.sort_by(|a, b| {
+        b.confidence
+            .partial_cmp(&a.confidence)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| a.hole_id.cmp(&b.hole_id))
+            .then_with(|| a.sample_idx.cmp(&b.sample_idx))
+            .then_with(|| a.prop_name.cmp(&b.prop_name))
+    });
+
+    println!("{}", final_suspects.len());
+    for s in final_suspects {
+        let conf = if s.confidence.is_finite() {
+            s.confidence
+        } else {
+            999.0
+        };
+        println!("{} {} {} {:.4}", s.hole_id, s.sample_idx, s.prop_name, conf.max(EPS));
+    }
+}

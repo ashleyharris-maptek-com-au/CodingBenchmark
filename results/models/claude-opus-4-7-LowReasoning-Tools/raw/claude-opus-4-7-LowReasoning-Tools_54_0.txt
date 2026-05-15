@@ -1,0 +1,265 @@
+import math
+
+_state = {
+    "t": 0.0,
+    "ias_filt": None,
+    "loc_filt": 0.0,
+    "gs_filt": 0.0,
+    "vs_filt": 0.0,
+    "pitch_filt": 0.0,
+    "roll_filt": 0.0,
+    "hdg_filt": None,
+    "ias_i": 0.0,
+    "ga_active": False,
+    "ga_peak_alt": 0.0,
+    "td_time": 0.0,
+    "rollout_hdg": None,
+}
+
+
+def _median(vals):
+    vals = sorted(v for v in vals if v is not None and math.isfinite(v))
+    if not vals:
+        return None
+    n = len(vals)
+    if n % 2 == 1:
+        return vals[n // 2]
+    return 0.5 * (vals[n // 2 - 1] + vals[n // 2])
+
+
+def _clip(x, lo, hi):
+    return max(lo, min(hi, x))
+
+
+def _hdg_diff(a, b):
+    return (a - b + 540.0) % 360.0 - 180.0
+
+
+def autopilot_step(state: dict, dt: float) -> dict:
+    s = _state
+    if dt is None or dt <= 0:
+        dt = 0.05
+    s["t"] += dt
+
+    # Sensor fusion - median of valid redundant sensors
+    def fused(prefix, suffix, valid_suffix="_valid", count=3):
+        out = []
+        for i in range(1, count + 1):
+            v = state.get(f"{prefix}_{i}_{suffix}")
+            ok = state.get(f"{prefix}_{i}{valid_suffix}", True)
+            if v is not None and ok and isinstance(v, (int, float)) and math.isfinite(v):
+                out.append(v)
+        return _median(out)
+
+    gs_dots = fused("glideslope", "dots") or 0.0
+    gs_valid = any(state.get(f"glideslope_{i}_valid", False) for i in (1, 2, 3))
+    loc_dots = fused("localizer", "dots") or 0.0
+    loc_valid = any(state.get(f"localizer_{i}_valid", False) for i in (1, 2, 3))
+
+    radio_alt = state.get("radio_alt_ft")
+    if radio_alt is None or not isinstance(radio_alt, (int, float)) or not math.isfinite(radio_alt):
+        radio_alt = None
+
+    baro_alt = fused("baro_alt", "ft") or 0.0
+    ias = fused("ias", "kt") or 140.0
+    target_vref = state.get("target_vref_kt") or 137.0
+    target_ias = state.get("target_ias_kt") or target_vref
+    target_hdg = state.get("target_hdg_deg")
+
+    # IRS fused
+    pitch_vals, roll_vals, hdg_vals, vs_vals, gs_kt_vals = [], [], [], [], []
+    for i in (1, 2, 3):
+        if not state.get(f"irs_{i}_valid", True):
+            continue
+        for arr, key in (
+            (pitch_vals, f"irs_{i}_pitch_deg"),
+            (roll_vals, f"irs_{i}_roll_deg"),
+            (hdg_vals, f"irs_{i}_heading_deg"),
+            (vs_vals, f"irs_{i}_vs_fpm"),
+            (gs_kt_vals, f"irs_{i}_gs_kt"),
+        ):
+            v = state.get(key)
+            if v is not None and isinstance(v, (int, float)) and math.isfinite(v):
+                arr.append(v)
+    pitch = _median(pitch_vals) or 0.0
+    roll = _median(roll_vals) or 0.0
+    heading = _median(hdg_vals) or 0.0
+    vs = _median(vs_vals) or 0.0
+    gs_kt = _median(gs_kt_vals) or ias
+
+    if target_hdg is None:
+        target_hdg = heading
+
+    weight_on_wheels = bool(state.get("weight_on_wheels", False))
+    on_ground = bool(state.get("on_ground", False)) or weight_on_wheels
+    groundspeed = state.get("groundspeed_kt") or gs_kt
+
+    # Engines
+    eng_running = []
+    for i in (1, 2):
+        r = state.get(f"engine_{i}_running", True)
+        fire = state.get(f"engine_{i}_fire", False)
+        n1 = state.get(f"engine_{i}_n1_pct", 0.0) or 0.0
+        eng_running.append(bool(r) and not fire and n1 > 15.0)
+    n_eng = sum(eng_running)
+
+    alt_agl = radio_alt if radio_alt is not None else baro_alt
+
+    # Filtering
+    af, asl = 0.5, 0.25
+    s["loc_filt"] += af * (loc_dots - s["loc_filt"])
+    s["gs_filt"] += af * (gs_dots - s["gs_filt"])
+    if s["ias_filt"] is None:
+        s["ias_filt"] = ias
+    s["ias_filt"] += asl * (ias - s["ias_filt"])
+    s["vs_filt"] += asl * (vs - s["vs_filt"])
+    s["pitch_filt"] += af * (pitch - s["pitch_filt"])
+    s["roll_filt"] += af * (roll - s["roll_filt"])
+
+    landed = weight_on_wheels or on_ground
+    flare = (radio_alt is not None and radio_alt < 50.0) and not landed
+
+    # Go-around continuation
+    if s["ga_active"]:
+        s["ga_peak_alt"] = max(s["ga_peak_alt"], alt_agl)
+
+    out = {}
+
+    # Schedule flaps/gear
+    if not landed:
+        if alt_agl > 1800.0:
+            flap_tgt = 15.0
+            gear_tgt = 0.0
+        elif alt_agl > 1000.0:
+            flap_tgt = 25.0
+            gear_tgt = 1.0
+        else:
+            flap_tgt = 30.0
+            gear_tgt = 1.0
+    else:
+        flap_tgt = 30.0
+        gear_tgt = 1.0
+
+    # ---- GO-AROUND ----
+    if s["ga_active"]:
+        out["throttle_1"] = 1.0
+        out["throttle_2"] = 1.0
+        out["speedbrake"] = 0.0
+        target_pitch = 12.0
+        pitch_err = target_pitch - s["pitch_filt"]
+        out["elevator"] = _clip(0.05 * pitch_err - 0.0005 * s["vs_filt"], -0.6, 0.9)
+        hdg_err = _hdg_diff(target_hdg, heading)
+        roll_tgt = _clip(0.5 * hdg_err, -15.0, 15.0)
+        out["aileron"] = _clip(0.035 * (roll_tgt - s["roll_filt"]), -0.6, 0.6)
+        out["rudder"] = _clip(0.02 * hdg_err, -0.3, 0.3)
+        out["flaps"] = 15.0 if alt_agl > 1000.0 else 25.0
+        out["gear"] = 0.0 if alt_agl > 400.0 else 1.0
+        out["spoiler"] = 0.0
+        out["autobrake"] = 0.0
+        out["reverse_1"] = 0.0
+        out["reverse_2"] = 0.0
+        return out
+
+    # ---- LATERAL ----
+    loc = s["loc_filt"]
+    hdg_err = _hdg_diff(target_hdg, heading)
+    roll_from_loc = _clip(-6.0 * loc, -20.0, 20.0)
+    roll_from_hdg = _clip(0.8 * hdg_err, -20.0, 20.0)
+    if loc_valid and not landed and alt_agl > 5.0:
+        roll_tgt = 0.7 * roll_from_loc + 0.3 * roll_from_hdg
+    else:
+        roll_tgt = roll_from_hdg
+    if landed:
+        roll_tgt = 0.0
+    aileron = _clip(0.04 * (roll_tgt - s["roll_filt"]), -0.7, 0.7)
+
+    rudder = 0.0
+    if not landed:
+        rudder = _clip(0.02 * hdg_err, -0.3, 0.3)
+        if radio_alt is not None and radio_alt < 30.0:
+            rudder = _clip(0.05 * hdg_err, -0.6, 0.6)
+            aileron *= 0.6
+    else:
+        if s["rollout_hdg"] is None:
+            s["rollout_hdg"] = target_hdg
+        gs_err = _hdg_diff(s["rollout_hdg"], heading)
+        rudder = _clip(0.06 * gs_err + 0.4 * loc, -1.0, 1.0)
+        aileron = _clip(-0.2 * loc, -0.3, 0.3)
+
+    # Asymmetric thrust comp
+    if n_eng == 1 and not landed:
+        if eng_running[0] and not eng_running[1]:
+            rudder = _clip(rudder + 0.18, -1.0, 1.0)
+        elif eng_running[1] and not eng_running[0]:
+            rudder = _clip(rudder - 0.18, -1.0, 1.0)
+
+    out["aileron"] = aileron
+    out["rudder"] = rudder
+
+    # ---- VERTICAL ----
+    if not landed:
+        if flare:
+            ra = radio_alt if radio_alt is not None else 30.0
+            flare_pitch = _clip(3.0 + (1.0 - ra / 50.0) * 4.0, 2.0, 7.0)
+            pitch_err = flare_pitch - s["pitch_filt"]
+            vs_err = -100.0 - s["vs_filt"]
+            out["elevator"] = _clip(0.06 * pitch_err + 0.0006 * vs_err, -0.3, 0.7)
+            out["throttle_1"] = 0.0
+            out["throttle_2"] = 0.0
+        else:
+            # Glideslope -> vs target
+            base_vs = -(gs_kt or 140.0) * 101.3 * math.tan(math.radians(3.0))
+            if gs_valid:
+                vs_target = base_vs - 250.0 * s["gs_filt"]
+            else:
+                vs_target = state.get("target_vs_fpm") or -700.0
+            vs_target = _clip(vs_target, -1400.0, 300.0)
+
+            vs_err = vs_target - s["vs_filt"]
+            pitch_target = _clip(s["pitch_filt"] + 0.004 * vs_err, -5.0, 10.0)
+            pitch_err = pitch_target - s["pitch_filt"]
+            elev = _clip(0.05 * pitch_err, -0.5, 0.5)
+
+            if n_eng == 0:
+                # Glide: maintain best glide speed
+                glide_ias = (target_vref or 137.0) + 20.0
+                ias_err = glide_ias - s["ias_filt"]
+                elev = _clip(elev - 0.012 * ias_err, -0.6, 0.6)
+            out["elevator"] = elev
+
+            tgt_ias = target_ias or target_vref or 137.0
+            ias_err = tgt_ias - s["ias_filt"]
+            s["ias_i"] = _clip(s["ias_i"] + ias_err * dt * 0.01, -0.3, 0.3)
+            thr = 0.35 + 0.025 * ias_err + s["ias_i"] - 0.0003 * s["vs_filt"]
+            thr = _clip(thr, 0.0, 1.0)
+            out["throttle_1"] = thr if eng_running[0] else 0.0
+            out["throttle_2"] = thr if eng_running[1] else 0.0
+    else:
+        if s["td_time"] == 0.0:
+            s["td_time"] = s["t"]
+        dt_td = s["t"] - s["td_time"]
+        out["elevator"] = 0.0 if dt_td < 1.5 else -0.1
+        out["throttle_1"] = 0.0
+        out["throttle_2"] = 0.0
+
+    out["flaps"] = flap_tgt
+    out["gear"] = gear_tgt
+
+    if landed:
+        out["speedbrake"] = 1.0
+        out["spoiler"] = 1.0
+        out["autobrake"] = 0.8
+        if groundspeed and groundspeed > 60.0:
+            out["reverse_1"] = 0.9 if eng_running[0] else 0.0
+            out["reverse_2"] = 0.9 if eng_running[1] else 0.0
+        else:
+            out["reverse_1"] = 0.0
+            out["reverse_2"] = 0.0
+    else:
+        out["speedbrake"] = 0.0
+        out["spoiler"] = 0.0
+        out["autobrake"] = 0.0
+        out["reverse_1"] = 0.0
+        out["reverse_2"] = 0.0
+
+    return out

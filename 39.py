@@ -14,13 +14,13 @@ import subprocess
 import time
 from typing import List, Tuple, Set, Dict, Any, Iterable
 from native_compiler import RustCompiler, CompilationError, ExecutionError
-from solver_utils import StreamingInputFile
+from solver_utils import StreamingInputFile, normalize_code_result
 
 title = "Graph Bisection (Rust)"
 
 tags = [
   "rust",
-  "structured response",
+  "freeform response",
   "np hard",
   "graph theory",
 ]
@@ -285,21 +285,7 @@ Write complete Rust code with `main` that reads stdin and writes stdout.
 
 extraGradeAnswerRuns = list(range(len(TEST_CASES)))
 
-structure = {
-  "type": "object",
-  "properties": {
-    "reasoning": {
-      "type": "string",
-      "description": "Explain your graph bisection approach"
-    },
-    "rust_code": {
-      "type": "string",
-      "description": "Complete Rust code with main function that handles all scales"
-    }
-  },
-  "required": ["reasoning", "rust_code"],
-  "additionalProperties": False
-}
+structure = None
 
 
 def _parse_output(stdout: str) -> Tuple[int, List[int]]:
@@ -365,6 +351,7 @@ def _build_bisection_viz(num_vertices: int, edges: List[Tuple[int, int]], partit
 
 
 def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
+  result = normalize_code_result(result, "rust_code")
   if not result or "rust_code" not in result:
     return 0.0, "No Rust code provided"
 
@@ -453,6 +440,7 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
 
 
 def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
+  result = normalize_code_result(result, "rust_code")
   if not result:
     return "<p style='color:red'>No result provided</p>"
   case = TEST_CASES[subPass]

@@ -16,13 +16,13 @@ import time
 import math
 from typing import List, Tuple, Dict, Any
 from native_compiler import CSharpCompiler, CompilationError, ExecutionError
-from solver_utils import StreamingInputFile
+from solver_utils import StreamingInputFile, normalize_code_result
 
 title = "Quadratic Assignment Problem (C#)"
 
 tags = [
   "csharp",
-  "structured response",
+  "freeform response",
   "np hard",
   "optimization",
 ]
@@ -225,21 +225,7 @@ Write complete, compilable C# code with a Main method. Assume only the standard 
 
 extraGradeAnswerRuns = list(range(len(TEST_CASES)))
 
-structure = {
-  "type": "object",
-  "properties": {
-    "reasoning": {
-      "type": "string",
-      "description": "Explain your algorithm approach and how it adapts to different problem sizes"
-    },
-    "csharp_code": {
-      "type": "string",
-      "description": "Complete C# code with Main method that handles all scales"
-    }
-  },
-  "required": ["reasoning", "csharp_code"],
-  "additionalProperties": False
-}
+structure = None
 
 
 def greedy_assignment(flow: List[List[int]], dist: List[List[int]]) -> Tuple[List[int], int]:
@@ -261,6 +247,7 @@ def greedy_assignment(flow: List[List[int]], dist: List[List[int]]) -> Tuple[Lis
 
 
 def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
+  result = normalize_code_result(result, "csharp_code")
   if not result or "csharp_code" not in result:
     return 0.0, "No C# code provided"
 
@@ -338,6 +325,7 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
 
 
 def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
+  result = normalize_code_result(result, "csharp_code")
   if not result:
     return "<p style='color:red'>No result provided</p>"
   case = TEST_CASES[subPass]

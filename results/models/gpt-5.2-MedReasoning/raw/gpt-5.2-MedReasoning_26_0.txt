@@ -1,0 +1,463 @@
+use std::cmp::min;
+use std::fs::{File, OpenOptions};
+use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+#[derive(Clone, Copy, Debug, Default)]
+struct Point {
+    x: f32,
+    y: f32,
+    z: f32,
+}
+
+impl Point {
+    #[inline]
+    fn add(self, o: Point) -> Point {
+        Point {
+            x: self.x + o.x,
+            y: self.y + o.y,
+            z: self.z + o.z,
+        }
+    }
+    #[inline]
+    fn sub(self, o: Point) -> Point {
+        Point {
+            x: self.x - o.x,
+            y: self.y - o.y,
+            z: self.z - o.z,
+        }
+    }
+    #[inline]
+    fn mul(self, s: f32) -> Point {
+        Point {
+            x: self.x * s,
+            y: self.y * s,
+            z: self.z * s,
+        }
+    }
+    #[inline]
+    fn norm2(self) -> f32 {
+        self.x * self.x + self.y * self.y + self.z * self.z
+    }
+}
+
+#[inline]
+fn dist2(a: Point, b: Point) -> f32 {
+    a.sub(b).norm2()
+}
+
+// Simple fast RNG (xorshift64*).
+#[derive(Clone)]
+struct Rng {
+    state: u64,
+}
+impl Rng {
+    fn new(seed: u64) -> Self {
+        let s = if seed == 0 { 0x9e3779b97f4a7c15 } else { seed };
+        Self { state: s }
+    }
+    #[inline]
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.state;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.state = x;
+        x.wrapping_mul(0x2545F4914F6CDD1D)
+    }
+    #[inline]
+    fn next_f64(&mut self) -> f64 {
+        // 53 bits of precision.
+        let v = self.next_u64() >> 11;
+        (v as f64) * (1.0 / ((1u64 << 53) as f64))
+    }
+    #[inline]
+    fn gen_range_usize(&mut self, upper: usize) -> usize {
+        if upper <= 1 {
+            0
+        } else {
+            (self.next_u64() as usize) % upper
+        }
+    }
+}
+
+fn read_usize_token<R: Read>(r: &mut R) -> io::Result<u64> {
+    let mut buf = [0u8; 1];
+    // Skip leading whitespace
+    loop {
+        match r.read(&mut buf)? {
+            0 => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "missing header")),
+            _ => {
+                if !buf[0].is_ascii_whitespace() {
+                    break;
+                }
+            }
+        }
+    }
+    let mut n: u64 = (buf[0] - b'0') as u64;
+    loop {
+        match r.read(&mut buf)? {
+            0 => break,
+            _ => {
+                let c = buf[0];
+                if c.is_ascii_whitespace() {
+                    break;
+                }
+                if !(b'0'..=b'9').contains(&c) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "header must be ASCII integers",
+                    ));
+                }
+                n = n
+                    .saturating_mul(10)
+                    .saturating_add((c - b'0') as u64);
+            }
+        }
+    }
+    Ok(n)
+}
+
+#[inline]
+fn read_point<R: Read>(r: &mut R, buf: &mut [u8; 12]) -> io::Result<Option<Point>> {
+    match r.read_exact(buf) {
+        Ok(()) => {
+            let x = f32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+            let y = f32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+            let z = f32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
+            Ok(Some(Point { x, y, z }))
+        }
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+#[inline]
+fn write_u32<W: Write>(w: &mut W, v: u32) -> io::Result<()> {
+    w.write_all(&v.to_le_bytes())
+}
+
+fn argmin_centroid(p: Point, centroids: &[Point]) -> usize {
+    let mut best_i = 0usize;
+    let mut best_d = dist2(p, centroids[0]);
+    for (i, &c) in centroids.iter().enumerate().skip(1) {
+        let d = dist2(p, c);
+        if d < best_d {
+            best_d = d;
+            best_i = i;
+        }
+    }
+    best_i
+}
+
+fn init_centroids(reservoir: &[Point], k: usize, rng: &mut Rng) -> Vec<Point> {
+    if k == 0 {
+        return Vec::new();
+    }
+    if reservoir.is_empty() {
+        return vec![Point::default(); k];
+    }
+
+    // For very large k, k-means++ becomes too expensive; use random seeding.
+    if k > 2048 {
+        let mut c = Vec::with_capacity(k);
+        for _ in 0..k {
+            c.push(reservoir[rng.gen_range_usize(reservoir.len())]);
+        }
+        return c;
+    }
+
+    // k-means++ on reservoir.
+    let s = reservoir.len();
+    let mut centroids = Vec::with_capacity(k);
+    centroids.push(reservoir[rng.gen_range_usize(s)]);
+    let mut d2 = vec![0f32; s];
+
+    for &p in reservoir.iter().enumerate().map(|(_, p)| p) {
+        let _ = p; // keep borrow checker happy in older compilers
+    }
+
+    for _ in 1..k {
+        let mut sum = 0f64;
+        for (i, &p) in reservoir.iter().enumerate() {
+            let mut best = dist2(p, centroids[0]);
+            for &c in centroids.iter().skip(1) {
+                let d = dist2(p, c);
+                if d < best {
+                    best = d;
+                }
+            }
+            // Clamp to avoid NaNs poisoning selection.
+            let v = if best.is_finite() && best > 0.0 { best } else { 0.0 };
+            d2[i] = v;
+            sum += v as f64;
+        }
+
+        if sum <= 0.0 || !sum.is_finite() {
+            centroids.push(reservoir[rng.gen_range_usize(s)]);
+            continue;
+        }
+
+        let mut target = rng.next_f64() * sum;
+        let mut chosen = reservoir[0];
+        for (i, &p) in reservoir.iter().enumerate() {
+            target -= d2[i] as f64;
+            if target <= 0.0 {
+                chosen = p;
+                break;
+            }
+        }
+        centroids.push(chosen);
+    }
+    centroids
+}
+
+fn lloyd_kmeans(points: &[Point], k: usize, max_iter: usize, rng: &mut Rng) -> Vec<Point> {
+    let mut centroids = init_centroids(points, k, rng);
+    if k == 0 || points.is_empty() {
+        return centroids;
+    }
+
+    let mut assignments = vec![0usize; points.len()];
+    let mut prev_inertia = f64::INFINITY;
+
+    for _ in 0..max_iter {
+        let mut sums = vec![Point::default(); k];
+        let mut counts = vec![0u64; k];
+        let mut inertia = 0f64;
+
+        for (i, &p) in points.iter().enumerate() {
+            let ci = argmin_centroid(p, &centroids);
+            assignments[i] = ci;
+            sums[ci] = sums[ci].add(p);
+            counts[ci] += 1;
+            inertia += dist2(p, centroids[ci]) as f64;
+        }
+
+        for ci in 0..k {
+            if counts[ci] == 0 {
+                centroids[ci] = points[rng.gen_range_usize(points.len())];
+            } else {
+                let inv = 1.0f32 / (counts[ci] as f32);
+                centroids[ci] = sums[ci].mul(inv);
+            }
+        }
+
+        // Simple convergence check.
+        let rel = (prev_inertia - inertia).abs() / prev_inertia.max(1.0);
+        prev_inertia = inertia;
+        if rel < 1e-4 {
+            break;
+        }
+    }
+
+    centroids
+}
+
+fn streaming_minibatch_kmeans<R: Read>(
+    mut data: R,
+    k: usize,
+    initial: Vec<Point>,
+    epochs: usize,
+    reservoir_for_reinit: &[Point],
+) -> io::Result<Vec<Point>> {
+    let mut centroids = initial;
+    if k == 0 {
+        return Ok(centroids);
+    }
+    if centroids.len() != k {
+        centroids.resize(k, Point::default());
+    }
+
+    let mut counts = vec![1u64; k];
+    let mut buf = [0u8; 12];
+
+    for _ in 0..epochs {
+        // reset stream each epoch (caller supplies new reader / seeked file)
+        loop {
+            let p = match read_point(&mut data, &mut buf)? {
+                Some(p) => p,
+                None => break,
+            };
+            let ci = argmin_centroid(p, &centroids);
+            counts[ci] = counts[ci].saturating_add(1);
+            let eta = 1.0f32 / (counts[ci] as f32);
+            let delta = p.sub(centroids[ci]);
+            centroids[ci] = centroids[ci].add(delta.mul(eta));
+        }
+    }
+
+    // Reinitialize any centroids that never got updated (very unlikely with counts starting at 1),
+    // or that became non-finite.
+    for c in &mut centroids {
+        if !(c.x.is_finite() && c.y.is_finite() && c.z.is_finite()) {
+            if !reservoir_for_reinit.is_empty() {
+                *c = reservoir_for_reinit[0];
+            } else {
+                *c = Point::default();
+            }
+        }
+    }
+    Ok(centroids)
+}
+
+fn main() -> io::Result<()> {
+    let stdin = io::stdin();
+    let mut reader = BufReader::new(stdin.lock());
+
+    let num_points_u64 = read_usize_token(&mut reader)?;
+    let k_u64 = read_usize_token(&mut reader)?;
+    let num_points = num_points_u64 as u64;
+    let k = k_u64 as usize;
+
+    let seed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64
+        ^ (num_points_u64.wrapping_mul(0x9E3779B97F4A7C15))
+        ^ ((k_u64 as u64).rotate_left(17));
+    let mut rng = Rng::new(seed);
+
+    if k == 0 {
+        // Nothing sensible to output; spec implies k>0, but be robust.
+        return Ok(());
+    }
+
+    // Decide strategy.
+    let small_in_memory = num_points_u64 <= 10_000_000 && (num_points_u64 as usize) <= usize::MAX / 12;
+    let medium_in_memory = num_points_u64 <= 25_000_000 && k <= 256;
+
+    // Reservoir size for seeding.
+    let mut sample_target = if k <= 256 {
+        200_000usize
+    } else if k <= 2048 {
+        150_000usize
+    } else {
+        // Keep bounded when k is huge.
+        min(200_000usize, k.saturating_mul(20).max(20_000))
+    };
+    if num_points_u64 < sample_target as u64 {
+        sample_target = num_points_u64 as usize;
+    }
+
+    let mut reservoir: Vec<Point> = Vec::with_capacity(sample_target);
+    let mut points_mem: Vec<Point> = Vec::new();
+
+    // If not in-memory, spill the raw point stream to a temp file to enable multi-pass.
+    let mut spill_path: Option<PathBuf> = None;
+    let mut spill_writer: Option<BufWriter<File>> = None;
+
+    if small_in_memory || medium_in_memory {
+        points_mem = Vec::with_capacity(min(num_points_u64 as usize, 5_000_000usize));
+    } else {
+        let mut path = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let pid = std::process::id();
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        path.push(format!("kmeans_spill_{}_{}.bin", pid, ts));
+        let f = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&path)?;
+        spill_writer = Some(BufWriter::new(f));
+        spill_path = Some(path);
+    }
+
+    // First pass: read points, build reservoir sample, optionally store or spill.
+    let mut buf = [0u8; 12];
+    let mut seen: u64 = 0;
+    while seen < num_points {
+        let p = match read_point(&mut reader, &mut buf)? {
+            Some(p) => p,
+            None => break,
+        };
+        seen += 1;
+
+        if small_in_memory || medium_in_memory {
+            points_mem.push(p);
+        } else if let Some(w) = spill_writer.as_mut() {
+            w.write_all(&buf)?;
+        }
+
+        // Reservoir sampling (Algorithm R).
+        if reservoir.len() < sample_target {
+            reservoir.push(p);
+        } else if sample_target > 0 {
+            let j = (rng.next_u64() % (seen as u64)) as u64;
+            if j < sample_target as u64 {
+                reservoir[j as usize] = p;
+            }
+        }
+    }
+    if let Some(w) = spill_writer.as_mut() {
+        w.flush()?;
+    }
+
+    // Build initial centroids.
+    let init_source: &[Point] = if !reservoir.is_empty() {
+        &reservoir
+    } else {
+        &points_mem
+    };
+    let mut centroids = init_centroids(init_source, k, &mut rng);
+
+    // Training.
+    if small_in_memory && !points_mem.is_empty() {
+        // Standard k-means.
+        centroids = lloyd_kmeans(&points_mem, k, 12, &mut rng);
+    } else if medium_in_memory && !points_mem.is_empty() {
+        // Fewer Lloyd iterations; still in-memory.
+        centroids = lloyd_kmeans(&points_mem, k, 6, &mut rng);
+    } else {
+        // Streaming mini-batch across the spilled file, with small epoch count.
+        let epochs = if num_points_u64 <= 100_000_000 {
+            2
+        } else if num_points_u64 <= 1_000_000_000 {
+            1
+        } else {
+            1
+        };
+
+        let path = spill_path.as_ref().expect("spill file must exist");
+        for _ in 0..epochs {
+            let f = File::open(path)?;
+            let r = BufReader::new(f);
+            centroids = streaming_minibatch_kmeans(r, k, centroids, 1, &reservoir)?;
+        }
+    }
+
+    // Final assignment pass: output one u32 per point in original order.
+    let stdout = io::stdout();
+    let mut out = BufWriter::new(stdout.lock());
+
+    if small_in_memory || medium_in_memory {
+        for &p in &points_mem {
+            let ci = argmin_centroid(p, &centroids) as u32;
+            write_u32(&mut out, ci)?;
+        }
+    } else {
+        let path = spill_path.as_ref().expect("spill file must exist");
+        let f = File::open(path)?;
+        let mut r = BufReader::new(f);
+        let mut pbuf = [0u8; 12];
+        loop {
+            let p = match read_point(&mut r, &mut pbuf)? {
+                Some(p) => p,
+                None => break,
+            };
+            let ci = argmin_centroid(p, &centroids) as u32;
+            write_u32(&mut out, ci)?;
+        }
+    }
+    out.flush()?;
+
+    // Best-effort cleanup for spill file.
+    if let Some(path) = spill_path {
+        let _ = std::fs::remove_file(path);
+    }
+    Ok(())
+}

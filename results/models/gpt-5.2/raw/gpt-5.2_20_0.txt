@@ -1,0 +1,468 @@
+﻿use std::cmp::Ordering;
+use std::collections::HashMap;
+use std::f64;
+use std::io::{self, Read};
+
+#[derive(Clone, Debug)]
+struct Sample {
+    depth: f64,
+    props: Vec<f64>, // NaN indicates missing
+}
+
+#[derive(Clone, Debug)]
+struct Hole {
+    id: String,
+    start: [f64; 3],
+    dir: [f64; 3],
+    length: f64,
+    samples: Vec<Sample>,
+}
+
+#[derive(Clone, Debug)]
+struct Suspect {
+    hole_id: String,
+    sample_idx: usize,
+    property_name: String,
+    confidence: f64,
+}
+
+fn parse_f64(token: &str) -> f64 {
+    if token.eq_ignore_ascii_case("nan")
+        || token.eq_ignore_ascii_case("na")
+        || token.eq_ignore_ascii_case("null")
+        || token.eq_ignore_ascii_case("none")
+        || token.is_empty()
+    {
+        f64::NAN
+    } else {
+        token.parse::<f64>().unwrap_or(f64::NAN)
+    }
+}
+
+fn norm3(v: [f64; 3]) -> f64 {
+    (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt()
+}
+
+fn add3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
+}
+
+fn mul3(v: [f64; 3], s: f64) -> [f64; 3] {
+    [v[0] * s, v[1] * s, v[2] * s]
+}
+
+fn dist2(a: [f64; 3], b: [f64; 3]) -> f64 {
+    let dx = a[0] - b[0];
+    let dy = a[1] - b[1];
+    let dz = a[2] - b[2];
+    dx * dx + dy * dy + dz * dz
+}
+
+fn clamp01(x: f64) -> f64 {
+    if !x.is_finite() {
+        0.0
+    } else if x < 0.0 {
+        0.0
+    } else if x > 1.0 {
+        1.0
+    } else {
+        x
+    }
+}
+
+fn median(mut vals: Vec<f64>) -> f64 {
+    vals.retain(|v| v.is_finite());
+    if vals.is_empty() {
+        return f64::NAN;
+    }
+    vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+    let n = vals.len();
+    if n % 2 == 1 {
+        vals[n / 2]
+    } else {
+        0.5 * (vals[n / 2 - 1] + vals[n / 2])
+    }
+}
+
+fn mad_scale(vals: &[f64], med: f64) -> f64 {
+    let mut devs = Vec::with_capacity(vals.len());
+    for &v in vals {
+        if v.is_finite() {
+            devs.push((v - med).abs());
+        }
+    }
+    let mad = median(devs);
+    if mad.is_finite() && mad > 0.0 {
+        mad * 1.4826
+    } else {
+        f64::NAN
+    }
+}
+
+fn mean_std(vals: &[f64]) -> (f64, f64) {
+    let mut n = 0usize;
+    let mut mean = 0.0f64;
+    let mut m2 = 0.0f64;
+    for &x in vals {
+        if !x.is_finite() {
+            continue;
+        }
+        n += 1;
+        let delta = x - mean;
+        mean += delta / (n as f64);
+        let delta2 = x - mean;
+        m2 += delta * delta2;
+    }
+    if n < 2 {
+        return (f64::NAN, f64::NAN);
+    }
+    let var = m2 / ((n - 1) as f64);
+    (mean, var.max(0.0).sqrt())
+}
+
+fn robust_z(x: f64, center: f64, scale: f64) -> f64 {
+    if !x.is_finite() || !center.is_finite() || !scale.is_finite() || scale <= 0.0 {
+        f64::NAN
+    } else {
+        (x - center) / scale
+    }
+}
+
+fn build_global_stats(holes: &[Hole], num_props: usize) -> Vec<(f64, f64, f64, f64)> {
+    let mut per_prop: Vec<Vec<f64>> = (0..num_props).map(|_| Vec::new()).collect();
+    for h in holes {
+        for s in &h.samples {
+            for p in 0..num_props {
+                let v = s.props[p];
+                if v.is_finite() {
+                    per_prop[p].push(v);
+                }
+            }
+        }
+    }
+    let mut stats = Vec::with_capacity(num_props);
+    for p in 0..num_props {
+        let vals = &per_prop[p];
+        let med = median(vals.clone());
+        let mad = if med.is_finite() { mad_scale(vals, med) } else { f64::NAN };
+        let (mean, std) = mean_std(vals);
+        stats.push((med, mad, mean, std));
+    }
+    stats
+}
+
+fn choose_k(total_samples: usize) -> usize {
+    if total_samples < 5_000 {
+        16
+    } else if total_samples < 50_000 {
+        24
+    } else if total_samples < 500_000 {
+        32
+    } else {
+        40
+    }
+}
+
+fn choose_grid_cell(holes: &[Hole]) -> f64 {
+    let mut lens = Vec::with_capacity(holes.len());
+    for h in holes {
+        if h.length.is_finite() && h.length > 0.0 {
+            lens.push(h.length);
+        }
+    }
+    let med_len = median(lens);
+    let base = if med_len.is_finite() { med_len } else { 100.0 };
+    let mut cell = base / 10.0;
+    if !cell.is_finite() || cell <= 0.0 {
+        cell = 25.0;
+    }
+    cell.clamp(5.0, 200.0)
+}
+
+fn grid_key(p: [f64; 3], cell: f64) -> (i32, i32, i32) {
+    ((p[0] / cell).floor() as i32, (p[1] / cell).floor() as i32, (p[2] / cell).floor() as i32)
+}
+
+fn gather_neighbors_grid(
+    point: [f64; 3],
+    cell: f64,
+    grid: &HashMap<(i32, i32, i32), Vec<usize>>,
+    positions: &[[f64; 3]],
+    target_k: usize,
+) -> Vec<usize> {
+    let (cx, cy, cz) = grid_key(point, cell);
+    let mut candidates: Vec<usize> = Vec::new();
+    for r in 0..=4 {
+        for dx in -r..=r {
+            for dy in -r..=r {
+                for dz in -r..=r {
+                    let key = (cx + dx, cy + dy, cz + dz);
+                    if let Some(list) = grid.get(&key) {
+                        candidates.extend_from_slice(list);
+                    }
+                }
+            }
+        }
+        if candidates.len() >= target_k * 4 {
+            break;
+        }
+    }
+    let mut dists: Vec<(f64, usize)> = candidates
+        .into_iter()
+        .map(|idx| (dist2(point, positions[idx]), idx))
+        .collect();
+    dists.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
+    dists.into_iter().take(target_k).map(|(_, idx)| idx).collect()
+}
+
+fn main() {
+    let mut input = String::new();
+    io::stdin().read_to_string(&mut input).unwrap();
+    let mut it = input.split_whitespace();
+
+    let num_holes: usize = match it.next() {
+        Some(t) => t.parse().unwrap_or(0),
+        None => {
+            println!("0");
+            return;
+        }
+    };
+    let num_props: usize = match it.next() {
+        Some(t) => t.parse().unwrap_or(0),
+        None => {
+            println!("0");
+            return;
+        }
+    };
+
+    let mut prop_names: Vec<String> = Vec::with_capacity(num_props);
+    for i in 0..num_props {
+        prop_names.push(it.next().unwrap_or(&format!("prop{}", i + 1)).to_string());
+    }
+
+    let mut holes: Vec<Hole> = Vec::with_capacity(num_holes);
+    for _ in 0..num_holes {
+        let hole_id = match it.next() {
+            Some(v) => v.to_string(),
+            None => break,
+        };
+        let start_x = parse_f64(it.next().unwrap_or("nan"));
+        let start_y = parse_f64(it.next().unwrap_or("nan"));
+        let start_z = parse_f64(it.next().unwrap_or("nan"));
+        let dir_x = parse_f64(it.next().unwrap_or("nan"));
+        let dir_y = parse_f64(it.next().unwrap_or("nan"));
+        let dir_z = parse_f64(it.next().unwrap_or("nan"));
+        let length = parse_f64(it.next().unwrap_or("nan"));
+        let num_samples = it.next().and_then(|t| t.parse::<usize>().ok()).unwrap_or(0);
+
+        let mut samples: Vec<Sample> = Vec::with_capacity(num_samples);
+        for _ in 0..num_samples {
+            let depth = parse_f64(it.next().unwrap_or("nan"));
+            let mut props = vec![f64::NAN; num_props];
+            for p in 0..num_props {
+                props[p] = parse_f64(it.next().unwrap_or("nan"));
+            }
+            samples.push(Sample { depth, props });
+        }
+
+        holes.push(Hole {
+            id: hole_id,
+            start: [start_x, start_y, start_z],
+            dir: [dir_x, dir_y, dir_z],
+            length,
+            samples,
+        });
+    }
+
+    if holes.is_empty() || num_props == 0 {
+        println!("0");
+        return;
+    }
+
+    let mut positions: Vec<[f64; 3]> = Vec::new();
+    let mut sample_ref: Vec<(usize, usize)> = Vec::new();
+    positions.reserve(holes.iter().map(|h| h.samples.len()).sum());
+    sample_ref.reserve(positions.capacity());
+
+    for (hi, h) in holes.iter().enumerate() {
+        let mut dir = h.dir;
+        let nrm = norm3(dir);
+        if nrm.is_finite() && nrm > 0.0 {
+            dir = [dir[0] / nrm, dir[1] / nrm, dir[2] / nrm];
+        } else {
+            dir = [0.0, 0.0, -1.0];
+        }
+        for (si, s) in h.samples.iter().enumerate() {
+            let d = if s.depth.is_finite() { s.depth } else { si as f64 };
+            positions.push(add3(h.start, mul3(dir, d)));
+            sample_ref.push((hi, si));
+        }
+    }
+
+    let total_samples = positions.len();
+    if total_samples == 0 {
+        println!("0");
+        return;
+    }
+
+    let use_grid = total_samples >= 30_000;
+    let target_k = choose_k(total_samples);
+    let global_stats = build_global_stats(&holes, num_props);
+
+    let mut grid: HashMap<(i32, i32, i32), Vec<usize>> = HashMap::new();
+    let mut cell = 0.0;
+    if use_grid {
+        cell = choose_grid_cell(&holes);
+        grid.reserve((total_samples / 4).max(1));
+        for (idx, &pos) in positions.iter().enumerate() {
+            grid.entry(grid_key(pos, cell)).or_default().push(idx);
+        }
+    }
+
+    let max_suspects = 50_000usize.min(total_samples.saturating_mul(num_props));
+    let mut suspects: Vec<Suspect> = Vec::new();
+
+    let mut dup_depth_flags: Vec<Vec<bool>> = vec![Vec::new(); holes.len()];
+    for (hi, h) in holes.iter().enumerate() {
+        let mut seen: HashMap<i64, usize> = HashMap::new();
+        let mut flags = vec![false; h.samples.len()];
+        for (si, s) in h.samples.iter().enumerate() {
+            if !s.depth.is_finite() {
+                continue;
+            }
+            let key = (s.depth * 1000.0).round() as i64;
+            if let Some(&prev) = seen.get(&key) {
+                flags[si] = true;
+                flags[prev] = true;
+            } else {
+                seen.insert(key, si);
+            }
+        }
+        dup_depth_flags[hi] = flags;
+    }
+
+    for idx in 0..total_samples {
+        let (hi, si) = sample_ref[idx];
+        let point = positions[idx];
+
+        let neighbors: Vec<usize> = if total_samples <= 2000 {
+            let mut dists: Vec<(f64, usize)> = (0..total_samples)
+                .filter(|&j| j != idx)
+                .map(|j| (dist2(point, positions[j]), j))
+                .collect();
+            dists.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
+            dists.into_iter().take(target_k).map(|(_, j)| j).collect()
+        } else if use_grid {
+            gather_neighbors_grid(point, cell, &grid, &positions, target_k)
+                .into_iter()
+                .filter(|&j| j != idx)
+                .collect()
+        } else {
+            let step = (total_samples / (target_k * 50).max(1)).max(1);
+            let mut dists: Vec<(f64, usize)> = (0..total_samples)
+                .step_by(step)
+                .filter(|&j| j != idx)
+                .map(|j| (dist2(point, positions[j]), j))
+                .collect();
+            dists.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
+            dists.into_iter().take(target_k).map(|(_, j)| j).collect()
+        };
+
+        if neighbors.is_empty() {
+            continue;
+        }
+
+        for p in 0..num_props {
+            let v = holes[hi].samples[si].props[p];
+            if !v.is_finite() {
+                continue;
+            }
+
+            let mut nvals: Vec<f64> = Vec::with_capacity(neighbors.len());
+            for &j in &neighbors {
+                let (h2, s2) = sample_ref[j];
+                let vv = holes[h2].samples[s2].props[p];
+                if vv.is_finite() {
+                    nvals.push(vv);
+                }
+            }
+
+            if nvals.len() < 6 {
+                continue;
+            }
+
+            let local_med = median(nvals.clone());
+            let local_scale = if local_med.is_finite() { mad_scale(&nvals, local_med) } else { f64::NAN };
+
+            let (g_med, g_mad, g_mean, g_std) = global_stats[p];
+            let (center, scale) = if local_scale.is_finite() && local_scale > 1e-12 {
+                (local_med, local_scale)
+            } else if g_mad.is_finite() && g_mad > 1e-12 {
+                (g_med, g_mad)
+            } else if g_std.is_finite() && g_std > 1e-12 {
+                (g_mean, g_std)
+            } else {
+                continue;
+            };
+
+            let z = robust_z(v, center, scale);
+            if !z.is_finite() {
+                continue;
+            }
+            let az = z.abs();
+
+            let base = (az - 3.5) / 6.0;
+            let mut conf = clamp01(base);
+
+            if dup_depth_flags[hi].get(si).copied().unwrap_or(false) {
+                conf = (conf + 0.10).min(1.0);
+            }
+
+            if g_med.is_finite() {
+                let g_scale = if g_mad.is_finite() && g_mad > 1e-12 {
+                    g_mad
+                } else if g_std.is_finite() && g_std > 1e-12 {
+                    g_std
+                } else {
+                    f64::NAN
+                };
+                if g_scale.is_finite() {
+                    let gz = ((v - g_med) / g_scale).abs();
+                    if gz > 10.0 {
+                        conf = (conf + 0.15).min(1.0);
+                    }
+                }
+            }
+
+            if conf >= 0.55 {
+                suspects.push(Suspect {
+                    hole_id: holes[hi].id.clone(),
+                    sample_idx: si,
+                    property_name: prop_names[p].clone(),
+                    confidence: conf,
+                });
+
+                if suspects.len() >= max_suspects {
+                    break;
+                }
+            }
+        }
+        if suspects.len() >= max_suspects {
+            break;
+        }
+    }
+
+    suspects.sort_by(|a, b| {
+        b.confidence
+            .partial_cmp(&a.confidence)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| a.hole_id.cmp(&b.hole_id))
+            .then_with(|| a.sample_idx.cmp(&b.sample_idx))
+            .then_with(|| a.property_name.cmp(&b.property_name))
+    });
+
+    println!("{}", suspects.len());
+    for s in suspects {
+        println!("{} {} {} {:.6}", s.hole_id, s.sample_idx, s.property_name, s.confidence);
+    }
+}

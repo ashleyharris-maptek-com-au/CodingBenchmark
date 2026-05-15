@@ -30,12 +30,13 @@ import numpy as np
 
 from shader_test_utils import validate_spirv
 from compute_test_utils import ComputeShaderRunner, grade_compute
+from solver_utils import normalize_code_result
 
 title = "Parallel Prefix Sum (SPIR-V Binary Compute)"
 
 tags = [
   "spirv",
-  "structured response",
+  "freeform response",
   "gpu compute",
   "algorithm design",
 ]
@@ -186,27 +187,14 @@ The entire binary is one continuous hex string with no spaces or line breaks.
 
 extraGradeAnswerRuns = list(range(1, len(SUBPASSES)))
 
-structure = {
-    "type": "object",
-    "properties": {
-        "reasoning": {
-            "type": "string",
-            "description": "Explain your approach to the prefix sum SPIR-V binary"
-        },
-        "spirv_hex": {
-            "type": "string",
-            "description": "Complete SPIR-V binary as a hex-encoded string (no spaces)"
-        }
-    },
-    "required": ["reasoning", "spirv_hex"],
-    "additionalProperties": False
-}
+structure = None
 
 _runner_cache = None
 _REPORT_CACHE = {}
 
 
 def _grade_answer_inner(result, subPass, aiEngineName):
+  result = normalize_code_result(result, "spirv_hex")
   global _runner_cache
 
   if not result or "spirv_hex" not in result:
@@ -286,6 +274,7 @@ def _grade_answer_inner(result, subPass, aiEngineName):
 
 def gradeAnswer(result, subPass, aiEngineName):
   """Run grading in an isolated subprocess to survive GPU hangs/TDRs."""
+  result = normalize_code_result(result, "spirv_hex")
   if not result or "spirv_hex" not in result:
     return 0.0, "No SPIR-V hex provided"
 
@@ -428,6 +417,7 @@ def _block_accuracy_svg(matches, width=300, height=18):
 
 
 def resultToNiceReport(result, subPass, aiEngineName):
+  result = normalize_code_result(result, "spirv_hex")
   from html import escape
 
   report = _REPORT_CACHE.get((aiEngineName, subPass))

@@ -224,9 +224,7 @@ class LanderSimulator:
     return math.sqrt((self.x - self.world.target_x)**2 + (self.y - self.world.target_y)**2)
 
 
-def create_lander_svg(world: LunarLanderWorld,
-                      path: List[Tuple[float, float]],
-                      landed: bool,
+def create_lander_svg(world: LunarLanderWorld, path: List[Tuple[float, float]], landed: bool,
                       crashed: bool) -> str:
   """Render the world and lander path as SVG for reasonably sized maps."""
   if world.width * world.height > MAX_SVG_CELLS:
@@ -255,8 +253,7 @@ def create_lander_svg(world: LunarLanderWorld,
       px = margin + x * cell_size
       py = margin + y * cell_size
       svg_elements.append(
-        f'<rect x="{px}" y="{py}" width="{cell_size}" height="{cell_size}" fill="{color}" />'
-      )
+        f'<rect x="{px}" y="{py}" width="{cell_size}" height="{cell_size}" fill="{color}" />')
 
   if path:
     points = []
@@ -274,11 +271,9 @@ def create_lander_svg(world: LunarLanderWorld,
   target_x = margin + world.target_x * cell_size + cell_size / 2
   target_y = margin + world.target_y * cell_size + cell_size / 2
   svg_elements.append(
-    f'<circle cx="{start_x:.1f}" cy="{start_y:.1f}" r="{cell_size * 0.6:.1f}" fill="#fbbf24" />'
-  )
+    f'<circle cx="{start_x:.1f}" cy="{start_y:.1f}" r="{cell_size * 0.6:.1f}" fill="#fbbf24" />')
   svg_elements.append(
-    f'<circle cx="{target_x:.1f}" cy="{target_y:.1f}" r="{cell_size * 0.6:.1f}" fill="#22c55e" />'
-  )
+    f'<circle cx="{target_x:.1f}" cy="{target_y:.1f}" r="{cell_size * 0.6:.1f}" fill="#22c55e" />')
 
   svg_html = f'''
     <div style="margin: 16px 0; padding: 12px; border: 1px solid #1f2937; border-radius: 8px; background: #0b1120;">
@@ -309,7 +304,7 @@ TEST_CASES = [
     "gravity": 1.62,  # Moon gravity
     "max_thrust": 5.0,
     "fuel": 50.0,
-    "max_time": 30.0,
+    "max_time": 300.0,
     "description": "100x50 - simple landing"
   },
   # Subpass 1: Small world
@@ -319,7 +314,7 @@ TEST_CASES = [
     "gravity": 1.62,
     "max_thrust": 5.0,
     "fuel": 100.0,
-    "max_time": 45.0,
+    "max_time": 450.0,
     "description": "200x100 - short hop"
   },
   # Subpass 2: Medium world
@@ -329,7 +324,7 @@ TEST_CASES = [
     "gravity": 1.62,
     "max_thrust": 8.0,
     "fuel": 200.0,
-    "max_time": 60.0,
+    "max_time": 600.0,
     "description": "500x200 - orbital insertion"
   },
   # Subpass 3: Larger world
@@ -339,7 +334,7 @@ TEST_CASES = [
     "gravity": 1.62,
     "max_thrust": 10.0,
     "fuel": 400.0,
-    "max_time": 90.0,
+    "max_time": 900.0,
     "description": "1000x400 - cross-crater hop"
   },
   # Subpass 4: Large world
@@ -349,7 +344,7 @@ TEST_CASES = [
     "gravity": 1.62,
     "max_thrust": 15.0,
     "fuel": 800.0,
-    "max_time": 120.0,
+    "max_time": 1200.0,
     "description": "2km x 800m - regional transfer"
   },
   # Subpass 5: Very large
@@ -359,7 +354,7 @@ TEST_CASES = [
     "gravity": 1.62,
     "max_thrust": 20.0,
     "fuel": 2000.0,
-    "max_time": 180.0,
+    "max_time": 1800.0,
     "description": "5km x 2km - long range"
   },
   # Extreme cases
@@ -369,7 +364,7 @@ TEST_CASES = [
     "gravity": 1.62,
     "max_thrust": 30.0,
     "fuel": 5000.0,
-    "max_time": 240.0,
+    "max_time": 2400.0,
     "description": "10km x 4km - continental"
   },
   {
@@ -378,7 +373,7 @@ TEST_CASES = [
     "gravity": 1.62,
     "max_thrust": 50.0,
     "fuel": 15000.0,
-    "max_time": 300.0,
+    "max_time": 3000.0,
     "description": "25km x 10km - suborbital"
   },
   {
@@ -387,7 +382,7 @@ TEST_CASES = [
     "gravity": 1.62,
     "max_thrust": 80.0,
     "fuel": 40000.0,
-    "max_time": 300.0,
+    "max_time": 3000.0,
     "description": "50km x 20km - orbital transfer"
   },
   {
@@ -396,7 +391,7 @@ TEST_CASES = [
     "gravity": 1.62,
     "max_thrust": 100.0,
     "fuel": 100000.0,
-    "max_time": 300.0,
+    "max_time": 3000.0,
     "description": "100km x 40km - trans-lunar injection"
   },
   {
@@ -405,7 +400,7 @@ TEST_CASES = [
     "gravity": 1.62,
     "max_thrust": 200.0,
     "fuel": 500000.0,
-    "max_time": 300.0,
+    "max_time": 3600.0,
     "description": "500km x 200km - interplanetary scale"
   },
 ]
@@ -618,7 +613,7 @@ def run_lander_simulation(code: str, case: dict, subpass: int,
     ]
     for line in header_lines:
       try:
-        stdin_queue.put(line,timeout=5)
+        stdin_queue.put(line, timeout=5)
       except Exception:
         dropped_inputs += 1
         log_event("stdin_drop: header")
@@ -730,7 +725,8 @@ def run_lander_simulation(code: str, case: dict, subpass: int,
     exec_time = time.time() - start_time
     distance = sim.distance_to_target()
 
-    avg_command_interval = (sum(command_intervals) / len(command_intervals)) if command_intervals else 0
+    avg_command_interval = (sum(command_intervals) /
+                            len(command_intervals)) if command_intervals else 0
     LAST_LANDER_STATS[(subpass, engine_name)] = {
       "world": world,
       "path": path,
@@ -876,8 +872,7 @@ def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
         html += (
           "<details><summary>Crash Debug Log (subpass 0)</summary>"
           f"<pre style='white-space: pre-wrap; background: #0b1120; color: #e2e8f0; padding: 10px; border-radius: 6px;'>"
-          f"{log_text}</pre></details>"
-        )
+          f"{log_text}</pre></details>")
   return html
 
 

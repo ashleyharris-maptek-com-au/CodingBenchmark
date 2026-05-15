@@ -1,0 +1,500 @@
+import math
+
+# Persistent autopilot memory (integrators, last values, etc.)
+_AP = {
+    "init": False,
+    "t": 0.0,
+    "last": {},
+    "i": {},  # integrators
+}
+
+
+def _clamp(x, lo, hi):
+    return lo if x < lo else hi if x > hi else x
+
+
+def _wrap180(deg):
+    d = (deg + 180.0) % 360.0 - 180.0
+    # avoid -180 edge for control symmetry
+    return 180.0 if d == -180.0 else d
+
+
+def _isfinite(x):
+    return x is not None and isinstance(x, (int, float)) and math.isfinite(x)
+
+
+def _robust_triplet(values, hard_min=None, hard_max=None):
+    """
+    values: list of (v, valid_flag_like) entries (len 1..3)
+    Returns (best_value, quality_0to1).
+    """
+    candidates = []
+    for v, ok in values:
+        if not _isfinite(v):
+            continue
+        # treat valid flag as a soft hint; still accept if flag is falsy but value plausible
+        if hard_min is not None and v < hard_min:
+            continue
+        if hard_max is not None and v > hard_max:
+            continue
+        candidates.append(float(v))
+    if not candidates:
+        return None, 0.0
+    candidates.sort()
+    med = candidates[len(candidates) // 2]
+    # Robust outlier trimming using MAD
+    abs_dev = [abs(v - med) for v in candidates]
+    abs_dev.sort()
+    mad = abs_dev[len(abs_dev) // 2] if abs_dev else 0.0
+    # If mad is ~0, all equal; otherwise drop far outliers
+    if mad > 1e-6:
+        thresh = 6.0 * mad
+        kept = [v for v in candidates if abs(v - med) <= thresh]
+        if kept:
+            kept.sort()
+            med = kept[len(kept) // 2]
+            quality = _clamp(len(kept) / 3.0, 0.33, 1.0)
+            return med, quality
+    quality = _clamp(len(candidates) / 3.0, 0.33, 1.0)
+    return med, quality
+
+
+def _get(state, key, default=None):
+    v = state.get(key, default)
+    return v
+
+
+def _fused_altitude_ft(state, dt):
+    # Baro altitude (good for flight path); GPS can drift; radar good near ground.
+    baro, q_baro = _robust_triplet(
+        [
+            (_get(state, "baro_alt_1_ft"), _get(state, "baro_alt_1_valid")),
+            (_get(state, "baro_alt_2_ft"), _get(state, "baro_alt_2_valid")),
+            (_get(state, "baro_alt_3_ft"), _get(state, "baro_alt_3_valid")),
+        ],
+        hard_min=-2000.0,
+        hard_max=60000.0,
+    )
+    gps_alt, q_gps = _robust_triplet(
+        [
+            (_get(state, "gps_1_alt_ft"), _get(state, "gps_1_valid")),
+            (_get(state, "gps_2_alt_ft"), _get(state, "gps_2_valid")),
+            (_get(state, "gps_3_alt_ft"), _get(state, "gps_3_valid")),
+        ],
+        hard_min=-2000.0,
+        hard_max=70000.0,
+    )
+    radar, q_radar = _robust_triplet(
+        [
+            (_get(state, "radar_alt_1_ft"), _get(state, "radar_alt_1_valid")),
+            (_get(state, "radar_alt_2_ft"), _get(state, "radar_alt_2_valid")),
+            (_get(state, "radar_alt_3_ft"), _get(state, "radar_alt_3_valid")),
+        ],
+        hard_min=-100.0,
+        hard_max=2500.0,
+    )
+
+    # Consistency checks: if GPS and baro disagree wildly, down-weight GPS (more spoofable).
+    w_baro = 0.65 * q_baro
+    w_gps = 0.25 * q_gps
+    w_radar = 0.10 * q_radar
+    if baro is not None and gps_alt is not None:
+        if abs(gps_alt - baro) > 1500.0:
+            w_gps *= 0.1
+    # If very near ground (radar valid) prefer radar for "height above terrain" actions,
+    # but keep baro for actual altitude hold.
+    alt = None
+    denom = 0.0
+    for v, w in ((baro, w_baro), (gps_alt, w_gps)):
+        if v is not None and w > 0.0:
+            alt = (alt or 0.0) + v * w
+            denom += w
+    if alt is None or denom <= 1e-9:
+        alt = baro if baro is not None else gps_alt
+        denom = 1.0 if alt is not None else 0.0
+    fused = alt / denom if denom > 0 else 0.0
+
+    # Derive vertical speed from fused altitude (helps when VS sensors are wrong)
+    last_alt = _AP["last"].get("alt_ft")
+    if _isfinite(last_alt) and _isfinite(fused) and dt > 1e-3:
+        vs_from_alt = (fused - last_alt) / dt * 60.0
+    else:
+        vs_from_alt = None
+    _AP["last"]["alt_ft"] = fused
+
+    return fused, radar, vs_from_alt, (q_baro, q_gps, q_radar)
+
+
+def _fused_ias_kt(state):
+    ias, q = _robust_triplet(
+        [
+            (_get(state, "ias_1_kt"), _get(state, "ias_1_valid")),
+            (_get(state, "ias_2_kt"), _get(state, "ias_2_valid")),
+            (_get(state, "ias_3_kt"), _get(state, "ias_3_valid")),
+        ],
+        hard_min=0.0,
+        hard_max=500.0,
+    )
+    return ias, q
+
+
+def _fused_attitude(state):
+    pitch, q_p = _robust_triplet(
+        [
+            (_get(state, "irs_1_pitch_deg"), _get(state, "irs_1_valid")),
+            (_get(state, "irs_2_pitch_deg"), _get(state, "irs_2_valid")),
+            (_get(state, "irs_3_pitch_deg"), _get(state, "irs_3_valid")),
+        ],
+        hard_min=-45.0,
+        hard_max=45.0,
+    )
+    roll, q_r = _robust_triplet(
+        [
+            (_get(state, "irs_1_roll_deg"), _get(state, "irs_1_valid")),
+            (_get(state, "irs_2_roll_deg"), _get(state, "irs_2_valid")),
+            (_get(state, "irs_3_roll_deg"), _get(state, "irs_3_valid")),
+        ],
+        hard_min=-90.0,
+        hard_max=90.0,
+    )
+    hdg, q_h = _robust_triplet(
+        [
+            (_get(state, "irs_1_heading_deg"), _get(state, "irs_1_valid")),
+            (_get(state, "irs_2_heading_deg"), _get(state, "irs_2_valid")),
+            (_get(state, "irs_3_heading_deg"), _get(state, "irs_3_valid")),
+        ],
+        hard_min=0.0,
+        hard_max=360.0,
+    )
+    track, q_t = _robust_triplet(
+        [
+            (_get(state, "gps_1_track_deg"), _get(state, "gps_1_valid")),
+            (_get(state, "gps_2_track_deg"), _get(state, "gps_2_valid")),
+            (_get(state, "gps_3_track_deg"), _get(state, "gps_3_valid")),
+        ],
+        hard_min=0.0,
+        hard_max=360.0,
+    )
+    return pitch, roll, hdg, track, (q_p, q_r, q_h, q_t)
+
+
+def _fused_rates(state):
+    pr, q_pr = _robust_triplet(
+        [
+            (_get(state, "gyro_1_pitch_rate_dps"), _get(state, "gyro_1_valid")),
+            (_get(state, "gyro_2_pitch_rate_dps"), _get(state, "gyro_2_valid")),
+            (_get(state, "gyro_3_pitch_rate_dps"), _get(state, "gyro_3_valid")),
+        ],
+        hard_min=-60.0,
+        hard_max=60.0,
+    )
+    rr, q_rr = _robust_triplet(
+        [
+            (_get(state, "gyro_1_roll_rate_dps"), _get(state, "gyro_1_valid")),
+            (_get(state, "gyro_2_roll_rate_dps"), _get(state, "gyro_2_valid")),
+            (_get(state, "gyro_3_roll_rate_dps"), _get(state, "gyro_3_valid")),
+        ],
+        hard_min=-120.0,
+        hard_max=120.0,
+    )
+    yr, q_yr = _robust_triplet(
+        [
+            (_get(state, "gyro_1_yaw_rate_dps"), _get(state, "gyro_1_valid")),
+            (_get(state, "gyro_2_yaw_rate_dps"), _get(state, "gyro_2_valid")),
+            (_get(state, "gyro_3_yaw_rate_dps"), _get(state, "gyro_3_valid")),
+        ],
+        hard_min=-60.0,
+        hard_max=60.0,
+    )
+    return pr, rr, yr, (q_pr, q_rr, q_yr)
+
+
+def _fused_vs_fpm(state):
+    vs, q_vs = _robust_triplet(
+        [
+            (_get(state, "irs_1_vs_fpm"), _get(state, "irs_1_valid")),
+            (_get(state, "irs_2_vs_fpm"), _get(state, "irs_2_valid")),
+            (_get(state, "irs_3_vs_fpm"), _get(state, "irs_3_valid")),
+        ],
+        hard_min=-8000.0,
+        hard_max=8000.0,
+    )
+    nav_vs = _get(state, "vertical_speed_fpm")
+    if _isfinite(nav_vs):
+        # If nav vs grossly disagrees with IRS, treat it as suspect
+        if vs is None:
+            return float(nav_vs), 0.5
+        if abs(float(nav_vs) - vs) < 1500.0:
+            return 0.7 * vs + 0.3 * float(nav_vs), _clamp(0.5 + 0.5 * q_vs, 0.0, 1.0)
+    return vs, q_vs
+
+
+def _fused_aoa_deg(state):
+    aoa, q = _robust_triplet(
+        [
+            (_get(state, "aoa_1_deg"), _get(state, "aoa_1_valid")),
+            (_get(state, "aoa_2_deg"), _get(state, "aoa_2_valid")),
+            (_get(state, "aoa_3_deg"), _get(state, "aoa_3_valid")),
+        ],
+        hard_min=-10.0,
+        hard_max=40.0,
+    )
+    return aoa, q
+
+
+def _pid(name, err, dt, kp, ki, kd, i_min=-1e9, i_max=1e9, d_meas=None):
+    integ = _AP["i"].get(name, 0.0)
+    if dt > 1e-6 and ki != 0.0 and _isfinite(err):
+        integ += err * dt
+        integ = _clamp(integ, i_min, i_max)
+        _AP["i"][name] = integ
+    # derivative: prefer measured rate (d_meas) where provided; else finite-diff of error
+    if d_meas is not None and _isfinite(d_meas):
+        derr = d_meas
+    else:
+        prev = _AP["last"].get(f"e_{name}")
+        if _isfinite(prev) and dt > 1e-6 and _isfinite(err):
+            derr = (err - prev) / dt
+        else:
+            derr = 0.0
+    _AP["last"][f"e_{name}"] = err
+    return kp * err + ki * integ + kd * derr
+
+
+def autopilot_step(state: dict, dt: float) -> dict:
+    # Use provided dt if caller passes nonsense
+    if not _isfinite(dt) or dt <= 0.0:
+        dt = state.get("dt", 0.05) if _isfinite(state.get("dt", None)) else 0.05
+    dt = float(_clamp(dt, 0.01, 0.2))
+
+    if not _AP["init"]:
+        _AP["init"] = True
+        _AP["t"] = float(state.get("sim_time_s", 0.0) or 0.0)
+        _AP["last"].clear()
+        _AP["i"].clear()
+
+    _AP["t"] += dt
+
+    ap_on = bool(state.get("ap_engaged", True))
+    at_on = bool(state.get("at_engaged", True))
+    if not ap_on and not at_on:
+        return {}
+
+    alt_ft, radar_ft, vs_from_alt_fpm, _ = _fused_altitude_ft(state, dt)
+    ias_kt, q_ias = _fused_ias_kt(state)
+    pitch_deg, roll_deg, hdg_deg, track_deg, _ = _fused_attitude(state)
+    pitch_rate_dps, roll_rate_dps, yaw_rate_dps, _ = _fused_rates(state)
+    vs_fpm, q_vs = _fused_vs_fpm(state)
+    aoa_deg, q_aoa = _fused_aoa_deg(state)
+
+    # If VS is unreliable, fall back to altitude-derived VS
+    if (vs_fpm is None or q_vs < 0.34) and _isfinite(vs_from_alt_fpm):
+        vs_fpm = float(_clamp(vs_from_alt_fpm, -8000.0, 8000.0))
+        q_vs = 0.5
+    if vs_fpm is None:
+        vs_fpm = 0.0
+
+    # Targets
+    target_alt = state.get("target_alt_ft", alt_ft)
+    target_hdg = state.get("target_hdg_deg", hdg_deg if hdg_deg is not None else 0.0)
+    target_ias = state.get("target_ias_kt", ias_kt if ias_kt is not None else 250.0)
+    target_vs = state.get("target_vs_fpm", None)
+    if not _isfinite(target_alt):
+        target_alt = alt_ft
+    if not _isfinite(target_hdg):
+        target_hdg = hdg_deg if hdg_deg is not None else 0.0
+    if not _isfinite(target_ias):
+        target_ias = ias_kt if ias_kt is not None else 250.0
+
+    target_alt = float(_clamp(float(target_alt), -1000.0, 60000.0))
+    target_hdg = float(float(target_hdg) % 360.0)
+    target_ias = float(_clamp(float(target_ias), 140.0, 340.0))
+
+    # Basic flight envelope heuristics (A320-class)
+    vne_kt = 365.0
+    vmo_kt = 350.0
+    vref_kt = 140.0
+    stall_aoa_deg = 14.0
+
+    # Detect on-ground / near-ground
+    wow = bool(state.get("weight_on_wheels_left", False) or state.get("weight_on_wheels_nose", False) or state.get("weight_on_wheels_right", False))
+    near_ground = (radar_ft is not None and radar_ft < 2500.0) or wow
+    ra = float(radar_ft) if _isfinite(radar_ft) else None
+
+    # Engine status / asymmetry
+    eng1_run = bool(state.get("engine_1_running", True)) and not bool(state.get("engine_1_fire", False))
+    eng2_run = bool(state.get("engine_2_running", True)) and not bool(state.get("engine_2_fire", False))
+    thrust1 = state.get("engine_1_thrust_pct", None)
+    thrust2 = state.get("engine_2_thrust_pct", None)
+    if not _isfinite(thrust1):
+        thrust1 = 0.0
+    if not _isfinite(thrust2):
+        thrust2 = 0.0
+    thrust_asym = float(thrust1) - float(thrust2)
+
+    # --- Lateral (heading -> bank -> aileron) ---
+    if hdg_deg is None:
+        hdg_use = track_deg if track_deg is not None else 0.0
+    else:
+        hdg_use = hdg_deg
+    hdg_err = _wrap180(target_hdg - float(hdg_use))
+
+    # Bank command: proportional heading error with limits
+    bank_cmd_deg = _clamp(0.35 * hdg_err, -25.0, 25.0)
+    if near_ground:
+        bank_cmd_deg = _clamp(bank_cmd_deg, -15.0, 15.0)
+
+    roll_use = roll_deg if roll_deg is not None else 0.0
+    roll_err = float(bank_cmd_deg) - float(roll_use)
+    # Aileron control with roll-rate damping
+    aileron = _pid("roll", roll_err, dt, kp=0.06, ki=0.02, kd=0.0, i_min=-10.0, i_max=10.0) - 0.015 * (roll_rate_dps or 0.0)
+    aileron = float(_clamp(aileron, -1.0, 1.0))
+
+    # Rudder yaw damping + engine asymmetry compensation
+    # Use small rudder for yaw-rate, plus a bias for asym thrust.
+    rudder = 0.0
+    if _isfinite(yaw_rate_dps):
+        rudder += _clamp(-0.03 * float(yaw_rate_dps), -0.3, 0.3)
+    rudder += _clamp(0.0035 * thrust_asym, -0.25, 0.25)
+    if near_ground:
+        rudder = _clamp(rudder, -0.2, 0.2)
+    rudder = float(_clamp(rudder, -1.0, 1.0))
+
+    # --- Longitudinal (altitude/VS -> elevator; speed -> throttle) ---
+    alt_err = target_alt - float(alt_ft)
+    if target_vs is None or not _isfinite(target_vs):
+        vs_cmd_fpm = _clamp(0.55 * alt_err, -2500.0, 2500.0)
+    else:
+        vs_cmd_fpm = _clamp(float(target_vs), -3500.0, 3500.0)
+    if near_ground:
+        vs_cmd_fpm = _clamp(vs_cmd_fpm, -1500.0, 1500.0)
+
+    vs_err = float(vs_cmd_fpm) - float(vs_fpm)
+    # Use pitch-rate as a stabilizing term; pitch helps remove steady-state offset
+    pitch_use = float(pitch_deg) if _isfinite(pitch_deg) else 0.0
+    pitch_rate_use = float(pitch_rate_dps) if _isfinite(pitch_rate_dps) else 0.0
+    elevator = _pid("vs", vs_err, dt, kp=0.00065, ki=0.00018, kd=0.0, i_min=-3000.0, i_max=3000.0)
+    elevator += _clamp(-0.015 * pitch_rate_use, -0.3, 0.3)
+    elevator += _clamp(-0.02 * pitch_use, -0.2, 0.2)
+    elevator = float(_clamp(elevator, -1.0, 1.0))
+
+    # Trim: slowly chase persistent elevator command so elevator can return near 0
+    trim_cmd = 0.0
+    if ap_on:
+        # accumulate only when stable (avoid during aggressive maneuvers)
+        if abs(roll_err) < 8.0 and abs(vs_err) < 800.0 and not wow:
+            trim_cmd = _clamp(0.12 * elevator, -0.25, 0.25)
+
+    # Speed / autothrottle
+    throttle_1 = None
+    throttle_2 = None
+    speedbrake = None
+    if ias_kt is None:
+        ias_use = float(state.get("ground_speed_kt", target_ias) or target_ias)
+    else:
+        ias_use = float(ias_kt)
+
+    # Anti-stall protection (priority over everything)
+    stall_risk = False
+    if _isfinite(aoa_deg) and q_aoa >= 0.34 and float(aoa_deg) > stall_aoa_deg:
+        stall_risk = True
+    if ias_use < vref_kt and not wow and (ra is None or ra > 50.0):
+        stall_risk = stall_risk or True
+
+    overspeed = ias_use > vmo_kt or ias_use > vne_kt * 0.98
+
+    if stall_risk:
+        # Push nose down slightly and add power
+        elevator = float(_clamp(elevator - 0.35, -1.0, 1.0))
+        if at_on:
+            throttle_1 = 1.0 if eng1_run else 0.0
+            throttle_2 = 1.0 if eng2_run else 0.0
+        speedbrake = 0.0
+    elif overspeed:
+        # Reduce power; use speedbrake; avoid aggressive pitch-up at low altitude
+        if at_on:
+            throttle_1 = 0.0 if eng1_run else 0.0
+            throttle_2 = 0.0 if eng2_run else 0.0
+        speedbrake = 0.7 if not near_ground else 0.2
+        elevator = float(_clamp(elevator + (0.10 if not near_ground else 0.04), -1.0, 1.0))
+    else:
+        if at_on:
+            spd_err = float(target_ias) - ias_use
+            # Throttle PID (slow integrator, limited)
+            thr = _pid("spd", spd_err, dt, kp=0.012, ki=0.0035, kd=0.0, i_min=-50.0, i_max=50.0)
+            # convert to [0,1] around a baseline that depends on climb/descent
+            baseline = 0.55
+            if vs_cmd_fpm > 800:
+                baseline = 0.70
+            elif vs_cmd_fpm < -800:
+                baseline = 0.40
+            thr_cmd = _clamp(baseline + 0.02 * thr, 0.0, 1.0)
+
+            # Single engine: keep failed engine at idle
+            if not eng1_run and eng2_run:
+                throttle_1 = 0.0
+                throttle_2 = _clamp(thr_cmd + 0.10, 0.0, 1.0)
+            elif not eng2_run and eng1_run:
+                throttle_2 = 0.0
+                throttle_1 = _clamp(thr_cmd + 0.10, 0.0, 1.0)
+            else:
+                throttle_1 = thr_cmd
+                throttle_2 = thr_cmd
+
+        # Keep speedbrake retracted unless commanded by overspeed or steep descent
+        if speedbrake is None:
+            if vs_cmd_fpm < -1800.0 and ias_use > target_ias + 15.0 and not near_ground:
+                speedbrake = 0.25
+            else:
+                speedbrake = 0.0
+
+    # --- High-level configuration (gear/flaps) ---
+    gear = None
+    flaps = None
+    if wow:
+        gear = 1
+    else:
+        if ra is not None:
+            if ra < 1500.0 and target_alt < 5000.0:
+                gear = 1
+            elif ra > 2000.0 and target_alt > 6000.0:
+                gear = 0
+        else:
+            # no radar: use altitude target heuristic
+            gear = 1 if target_alt < 3000.0 else 0
+
+    # Flap schedule: conservative, prioritize staying away from stall
+    if ra is not None and ra < 2500.0 and target_alt < 5000.0:
+        if ias_use < 160.0:
+            flaps = 20
+        elif ias_use < 190.0:
+            flaps = 10
+        else:
+            flaps = 0
+    else:
+        flaps = 0
+
+    # If overspeed, retract flaps
+    if overspeed:
+        flaps = 0
+        if gear == 1 and (ra is None or ra > 500.0):
+            gear = 0
+
+    # --- Assemble output ---
+    out = {
+        "aileron": aileron,
+        "rudder": rudder,
+    }
+
+    if ap_on:
+        out["elevator"] = elevator
+        out["elevator_trim"] = float(_clamp(trim_cmd, -1.0, 1.0))
+        out["flaps"] = int(_clamp(int(flaps), 0, 40))
+        out["gear"] = int(1 if gear else 0)
+        out["speedbrake"] = float(_clamp(float(speedbrake), 0.0, 1.0))
+
+    if at_on and throttle_1 is not None and throttle_2 is not None:
+        out["throttle_1"] = float(_clamp(float(throttle_1), 0.0, 1.0))
+        out["throttle_2"] = float(_clamp(float(throttle_2), 0.0, 1.0))
+
+    return out

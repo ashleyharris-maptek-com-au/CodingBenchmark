@@ -5,14 +5,14 @@ import time
 from pathlib import Path
 
 from native_compiler import CSharpCompiler, compile_and_run, describe_this_pc
-from solver_utils import StreamingInputFile
+from solver_utils import StreamingInputFile, normalize_code_result
 from collections import defaultdict
 
 title = "Chinese Postman Problem Solver (C#)"
 
 tags = [
   "csharp",
-  "structured response",
+  "freeform response",
   "graph theory",
   "optimization",
 ]
@@ -158,23 +158,7 @@ Write complete, compilable C# code with a static void Main method.
 # List of subpasses to grade the single answer against all difficulty levels
 extraGradeAnswerRuns = list(range(1, len(GRAPH_CONFIGS)))
 
-structure = {
-  "type": "object",
-  "properties": {
-    "reasoning": {
-      "type":
-      "string",
-      "description":
-      "Explain your approach to solving the Chinese Postman Problem and how it adapts to different graph sizes"
-    },
-    "csharp_code": {
-      "type": "string",
-      "description": "Complete C# code with Main method that handles all scales"
-    }
-  },
-  "required": ["reasoning", "csharp_code"],
-  "additionalProperties": False
-}
+structure = None
 
 
 def build_adjacency(num_nodes: int, edges: list) -> dict:
@@ -321,6 +305,7 @@ lastRoute = None
 
 
 def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
+  result = normalize_code_result(result, "csharp_code")
   if not result:
     return 0.0, "No result provided"
 
@@ -400,6 +385,7 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
 
 def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
   """Generate a nice HTML report for the result."""
+  result = normalize_code_result(result, "csharp_code")
   if not result:
     return "<p style='color:red'>No result provided</p>"
 

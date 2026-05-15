@@ -1,0 +1,208 @@
+// C++ solution for the 3D Lunar Lander benchmark.
+//
+// Design:
+// - Read the header and terrain path.
+// - Parse the terrain file in a background thread.
+// - Keep stdin drained in the main thread and output commands at >= 10 Hz.
+// - Use a simple scale-invariant guidance law:
+//   * rotate thrust axis toward a target acceleration vector
+//   * descend with a speed limit that tightens near the landing target
+//   * hold attitude with proportional/derivative control
+//
+// The controller is intentionally conservative. It does not attempt aggressive
+// terrain-aware path planning, but it handles arbitrary map scales and respects
+// the real-time IO constraints of the benchmark.
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <fstream>
+#include <iostream>
+#include <limits>
+#include <mutex>
+#include <optional>
+#include <string>
+#include <thread>
+#include <vector>
+
+using namespace std;
+
+static constexpr double kPi = 3.141592653589793238462643383279502884;
+
+struct Vec3 {
+    double x = 0, y = 0, z = 0;
+    Vec3() = default;
+    Vec3(double xx, double yy, double zz) : x(xx), y(yy), z(zz) {}
+};
+
+static inline Vec3 operator+(const Vec3& a, const Vec3& b) { return {a.x + b.x, a.y + b.y, a.z + b.z}; }
+static inline Vec3 operator-(const Vec3& a, const Vec3& b) { return {a.x - b.x, a.y - b.y, a.z - b.z}; }
+static inline Vec3 operator*(const Vec3& a, double s) { return {a.x * s, a.y * s, a.z * s}; }
+static inline Vec3 operator*(double s, const Vec3& a) { return a * s; }
+static inline Vec3 operator/(const Vec3& a, double s) { return {a.x / s, a.y / s, a.z / s}; }
+
+static inline double dot(const Vec3& a, const Vec3& b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+static inline double norm2(const Vec3& a) { return dot(a, a); }
+static inline double norm(const Vec3& a) { return sqrt(norm2(a)); }
+
+static inline Vec3 normalize(const Vec3& v) {
+    double n = norm(v);
+    if (n < 1e-12) return {0, 0, 1};
+    return v / n;
+}
+
+static inline double clampd(double v, double lo, double hi) {
+    return max(lo, min(hi, v));
+}
+
+static inline double signnz(double v) { return (v > 0) - (v < 0); }
+
+static inline double wrap_pi(double a) {
+    while (a > kPi) a -= 2.0 * kPi;
+    while (a < -kPi) a += 2.0 * kPi;
+    return a;
+}
+
+struct State {
+    double x = 0, y = 0, z = 0;
+    double vx = 0, vy = 0, vz = 0;
+    double pitch = 0, yaw = 0, roll = 0;
+    double pitch_rate = 0, yaw_rate = 0, roll_rate = 0;
+    double fuel = 0;
+};
+
+struct TerrainMeta {
+    int width = 0, depth = 0, height = 0;
+    string path;
+};
+
+static Vec3 thrust_dir_from_angles(double pitch, double yaw) {
+    // yaw=0,pitch=0 => +Z. Pitch positive tilts toward -X.
+    double cp = cos(pitch);
+    return { -sin(pitch) * cos(yaw), -sin(pitch) * sin(yaw), cp };
+}
+
+static void terrain_loader(TerrainMeta meta, atomic<bool>& ready) {
+    ifstream f(meta.path, ios::binary);
+    if (!f) {
+        ready.store(true, memory_order_release);
+        return;
+    }
+    vector<uint16_t> buf;
+    buf.reserve(static_cast<size_t>(meta.width) * static_cast<size_t>(meta.depth) * 3);
+    char bytes[2];
+    while (f.read(bytes, 2)) {
+        uint16_t v = static_cast<unsigned char>(bytes[0]) | (static_cast<unsigned char>(bytes[1]) << 8);
+        buf.push_back(v);
+    }
+    ready.store(true, memory_order_release);
+}
+
+static bool read_state(State& s) {
+    return static_cast<bool>(cin >> s.x >> s.y >> s.z >> s.vx >> s.vy >> s.vz
+                              >> s.pitch >> s.yaw >> s.roll
+                              >> s.pitch_rate >> s.yaw_rate >> s.roll_rate
+                              >> s.fuel);
+}
+
+int main() {
+    ios::sync_with_stdio(false);
+    cin.tie(nullptr);
+
+    TerrainMeta meta;
+    double gravity = 1.62;
+    double max_thrust = 1.0;
+    double fuel_capacity = 0.0;
+    double start_x, start_y, start_z;
+    double target_x, target_y, target_z;
+
+    if (!(cin >> meta.width >> meta.depth >> meta.height >> gravity >> max_thrust >> fuel_capacity)) {
+        return 0;
+    }
+    // The prompt's header repeats a field name; the sixth number is fuel capacity.
+    // We do not need it here, but we must consume the stream correctly.
+    cin >> start_x >> start_y >> start_z >> target_x >> target_y >> target_z;
+    cin >> ws;
+    getline(cin, meta.path);
+    if (meta.path.empty() && cin.good()) getline(cin, meta.path);
+
+    atomic<bool> terrain_ready{false};
+    thread loader(terrain_loader, meta, ref(terrain_ready));
+    loader.detach();
+
+    const Vec3 target(target_x, target_y, target_z);
+    const double landing_radius = max(5.0, min(meta.width, meta.depth) * 0.02);
+
+    State s;
+    auto last_print = chrono::steady_clock::now();
+
+    while (read_state(s)) {
+        Vec3 pos(s.x, s.y, s.z);
+        Vec3 vel(s.vx, s.vy, s.vz);
+        Vec3 to_target = target - pos;
+        double dist_xy = hypot(to_target.x, to_target.y);
+        double vertical_speed = s.vz;
+
+        double height_error = max(0.0, pos.z - target.z);
+        double near_factor = clampd(dist_xy / max(landing_radius, 1.0), 0.0, 1.0);
+
+        double desired_vz = -clampd(0.4 + 0.08 * sqrt(max(0.0, height_error)), 0.35, 6.0);
+        if (dist_xy < landing_radius * 2.5) {
+            desired_vz = -clampd(0.25 + 0.05 * sqrt(max(0.0, height_error)), 0.2, 3.0);
+        }
+        if (height_error < 25.0) desired_vz = max(desired_vz, -1.5);
+
+        Vec3 desired_acc(0, 0, gravity);
+
+        Vec3 horiz_correction = { -0.08 * to_target.x - 0.35 * vel.x, -0.08 * to_target.y - 0.35 * vel.y, 0 };
+        if (dist_xy < landing_radius * 4.0) {
+            horiz_correction = horiz_correction * (0.4 + 0.15 * near_factor);
+        }
+
+        double vz_error = desired_vz - vertical_speed;
+        desired_acc.z += clampd(1.8 * vz_error, -0.2, max_thrust);
+        desired_acc.x += horiz_correction.x;
+        desired_acc.y += horiz_correction.y;
+
+        double acc_mag = norm(desired_acc);
+        if (acc_mag < 1e-6) desired_acc = {0, 0, gravity};
+        else desired_acc = desired_acc / acc_mag * clampd(acc_mag, 0.0, max_thrust);
+
+        Vec3 thrust_dir = thrust_dir_from_angles(s.pitch, s.yaw);
+        Vec3 desired_dir = normalize(desired_acc);
+
+        Vec3 axis = {thrust_dir.y * desired_dir.z - thrust_dir.z * desired_dir.y,
+                     thrust_dir.z * desired_dir.x - thrust_dir.x * desired_dir.z,
+                     thrust_dir.x * desired_dir.y - thrust_dir.y * desired_dir.x};
+
+        double yaw_cmd = clampd(3.0 * axis.z - 0.8 * s.yaw_rate, -1.0, 1.0);
+        double pitch_cmd = clampd(3.0 * (axis.y * cos(s.yaw) - axis.x * sin(s.yaw)) - 0.8 * s.pitch_rate, -1.0, 1.0);
+        double roll_cmd = clampd(-0.6 * s.roll - 0.7 * s.roll_rate, -1.0, 1.0);
+
+        double thrust = 0.0;
+        double desired_up_acc = dot(desired_acc, Vec3{0, 0, 1});
+        double alignment = clampd(dot(thrust_dir, desired_dir), 0.0, 1.0);
+        if (s.fuel > 0.0) {
+            thrust = clampd((desired_up_acc / max_thrust) / max(0.25, alignment), 0.0, 1.0);
+            if (dist_xy < landing_radius * 1.5 && height_error < 10.0) {
+                thrust = min(1.0, thrust + 0.2);
+            }
+        }
+
+        auto now = chrono::steady_clock::now();
+        auto elapsed = chrono::duration_cast<chrono::milliseconds>(now - last_print).count();
+        if (elapsed < 90) {
+            this_thread::sleep_for(chrono::milliseconds(90 - elapsed));
+        }
+        last_print = chrono::steady_clock::now();
+
+        cout.setf(ios::fixed);
+        cout.precision(6);
+        cout << thrust << ' ' << pitch_cmd << ' ' << yaw_cmd << ' ' << roll_cmd << '\n';
+        cout.flush();
+    }
+
+    return 0;
+}

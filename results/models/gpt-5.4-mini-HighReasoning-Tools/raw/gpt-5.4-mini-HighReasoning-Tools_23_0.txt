@@ -1,0 +1,306 @@
+use std::cmp::{max, min};
+use std::io::{self, BufRead, Write};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
+
+#[derive(Clone, Copy, Default)]
+struct State {
+    x: f64,
+    y: f64,
+    vx: f64,
+    vy: f64,
+    angle: f64,
+    angular_vel: f64,
+    fuel_remaining: f64,
+}
+
+#[derive(Clone)]
+struct Env {
+    width: usize,
+    height: usize,
+    gravity: f64,
+    max_thrust: f64,
+    pad_x: f64,
+    pad_y: f64,
+    pad_half_width: f64,
+    surface: Vec<usize>,
+}
+
+fn clamp(v: f64, lo: f64, hi: f64) -> f64 {
+    if v < lo {
+        lo
+    } else if v > hi {
+        hi
+    } else {
+        v
+    }
+}
+
+fn parse_numbers(line: &str) -> Vec<f64> {
+    line.split_whitespace()
+        .filter_map(|s| s.parse::<f64>().ok())
+        .collect()
+}
+
+fn read_nonempty_line(reader: &mut dyn BufRead, buf: &mut String) -> io::Result<bool> {
+    loop {
+        buf.clear();
+        let n = reader.read_line(buf)?;
+        if n == 0 {
+            return Ok(false);
+        }
+        if !buf.trim().is_empty() {
+            return Ok(true);
+        }
+    }
+}
+
+fn read_state_line(reader: &mut dyn BufRead, buf: &mut String) -> io::Result<Option<State>> {
+    loop {
+        buf.clear();
+        let n = reader.read_line(buf)?;
+        if n == 0 {
+            return Ok(None);
+        }
+        let nums = parse_numbers(buf);
+        if nums.len() >= 7 {
+            return Ok(Some(State {
+                x: nums[0],
+                y: nums[1],
+                vx: nums[2],
+                vy: nums[3],
+                angle: nums[4],
+                angular_vel: nums[5],
+                fuel_remaining: nums[6],
+            }));
+        }
+    }
+}
+
+fn build_env(reader: &mut dyn BufRead) -> io::Result<Env> {
+    let mut line = String::new();
+
+    if !read_nonempty_line(reader, &mut line)? {
+        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "missing header"));
+    }
+    let first = parse_numbers(&line);
+    if first.len() < 5 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid header"));
+    }
+    let width = first[0].max(0.0) as usize;
+    let height = first[1].max(0.0) as usize;
+    let gravity = first[2];
+    let max_thrust = first[3];
+
+    if !read_nonempty_line(reader, &mut line)? {
+        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "missing start/target line"));
+    }
+    let second = parse_numbers(&line);
+    if second.len() < 4 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid start/target line"));
+    }
+    let target_x = second[2];
+    let target_y = second[3];
+
+    let mut surface = vec![height; width];
+    let mut pad_min_x: Option<usize> = None;
+    let mut pad_max_x: Option<usize> = None;
+    let mut pad_y: Option<usize> = None;
+
+    let mut rows_read = 0usize;
+    while rows_read < height {
+        line.clear();
+        let n = reader.read_line(&mut line)?;
+        if n == 0 {
+            break;
+        }
+        let row = line.trim_end_matches(&['\r', '\n'][..]);
+        if row.is_empty() {
+            continue;
+        }
+        for (x, b) in row.as_bytes().iter().enumerate().take(width) {
+            if surface[x] == height && (*b == b'#' || *b == b'L' || *b == b'T') {
+                surface[x] = rows_read;
+            }
+            if *b == b'L' || *b == b'T' {
+                pad_min_x = Some(pad_min_x.map_or(x, |v| min(v, x)));
+                pad_max_x = Some(pad_max_x.map_or(x, |v| max(v, x)));
+                pad_y = Some(rows_read);
+            }
+        }
+        rows_read += 1;
+    }
+
+    let pad_x = if let (Some(lo), Some(hi)) = (pad_min_x, pad_max_x) {
+        (lo as f64 + hi as f64) * 0.5
+    } else {
+        target_x
+    };
+    let pad_y = pad_y.unwrap_or(target_y.round().max(0.0) as usize);
+    let pad_half_width = if let (Some(lo), Some(hi)) = (pad_min_x, pad_max_x) {
+        ((hi - lo + 1) as f64) * 0.5
+    } else {
+        2.0
+    };
+
+    Ok(Env {
+        width,
+        height,
+        gravity,
+        max_thrust,
+        pad_x,
+        pad_y: pad_y as f64,
+        pad_half_width,
+        surface,
+    })
+}
+
+fn corridor_limit(env: &Env, x0: f64, x1: f64) -> f64 {
+    if env.surface.is_empty() {
+        return env.pad_y - 6.0;
+    }
+
+    let mut lo = x0.min(x1).floor() as isize - 4;
+    let mut hi = x0.max(x1).ceil() as isize + 4;
+    lo = lo.max(0);
+    hi = hi.min((env.width.saturating_sub(1)) as isize);
+    if lo > hi {
+        return env.pad_y - 6.0;
+    }
+
+    let mut min_surface = env.height;
+    for x in lo as usize..=hi as usize {
+        min_surface = min(min_surface, env.surface[x]);
+    }
+    min_surface.saturating_sub(6) as f64
+}
+
+fn compute_command(env: &Env, state: &State) -> (f64, f64) {
+    let x_err = env.pad_x - state.x;
+    let alt = env.pad_y - state.y;
+    let above_pad = alt.max(0.0);
+    let near_pad = x_err.abs() <= env.pad_half_width + 1.5;
+
+    let corridor_y = corridor_limit(env, state.x, env.pad_x);
+    let mut vy_des: f64 = if above_pad > 80.0 {
+        12.0
+    } else if above_pad > 40.0 {
+        8.0
+    } else if above_pad > 20.0 {
+        4.0
+    } else if above_pad > 8.0 {
+        1.5
+    } else {
+        0.5
+    };
+
+    if near_pad && above_pad < 25.0 {
+        vy_des = vy_des.min(1.0);
+    }
+
+    if state.y > corridor_y && x_err.abs() > env.pad_half_width + 3.0 {
+        vy_des = -1.5;
+    }
+
+    let desired_vx = if above_pad > 35.0 {
+        clamp(x_err * 0.18, -7.0, 7.0)
+    } else if above_pad > 15.0 {
+        clamp(x_err * 0.12, -4.0, 4.0)
+    } else {
+        clamp(x_err * 0.08, -1.5, 1.5)
+    };
+
+    let vx_error = desired_vx - state.vx;
+    let mut max_tilt = if above_pad > 50.0 {
+        0.65
+    } else if above_pad > 20.0 {
+        0.45
+    } else {
+        0.18
+    };
+    if state.fuel_remaining < 3.0 {
+        max_tilt *= 0.75;
+    }
+
+    let desired_angle = clamp(
+        x_err * if above_pad > 30.0 { 0.016 } else { 0.025 } + vx_error * 0.11,
+        -max_tilt,
+        max_tilt,
+    );
+
+    let angle_error = desired_angle - state.angle;
+    let turn = clamp(angle_error * 3.5 - state.angular_vel * 0.9, -1.0, 1.0);
+
+    let vy_error = vy_des - state.vy;
+    let mut a_des = clamp(vy_error * 0.9, -env.max_thrust * 0.85, env.max_thrust * 0.35);
+    if alt < 4.0 && near_pad {
+        a_des = a_des.min(-0.5);
+    }
+
+    let cos_a = desired_angle.cos().abs().max(0.15);
+    let mut thrust = (env.gravity - a_des) / (env.max_thrust * cos_a);
+    if !thrust.is_finite() {
+        thrust = 0.0;
+    }
+    if above_pad < 10.0 && near_pad && state.vx.abs() < 3.0 && state.vy > 0.0 {
+        thrust = thrust.max(0.8);
+    }
+    if state.fuel_remaining < 1.0 {
+        thrust = thrust.max(0.4);
+    }
+    thrust = clamp(thrust, 0.0, 1.0);
+
+    (thrust, turn)
+}
+
+fn main() -> io::Result<()> {
+    let stdin = io::stdin();
+    let mut reader = stdin.lock();
+    let env = build_env(&mut reader)?;
+    let shared_state: Arc<Mutex<Option<State>>> = Arc::new(Mutex::new(None));
+    let running = Arc::new(Mutex::new(true));
+
+    let writer_state = Arc::clone(&shared_state);
+    let writer_running = Arc::clone(&running);
+    let writer_env = env.clone();
+
+    let handle = thread::spawn(move || {
+        let stdout = io::stdout();
+        let mut out = stdout.lock();
+        let tick = Duration::from_millis(50);
+        let mut next = Instant::now();
+
+        loop {
+            if !*writer_running.lock().unwrap() {
+                break;
+            }
+
+            let state = writer_state.lock().unwrap().clone().unwrap_or_default();
+            let (thrust, turn) = compute_command(&writer_env, &state);
+            if writeln!(out, "{:.6} {:.6}", thrust, turn).is_err() {
+                break;
+            }
+            if out.flush().is_err() {
+                break;
+            }
+
+            next += tick;
+            let now = Instant::now();
+            if next > now {
+                thread::sleep(next - now);
+            } else {
+                next = now;
+            }
+        }
+    });
+
+    let mut line = String::new();
+    while let Some(state) = read_state_line(&mut reader, &mut line)? {
+        *shared_state.lock().unwrap() = Some(state);
+    }
+
+    *running.lock().unwrap() = false;
+    let _ = handle.join();
+    Ok(())
+}

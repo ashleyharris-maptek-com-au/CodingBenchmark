@@ -380,27 +380,111 @@ PUZZLES = [
 
 # Subpasses 20+: Full games vs Stockfish at increasing ELO
 STOCKFISH_GAMES = [
-  {"elo": 100,  "time_per_move": 5,  "name": "Stockfish ELO 100 (absolute beginner)"},
-  {"elo": 400,  "time_per_move": 5,  "name": "Stockfish ELO 400 (casual player)"},
-  {"elo": 700,  "time_per_move": 5,  "name": "Stockfish ELO 700 (club beginner)"},
-  {"elo": 1000, "time_per_move": 10, "name": "Stockfish ELO 1000 (intermediate)"},
-  {"elo": 1200, "time_per_move": 10, "name": "Stockfish ELO 1200 (club player)"},
-  {"elo": 1400, "time_per_move": 10, "name": "Stockfish ELO 1400 (Author after a few drinks)"},
-  {"elo": 1500, "time_per_move": 15, "name": "Stockfish ELO 1500 (strong club)"},
-  {"elo": 1600, "time_per_move": 15, "name": "Stockfish ELO 1600 (Author with his ADHD meds)"},
-  {"elo": 1800, "time_per_move": 20, "name": "Stockfish ELO 1800 (expert)"},
-  {"elo": 2000, "time_per_move": 30, "name": "Stockfish ELO 2000 (candidate master)"},
-  {"elo": 2100, "time_per_move": 30, "name": "Stockfish ELO 2100"},
-  {"elo": 2200, "time_per_move": 45, "name": "Stockfish ELO 2200 (master)"},
-  {"elo": 2300, "time_per_move": 30, "name": "Stockfish ELO 2300"},
-  {"elo": 2400, "time_per_move": 30, "name": "Stockfish ELO 2400"},
-  {"elo": 2500, "time_per_move": 60, "name": "Stockfish ELO 2500 (grandmaster)"},
-  {"elo": 2600, "time_per_move": 30, "name": "Stockfish ELO 2600"},
-  {"elo": 2700, "time_per_move": 30, "name": "Stockfish ELO 2700"},
-  {"elo": 2800, "time_per_move": 60, "name": "Stockfish ELO 2800 (Magnus Carlsen)"},
-  {"elo": 3000, "time_per_move": 120, "name": "Stockfish ELO 3000 (Epic chess engine)"},
-  {"elo": 3190, "time_per_move": 300, "name": "Stockfish ELO 3190 (Stockfish 18 highest limitable)"},
-  {"elo": 3600, "time_per_move": 900, "name": "Stockfish ELO 3600 (Stockfish 18 full power)"},
+  {
+    "elo": 100,
+    "time_per_move": 5,
+    "name": "Stockfish ELO 100 (absolute beginner)"
+  },
+  {
+    "elo": 400,
+    "time_per_move": 5,
+    "name": "Stockfish ELO 400 (casual player)"
+  },
+  {
+    "elo": 700,
+    "time_per_move": 5,
+    "name": "Stockfish ELO 700 (club beginner)"
+  },
+  {
+    "elo": 1000,
+    "time_per_move": 10,
+    "name": "Stockfish ELO 1000 (intermediate)"
+  },
+  {
+    "elo": 1200,
+    "time_per_move": 10,
+    "name": "Stockfish ELO 1200 (club player)"
+  },
+  {
+    "elo": 1400,
+    "time_per_move": 10,
+    "name": "Stockfish ELO 1400 (Author after a few drinks)"
+  },
+  {
+    "elo": 1500,
+    "time_per_move": 15,
+    "name": "Stockfish ELO 1500 (strong club)"
+  },
+  {
+    "elo": 1600,
+    "time_per_move": 15,
+    "name": "Stockfish ELO 1600 (Author with his ADHD meds)"
+  },
+  {
+    "elo": 1800,
+    "time_per_move": 20,
+    "name": "Stockfish ELO 1800 (expert)"
+  },
+  {
+    "elo": 2000,
+    "time_per_move": 30,
+    "name": "Stockfish ELO 2000 (candidate master)"
+  },
+  {
+    "elo": 2100,
+    "time_per_move": 30,
+    "name": "Stockfish ELO 2100"
+  },
+  {
+    "elo": 2200,
+    "time_per_move": 45,
+    "name": "Stockfish ELO 2200 (master)"
+  },
+  {
+    "elo": 2300,
+    "time_per_move": 30,
+    "name": "Stockfish ELO 2300"
+  },
+  {
+    "elo": 2400,
+    "time_per_move": 30,
+    "name": "Stockfish ELO 2400"
+  },
+  {
+    "elo": 2500,
+    "time_per_move": 60,
+    "name": "Stockfish ELO 2500 (grandmaster)"
+  },
+  {
+    "elo": 2600,
+    "time_per_move": 30,
+    "name": "Stockfish ELO 2600"
+  },
+  {
+    "elo": 2700,
+    "time_per_move": 30,
+    "name": "Stockfish ELO 2700"
+  },
+  {
+    "elo": 2800,
+    "time_per_move": 60,
+    "name": "Stockfish ELO 2800 (Magnus Carlsen)"
+  },
+  {
+    "elo": 3000,
+    "time_per_move": 120,
+    "name": "Stockfish ELO 3000 (Epic chess engine)"
+  },
+  {
+    "elo": 3190,
+    "time_per_move": 300,
+    "name": "Stockfish ELO 3190 (Stockfish 18 highest limitable)"
+  },
+  {
+    "elo": 3600,
+    "time_per_move": 900,
+    "name": "Stockfish ELO 3600 (Stockfish 18 full power)"
+  },
 ]
 
 subpassParamSummary = []
@@ -423,9 +507,7 @@ def _cache_key_parts(result: str, subPass: int) -> tuple:
     case_key = f"trivial|fen={pos['fen']}|name={pos['name']}"
   elif subPass < 20:
     puz = PUZZLES[subPass - 5]
-    case_key = (
-      f"puzzle|fen={puz['fen']}|moves={puz['max_moves']}|name={puz['name']}"
-    )
+    case_key = (f"puzzle|fen={puz['fen']}|moves={puz['max_moves']}|name={puz['name']}")
   else:
     game_cfg = STOCKFISH_GAMES[subPass - 20]
     case_key = f"game|elo={game_cfg['elo']}|t={game_cfg['time_per_move']}"
@@ -438,6 +520,7 @@ def _cache_key_parts(result: str, subPass: int) -> tuple:
 # ---------------------------------------------------------------------------
 # Engine runner - invoke the C++ bot for a single position
 # ---------------------------------------------------------------------------
+
 
 def _run_engine_once(exe_path: str, fen: str, timeout: float) -> Tuple[Optional[str], str]:
   """Run the C++ engine for one position. Returns (move_string, error_or_empty)."""
@@ -466,6 +549,7 @@ def _run_engine_once(exe_path: str, fen: str, timeout: float) -> Tuple[Optional[
 # ---------------------------------------------------------------------------
 # gradeAnswer
 # ---------------------------------------------------------------------------
+
 
 def gradeAnswer(result, subPass, aiEngineName):
   if len(result) < 10:
@@ -521,8 +605,12 @@ def _grade_trivial(exe_path: str, subPass: int, aiEngineName: str):
   move_str, err = _run_engine_once(exe_path, pos["fen"], timeout=10)
   if err:
     _REPORT_CACHE[(aiEngineName, subPass)] = {
-      "type": "trivial", "pos": pos, "board_fen": pos["fen"],
-      "engine_move": None, "error": err, "score": 0.0,
+      "type": "trivial",
+      "pos": pos,
+      "board_fen": pos["fen"],
+      "engine_move": None,
+      "error": err,
+      "score": 0.0,
       "moves": [],
     }
     return 0.0, f"[{pos['name']}] {err}"
@@ -531,8 +619,12 @@ def _grade_trivial(exe_path: str, subPass: int, aiEngineName: str):
   parsed = disambig_to_move(board, move_str)
   if parsed is None:
     _REPORT_CACHE[(aiEngineName, subPass)] = {
-      "type": "trivial", "pos": pos, "board_fen": pos["fen"],
-      "engine_move": move_str, "error": f"Invalid move: {move_str}", "score": 0.0,
+      "type": "trivial",
+      "pos": pos,
+      "board_fen": pos["fen"],
+      "engine_move": move_str,
+      "error": f"Invalid move: {move_str}",
+      "score": 0.0,
       "moves": [],
     }
     return 0.0, f"[{pos['name']}] Invalid move: {move_str}"
@@ -565,8 +657,12 @@ def _grade_trivial(exe_path: str, subPass: int, aiEngineName: str):
       pass
 
   _REPORT_CACHE[(aiEngineName, subPass)] = {
-    "type": "trivial", "pos": pos, "board_fen": pos["fen"],
-    "engine_move": move_str, "error": "", "score": score,
+    "type": "trivial",
+    "pos": pos,
+    "board_fen": pos["fen"],
+    "engine_move": move_str,
+    "error": "",
+    "score": score,
     "sf_start_eval": sf_start_eval,
     "sf_end_eval": sf_end_eval,
     "moves": [(pos["fen"], move_str, True)],
@@ -602,7 +698,6 @@ def _grade_puzzle(exe_path: str, subPass: int, aiEngineName: str):
     except Exception:
       sf_engine = None
 
-  
   playerColour = chess.WHITE if puz["fen"].split()[1] == "w" else chess.BLACK
 
   score = 0.0
@@ -685,8 +780,11 @@ def _grade_puzzle(exe_path: str, subPass: int, aiEngineName: str):
         pass
 
   _REPORT_CACHE[(aiEngineName, subPass)] = {
-    "type": "puzzle", "puzzle": puz, "board_fen": puz["fen"],
-    "moves": moves_played, "score": score,
+    "type": "puzzle",
+    "puzzle": puz,
+    "board_fen": puz["fen"],
+    "moves": moves_played,
+    "score": score,
     "final_fen": board.fen(),
   }
   return score, detail
@@ -719,7 +817,7 @@ def _grade_stockfish_game(exe_path: str, subPass: int, aiEngineName: str):
 
   try:
     sf_engine = chess.engine.SimpleEngine.popen_uci(sf_path)
- 
+
     if sf_elo > 3190:
       sf_engine.configure({"UCI_LimitStrength": False, "Threads": min(32, os.cpu_count())})
     else:
@@ -734,8 +832,7 @@ def _grade_stockfish_game(exe_path: str, subPass: int, aiEngineName: str):
 
       if board.turn == chess.WHITE:
         # Tested engine's turn
-        move_str, err = _run_engine_once(
-          exe_path, board.fen(), timeout=game_cfg["time_per_move"])
+        move_str, err = _run_engine_once(exe_path, board.fen(), timeout=game_cfg["time_per_move"])
         if err:
           moves_played.append((board.fen(), None, False))
           error = f"Engine error on move {half_move//2 + 1}: {err}"
@@ -792,9 +889,13 @@ def _grade_stockfish_game(exe_path: str, subPass: int, aiEngineName: str):
     detail = f"[{game_cfg['name']}] Draw ({outcome.termination.name})"
 
   _REPORT_CACHE[(aiEngineName, subPass)] = {
-    "type": "game", "game_cfg": game_cfg, "board_fen": chess.STARTING_FEN,
-    "moves": moves_played, "score": score,
-    "final_fen": board.fen(), "error": error,
+    "type": "game",
+    "game_cfg": game_cfg,
+    "board_fen": chess.STARTING_FEN,
+    "moves": moves_played,
+    "score": score,
+    "final_fen": board.fen(),
+    "error": error,
     "outcome": outcome.termination.name if outcome else "incomplete",
   }
   return score, detail
@@ -838,18 +939,14 @@ def _build_report_html(report, board_states, moves, score, error):
   else:
     sc, status = "#ef4444", "FAIL"
 
-  frames_json = json.dumps([
-    {"svg": s["svg"], "label": s["label"]} for s in board_states
-  ])
+  frames_json = json.dumps([{"svg": s["svg"], "label": s["label"]} for s in board_states])
 
   uid = "chess_" + str(id(report))
 
   error_html = ""
   if error:
-    error_html = (
-      "<div style='color:#ef4444;font-size:12px;margin-top:6px;'>"
-      + escape(str(error)) + "</div>"
-    )
+    error_html = ("<div style='color:#ef4444;font-size:12px;margin-top:6px;'>" +
+                  escape(str(error)) + "</div>")
 
   last_idx = len(board_states) - 1
   score_pct = f"{score:.0%}"
@@ -873,49 +970,53 @@ def _build_report_html(report, board_states, moves, score, error):
   parts = []
   parts.append("<div style='margin:10px 0;padding:14px;border:1px solid #1f2937;")
   parts.append("            border-radius:8px;background:#0f172a;height:380px;width:800px;'>")
-  parts.append(f"  <div id='{uid}_board' style='width:360px;height:360px;margin:8px 0;float:left'></div>")
+  parts.append(
+    f"  <div id='{uid}_board' style='width:360px;height:360px;margin:8px 0;float:left'></div>")
   parts.append(f"  <div style='font-weight:600;color:#e2e8f0;font-size:14px;margin-bottom:2px;'>")
   parts.append(f"    {title_text}</div>")
   parts.append(f"  <div style='font-size:12px;color:#64748b;margin-bottom:10px;'>")
   parts.append(f"    {len(moves)} moves &middot;")
   parts.append(f"    <span style='color:{sc};font-weight:700;'>{status} ({score_pct})</span></div>")
   parts.append(f"  {error_html}<br>")
-  parts.append(f"FEN:<input type='text' id='fen' value='" + report.get("board_fen", chess.STARTING_FEN) + "'><br>")
+  parts.append(f"FEN:<input type='text' id='fen' value='" +
+               report.get("board_fen", chess.STARTING_FEN) + "'><br>")
 
   parts.append("<table style='padding-left:10px;width:300px'><tr><td style='border:0px'><ol>")
-  tableSize = 10 if len(moves) < 30 else moves //3 + 1
-  for counter,move in enumerate(moves):
-   try:
-    m = move[1]
-    m = peiceToUnicode(m[0]) + m[1:]
+  tableSize = 10 if len(moves) < 30 else len(moves) // 3 + 1
+  for counter, move in enumerate(moves):
+    try:
+      m = move[1]
+      m = peiceToUnicode(m[0]) + m[1:]
 
-    if m[3] == 'x':
-      m = m[0:3] + '↠' + m[4:]
-    else:
-      m = m[0:3] + "→" + m[3:]
+      if m[3] == 'x':
+        m = m[0:3] + '↠' + m[4:]
+      else:
+        m = m[0:3] + "→" + m[3:]
 
-    if "/" in m:
-      m = m[:-1] + peiceToUnicode(m[-1])
+      if "/" in m:
+        m = m[:-1] + peiceToUnicode(m[-1])
 
-    parts.append(f"<li>{m}</li>")
-   except:
-    parts.append(f"<li>{move[1]}</li>")
+      parts.append(f"<li>{m}</li>")
+    except:
+      parts.append(f"<li>{move[1]}</li>")
 
-   if counter % tableSize == tableSize-1:
-    parts.append("</ol></td> <td style='border:0px'><ol start='{}'>".format(counter+1))
+    if counter % tableSize == tableSize - 1:
+      parts.append("</ol></td> <td style='border:0px'><ol start='{}'>".format(counter + 1))
 
   parts.append("</ol></td></tr></table>")
 
   parts.append(f"  <div style='display:flex;align-items:center;gap:8px;margin-top:6px;'>")
   parts.append(f"    <button onclick='{uid}_go(0)' style='{_BTN_STYLE}'>&#x23EE;</button>")
   parts.append(f"    <button onclick='{uid}_step(-1)' style='{_BTN_STYLE}'>&larr;</button>")
-  parts.append(f"    <button onclick='{uid}_toggle()' id='{uid}_play' style='{_BTN_STYLE}'>&#x25B6;</button>")
+  parts.append(
+    f"    <button onclick='{uid}_toggle()' id='{uid}_play' style='{_BTN_STYLE}'>&#x25B6;</button>")
   parts.append(f"    <button onclick='{uid}_step(1)' style='{_BTN_STYLE}'>&rarr;</button>")
   parts.append(f"    <button onclick='{uid}_go({last_idx})' style='{_BTN_STYLE}'>&#x23ED;</button>")
   parts.append(f"    <input type='range' min='0' max='{last_idx}' value='0'")
   parts.append(f"           id='{uid}_slider' oninput='{uid}_go(+this.value)'")
   parts.append(f"           style='flex:1;accent-color:#3b82f6;'/>")
-  parts.append(f"    <span id='{uid}_lbl' style='font-size:11px;color:#94a3b8;min-width:80px;'>Start</span>")
+  parts.append(
+    f"    <span id='{uid}_lbl' style='font-size:11px;color:#94a3b8;min-width:80px;'>Start</span>")
   parts.append(f"  </div>")
 
   parts.append("<span style='clear:both'></span>")
@@ -966,65 +1067,68 @@ def _build_report_html(report, board_states, moves, score, error):
 def resultToNiceReport(result, subPass, aiEngineName):
   if not result:
     return "<div style='color:#94a3b8;'>No result provided</div>"
+  try:
+    cache_parts = _cache_key_parts(result, subPass)
+    cached = _grade_cache.get_report(*cache_parts)
+    if cached is not None:
+      return cached
 
-  cache_parts = _cache_key_parts(result, subPass)
-  cached = _grade_cache.get_report(*cache_parts)
-  if cached is not None:
-    return cached
+    report = _REPORT_CACHE.get((aiEngineName, subPass))
+    if not report:
+      return "<div style='color:#94a3b8;'>No visualization data captured</div>"
 
-  report = _REPORT_CACHE.get((aiEngineName, subPass))
-  if not report:
-    return "<div style='color:#94a3b8;'>No visualization data captured</div>"
+    moves = report.get("moves", [])
+    score = report.get("score", 0)
+    error = report.get("error", "")
 
-  moves = report.get("moves", [])
-  score = report.get("score", 0)
-  error = report.get("error", "")
-
-  # Build the board states for playback
-  board_states = []
-  initial_fen = report.get("board_fen", chess.STARTING_FEN)
-  board = chess.Board(initial_fen)
-  board_states.append({
-    "fen": initial_fen,
-    "svg": _board_svg(board),
-    "label": "Start",
-  })
-
-  for i, (fen, move_str, valid) in enumerate(moves):
-    b = chess.Board(fen)
-    if move_str and valid:
-      parsed = disambig_to_move(b, move_str)
-      if parsed:
-        b.push(parsed)
-    label = f"{i+1}. {move_str or '?'}"
-    if not valid:
-      label += " (invalid)"
+    # Build the board states for playback
+    board_states = []
+    initial_fen = report.get("board_fen", chess.STARTING_FEN)
+    board = chess.Board(initial_fen)
     board_states.append({
-      "fen": b.fen(),
-      "svg": _board_svg(b),
-      "label": label,
+      "fen": initial_fen,
+      "svg": _board_svg(board),
+      "label": "Start",
     })
 
+    for i, (fen, move_str, valid) in enumerate(moves):
+      b = chess.Board(fen)
+      if move_str and valid:
+        parsed = disambig_to_move(b, move_str)
+        if parsed:
+          b.push(parsed)
+      label = f"{i+1}. {move_str or '?'}"
+      if not valid:
+        label += " (invalid)"
+      board_states.append({
+        "fen": b.fen(),
+        "svg": _board_svg(b),
+        "label": label,
+      })
 
-  if subPass == 0:
-    htmlHeader = ""
-    d = parse_freeform_response(result)
-    code = d["code"]
-    discussion = d["discussion"]
-    if discussion:
-      htmlHeader += f"<details><summary>View Reasoning and Discussion ({len(discussion)} chars)</summary><pre>{discussion}</pre></details><br>"
-    if code:
-      code_escaped = code.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-      htmlHeader += f"<details><summary>View Code ({len(code)} chars)</summary><pre>{code_escaped}</pre></details><br>"
-  else:
-    htmlHeader = ""
+    if subPass == 0:
+      htmlHeader = ""
+      d = parse_freeform_response(result)
+      code = d["code"]
+      discussion = d["discussion"]
+      if discussion:
+        htmlHeader += f"<details><summary>View Reasoning and Discussion ({len(discussion)} chars)</summary><pre>{discussion}</pre></details><br>"
+      if code:
+        code_escaped = code.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        htmlHeader += f"<details><summary>View Code ({len(code)} chars)</summary><pre>{code_escaped}</pre></details><br>"
+    else:
+      htmlHeader = ""
 
-  html = htmlHeader + _build_report_html(report, board_states, moves, score, error)
-  _grade_cache.put_report(html, *cache_parts)
-  return html
+    html = htmlHeader + _build_report_html(report, board_states, moves, score, error)
+    _grade_cache.put_report(html, *cache_parts)
+    return html
+  except Exception as e:
+    return "<p>Unable to render - Exception: " + str(e)
+
 
 def setup():
   _find_stockfish()
+
 
 highLevelSummary = """
 <p>Write a C++ chess engine that, given any board position in FEN notation, returns

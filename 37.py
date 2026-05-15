@@ -15,13 +15,13 @@ import random
 import time
 from typing import List, Tuple, Set, Dict, Any, Iterable
 from native_compiler import CSharpCompiler, CompilationError, ExecutionError, describe_this_pc
-from solver_utils import StreamingInputFile
+from solver_utils import StreamingInputFile, normalize_code_result
 
 title = "Feedback Vertex Set (C#)"
 
 tags = [
   "csharp",
-  "structured response",
+  "freeform response",
   "np hard",
   "graph theory",
 ]
@@ -318,21 +318,7 @@ v1 v2 v3 ... vk
 
 extraGradeAnswerRuns = list(range(len(TEST_CASES)))
 
-structure = {
-  "type": "object",
-  "properties": {
-    "reasoning": {
-      "type": "string",
-      "description": "Explain your approach for minimum directed feedback vertex set"
-    },
-    "csharp_code": {
-      "type": "string",
-      "description": "Complete C# code with Main method that handles all scales"
-    }
-  },
-  "required": ["reasoning", "csharp_code"],
-  "additionalProperties": False
-}
+structure = None
 
 
 def _parse_output(stdout: str) -> Tuple[int, List[int]]:
@@ -383,6 +369,7 @@ def _build_fvs_viz(num_vertices: int, edges: List[Tuple[int, int]], dag_vertices
 
 
 def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
+  result = normalize_code_result(result, "csharp_code")
   if not result or "csharp_code" not in result:
     return 0.0, "No C# code provided"
 
@@ -466,6 +453,7 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
 
 
 def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
+  result = normalize_code_result(result, "csharp_code")
   if not result:
     return "<p style='color:red'>No result provided</p>"
   case = TEST_CASES[subPass]

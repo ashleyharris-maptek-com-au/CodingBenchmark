@@ -24,13 +24,13 @@ import subprocess
 import time
 import math
 from typing import List, Tuple, Set, Optional, Dict, Any
-from solver_utils import StreamingInputFile
+from solver_utils import StreamingInputFile, normalize_code_result
 
 title = "3-SAT Solver (Python)"
 
 tags = [
   "python",
-  "structured response",
+  "freeform response",
   "np hard",
   "constraint satisfaction",
 ]
@@ -303,22 +303,7 @@ Write complete, runnable Python code.
 
 extraGradeAnswerRuns = list(range(len(TEST_CASES)))
 
-structure = {
-  "type": "object",
-  "properties": {
-    "reasoning": {
-      "type": "string",
-      "description": "Explain your algorithm approach for solving 3-SAT at scale"
-    },
-    "python_code": {
-      "type": "string",
-      "description":
-      "Complete Python code that reads a 3-SAT instance from stdin and outputs a satisfying assignment"
-    }
-  },
-  "required": ["reasoning", "python_code"],
-  "additionalProperties": False
-}
+structure = None
 
 
 def verify_assignment(clauses: List[Tuple[int, int, int]],
@@ -338,6 +323,7 @@ def verify_assignment(clauses: List[Tuple[int, int, int]],
 
 
 def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
+  result = normalize_code_result(result, "python_code")
   if not result or "python_code" not in result:
     return 0.0, "No Python code provided"
 
@@ -430,6 +416,7 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
 
 
 def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
+  result = normalize_code_result(result, "python_code")
   if not result:
     return "<p style='color:red'>No result provided</p>"
   case = TEST_CASES[subPass]

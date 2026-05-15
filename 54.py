@@ -13,6 +13,7 @@ import math
 import traceback
 
 from visualization_utils import generate_threejs_flight_path
+from solver_utils import normalize_code_result
 
 from autoland_sim import (
   make_autoland_truth,
@@ -42,7 +43,7 @@ title = "Aircraft Autoland (Python)"
 
 tags = [
   "python",
-  "structured response",
+  "freeform response",
   "control systems",
   "simulation",
 ]
@@ -374,21 +375,7 @@ but are **reset** between scenarios and between go-around attempts.
 
 extraGradeAnswerRuns = list(range(1, len(SCENARIOS)))
 
-structure = {
-  "type": "object",
-  "properties": {
-    "reasoning": {
-      "type": "string",
-      "description": "Explain your autoland design"
-    },
-    "python_code": {
-      "type": "string",
-      "description": "Complete Python code defining autopilot_step(state, dt)"
-    }
-  },
-  "required": ["reasoning", "python_code"],
-  "additionalProperties": False
-}
+structure = None
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -594,6 +581,7 @@ def _run_scenario(runner, autopilot_fn, sc, max_steps=6000, dt=0.05):
 
 
 def gradeAnswer(result, subPass, aiEngineName):
+  result = normalize_code_result(result, "python_code")
   if not result or 'python_code' not in result:
     return 0.0, 'No Python code provided'
 
@@ -663,6 +651,7 @@ def _history_to_path(history):
 
 
 def resultToNiceReport(result, subPass, aiEngineName):
+  result = normalize_code_result(result, "python_code")
   sc_idx = subPass
   if sc_idx >= len(SCENARIOS):
     return ''

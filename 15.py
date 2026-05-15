@@ -27,13 +27,13 @@ import numpy as np
 from PIL import Image, ImageDraw
 
 from native_compiler import RustCompiler, compile_and_run, describe_this_pc
-from solver_utils import GradeCache
+from solver_utils import GradeCache, normalize_code_result
 
 title = "Tetrahedron Shadow Covering (Rust)"
 
 tags = [
   "rust",
-  "structured response",
+  "freeform response",
   "geometry",
   "optimization",
 ]
@@ -226,23 +226,7 @@ Include adaptive logic that chooses different strategies based on problem scale.
 # List of subpasses to grade the single answer against all difficulty levels
 extraGradeAnswerRuns = list(range(len(TEST_CASES)))
 
-structure = {
-  "type": "object",
-  "properties": {
-    "reasoning": {
-      "type":
-      "string",
-      "description":
-      "Explain your shadow covering algorithm and how it adapts to different polygon complexities"
-    },
-    "rust_code": {
-      "type": "string",
-      "description": "Complete Rust code with main() that handles all scales"
-    }
-  },
-  "required": ["reasoning", "rust_code"],
-  "additionalProperties": False
-}
+structure = None
 
 
 def quaternion_rotate_point(q, p):
@@ -545,6 +529,7 @@ _grade_cache = GradeCache('test15')
 
 def _cache_key_parts(result, subPass):
   """Build cache key from code hash + subpass."""
+  result = normalize_code_result(result, "rust_code")
   code = result.get("rust_code", "") if isinstance(result, dict) else ""
   code_hash = hashlib.sha256(code.encode('utf-8')).hexdigest()[:16]
   return (code_hash, str(subPass))
@@ -552,6 +537,7 @@ def _cache_key_parts(result, subPass):
 
 def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
   """Grade the shadow covering solver."""
+  result = normalize_code_result(result, "rust_code")
   if not result:
     return 0.0, "No result provided"
 
@@ -618,6 +604,7 @@ lastCase = None
 
 def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
   """Generate HTML report."""
+  result = normalize_code_result(result, "rust_code")
   if not result:
     return "<p style='color:red'>No result provided</p>"
 
