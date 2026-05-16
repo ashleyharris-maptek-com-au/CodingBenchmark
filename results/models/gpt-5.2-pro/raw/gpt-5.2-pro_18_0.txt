@@ -1,1 +1,641 @@
-{'__exception__': "Can't run here - we're trying to get this working in codex."}
+```cpp
+// Minimum Edge Cut (Global Min-Cut) solver for undirected connected graphs.
+// Adaptive strategy:
+//
+// 1) Always spool the input edge list to a temporary binary file (so we can re-scan without RAM blowup).
+// 2) Compute a valid upper bound UB on the global min-cut:
+//      - UB_deg = min degree (exact upper bound)
+//      - optionally improve UB via a few randomized Karger contractions using the edge-file (still only produces
+//        a VALID cut => still an upper bound; correctness is preserved even if not improved).
+// 3) Build a Nagamochi–Ibaraki-style sparse certificate that preserves all cuts of size < (UB+1):
+//      - Construct union of (UB+1) greedy spanning forests by repeated scans.
+//      - Certificate has <= (UB+1)*(N-1) edges.
+//      - The true global min-cut value λ satisfies λ <= UB, hence λ < UB+1, so λ is preserved in the certificate.
+//      => Running an exact min-cut algorithm on the certificate yields the exact global min-cut of the original graph.
+// 4) Compute exact min-cut on the (much smaller) certificate using Stoer–Wagner (sparse version).
+// 5) Recover the actual cut edges by scanning the original edge file and output all edges crossing the found partition.
+//
+// Notes:
+// - If UB is very large, the certificate can be too big / too many passes; then we try to improve UB with Karger.
+// - This is still not magic: if the true min-cut is huge, output size itself is huge.
+//
+// Build: MSVC cl 19.50+ /std:c++20
+
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <cassert>
+
+#include <algorithm>
+#include <chrono>
+#include <filesystem>
+#include <iostream>
+#include <limits>
+#include <numeric>
+#include <queue>
+#include <random>
+#include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+using Node = uint32_t;
+struct Edge { Node u, v; };
+
+static FILE* wfopen_fs(const std::filesystem::path& p, const wchar_t* mode) {
+    FILE* f = nullptr;
+    _wfopen_s(&f, p.c_str(), mode);
+    return f;
+}
+
+struct FastScanner {
+    static constexpr size_t BUFSZ = 1u << 20;
+    char buf[BUFSZ];
+    size_t i = 0, n = 0;
+
+    inline char readChar() {
+        if (i >= n) {
+            n = std::fread(buf, 1, BUFSZ, stdin);
+            i = 0;
+            if (n == 0) return 0;
+        }
+        return buf[i++];
+    }
+
+    template <class T>
+    bool readUInt(T& out) {
+        out = 0;
+        char c;
+        do {
+            c = readChar();
+            if (!c) return false;
+        } while (c <= ' ');
+
+        if (c < '0' || c > '9') return false;
+        while (c >= '0' && c <= '9') {
+            out = out * 10 + (c - '0');
+            c = readChar();
+        }
+        return true;
+    }
+};
+
+struct FastOutput {
+    static constexpr size_t BUFSZ = 1u << 20;
+    char buf[BUFSZ];
+    size_t i = 0;
+
+    ~FastOutput() { flush(); }
+
+    inline void flush() {
+        if (i) std::fwrite(buf, 1, i, stdout);
+        i = 0;
+    }
+    inline void putChar(char c) {
+        if (i >= BUFSZ) flush();
+        buf[i++] = c;
+    }
+    inline void writeStr(const char* s) {
+        while (*s) putChar(*s++);
+    }
+    template <class T>
+    inline void writeUInt(T x) {
+        char tmp[32];
+        int len = 0;
+        if (x == 0) tmp[len++] = '0';
+        while (x > 0) {
+            tmp[len++] = char('0' + (x % 10));
+            x /= 10;
+        }
+        for (int k = len - 1; k >= 0; --k) putChar(tmp[k]);
+    }
+    inline void writeLn() { putChar('\n'); }
+};
+
+struct DSU {
+    std::vector<int> p, sz;
+    int comps = 0;
+    DSU() = default;
+    explicit DSU(int n) { init(n); }
+    void init(int n) {
+        p.resize(n);
+        sz.assign(n, 1);
+        std::iota(p.begin(), p.end(), 0);
+        comps = n;
+    }
+    int find(int a) {
+        while (p[a] != a) {
+            p[a] = p[p[a]];
+            a = p[a];
+        }
+        return a;
+    }
+    bool unite(int a, int b) {
+        a = find(a); b = find(b);
+        if (a == b) return false;
+        if (sz[a] < sz[b]) std::swap(a, b);
+        p[b] = a;
+        sz[a] += sz[b];
+        --comps;
+        return true;
+    }
+};
+
+// Splitmix64 hasher to reduce worst-case behavior for unordered_map.
+struct SplitMix64 {
+    size_t operator()(uint64_t x) const noexcept {
+        static const uint64_t FIXED_RANDOM =
+            (uint64_t)std::chrono::high_resolution_clock::now().time_since_epoch().count();
+        x += FIXED_RANDOM + 0x9e3779b97f4a7c15ULL;
+        x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+        x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+        x = x ^ (x >> 31);
+        return (size_t)x;
+    }
+};
+
+// Count cut size for a given partition (side[v] in {0,1}) by scanning an edge file.
+static uint64_t countCutFromFile(FILE* f, uint64_t M, const std::vector<uint8_t>& side) {
+    std::rewind(f);
+    uint64_t cnt = 0;
+    static constexpr size_t CHUNK = 1u << 20;
+    std::vector<Edge> buf(CHUNK);
+
+    uint64_t left = M;
+    while (left) {
+        size_t take = (size_t)std::min<uint64_t>(left, CHUNK);
+        size_t got = std::fread(buf.data(), sizeof(Edge), take, f);
+        if (got != take) break;
+        for (size_t i = 0; i < got; ++i) {
+            const auto& e = buf[i];
+            if (e.u == e.v) continue;
+            cnt += (side[e.u] ^ side[e.v]) ? 1ULL : 0ULL;
+        }
+        left -= got;
+    }
+    return cnt;
+}
+
+// A few Karger-style trials to improve UB. Produces a VALID cut partition => upper bound.
+// Uses random edge sampling by seeking in the edge binary file.
+static uint64_t kargerUpperBound(FILE* edgeFile, uint64_t M, uint32_t N,
+                                 int trials, std::vector<uint8_t>* bestSideOut) {
+    if (N < 2 || M == 0) return 0;
+
+    std::mt19937_64 rng(
+        (uint64_t)std::chrono::high_resolution_clock::now().time_since_epoch().count()
+        ^ (uint64_t)(uintptr_t)&edgeFile
+    );
+    std::uniform_int_distribution<uint64_t> dist(0, M - 1);
+
+    uint64_t best = std::numeric_limits<uint64_t>::max();
+    std::vector<uint8_t> bestSide;
+
+    for (int t = 0; t < trials; ++t) {
+        DSU dsu((int)N);
+
+        // Contract until 2 components remain.
+        // Random sampling with rejection (self-loops under contraction are ignored).
+        while (dsu.comps > 2) {
+            uint64_t idx = dist(rng);
+            // Seek to idx-th edge.
+            const int64_t off = (int64_t)(idx * sizeof(Edge));
+            _fseeki64(edgeFile, off, SEEK_SET);
+            Edge e{};
+            if (std::fread(&e, sizeof(Edge), 1, edgeFile) != 1) break;
+            if (e.u == e.v) continue;
+            dsu.unite((int)e.u, (int)e.v);
+        }
+
+        // Build a partition from the 2 components.
+        int rep0 = dsu.find(0);
+        std::vector<uint8_t> side(N, 0);
+        for (uint32_t i = 0; i < N; ++i) side[i] = (dsu.find((int)i) == rep0) ? 1 : 0;
+        // Ensure non-empty both sides (should hold if N>=2).
+        uint64_t cut = countCutFromFile(edgeFile, M, side);
+        if (cut < best) {
+            best = cut;
+            bestSide.swap(side);
+        }
+    }
+
+    if (bestSideOut) *bestSideOut = std::move(bestSide);
+    return best;
+}
+
+// Build a (k)-forest certificate by repeated scans:
+// Each iteration: greedily take a spanning forest (DSU) from the remaining edge stream.
+// The union of k forests preserves all cuts of size < k.
+static void buildForestCertificate(const std::filesystem::path& inFilePath,
+                                  uint64_t M,
+                                  uint32_t N,
+                                  uint32_t k,
+                                  const std::filesystem::path& certPath,
+                                  const std::filesystem::path& workAPath,
+                                  const std::filesystem::path& workBPath,
+                                  uint64_t& certEdgesOut) {
+    certEdgesOut = 0;
+
+    // Copy inFilePath -> workAPath initially (so we can destructively filter "remaining edges").
+    {
+        FILE* inF = wfopen_fs(inFilePath, L"rb");
+        FILE* outF = wfopen_fs(workAPath, L"wb");
+        if (!inF || !outF) {
+            std::cerr << "Failed to open temp files for certificate build.\n";
+            std::exit(1);
+        }
+        static constexpr size_t BUFB = 1u << 20;
+        std::vector<char> buf(BUFB);
+        size_t r;
+        while ((r = std::fread(buf.data(), 1, BUFB, inF)) > 0) {
+            std::fwrite(buf.data(), 1, r, outF);
+        }
+        std::fclose(inF);
+        std::fclose(outF);
+    }
+
+    FILE* certF = wfopen_fs(certPath, L"wb");
+    if (!certF) {
+        std::cerr << "Failed to open certificate file.\n";
+        std::exit(1);
+    }
+
+    uint64_t remainingM = M;
+    std::filesystem::path cur = workAPath;
+    std::filesystem::path nxt = workBPath;
+
+    static constexpr size_t CHUNK = 1u << 20;
+    std::vector<Edge> buf(CHUNK);
+
+    for (uint32_t iter = 0; iter < k && remainingM > 0; ++iter) {
+        DSU dsu((int)N);
+        FILE* curF = wfopen_fs(cur, L"rb");
+        FILE* nxtF = wfopen_fs(nxt, L"wb");
+        if (!curF || !nxtF) {
+            std::cerr << "Failed to open work files for iteration.\n";
+            std::exit(1);
+        }
+
+        uint64_t newRemaining = 0;
+        while (true) {
+            size_t got = std::fread(buf.data(), sizeof(Edge), CHUNK, curF);
+            if (got == 0) break;
+            for (size_t i = 0; i < got; ++i) {
+                Edge e = buf[i];
+                if (e.u == e.v) continue; // ignore self loops
+                if (dsu.unite((int)e.u, (int)e.v)) {
+                    std::fwrite(&e, sizeof(Edge), 1, certF);
+                    ++certEdgesOut;
+                } else {
+                    std::fwrite(&e, sizeof(Edge), 1, nxtF);
+                    ++newRemaining;
+                }
+            }
+        }
+        std::fclose(curF);
+        std::fclose(nxtF);
+
+        remainingM = newRemaining;
+        std::swap(cur, nxt);
+        // next iteration reads from 'cur' which now contains remaining edges.
+    }
+
+    std::fclose(certF);
+}
+
+// Stoer-Wagner on a sparse graph represented as adjacency hash-maps.
+// Returns (minCutValue, sideMask), where sideMask[v]=1 indicates one side of the min cut.
+static std::pair<uint64_t, std::vector<uint8_t>>
+stoerWagnerSparse(uint32_t N, const std::vector<Edge>& edges) {
+    if (N < 2) return {0, std::vector<uint8_t>(N, 0)};
+
+    // Build adjacency with weights (multi-edges accumulate).
+    using W = uint64_t;
+    std::vector<std::unordered_map<Node, W, SplitMix64>> adj(N);
+    std::vector<uint32_t> deg(N, 0);
+
+    for (const auto& e : edges) {
+        if (e.u == e.v) continue;
+        ++deg[e.u];
+        ++deg[e.v];
+    }
+    for (uint32_t i = 0; i < N; ++i) {
+        // Reserve somewhat above degree to reduce rehashing.
+        adj[i].reserve((size_t)deg[i] * 2 + 8);
+    }
+    for (const auto& e : edges) {
+        if (e.u == e.v) continue;
+        adj[e.u][e.v] += 1;
+        adj[e.v][e.u] += 1;
+    }
+
+    std::vector<uint8_t> active(N, 1);
+    std::vector<Node> verts;
+    verts.reserve(N);
+    for (Node i = 0; i < N; ++i) verts.push_back(i);
+
+    // Component lists to reconstruct a partition.
+    std::vector<std::vector<Node>> comp(N);
+    comp.reserve(N);
+    for (Node i = 0; i < N; ++i) comp[i] = {i};
+
+    uint64_t best = std::numeric_limits<uint64_t>::max();
+    std::vector<uint8_t> bestSide(N, 0);
+
+    std::vector<W> weight(N);
+    std::vector<uint8_t> added(N);
+
+    // Max-heap for selecting next vertex with maximum connection weight.
+    using PQItem = std::pair<W, Node>;
+    std::priority_queue<PQItem> pq;
+
+    while (verts.size() > 1) {
+        std::fill(weight.begin(), weight.end(), 0);
+        std::fill(added.begin(), added.end(), 0);
+        while (!pq.empty()) pq.pop();
+
+        // Start from an arbitrary active vertex.
+        Node start = verts[0];
+        added[start] = 1;
+        Node prev = start;
+        Node last = start;
+
+        // Initialize weights from start.
+        for (const auto& kv : adj[start]) {
+            Node to = kv.first;
+            if (!active[to] || added[to]) continue;
+            weight[to] += kv.second;
+            pq.push({weight[to], to});
+        }
+
+        // Grow the set A by repeatedly adding max-weight vertex.
+        for (size_t it = 1; it < verts.size(); ++it) {
+            Node sel = std::numeric_limits<Node>::max();
+            W selW = 0;
+
+            while (!pq.empty()) {
+                auto [w, v] = pq.top();
+                pq.pop();
+                if (!active[v] || added[v]) continue;
+                if (w != weight[v]) continue; // stale
+                sel = v;
+                selW = w;
+                break;
+            }
+            if (sel == std::numeric_limits<Node>::max()) {
+                // Graph may have become disconnected among remaining active vertices (shouldn't happen),
+                // pick any not-added active vertex.
+                for (Node v : verts) {
+                    if (active[v] && !added[v]) { sel = v; selW = weight[v]; break; }
+                }
+            }
+
+            prev = last;
+            last = sel;
+            added[sel] = 1;
+
+            // Update weights of neighbors.
+            for (const auto& kv : adj[sel]) {
+                Node to = kv.first;
+                if (!active[to] || added[to]) continue;
+                weight[to] += kv.second;
+                pq.push({weight[to], to});
+            }
+        }
+
+        // Now 'last' is t, 'prev' is s. The cut value is weight[t].
+        Node s = prev, t = last;
+        uint64_t cutVal = (uint64_t)weight[t];
+        if (cutVal < best) {
+            best = cutVal;
+            std::fill(bestSide.begin(), bestSide.end(), 0);
+            for (Node v : comp[t]) bestSide[v] = 1;
+        }
+
+        // Contract t into s.
+        if (t == s) {
+            // Should not happen, but protect against it.
+            active[t] = 0;
+        } else {
+            // For each neighbor v of t: add its weight to (s,v), update v's map: replace t by s.
+            // We'll iterate over a copy of keys because we modify maps.
+            std::vector<std::pair<Node, W>> tNbrs;
+            tNbrs.reserve(adj[t].size());
+            for (const auto& kv : adj[t]) tNbrs.push_back(kv);
+
+            for (const auto& [v, w] : tNbrs) {
+                if (v == s) continue;
+                if (!active[v]) continue;
+
+                adj[s][v] += w;
+                adj[v][s] += w;
+
+                auto it = adj[v].find(t);
+                if (it != adj[v].end()) adj[v].erase(it);
+            }
+
+            // Remove s<->t edge if present; clear t.
+            adj[s].erase(t);
+            adj[t].clear();
+            active[t] = 0;
+
+            // Merge component lists.
+            auto& cs = comp[s];
+            auto& ct = comp[t];
+            cs.insert(cs.end(), ct.begin(), ct.end());
+            std::vector<Node>().swap(ct); // free
+        }
+
+        // Remove t from verts.
+        auto itPos = std::find(verts.begin(), verts.end(), t);
+        if (itPos != verts.end()) {
+            *itPos = verts.back();
+            verts.pop_back();
+        } else {
+            // Fallback: remove any inactive.
+            verts.erase(std::remove_if(verts.begin(), verts.end(),
+                                      [&](Node v){ return !active[v]; }),
+                       verts.end());
+        }
+    }
+
+    // bestSide gives one side; ensure both sides non-empty.
+    // If bestSide is all 0 or all 1 (pathological), flip one node.
+    uint32_t cnt1 = 0;
+    for (uint32_t i = 0; i < N; ++i) cnt1 += bestSide[i] ? 1u : 0u;
+    if (cnt1 == 0 || cnt1 == N) {
+        std::fill(bestSide.begin(), bestSide.end(), 0);
+        bestSide[0] = 1;
+    }
+
+    return {best, bestSide};
+}
+
+int main() {
+    std::ios::sync_with_stdio(false);
+    std::cin.tie(nullptr);
+
+    FastScanner fs;
+    uint64_t N64 = 0, M64 = 0;
+    if (!fs.readUInt(N64) || !fs.readUInt(M64)) return 0;
+    if (N64 > std::numeric_limits<Node>::max()) {
+        std::cerr << "N too large for this implementation.\n";
+        return 1;
+    }
+    const uint32_t N = (uint32_t)N64;
+    const uint64_t M = M64;
+
+    if (N < 2) {
+        FastOutput out;
+        out.writeUInt(0);
+        out.writeLn();
+        return 0;
+    }
+
+    // Temp file paths.
+    std::filesystem::path tmpDir = std::filesystem::temp_directory_path();
+    uint64_t nonce = (uint64_t)std::chrono::high_resolution_clock::now().time_since_epoch().count();
+    auto mk = [&](const wchar_t* suffix) {
+        return tmpDir / (L"mincut_" + std::to_wstring(nonce) + suffix);
+    };
+    std::filesystem::path edgePath = mk(L"_edges.bin");
+    std::filesystem::path certPath = mk(L"_cert.bin");
+    std::filesystem::path workAPath = mk(L"_workA.bin");
+    std::filesystem::path workBPath = mk(L"_workB.bin");
+
+    // Spool input edges to edgePath; compute degrees.
+    std::vector<uint32_t> deg;
+    try {
+        deg.assign(N, 0);
+    } catch (...) {
+        std::cerr << "Failed to allocate degree array.\n";
+        return 1;
+    }
+
+    FILE* edgeF = wfopen_fs(edgePath, L"wb+");
+    if (!edgeF) {
+        std::cerr << "Failed to create edge temp file.\n";
+        return 1;
+    }
+
+    for (uint64_t i = 0; i < M; ++i) {
+        uint64_t u64, v64;
+        if (!fs.readUInt(u64) || !fs.readUInt(v64)) {
+            std::cerr << "Bad input.\n";
+            return 1;
+        }
+        if (u64 >= N || v64 >= N) {
+            std::cerr << "Node id out of range.\n";
+            return 1;
+        }
+        Edge e{(Node)u64, (Node)v64};
+        std::fwrite(&e, sizeof(Edge), 1, edgeF);
+        if (e.u != e.v) {
+            ++deg[e.u];
+            ++deg[e.v];
+        }
+    }
+    std::fflush(edgeF);
+
+    uint32_t UB_deg = std::numeric_limits<uint32_t>::max();
+    for (uint32_t i = 0; i < N; ++i) UB_deg = std::min(UB_deg, deg[i]);
+    if (UB_deg == 0) {
+        // If graph is connected this shouldn't happen; still output a trivial cut.
+        FastOutput out;
+        out.writeUInt(0);
+        out.writeLn();
+        std::fclose(edgeF);
+        std::filesystem::remove(edgePath);
+        return 0;
+    }
+
+    // Potentially improve UB via a few Karger trials if UB is large.
+    uint32_t UB = UB_deg;
+    {
+        int trials = 0;
+        if (UB > 64) trials = 3;
+        else if (UB > 16) trials = 2;
+        else trials = 0;
+
+        if (trials > 0 && M > 0) {
+            std::vector<uint8_t> tmpSide;
+            uint64_t ub2 = kargerUpperBound(edgeF, M, N, trials, &tmpSide);
+            if (ub2 > 0 && ub2 < UB) UB = (uint32_t)ub2;
+        }
+    }
+
+    // Build sparse certificate with k = UB+1 to preserve all cuts of size <= UB (since we preserve < k).
+    uint32_t k = UB + 1;
+
+    // If k is enormous, the repeated-scan forest packing may be impractical.
+    // We'll still attempt it; if k is huge, certificate may approach the whole graph anyway.
+    uint64_t certM = 0;
+    buildForestCertificate(edgePath, M, N, k, certPath, workAPath, workBPath, certM);
+
+    // Load certificate edges into RAM.
+    std::vector<Edge> certEdges;
+    certEdges.reserve((size_t)std::min<uint64_t>(certM, 200000000ULL)); // best-effort
+    {
+        FILE* cf = wfopen_fs(certPath, L"rb");
+        if (!cf) {
+            std::cerr << "Failed to open cert file.\n";
+            return 1;
+        }
+        static constexpr size_t CHUNK = 1u << 20;
+        std::vector<Edge> buf(CHUNK);
+        while (true) {
+            size_t got = std::fread(buf.data(), sizeof(Edge), CHUNK, cf);
+            if (got == 0) break;
+            certEdges.insert(certEdges.end(), buf.begin(), buf.begin() + (ptrdiff_t)got);
+        }
+        std::fclose(cf);
+    }
+
+    // Exact global min-cut on certificate (Stoer–Wagner).
+    auto [minCutVal, side] = stoerWagnerSparse(N, certEdges);
+
+    // Count and output actual cut edges by scanning original edges.
+    // Need two passes: one to count, one to print (because K must be printed first).
+    std::rewind(edgeF);
+    uint64_t K = countCutFromFile(edgeF, M, side);
+
+    FastOutput out;
+    out.writeUInt(K);
+    out.writeLn();
+
+    // Second pass to print edges.
+    std::rewind(edgeF);
+    static constexpr size_t CHUNK = 1u << 20;
+    std::vector<Edge> buf(CHUNK);
+    uint64_t left = M;
+    while (left) {
+        size_t take = (size_t)std::min<uint64_t>(left, CHUNK);
+        size_t got = std::fread(buf.data(), sizeof(Edge), take, edgeF);
+        if (got != take) break;
+        for (size_t i = 0; i < got; ++i) {
+            const Edge& e = buf[i];
+            if (e.u == e.v) continue;
+            if (side[e.u] ^ side[e.v]) {
+                out.writeUInt((uint64_t)e.u);
+                out.putChar(' ');
+                out.writeUInt((uint64_t)e.v);
+                out.writeLn();
+            }
+        }
+        left -= got;
+    }
+    out.flush();
+
+    std::fclose(edgeF);
+
+    // Cleanup temp files (best-effort).
+    std::error_code ec;
+    std::filesystem::remove(edgePath, ec);
+    std::filesystem::remove(certPath, ec);
+    std::filesystem::remove(workAPath, ec);
+    std::filesystem::remove(workBPath, ec);
+
+    return 0;
+}
+```

@@ -1,1 +1,223 @@
-{'__exception__': '{"type":"result","subtype":"success","is_error":true,"api_error_status":529,"duration_ms":196337,"duration_api_ms":1022,"num_turns":1,"result":"API Error: 529 Overloaded. This is a server-side issue, usually temporary — try again in a moment. If it persists, check status.claude.com.","stop_reason":"stop_sequence","session_id":"9539b438-f133-450b-9256-95607a005635","total_cost_usd":0.000493,"usage":{"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":0,"server_tool_use":{"web_search_requests":0,"web_fetch_requests":0},"service_tier":"standard","cache_creation":{"ephemeral_1h_input_tokens":0,"ephemeral_5m_input_tokens":0},"inference_geo":"","iterations":[],"speed":"standard"},"modelUsage":{"claude-haiku-4-5-20251001":{"inputTokens":428,"outputTokens":13,"cacheReadInputTokens":0,"cacheCreationInputTokens":0,"webSearchRequests":0,"costUSD":0.000493,"contextWindow":200000,"maxOutputTokens":32000}},"permission_denials":[],"terminal_reason":"completed","fast_mode_state":"off","uuid":"2ca9bc03-3244-4c72-aa64-da7f59a69322"}'}
+import math
+
+# Module-level persistent state
+_state = {
+    "step": 0,
+    "est_pos": None,
+    "est_vel": None,
+    "n": None,
+    "last_valid_pos": None,
+    "last_valid_vel": None,
+}
+
+
+def _median(vals):
+    vals = sorted(vals)
+    n = len(vals)
+    if n == 0:
+        return None
+    if n % 2 == 1:
+        return vals[n // 2]
+    return 0.5 * (vals[n // 2 - 1] + vals[n // 2])
+
+
+def _mean_motion(state):
+    mu = 3.986004418e14
+    if state.get("ground_semi_major_axis_m_valid") and state.get("ground_semi_major_axis_m"):
+        a = state["ground_semi_major_axis_m"]
+        if a and a > 6e6:
+            return math.sqrt(mu / (a ** 3))
+    if state.get("ground_altitude_km_valid") and state.get("ground_altitude_km"):
+        a = 6371000.0 + state["ground_altitude_km"] * 1000.0
+        return math.sqrt(mu / (a ** 3))
+    a = 6371000.0 + 400000.0
+    return math.sqrt(mu / (a ** 3))
+
+
+def _fuse_position(state):
+    cx, cy, cz = [], [], []
+    if state.get("radar_rel_x_valid"): cx.append(state["radar_rel_pos_x_m"])
+    if state.get("radar_rel_y_valid"): cy.append(state["radar_rel_pos_y_m"])
+    if state.get("radar_rel_z_valid"): cz.append(state["radar_rel_pos_z_m"])
+    if state.get("lidar_rel_x_valid"): cx.append(state["lidar_rel_pos_x_m"])
+    if state.get("lidar_rel_y_valid"): cy.append(state["lidar_rel_pos_y_m"])
+    if state.get("lidar_rel_z_valid"): cz.append(state["lidar_rel_pos_z_m"])
+    if state.get("dock_camera_active") and state.get("dock_camera_range_m"):
+        r = state["dock_camera_range_m"]
+        if r and r > 0:
+            if state.get("dock_camera_bearing_x_valid"): cx.append(state["dock_camera_bearing_x"] * r)
+            if state.get("dock_camera_bearing_y_valid"): cy.append(state["dock_camera_bearing_y"] * r)
+            if state.get("dock_camera_bearing_z_valid"): cz.append(state["dock_camera_bearing_z"] * r)
+    return (_median(cx) if cx else None,
+            _median(cy) if cy else None,
+            _median(cz) if cz else None)
+
+
+def _fuse_velocity(state):
+    cx, cy, cz = [], [], []
+    if state.get("radar_relv_x_valid"): cx.append(state["radar_rel_vel_x_ms"])
+    if state.get("radar_relv_y_valid"): cy.append(state["radar_rel_vel_y_ms"])
+    if state.get("radar_relv_z_valid"): cz.append(state["radar_rel_vel_z_ms"])
+    if state.get("lidar_relv_x_valid"): cx.append(state["lidar_rel_vel_x_ms"])
+    if state.get("lidar_relv_y_valid"): cy.append(state["lidar_rel_vel_y_ms"])
+    if state.get("lidar_relv_z_valid"): cz.append(state["lidar_rel_vel_z_ms"])
+    return (_median(cx) if cx else None,
+            _median(cy) if cy else None,
+            _median(cz) if cz else None)
+
+
+def _fuse_gyro(state):
+    out = {}
+    for axis in ("pitch", "roll", "yaw"):
+        cands = []
+        for i in (1, 2, 3):
+            if state.get(f"gyro_{i}_{axis}_valid"):
+                cands.append(state[f"gyro_{i}_{axis}_dps"])
+        out[axis] = _median(cands) if cands else 0.0
+    return out
+
+
+def _clip(v, lo, hi):
+    return max(lo, min(hi, v))
+
+
+def autopilot_step(state: dict, dt: float) -> dict:
+    """
+    Spacecraft autopilot for docking with a space station.
+
+    Strategy:
+      - Sensor fusion via median of redundant radar/lidar (+ dock camera) for
+        fault tolerance against silent sensor failures.
+      - Clohessy-Wiltshire feedforward to cancel orbital coupling
+        (the counter-intuitive prograde-raises-orbit effect).
+      - Velocity tracking feedback: command a desired closing velocity that
+        scales down as range decreases, providing a smooth braked approach.
+      - Terminal deadband: stop active thrust when range < 2 m and slow,
+        only nulling residual velocity to satisfy < 0.3 m/s docking criterion.
+      - Attitude rates damped toward zero using median of 3 gyros.
+      - Estimator propagates last known state via CW dynamics when sensors
+        drop out, so failures or flicker don't break the controller.
+    """
+    s = _state
+    s["step"] += 1
+
+    if s["n"] is None:
+        s["n"] = _mean_motion(state)
+    n = s["n"]
+
+    px, py, pz = _fuse_position(state)
+    vx, vy, vz = _fuse_velocity(state)
+
+    # Fall back to estimator-propagated values if sensors missing
+    if (px is None or py is None or pz is None or
+        vx is None or vy is None or vz is None) and s["est_pos"] is not None:
+        ex, ey, ez = s["est_pos"]
+        evx, evy, evz = s["est_vel"]
+        # CW unforced propagation
+        ax = 3 * n * n * ex + 2 * n * evy
+        ay = -2 * n * evx
+        az = -n * n * ez
+        evx += ax * dt
+        evy += ay * dt
+        evz += az * dt
+        ex += evx * dt
+        ey += evy * dt
+        ez += evz * dt
+        if px is None: px = ex
+        if py is None: py = ey
+        if pz is None: pz = ez
+        if vx is None: vx = evx
+        if vy is None: vy = evy
+        if vz is None: vz = evz
+
+    # Last-resort defaults
+    if px is None: px = 0.0
+    if py is None: py = -200.0
+    if pz is None: pz = 0.0
+    if vx is None: vx = 0.0
+    if vy is None: vy = 0.0
+    if vz is None: vz = 0.0
+
+    s["est_pos"] = (px, py, pz)
+    s["est_vel"] = (vx, vy, vz)
+
+    rng = math.sqrt(px * px + py * py + pz * pz)
+    vmag = math.sqrt(vx * vx + vy * vy + vz * vz)
+
+    # Approach speed schedule
+    if rng > 1000:
+        v_approach = 3.0
+    elif rng > 500:
+        v_approach = 2.0
+    elif rng > 200:
+        v_approach = 1.0
+    elif rng > 50:
+        v_approach = 0.4
+    elif rng > 10:
+        v_approach = 0.15
+    elif rng > 2:
+        v_approach = 0.08
+    else:
+        v_approach = 0.05
+
+    # Desired velocity vector points toward origin
+    if rng > 0.01:
+        ux, uy, uz = -px / rng, -py / rng, -pz / rng
+    else:
+        ux = uy = uz = 0.0
+    vdx, vdy, vdz = ux * v_approach, uy * v_approach, uz * v_approach
+
+    # Velocity errors
+    evx = vdx - vx
+    evy = vdy - vy
+    evz = vdz - vz
+
+    # CW feedforward acceleration required to cancel orbital coupling
+    ax_ff = -3 * n * n * px - 2 * n * vy
+    ay_ff = 2 * n * vx
+    az_ff = n * n * pz
+
+    # Feedback
+    kp_v = 2.0
+    ax_cmd = ax_ff + kp_v * evx
+    ay_cmd = ay_ff + kp_v * evy
+    az_cmd = az_ff + kp_v * evz
+
+    # Assume max per-axis accel ~0.44 m/s^2 (220 N / ~500 kg)
+    max_a = 0.44
+    tx = ax_cmd / max_a
+    ty = ay_cmd / max_a
+    tz = az_cmd / max_a
+
+    # Conserve fuel when low
+    fuel_pct = state.get("fuel_remaining_pct")
+    if fuel_pct is not None and fuel_pct < 15 and rng > 5:
+        tx *= 0.4
+        ty *= 0.4
+        tz *= 0.4
+
+    # Terminal deadband: very close and slow -> just trim residual velocity
+    if rng < 2.0 and vmag < 0.25:
+        tx = _clip(-vx / max_a * 1.5, -0.3, 0.3)
+        ty = _clip(-vy / max_a * 1.5, -0.3, 0.3)
+        tz = _clip(-vz / max_a * 1.5, -0.3, 0.3)
+
+    tx = _clip(tx, -1.0, 1.0)
+    ty = _clip(ty, -1.0, 1.0)
+    tz = _clip(tz, -1.0, 1.0)
+
+    # Attitude rate damping
+    rates = _fuse_gyro(state)
+    deg2rad = math.pi / 180.0
+    cmd_pitch = _clip(-rates["pitch"] * deg2rad, -0.035, 0.035)
+    cmd_roll = _clip(-rates["roll"] * deg2rad, -0.035, 0.035)
+    cmd_yaw = _clip(-rates["yaw"] * deg2rad, -0.035, 0.035)
+
+    return {
+        "thrust_x": tx,
+        "thrust_y": ty,
+        "thrust_z": tz,
+        "att_rate_roll": cmd_roll,
+        "att_rate_pitch": cmd_pitch,
+        "att_rate_yaw": cmd_yaw,
+    }

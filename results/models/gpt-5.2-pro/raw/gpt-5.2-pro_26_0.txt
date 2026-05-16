@@ -1,1 +1,976 @@
-{'__exception__': "Can't run here - we're trying to get this working in codex."}
+```rust
+// Rust 2021
+// Adaptive 3D k-means clustering (exactly K clusters) supporting in-memory and streaming modes.
+// - Input (stdin):
+//     num_points num_clusters\n
+//     then num_points * (x,y,z) as little-endian f32 triples (12 bytes/point)
+// - Output (stdout):
+//     num_points cluster indices as little-endian u32 (4 bytes/point)
+//
+// Notes:
+// - For small datasets: in-memory Lloyd iterations.
+// - For larger datasets: stream points into a temp file, train via streaming batch k-means
+//   (few epochs) or streaming online k-means (very large), then do one final pass to emit labels.
+// - Uses kd-tree over centroids for K>~32 to avoid O(K) scan per point.
+// - No external crates.
+
+use std::cmp::min;
+use std::fs::{File, OpenOptions};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+#[derive(Clone, Copy, Debug)]
+struct Point3 {
+    x: f32,
+    y: f32,
+    z: f32,
+}
+impl Point3 {
+    #[inline(always)]
+    fn dist2(&self, c: &Point3) -> f32 {
+        let dx = self.x - c.x;
+        let dy = self.y - c.y;
+        let dz = self.z - c.z;
+        dx * dx + dy * dy + dz * dz
+    }
+    #[inline(always)]
+    fn coord(&self, axis: u8) -> f32 {
+        match axis {
+            0 => self.x,
+            1 => self.y,
+            _ => self.z,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct XorShift64 {
+    state: u64,
+}
+impl XorShift64 {
+    fn new(seed: u64) -> Self {
+        let mut s = seed;
+        if s == 0 {
+            s = 0x9E3779B97F4A7C15;
+        }
+        Self { state: s }
+    }
+    #[inline(always)]
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.state = x;
+        x
+    }
+    #[inline(always)]
+    fn gen_usize(&mut self, upper: usize) -> usize {
+        if upper <= 1 {
+            0
+        } else {
+            (self.next_u64() as usize) % upper
+        }
+    }
+    #[inline(always)]
+    fn gen_f32(&mut self) -> f32 {
+        // 24-bit mantissa-ish
+        let v = (self.next_u64() >> 40) as u32;
+        (v as f32) / ((1u32 << 24) as f32)
+    }
+}
+
+// ------------------------- KD-Tree for centroid NN -------------------------
+
+#[derive(Clone, Copy)]
+struct KdNode {
+    idx: u32,  // centroid index
+    axis: u8,  // split axis
+    left: i32, // node index in nodes vec, -1 for none
+    right: i32,
+}
+
+struct KdTree {
+    nodes: Vec<KdNode>,
+    root: i32,
+}
+
+impl KdTree {
+    fn build(centroids: &[Point3]) -> Self {
+        let k = centroids.len();
+        if k == 0 {
+            return Self {
+                nodes: Vec::new(),
+                root: -1,
+            };
+        }
+        let mut indices: Vec<u32> = (0..k as u32).collect();
+        let mut nodes: Vec<KdNode> = Vec::with_capacity(k);
+
+        fn build_rec(
+            inds: &mut [u32],
+            depth: usize,
+            centroids: &[Point3],
+            nodes: &mut Vec<KdNode>,
+        ) -> i32 {
+            if inds.is_empty() {
+                return -1;
+            }
+            let axis = (depth % 3) as u8;
+            let mid = inds.len() / 2;
+
+            // median selection in-place
+            inds.select_nth_unstable_by(mid, |&a, &b| {
+                let ca = centroids[a as usize].coord(axis);
+                let cb = centroids[b as usize].coord(axis);
+                ca.total_cmp(&cb)
+            });
+
+            let (left, rest) = inds.split_at_mut(mid);
+            let (mid_slice, right) = rest.split_at_mut(1);
+            let idx = mid_slice[0];
+
+            let node_pos = nodes.len() as i32;
+            nodes.push(KdNode {
+                idx,
+                axis,
+                left: -1,
+                right: -1,
+            });
+
+            let l = build_rec(left, depth + 1, centroids, nodes);
+            let r = build_rec(right, depth + 1, centroids, nodes);
+
+            nodes[node_pos as usize].left = l;
+            nodes[node_pos as usize].right = r;
+            node_pos
+        }
+
+        let root = build_rec(&mut indices[..], 0, centroids, &mut nodes);
+        Self { nodes, root }
+    }
+
+    #[inline(always)]
+    fn nearest(&self, centroids: &[Point3], p: &Point3) -> (u32, f32) {
+        fn rec(
+            node_i: i32,
+            nodes: &[KdNode],
+            centroids: &[Point3],
+            p: &Point3,
+            best_idx: &mut u32,
+            best_d2: &mut f32,
+        ) {
+            if node_i < 0 {
+                return;
+            }
+            let node = nodes[node_i as usize];
+            let c = &centroids[node.idx as usize];
+            let d2 = p.dist2(c);
+            if d2 < *best_d2 {
+                *best_d2 = d2;
+                *best_idx = node.idx;
+            }
+            let axis = node.axis;
+            let diff = p.coord(axis) - c.coord(axis);
+
+            let (near, far) = if diff <= 0.0 {
+                (node.left, node.right)
+            } else {
+                (node.right, node.left)
+            };
+
+            rec(near, nodes, centroids, p, best_idx, best_d2);
+            if diff * diff < *best_d2 {
+                rec(far, nodes, centroids, p, best_idx, best_d2);
+            }
+        }
+
+        let mut best_idx = 0u32;
+        let mut best_d2 = f32::INFINITY;
+        rec(
+            self.root,
+            &self.nodes,
+            centroids,
+            p,
+            &mut best_idx,
+            &mut best_d2,
+        );
+        (best_idx, best_d2)
+    }
+}
+
+// ------------------------- Binary IO helpers -------------------------
+
+fn read_header_line(reader: &mut BufReader<io::StdinLock<'_>>) -> io::Result<(u64, usize)> {
+    let mut line = Vec::with_capacity(64);
+    reader.read_until(b'\n', &mut line)?;
+    if line.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "missing header"));
+    }
+    let s = std::str::from_utf8(&line)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "header not utf8"))?;
+    let mut it = s.split_whitespace();
+    let n: u64 = it
+        .next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing num_points"))?
+        .parse()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad num_points"))?;
+    let k_u64: u64 = it
+        .next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing num_clusters"))?
+        .parse()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad num_clusters"))?;
+    if k_u64 == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "num_clusters must be > 0",
+        ));
+    }
+    let k: usize = k_u64
+        .try_into()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "num_clusters too large"))?;
+    Ok((n, k))
+}
+
+#[inline]
+fn bytes_per_point() -> u64 {
+    12
+}
+
+fn make_temp_path() -> PathBuf {
+    let mut p = std::env::temp_dir();
+    let pid = std::process::id() as u64;
+    let t = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    p.push(format!("rust_kmeans3d_{}_{}.bin", pid, t));
+    p
+}
+
+fn decode_point_le(bytes: &[u8]) -> Point3 {
+    debug_assert!(bytes.len() >= 12);
+    let x = f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    let y = f32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+    let z = f32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+    Point3 { x, y, z }
+}
+
+fn spool_to_temp_and_sample(
+    reader: &mut BufReader<io::StdinLock<'_>>,
+    tmp: &mut File,
+    num_points: u64,
+    sample_size: usize,
+    reservoir: bool,
+    rng: &mut XorShift64,
+) -> io::Result<Vec<Point3>> {
+    // Copy binary points to temp file while building a sample.
+    let total_bytes = num_points
+        .checked_mul(bytes_per_point())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "input too large"))?;
+
+    let chunk_bytes: usize = (12usize) * 1_000_000; // 1M points per chunk max
+    let mut buf = vec![0u8; chunk_bytes];
+
+    let mut sample: Vec<Point3> = Vec::with_capacity(sample_size.min(num_points as usize));
+    let mut written: u64 = 0;
+    let mut i_point: u64 = 0;
+
+    while written < total_bytes {
+        let remaining = (total_bytes - written) as usize;
+        let to_read = min(remaining, buf.len());
+        // ensure to_read is multiple of 12 (input is exact, so last chunk also multiple)
+        let to_read = to_read - (to_read % 12);
+        if to_read == 0 {
+            break;
+        }
+        reader.read_exact(&mut buf[..to_read])?;
+        tmp.write_all(&buf[..to_read])?;
+
+        // sample handling
+        let mut off = 0usize;
+        while off < to_read {
+            if sample.len() < sample_size {
+                // decode until sample filled
+                let p = decode_point_le(&buf[off..off + 12]);
+                sample.push(p);
+            } else if reservoir {
+                // reservoir replacement: occasional decode
+                let j = (rng.next_u64() % (i_point + 1)) as usize;
+                if j < sample_size {
+                    let p = decode_point_le(&buf[off..off + 12]);
+                    sample[j] = p;
+                }
+            } else {
+                // take-first mode: do nothing once sample filled
+            }
+            off += 12;
+            i_point += 1;
+        }
+
+        written += to_read as u64;
+    }
+
+    if written != total_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "not enough point bytes",
+        ));
+    }
+    tmp.flush()?;
+    Ok(sample)
+}
+
+// Fast reading of points from a file into a f32 buffer.
+// On little-endian: zero-copy read into Vec<f32> storage.
+// On big-endian: fallback to bytes and decode (slower).
+struct PointChunkReader {
+    little_endian: bool,
+    fbuf: Vec<f32>,
+    bbuf: Vec<u8>,
+}
+impl PointChunkReader {
+    fn new() -> Self {
+        Self {
+            little_endian: cfg!(target_endian = "little"),
+            fbuf: Vec::new(),
+            bbuf: Vec::new(),
+        }
+    }
+
+    fn read_points(
+        &mut self,
+        file: &mut File,
+        points: usize,
+        out: &mut Vec<Point3>,
+    ) -> io::Result<usize> {
+        out.clear();
+        if points == 0 {
+            return Ok(0);
+        }
+        let want_bytes = points * 12;
+
+        if self.little_endian {
+            let want_floats = points * 3;
+            self.fbuf.resize(want_floats, 0.0);
+            unsafe {
+                let ptr = self.fbuf.as_mut_ptr() as *mut u8;
+                let slice = std::slice::from_raw_parts_mut(ptr, want_floats * 4);
+                // read_exact would error at EOF; for chunked reading we want partial reads,
+                // so use read() loop.
+                let mut read_total = 0usize;
+                while read_total < want_bytes {
+                    let n = file.read(&mut slice[read_total..want_bytes])?;
+                    if n == 0 {
+                        break;
+                    }
+                    read_total += n;
+                }
+                if read_total == 0 {
+                    return Ok(0);
+                }
+                if read_total % 12 != 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "point bytes not multiple of 12",
+                    ));
+                }
+                let got_points = read_total / 12;
+                out.reserve(got_points);
+                for i in 0..got_points {
+                    let x = self.fbuf[i * 3 + 0];
+                    let y = self.fbuf[i * 3 + 1];
+                    let z = self.fbuf[i * 3 + 2];
+                    out.push(Point3 { x, y, z });
+                }
+                Ok(got_points)
+            }
+        } else {
+            self.bbuf.resize(want_bytes, 0u8);
+            let mut read_total = 0usize;
+            while read_total < want_bytes {
+                let n = file.read(&mut self.bbuf[read_total..want_bytes])?;
+                if n == 0 {
+                    break;
+                }
+                read_total += n;
+            }
+            if read_total == 0 {
+                return Ok(0);
+            }
+            if read_total % 12 != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "point bytes not multiple of 12",
+                ));
+            }
+            let got_points = read_total / 12;
+            out.reserve(got_points);
+            for i in 0..got_points {
+                let off = i * 12;
+                out.push(decode_point_le(&self.bbuf[off..off + 12]));
+            }
+            Ok(got_points)
+        }
+    }
+}
+
+fn write_u32_le_chunk<W: Write>(w: &mut W, chunk: &[u32]) -> io::Result<()> {
+    if cfg!(target_endian = "little") {
+        unsafe {
+            let ptr = chunk.as_ptr() as *const u8;
+            let bytes = std::slice::from_raw_parts(ptr, chunk.len() * 4);
+            w.write_all(bytes)
+        }
+    } else {
+        let mut buf = [0u8; 4];
+        for &v in chunk {
+            buf.copy_from_slice(&v.to_le_bytes());
+            w.write_all(&buf)?;
+        }
+        Ok(())
+    }
+}
+
+// ------------------------- K-means core -------------------------
+
+#[inline(always)]
+fn nearest_centroid_bruteforce(centroids: &[Point3], p: &Point3) -> u32 {
+    let mut best_i = 0u32;
+    let mut best_d2 = f32::INFINITY;
+    for (i, c) in centroids.iter().enumerate() {
+        let d2 = p.dist2(c);
+        if d2 < best_d2 {
+            best_d2 = d2;
+            best_i = i as u32;
+        }
+    }
+    best_i
+}
+
+fn init_centroids_from_sample(
+    sample: &[Point3],
+    k: usize,
+    rng: &mut XorShift64,
+) -> Vec<Point3> {
+    let mut centroids = Vec::with_capacity(k);
+    if k == 0 {
+        return centroids;
+    }
+    if sample.is_empty() {
+        // fallback: zeros
+        centroids.resize(k, Point3 { x: 0.0, y: 0.0, z: 0.0 });
+        return centroids;
+    }
+
+    // Decide between kmeans++-style init (only when cheap enough) and random pick.
+    // kmeans++ is O(k * sample_len).
+    let s = sample.len();
+    let cost = (k as u128) * (s as u128);
+    let use_kpp = cost <= 50_000_000u128 && k <= 4096 && s >= k;
+
+    if !use_kpp {
+        // random distinct-ish picks by shuffling indices via Fisher-Yates on a small index buffer
+        let mut idxs: Vec<usize> = (0..s).collect();
+        for i in (1..s).rev().take(k * 3) {
+            let j = rng.gen_usize(i + 1);
+            idxs.swap(i, j);
+        }
+        for i in 0..k {
+            let id = idxs[i % s];
+            centroids.push(sample[id]);
+        }
+        return centroids;
+    }
+
+    // kmeans++ on sample
+    let first = rng.gen_usize(s);
+    centroids.push(sample[first]);
+
+    let mut dist2: Vec<f64> = vec![0.0; s];
+    for i in 0..s {
+        dist2[i] = (sample[i].dist2(&centroids[0]) as f64).max(1e-30);
+    }
+
+    while centroids.len() < k {
+        let mut sum = 0.0f64;
+        for &d in &dist2 {
+            sum += d;
+        }
+        if !sum.is_finite() || sum <= 0.0 {
+            centroids.push(sample[rng.gen_usize(s)]);
+            continue;
+        }
+
+        let mut r = rng.gen_f32() as f64 * sum;
+        let mut chosen = 0usize;
+        for (i, &d) in dist2.iter().enumerate() {
+            r -= d;
+            if r <= 0.0 {
+                chosen = i;
+                break;
+            }
+        }
+        let newc = sample[chosen];
+        centroids.push(newc);
+
+        // update distances
+        for i in 0..s {
+            let d = sample[i].dist2(&newc) as f64;
+            if d < dist2[i] {
+                dist2[i] = d.max(1e-30);
+            }
+        }
+    }
+    centroids
+}
+
+fn fix_empty_clusters(
+    centroids: &mut [Point3],
+    counts: &[u64],
+    sample: &[Point3],
+    rng: &mut XorShift64,
+) {
+    if sample.is_empty() {
+        return;
+    }
+    for (i, &c) in counts.iter().enumerate() {
+        if c == 0 {
+            centroids[i] = sample[rng.gen_usize(sample.len())];
+        }
+    }
+}
+
+fn centroid_shift2(a: &Point3, b: &Point3) -> f32 {
+    let dx = a.x - b.x;
+    let dy = a.y - b.y;
+    let dz = a.z - b.z;
+    dx * dx + dy * dy + dz * dz
+}
+
+fn kmeans_in_memory(
+    points: &[Point3],
+    k: usize,
+    sample: &[Point3],
+    rng: &mut XorShift64,
+) -> Vec<u32> {
+    let n = points.len();
+    let mut centroids = init_centroids_from_sample(if !sample.is_empty() { sample } else { points }, k, rng);
+    if centroids.len() < k {
+        centroids.resize(k, Point3 { x: 0.0, y: 0.0, z: 0.0 });
+    }
+
+    let mut assign = vec![0u32; n];
+    let mut sums = vec![[0f64; 3]; k];
+    let mut counts = vec![0u64; k];
+
+    let max_iters = 30usize;
+    let tol2 = 1e-8f32;
+
+    for _iter in 0..max_iters {
+        for s in &mut sums {
+            *s = [0.0; 3];
+        }
+        counts.fill(0);
+
+        let use_kd = k > 32;
+        let kdt = if use_kd { Some(KdTree::build(&centroids)) } else { None };
+
+        for (i, p) in points.iter().enumerate() {
+            let idx = if let Some(tree) = &kdt {
+                tree.nearest(&centroids, p).0
+            } else {
+                nearest_centroid_bruteforce(&centroids, p)
+            } as usize;
+
+            assign[i] = idx as u32;
+            counts[idx] += 1;
+            sums[idx][0] += p.x as f64;
+            sums[idx][1] += p.y as f64;
+            sums[idx][2] += p.z as f64;
+        }
+
+        let prev = centroids.to_vec();
+        for i in 0..k {
+            if counts[i] > 0 {
+                let inv = 1.0 / (counts[i] as f64);
+                centroids[i] = Point3 {
+                    x: (sums[i][0] * inv) as f32,
+                    y: (sums[i][1] * inv) as f32,
+                    z: (sums[i][2] * inv) as f32,
+                };
+            }
+        }
+        fix_empty_clusters(&mut centroids, &counts, if sample.is_empty() { points } else { sample }, rng);
+
+        let mut max_shift2 = 0.0f32;
+        for i in 0..k {
+            max_shift2 = max_shift2.max(centroid_shift2(&prev[i], &centroids[i]));
+        }
+        if max_shift2 <= tol2 {
+            break;
+        }
+    }
+
+    // Final assignment with final centroids
+    let use_kd = k > 32;
+    let kdt = if use_kd { Some(KdTree::build(&centroids)) } else { None };
+    for (i, p) in points.iter().enumerate() {
+        let idx = if let Some(tree) = &kdt {
+            tree.nearest(&centroids, p).0
+        } else {
+            nearest_centroid_bruteforce(&centroids, p)
+        };
+        assign[i] = idx;
+    }
+
+    assign
+}
+
+fn kmeans_streaming_batch(
+    tmp: &mut File,
+    num_points: u64,
+    k: usize,
+    epochs: usize,
+    sample: &[Point3],
+    rng: &mut XorShift64,
+) -> io::Result<Vec<Point3>> {
+    let mut centroids = init_centroids_from_sample(sample, k, rng);
+    centroids.resize(k, Point3 { x: 0.0, y: 0.0, z: 0.0 });
+
+    let mut sums = vec![[0f64; 3]; k];
+    let mut counts = vec![0u64; k];
+
+    let mut reader = PointChunkReader::new();
+    let mut chunk_pts: Vec<Point3> = Vec::new();
+    let chunk_points = 1_000_000usize;
+    let tol2 = 1e-7f32;
+
+    for _ep in 0..epochs {
+        for s in &mut sums {
+            *s = [0.0; 3];
+        }
+        counts.fill(0);
+
+        tmp.seek(SeekFrom::Start(0))?;
+        let mut processed: u64 = 0;
+
+        let use_kd = k > 32;
+        let kdt = if use_kd { Some(KdTree::build(&centroids)) } else { None };
+
+        while processed < num_points {
+            let want = min(chunk_points as u64, num_points - processed) as usize;
+            let got = reader.read_points(tmp, want, &mut chunk_pts)?;
+            if got == 0 {
+                break;
+            }
+            for p in &chunk_pts {
+                let idx = if let Some(tree) = &kdt {
+                    tree.nearest(&centroids, p).0
+                } else {
+                    nearest_centroid_bruteforce(&centroids, p)
+                } as usize;
+
+                counts[idx] += 1;
+                sums[idx][0] += p.x as f64;
+                sums[idx][1] += p.y as f64;
+                sums[idx][2] += p.z as f64;
+            }
+            processed += got as u64;
+        }
+
+        let prev = centroids.clone();
+        for i in 0..k {
+            if counts[i] > 0 {
+                let inv = 1.0 / (counts[i] as f64);
+                centroids[i] = Point3 {
+                    x: (sums[i][0] * inv) as f32,
+                    y: (sums[i][1] * inv) as f32,
+                    z: (sums[i][2] * inv) as f32,
+                };
+            }
+        }
+        fix_empty_clusters(&mut centroids, &counts, sample, rng);
+
+        let mut max_shift2 = 0.0f32;
+        for i in 0..k {
+            max_shift2 = max_shift2.max(centroid_shift2(&prev[i], &centroids[i]));
+        }
+        if max_shift2 <= tol2 {
+            break;
+        }
+    }
+
+    Ok(centroids)
+}
+
+fn kmeans_streaming_online(
+    tmp: &mut File,
+    num_points: u64,
+    k: usize,
+    passes: usize,
+    sample: &[Point3],
+    rng: &mut XorShift64,
+) -> io::Result<Vec<Point3>> {
+    let mut centroids = init_centroids_from_sample(sample, k, rng);
+    centroids.resize(k, Point3 { x: 0.0, y: 0.0, z: 0.0 });
+
+    let mut counts = vec![0u64; k];
+    let mut reader = PointChunkReader::new();
+    let mut chunk_pts: Vec<Point3> = Vec::new();
+    let chunk_points = 1_000_000usize;
+
+    for _pass in 0..passes {
+        tmp.seek(SeekFrom::Start(0))?;
+        let mut processed: u64 = 0;
+
+        // Periodically rebuild KD-tree (centroids move during online updates).
+        let rebuild_every: u64 = if num_points <= 200_000_000 {
+            10_000_000
+        } else {
+            50_000_000
+        };
+        let mut next_rebuild: u64 = 0;
+
+        let mut kdt = if k > 32 { Some(KdTree::build(&centroids)) } else { None };
+
+        while processed < num_points {
+            if processed >= next_rebuild {
+                if k > 32 {
+                    kdt = Some(KdTree::build(&centroids));
+                }
+                next_rebuild = processed.saturating_add(rebuild_every);
+            }
+
+            let want = min(chunk_points as u64, num_points - processed) as usize;
+            let got = reader.read_points(tmp, want, &mut chunk_pts)?;
+            if got == 0 {
+                break;
+            }
+
+            for p in &chunk_pts {
+                let idx_u32 = if let Some(tree) = &kdt {
+                    tree.nearest(&centroids, p).0
+                } else {
+                    nearest_centroid_bruteforce(&centroids, p)
+                };
+                let idx = idx_u32 as usize;
+
+                counts[idx] = counts[idx].saturating_add(1);
+                let eta = 1.0f32 / (counts[idx] as f32);
+
+                // online mean update
+                let c = &mut centroids[idx];
+                c.x = c.x + eta * (p.x - c.x);
+                c.y = c.y + eta * (p.y - c.y);
+                c.z = c.z + eta * (p.z - c.z);
+            }
+
+            processed += got as u64;
+        }
+    }
+
+    // (Optional) fix empties by re-seeding from sample
+    fix_empty_clusters(&mut centroids, &counts, sample, rng);
+    Ok(centroids)
+}
+
+fn emit_assignments(
+    tmp: &mut File,
+    num_points: u64,
+    centroids: &[Point3],
+    out: &mut BufWriter<io::StdoutLock<'_>>,
+) -> io::Result<()> {
+    let k = centroids.len();
+    let use_kd = k > 32;
+    let kdt = if use_kd { Some(KdTree::build(centroids)) } else { None };
+
+    tmp.seek(SeekFrom::Start(0))?;
+    let mut reader = PointChunkReader::new();
+    let mut chunk_pts: Vec<Point3> = Vec::new();
+    let mut labels: Vec<u32> = Vec::new();
+
+    let chunk_points = 1_000_000usize;
+    let mut processed: u64 = 0;
+
+    while processed < num_points {
+        let want = min(chunk_points as u64, num_points - processed) as usize;
+        let got = reader.read_points(tmp, want, &mut chunk_pts)?;
+        if got == 0 {
+            break;
+        }
+        labels.clear();
+        labels.reserve(got);
+
+        for p in &chunk_pts {
+            let idx = if let Some(tree) = &kdt {
+                tree.nearest(centroids, p).0
+            } else {
+                nearest_centroid_bruteforce(centroids, p)
+            };
+            labels.push(idx);
+        }
+
+        write_u32_le_chunk(out, &labels)?;
+        processed += got as u64;
+    }
+
+    out.flush()?;
+    Ok(())
+}
+
+// ------------------------- Strategy selection -------------------------
+
+#[derive(Debug, Clone, Copy)]
+enum Mode {
+    InMemory,
+    StreamingBatch { epochs: usize },
+    StreamingOnline { passes: usize },
+}
+
+fn choose_mode(num_points: u64, k: usize) -> Mode {
+    // Simple adaptive thresholds; intentionally conservative on RAM usage.
+    // Also reflect that multiple file passes are expensive at huge N.
+    let n = num_points;
+    let k_u64 = k as u64;
+
+    // If N small enough, in-memory k-means is simplest and high-quality.
+    if n <= 10_000_000 && k <= 10_000 {
+        return Mode::InMemory;
+    }
+
+    // If extremely large, do very few passes and online updates.
+    if n > 1_000_000_000 || k_u64 >= 10_000 {
+        return Mode::StreamingOnline { passes: 1 };
+    }
+
+    // Medium/Large: do a few epochs of batch k-means over the temp file.
+    if n <= 100_000_000 {
+        Mode::StreamingBatch { epochs: 8 }
+    } else if n <= 1_000_000_000 {
+        Mode::StreamingBatch { epochs: 4 }
+    } else {
+        Mode::StreamingOnline { passes: 1 }
+    }
+}
+
+fn pick_sample_size(num_points: u64, k: usize) -> usize {
+    // Sample used only for initialization and empty-cluster repair.
+    // Keep it bounded.
+    let base = k.saturating_mul(50).max(50_000);
+    let cap = 2_000_000usize;
+    let n_usize = if num_points > (usize::MAX as u64) {
+        cap
+    } else {
+        num_points as usize
+    };
+    min(min(base, cap), n_usize.max(1))
+}
+
+fn main() -> io::Result<()> {
+    let stdin = io::stdin();
+    let mut reader = BufReader::new(stdin.lock());
+
+    let (num_points, k) = read_header_line(&mut reader)?;
+
+    // Seed RNG from time; deterministic not required, but stable enough.
+    let seed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64
+        ^ ((num_points as u64).wrapping_mul(0x9E3779B97F4A7C15))
+        ^ (k as u64).wrapping_mul(0xBF58476D1CE4E5B9);
+    let mut rng = XorShift64::new(seed);
+
+    if num_points == 0 {
+        // Nothing to output.
+        return Ok(());
+    }
+
+    let mode = choose_mode(num_points, k);
+
+    // For streaming modes, spool to a temp file.
+    // For in-memory mode, we read points directly into RAM.
+    match mode {
+        Mode::InMemory => {
+            // Read all points into memory.
+            let n_usize: usize = num_points
+                .try_into()
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "num_points too large"))?;
+
+            // Read binary points. Use bytes and decode to avoid endianness issues.
+            let total_bytes = (num_points * bytes_per_point()) as usize;
+            let mut bytes = vec![0u8; total_bytes];
+            reader.read_exact(&mut bytes)?;
+
+            let mut points = Vec::with_capacity(n_usize);
+            for i in 0..n_usize {
+                let off = i * 12;
+                points.push(decode_point_le(&bytes[off..off + 12]));
+            }
+
+            let sample_size = pick_sample_size(num_points, k);
+            let sample = if points.len() <= sample_size {
+                points.clone()
+            } else {
+                // quick take-first sample to avoid O(N) reservoir in in-memory case
+                points[..sample_size].to_vec()
+            };
+
+            let assign = kmeans_in_memory(&points, k, &sample, &mut rng);
+
+            let stdout = io::stdout();
+            let mut out = BufWriter::new(stdout.lock());
+            write_u32_le_chunk(&mut out, &assign)?;
+            out.flush()?;
+        }
+
+        Mode::StreamingBatch { epochs } | Mode::StreamingOnline { .. } => {
+            // Spool to temp file and sample on the fly.
+            let tmp_path = make_temp_path();
+            let mut tmp = OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .read(true)
+                .write(true)
+                .open(&tmp_path)?;
+
+            let sample_size = pick_sample_size(num_points, k);
+
+            // Reservoir sampling is too costly (per-point RNG) at extreme scales.
+            let reservoir = num_points <= 100_000_000;
+            let sample = spool_to_temp_and_sample(
+                &mut reader,
+                &mut tmp,
+                num_points,
+                sample_size,
+                reservoir,
+                &mut rng,
+            )?;
+
+            // Train centroids
+            let centroids = match mode {
+                Mode::StreamingBatch { epochs } => {
+                    kmeans_streaming_batch(&mut tmp, num_points, k, epochs, &sample, &mut rng)?
+                }
+                Mode::StreamingOnline { passes } => {
+                    kmeans_streaming_online(&mut tmp, num_points, k, passes, &sample, &mut rng)?
+                }
+                Mode::InMemory => unreachable!(),
+            };
+
+            // Emit final labels
+            let stdout = io::stdout();
+            let mut out = BufWriter::new(stdout.lock());
+            emit_assignments(&mut tmp, num_points, &centroids, &mut out)?;
+
+            // Cleanup temp file (best-effort)
+            drop(tmp);
+            let _ = std::fs::remove_file(&tmp_path);
+        }
+    }
+
+    Ok(())
+}
+```

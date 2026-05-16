@@ -1,1 +1,690 @@
-{'__exception__': "Can't run here - we're trying to get this working in codex."}
+```csharp
+// Asteroid interception / deflection trajectory heuristic solver
+// - Reads initial N-body states (SSB frame) from stdin.
+// - Builds an internal N-body ephemeris via KDK integration (does not parse DE421).
+// - Searches for a feasible Lambert (2-body Sun) transfer Earth->Asteroid within the launch window.
+// - If direct is infeasible under delta-v, attempts a single flyby (powered if needed) via Venus/Mars/Jupiter (if present).
+// - Outputs impulsive burns: launch, optional flyby burn, and impact (0 dv).
+//
+// Notes / assumptions (due to unspecified sim interface details):
+// - warning_days is treated as the latest allowable intercept time (i.e., "impact time" of asteroid with Earth is ~warning_days).
+// - spacecraft starts co-moving with Earth at launch (SSB inertial), so launch burn is Δv = v_depart - v_earth.
+// - kinetic impact burn is zero; momentum transfer is implicit by collision.
+// - Deflection objective is a proxy: maximize (m_imp/m_ast * |v_rel|) * time_remaining.
+//
+// Build: csc /langversion:latest Program.cs
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Linq;
+
+public static class Program
+{
+    const double G = 6.67430e-11;
+
+    public static void Main()
+    {
+        var data = Console.In.ReadToEnd();
+        if (string.IsNullOrWhiteSpace(data))
+        {
+            Console.WriteLine("2\n0 0 0 0\n0 0 0 0");
+            return;
+        }
+
+        var tok = Tokenize(data);
+        int p = 0;
+
+        int numBodies = (int)ReadDouble(tok, ref p);
+        double warningDays = ReadDouble(tok, ref p);
+        double impactorMass = ReadDouble(tok, ref p);
+        double dvBudget = ReadDouble(tok, ref p);
+        double asteroidMass = ReadDouble(tok, ref p);
+        double t0UnixUtc = ReadDouble(tok, ref p); // unused (scenario metadata)
+
+        var bodies = new List<Body>(numBodies);
+        for (int i = 0; i < numBodies; i++)
+        {
+            string name = tok[p++];
+
+            double mass = ReadDouble(tok, ref p);
+            var r = new Vec3(ReadDouble(tok, ref p), ReadDouble(tok, ref p), ReadDouble(tok, ref p));
+            var v = new Vec3(ReadDouble(tok, ref p), ReadDouble(tok, ref p), ReadDouble(tok, ref p));
+            bodies.Add(new Body(name, mass, r, v));
+        }
+
+        // DE421 path provided, but not parsed here.
+        // Keep token consumption robust: if present, read one string.
+        if (p < tok.Length)
+        {
+            string de421Path = tok[p++];
+            _ = de421Path;
+        }
+
+        int iEarth = FindBodyIndex(bodies, "Earth");
+        int iAst = FindBodyIndex(bodies, "Asteroid");
+        int iSun = FindBodyIndex(bodies, "Sun");
+
+        if (iEarth < 0 || iAst < 0)
+        {
+            // Can't solve without Earth and Asteroid.
+            Console.WriteLine("2");
+            Console.WriteLine("0 0 0 0");
+            Console.WriteLine($"{warningDays.ToString("G17", CI)} 0 0 0");
+            return;
+        }
+        if (iSun < 0)
+        {
+            // Choose the most massive body as Sun surrogate.
+            iSun = bodies.Select((b, idx) => (b.Mass, idx)).OrderByDescending(x => x.Mass).First().idx;
+        }
+
+        // Build N-body ephemeris (KDK).
+        // Step sizing: keep steps manageable for 50-year cases.
+        double dtDays = ChooseStepDays(warningDays);
+        var eph = new Ephemeris(bodies, dtDays, warningDays);
+
+        double muSun = G * bodies[iSun].Mass;
+
+        // Mission search:
+        // 1) Direct Earth->Asteroid Lambert search
+        var best = MissionCandidate.None;
+
+        best = SearchDirect(eph, bodies, iSun, iEarth, iAst, muSun, warningDays, impactorMass, asteroidMass, dvBudget, best);
+
+        // 2) If not feasible enough, try 1-flyby (Venus/Mars/Jupiter) if present
+        if (!best.Feasible)
+        {
+            var flybyCandidates = new[] { "Venus", "Mars", "Jupiter" }
+                .Select(n => (name: n, idx: FindBodyIndex(bodies, n)))
+                .Where(x => x.idx >= 0)
+                .ToList();
+
+            foreach (var fb in flybyCandidates)
+            {
+                best = SearchSingleFlyby(eph, bodies, iSun, iEarth, iAst, fb.idx, muSun, warningDays,
+                                        impactorMass, asteroidMass, dvBudget, best);
+            }
+        }
+
+        // If still not feasible, print a minimal output within constraints.
+        if (!best.Feasible)
+        {
+            // Do "launch now with zero dv; impact at warningDays" fallback.
+            Console.WriteLine("2");
+            Console.WriteLine($"0 0 0 0");
+            Console.WriteLine($"{warningDays.ToString("G17", CI)} 0 0 0");
+            return;
+        }
+
+        // Output burns.
+        // Always include impact line with 0 dv.
+        if (best.Burns.Count == 1)
+        {
+            Console.WriteLine("2");
+            PrintBurn(best.Burns[0]);
+            Console.WriteLine($"{best.ImpactTimeDays.ToString("G17", CI)} 0 0 0");
+        }
+        else
+        {
+            Console.WriteLine((best.Burns.Count + 1).ToString(CI));
+            foreach (var b in best.Burns) PrintBurn(b);
+            Console.WriteLine($"{best.ImpactTimeDays.ToString("G17", CI)} 0 0 0");
+        }
+    }
+
+    // ---------------- Mission search ----------------
+
+    static MissionCandidate SearchDirect(
+        Ephemeris eph, List<Body> bodies,
+        int iSun, int iEarth, int iAst,
+        double muSun, double warningDays,
+        double impactorMass, double asteroidMass, double dvBudget,
+        MissionCandidate bestSoFar)
+    {
+        // Sampling:
+        // Launch in [0, warningDays], arrival in (launch+minTOF, warningDays]
+        double minTofDays = Math.Min(30.0, Math.Max(5.0, warningDays / 50.0)); // heuristic
+        if (warningDays < minTofDays + 1e-9) return bestSoFar;
+
+        int nLaunch = Clamp((int)(warningDays / 6.0) + 30, 40, 220);
+        int nArr = Clamp((int)(warningDays / 4.0) + 40, 50, 260);
+
+        // Bias towards early intercept (more leverage for deflection)
+        for (int iL = 0; iL < nLaunch; iL++)
+        {
+            double tL = warningDays * (iL / (double)(nLaunch - 1));
+            double tMinArr = tL + minTofDays;
+            if (tMinArr >= warningDays) continue;
+
+            // Nonlinear spacing for arrival to bias early:
+            for (int iA = 0; iA < nArr; iA++)
+            {
+                double u = iA / (double)(nArr - 1);
+                // Quadratic bias near early
+                double tA = tMinArr + (warningDays - tMinArr) * (u * u);
+                if (tA > warningDays) tA = warningDays;
+
+                var cand = EvaluateDirect(eph, bodies, iSun, iEarth, iAst, muSun,
+                                          tL, tA, impactorMass, asteroidMass, dvBudget);
+                bestSoFar = MissionCandidate.BetterOf(bestSoFar, cand);
+            }
+        }
+
+        return bestSoFar;
+    }
+
+    static MissionCandidate EvaluateDirect(
+        Ephemeris eph, List<Body> bodies,
+        int iSun, int iEarth, int iAst, double muSun,
+        double tLaunchDays, double tImpactDays,
+        double impactorMass, double asteroidMass, double dvBudget)
+    {
+        if (tImpactDays <= tLaunchDays) return MissionCandidate.None;
+
+        var sunL = eph.State(iSun, tLaunchDays);
+        var earthL = eph.State(iEarth, tLaunchDays);
+        var astI = eph.State(iAst, tImpactDays);
+        var sunI = eph.State(iSun, tImpactDays);
+
+        // Heliocentric endpoints (Sun-centered)
+        Vec3 r1 = earthL.R - sunL.R;
+        Vec3 r2 = astI.R - sunI.R;
+        double tof = (tImpactDays - tLaunchDays) * 86400.0;
+
+        if (!Lambert.SolveUniversal(r1, r2, tof, muSun, prograde: true, out var v1, out var v2))
+            return MissionCandidate.None;
+
+        // Convert to inertial (SSB) velocities by adding Sun barycentric velocity at endpoint times
+        Vec3 vDepartInertial = v1 + sunL.V;
+        Vec3 vArriveInertial = v2 + sunI.V;
+
+        // Spacecraft initially co-moving with Earth at launch
+        Vec3 dvLaunch = vDepartInertial - earthL.V;
+        double dv0 = dvLaunch.Norm();
+
+        if (double.IsNaN(dv0) || dv0 <= 0) return MissionCandidate.None;
+        if (dv0 > dvBudget) return MissionCandidate.None;
+
+        // Relative velocity at impact (approx)
+        Vec3 vRel = vArriveInertial - astI.V;
+        double vRelMag = vRel.Norm();
+
+        // Proxy deflection: deltaV_ast ≈ (m_imp/m_ast)*|v_rel|
+        double deltaVAst = (asteroidMass > 0) ? (impactorMass / asteroidMass) * vRelMag : 0.0;
+
+        // Proxy miss distance ~ deltaV * time_remaining
+        double timeRemaining = Math.Max(0.0, (eph.MaxTimeDays - tImpactDays)) * 86400.0;
+        double missProxy = deltaVAst * timeRemaining;
+
+        // Score: prioritize missProxy; small penalty for dv usage; also prefer earlier impact
+        double score = missProxy - 0.05 * dv0 - 1e-3 * (tImpactDays * 86400.0);
+
+        var burns = new List<Burn>
+        {
+            new Burn(tLaunchDays, dvLaunch)
+        };
+
+        return new MissionCandidate(
+            feasible: true,
+            score: score,
+            impactTimeDays: tImpactDays,
+            burns: burns,
+            dvUsed: dv0
+        );
+    }
+
+    static MissionCandidate SearchSingleFlyby(
+        Ephemeris eph, List<Body> bodies,
+        int iSun, int iEarth, int iAst, int iFlyby,
+        double muSun, double warningDays,
+        double impactorMass, double asteroidMass, double dvBudget,
+        MissionCandidate bestSoFar)
+    {
+        // Coarse grid to stay fast
+        double minLegDays = Math.Min(40.0, Math.Max(7.0, warningDays / 80.0));
+        if (warningDays < 2 * minLegDays + 1e-9) return bestSoFar;
+
+        int nLaunch = Clamp((int)(warningDays / 20.0) + 30, 30, 120);
+        int nFb = Clamp((int)(warningDays / 15.0) + 30, 30, 140);
+        int nArr = Clamp((int)(warningDays / 12.0) + 35, 35, 150);
+
+        for (int iL = 0; iL < nLaunch; iL++)
+        {
+            double tL = warningDays * (iL / (double)(nLaunch - 1));
+            double tFbMin = tL + minLegDays;
+            if (tFbMin >= warningDays - minLegDays) continue;
+
+            for (int iF = 0; iF < nFb; iF++)
+            {
+                double uF = iF / (double)(nFb - 1);
+                double tF = tFbMin + (warningDays - minLegDays - tFbMin) * (uF * uF);
+                if (tF <= tFbMin) continue;
+
+                double tArrMin = tF + minLegDays;
+                if (tArrMin >= warningDays) continue;
+
+                for (int iA = 0; iA < nArr; iA++)
+                {
+                    double uA = iA / (double)(nArr - 1);
+                    double tA = tArrMin + (warningDays - tArrMin) * (uA * uA);
+                    if (tA > warningDays) tA = warningDays;
+
+                    var cand = EvaluateSingleFlyby(eph, bodies, iSun, iEarth, iAst, iFlyby, muSun,
+                                                   tL, tF, tA, impactorMass, asteroidMass, dvBudget);
+
+                    bestSoFar = MissionCandidate.BetterOf(bestSoFar, cand);
+                }
+            }
+        }
+
+        return bestSoFar;
+    }
+
+    static MissionCandidate EvaluateSingleFlyby(
+        Ephemeris eph, List<Body> bodies,
+        int iSun, int iEarth, int iAst, int iFlyby,
+        double muSun,
+        double tLaunchDays, double tFlybyDays, double tImpactDays,
+        double impactorMass, double asteroidMass, double dvBudget)
+    {
+        if (!(tLaunchDays < tFlybyDays && tFlybyDays < tImpactDays)) return MissionCandidate.None;
+
+        var sunL = eph.State(iSun, tLaunchDays);
+        var sunF = eph.State(iSun, tFlybyDays);
+        var sunI = eph.State(iSun, tImpactDays);
+
+        var earthL = eph.State(iEarth, tLaunchDays);
+        var fbF = eph.State(iFlyby, tFlybyDays);
+        var astI = eph.State(iAst, tImpactDays);
+
+        Vec3 rE_L = earthL.R - sunL.R;
+        Vec3 rP_F = fbF.R - sunF.R;
+        Vec3 rA_I = astI.R - sunI.R;
+
+        double tof1 = (tFlybyDays - tLaunchDays) * 86400.0;
+        double tof2 = (tImpactDays - tFlybyDays) * 86400.0;
+
+        if (!Lambert.SolveUniversal(rE_L, rP_F, tof1, muSun, prograde: true, out var v1a, out var v1b))
+            return MissionCandidate.None;
+        if (!Lambert.SolveUniversal(rP_F, rA_I, tof2, muSun, prograde: true, out var v2a, out var v2b))
+            return MissionCandidate.None;
+
+        // Convert to inertial at each relevant time
+        Vec3 vDepartInertial = v1a + sunL.V;
+        Vec3 vArriveFlybyInertial = v1b + sunF.V;
+        Vec3 vDepartFlybyInertial = v2a + sunF.V;
+        Vec3 vArriveAstInertial = v2b + sunI.V;
+
+        Vec3 dvLaunch = vDepartInertial - earthL.V;
+        double dv0 = dvLaunch.Norm();
+        if (dv0 > dvBudget) return MissionCandidate.None;
+
+        // Powered flyby burn to match outgoing leg
+        Vec3 dvFlyby = vDepartFlybyInertial - vArriveFlybyInertial;
+        double dv1 = dvFlyby.Norm();
+
+        double dvTotal = dv0 + dv1;
+        if (dvTotal > dvBudget) return MissionCandidate.None;
+
+        // Deflection proxy
+        Vec3 vRel = vArriveAstInertial - astI.V;
+        double vRelMag = vRel.Norm();
+        double deltaVAst = (asteroidMass > 0) ? (impactorMass / asteroidMass) * vRelMag : 0.0;
+        double timeRemaining = Math.Max(0.0, (eph.MaxTimeDays - tImpactDays)) * 86400.0;
+        double missProxy = deltaVAst * timeRemaining;
+
+        // Penalties: dv usage and powered flyby usage (prefer unpowered-ish)
+        double score = missProxy - 0.06 * dvTotal - 0.02 * dv1 - 1e-3 * (tImpactDays * 86400.0);
+
+        var burns = new List<Burn>
+        {
+            new Burn(tLaunchDays, dvLaunch)
+        };
+
+        // Only include flyby burn if significant
+        if (dv1 > 1e-4)
+            burns.Add(new Burn(tFlybyDays, dvFlyby));
+
+        return new MissionCandidate(true, score, tImpactDays, burns, dvTotal);
+    }
+
+    // ---------------- Ephemeris (N-body KDK) ----------------
+
+    sealed class Ephemeris
+    {
+        readonly int n;
+        readonly double dtDays;
+        readonly double dt;
+        readonly int steps;
+        readonly double[] masses;
+
+        // states[step][body] for interpolation: store as parallel arrays for cache
+        readonly Vec3[][] pos; // [k][i]
+        readonly Vec3[][] vel; // [k][i]
+
+        public double MaxTimeDays { get; }
+
+        public Ephemeris(List<Body> bodies, double dtDays, double maxTimeDays)
+        {
+            this.n = bodies.Count;
+            this.dtDays = dtDays;
+            this.dt = dtDays * 86400.0;
+            this.MaxTimeDays = maxTimeDays;
+
+            steps = (int)Math.Ceiling(maxTimeDays / dtDays) + 1;
+            masses = bodies.Select(b => b.Mass).ToArray();
+
+            pos = new Vec3[steps][];
+            vel = new Vec3[steps][];
+
+            pos[0] = new Vec3[n];
+            vel[0] = new Vec3[n];
+            for (int i = 0; i < n; i++)
+            {
+                pos[0][i] = bodies[i].R;
+                vel[0][i] = bodies[i].V;
+            }
+
+            // Integrate forward
+            var r = new Vec3[n];
+            var v = new Vec3[n];
+            var a = new Vec3[n];
+
+            for (int i = 0; i < n; i++)
+            {
+                r[i] = pos[0][i];
+                v[i] = vel[0][i];
+            }
+
+            ComputeAccel(r, a);
+
+            for (int k = 1; k < steps; k++)
+            {
+                // Kick
+                for (int i = 0; i < n; i++)
+                    v[i] = v[i] + a[i] * (0.5 * dt);
+
+                // Drift
+                for (int i = 0; i < n; i++)
+                    r[i] = r[i] + v[i] * dt;
+
+                // Recompute accel
+                ComputeAccel(r, a);
+
+                // Kick
+                for (int i = 0; i < n; i++)
+                    v[i] = v[i] + a[i] * (0.5 * dt);
+
+                pos[k] = new Vec3[n];
+                vel[k] = new Vec3[n];
+                for (int i = 0; i < n; i++)
+                {
+                    pos[k][i] = r[i];
+                    vel[k][i] = v[i];
+                }
+            }
+        }
+
+        public (Vec3 R, Vec3 V) State(int bodyIndex, double tDays)
+        {
+            if (tDays <= 0) return (pos[0][bodyIndex], vel[0][bodyIndex]);
+            if (tDays >= MaxTimeDays) return (pos[steps - 1][bodyIndex], vel[steps - 1][bodyIndex]);
+
+            double x = tDays / dtDays;
+            int k = (int)Math.Floor(x);
+            if (k < 0) k = 0;
+            if (k >= steps - 1) k = steps - 2;
+            double u = x - k;
+
+            Vec3 r0 = pos[k][bodyIndex];
+            Vec3 r1 = pos[k + 1][bodyIndex];
+            Vec3 v0 = vel[k][bodyIndex];
+            Vec3 v1 = vel[k + 1][bodyIndex];
+
+            return (Lerp(r0, r1, u), Lerp(v0, v1, u));
+        }
+
+        void ComputeAccel(Vec3[] r, Vec3[] a)
+        {
+            for (int i = 0; i < n; i++) a[i] = default;
+
+            // O(N^2), N ~ <= 20; fine.
+            for (int i = 0; i < n; i++)
+            {
+                Vec3 ai = default;
+                Vec3 ri = r[i];
+
+                for (int j = 0; j < n; j++)
+                {
+                    if (j == i) continue;
+                    Vec3 dr = r[j] - ri;
+                    double d2 = dr.Dot(dr) + 1e-9; // softening to avoid singularities in pathological inputs
+                    double invR = 1.0 / Math.Sqrt(d2);
+                    double invR3 = invR * invR * invR;
+                    ai += dr * (G * masses[j] * invR3);
+                }
+
+                a[i] = ai;
+            }
+        }
+
+        static Vec3 Lerp(Vec3 a, Vec3 b, double u) => a * (1 - u) + b * u;
+    }
+
+    // ---------------- Lambert solver (universal variables) ----------------
+
+    static class Lambert
+    {
+        public static bool SolveUniversal(Vec3 r1, Vec3 r2, double tof, double mu, bool prograde, out Vec3 v1, out Vec3 v2)
+        {
+            v1 = default; v2 = default;
+            double r1n = r1.Norm();
+            double r2n = r2.Norm();
+            if (r1n < 1 || r2n < 1 || tof <= 0 || mu <= 0) return false;
+
+            double cosdnu = Clamp01(r1.Dot(r2) / (r1n * r2n));
+            Vec3 cr = r1.Cross(r2);
+            double sindnu = cr.Norm() / (r1n * r2n);
+            if (!prograde) sindnu = -sindnu;
+
+            double denom = (1.0 - cosdnu);
+            if (Math.Abs(denom) < 1e-12) return false;
+
+            double A = sindnu * Math.Sqrt(r1n * r2n / denom);
+            if (Math.Abs(A) < 1e-12) return false;
+
+            // Bisection on psi, robust for 0-rev solutions
+            double psiLow = -4.0 * Math.PI * Math.PI;
+            double psiUp =  4.0 * Math.PI * Math.PI;
+
+            // Ensure bounds bracket (monotonic in most practical cases)
+            double psi = 0.0;
+            double c2 = 0.5, c3 = 1.0 / 6.0;
+
+            double y = 0, chi = 0, tofEst = 0;
+
+            for (int iter = 0; iter < 120; iter++)
+            {
+                psi = 0.5 * (psiLow + psiUp);
+                Stumpff(psi, out c2, out c3);
+
+                // Prevent sqrt(c2) issues for negative c2
+                if (c2 <= 0) { psiLow = psi; continue; }
+
+                double sqrtC2 = Math.Sqrt(c2);
+                y = r1n + r2n + A * (psi * c3 - 1.0) / sqrtC2;
+
+                // For A>0, require y>0
+                if (A > 0 && y < 0)
+                {
+                    psiLow = psi;
+                    continue;
+                }
+
+                chi = Math.Sqrt(y / c2);
+                tofEst = (chi * chi * chi * c3 + A * Math.Sqrt(y)) / Math.Sqrt(mu);
+
+                if (double.IsNaN(tofEst) || double.IsInfinity(tofEst))
+                {
+                    psiLow = psi;
+                    continue;
+                }
+
+                if (tofEst <= tof) psiLow = psi;
+                else psiUp = psi;
+
+                if (Math.Abs(tofEst - tof) < 1e-7) break; // ~0.1 microsecond
+            }
+
+            // Compute f, g, gdot
+            if (c2 <= 0) return false;
+            double f = 1.0 - y / r1n;
+            double g = A * Math.Sqrt(y / mu);
+            double gdot = 1.0 - y / r2n;
+
+            if (Math.Abs(g) < 1e-12) return false;
+
+            v1 = (r2 - r1 * f) / g;
+            v2 = (r2 * gdot - r1) / g;
+            return IsFinite(v1) && IsFinite(v2);
+        }
+
+        static void Stumpff(double psi, out double c2, out double c3)
+        {
+            if (psi > 1e-6)
+            {
+                double s = Math.Sqrt(psi);
+                c2 = (1.0 - Math.Cos(s)) / psi;
+                c3 = (s - Math.Sin(s)) / (s * s * s);
+            }
+            else if (psi < -1e-6)
+            {
+                double s = Math.Sqrt(-psi);
+                c2 = (1.0 - Math.Cosh(s)) / psi; // psi negative => c2 positive
+                c3 = (Math.Sinh(s) - s) / (s * s * s);
+            }
+            else
+            {
+                c2 = 0.5;
+                c3 = 1.0 / 6.0;
+            }
+        }
+
+        static bool IsFinite(Vec3 v) =>
+            !(double.IsNaN(v.X) || double.IsNaN(v.Y) || double.IsNaN(v.Z) ||
+              double.IsInfinity(v.X) || double.IsInfinity(v.Y) || double.IsInfinity(v.Z));
+
+        static double Clamp01(double x)
+        {
+            if (x > 1.0) return 1.0;
+            if (x < -1.0) return -1.0;
+            return x;
+        }
+    }
+
+    // ---------------- Data structures ----------------
+
+    readonly record struct Burn(double TimeDays, Vec3 Dv);
+
+    readonly record struct MissionCandidate(bool Feasible, double Score, double ImpactTimeDays, List<Burn> Burns, double DvUsed)
+    {
+        public static MissionCandidate None => new MissionCandidate(false, double.NegativeInfinity, 0, new List<Burn>(), double.PositiveInfinity);
+
+        public static MissionCandidate BetterOf(MissionCandidate a, MissionCandidate b)
+        {
+            if (!a.Feasible) return b;
+            if (!b.Feasible) return a;
+            return (b.Score > a.Score) ? b : a;
+        }
+    }
+
+    sealed class Body
+    {
+        public string Name { get; }
+        public double Mass { get; }
+        public Vec3 R { get; }
+        public Vec3 V { get; }
+
+        public Body(string name, double mass, Vec3 r, Vec3 v)
+        {
+            Name = name;
+            Mass = mass;
+            R = r;
+            V = v;
+        }
+    }
+
+    readonly struct Vec3
+    {
+        public readonly double X, Y, Z;
+        public Vec3(double x, double y, double z) { X = x; Y = y; Z = z; }
+
+        public static Vec3 operator +(Vec3 a, Vec3 b) => new Vec3(a.X + b.X, a.Y + b.Y, a.Z + b.Z);
+        public static Vec3 operator -(Vec3 a, Vec3 b) => new Vec3(a.X - b.X, a.Y - b.Y, a.Z - b.Z);
+        public static Vec3 operator *(Vec3 a, double s) => new Vec3(a.X * s, a.Y * s, a.Z * s);
+        public static Vec3 operator *(double s, Vec3 a) => a * s;
+        public static Vec3 operator /(Vec3 a, double s) => new Vec3(a.X / s, a.Y / s, a.Z / s);
+
+        public double Dot(Vec3 b) => X * b.X + Y * b.Y + Z * b.Z;
+        public Vec3 Cross(Vec3 b) => new Vec3(
+            Y * b.Z - Z * b.Y,
+            Z * b.X - X * b.Z,
+            X * b.Y - Y * b.X
+        );
+
+        public double Norm() => Math.Sqrt(X * X + Y * Y + Z * Z);
+    }
+
+    // ---------------- Utilities ----------------
+
+    static readonly CultureInfo CI = CultureInfo.InvariantCulture;
+
+    static void PrintBurn(Burn b)
+    {
+        Console.WriteLine(
+            $"{b.TimeDays.ToString("G17", CI)} " +
+            $"{b.Dv.X.ToString("G17", CI)} {b.Dv.Y.ToString("G17", CI)} {b.Dv.Z.ToString("G17", CI)}"
+        );
+    }
+
+    static double ChooseStepDays(double warningDays)
+    {
+        // Target <= ~40000 steps
+        double dt = warningDays / 40000.0;
+        dt = Math.Max(dt, 0.25); // 6 hours minimum
+        dt = Math.Min(dt, 2.0);  // 2 days maximum
+        return dt;
+    }
+
+    static int FindBodyIndex(List<Body> bodies, string name)
+    {
+        for (int i = 0; i < bodies.Count; i++)
+            if (string.Equals(bodies[i].Name, name, StringComparison.OrdinalIgnoreCase))
+                return i;
+        return -1;
+    }
+
+    static int Clamp(int x, int lo, int hi) => x < lo ? lo : (x > hi ? hi : x);
+
+    static string[] Tokenize(string s)
+    {
+        // Fast-ish whitespace tokenizer without allocations per char
+        var res = new List<string>(8192);
+        int n = s.Length;
+        int i = 0;
+        while (i < n)
+        {
+            while (i < n && char.IsWhiteSpace(s[i])) i++;
+            if (i >= n) break;
+            int j = i;
+            while (j < n && !char.IsWhiteSpace(s[j])) j++;
+            res.Add(s.Substring(i, j - i));
+            i = j;
+        }
+        return res.ToArray();
+    }
+
+    static double ReadDouble(string[] tok, ref int p)
+        => double.Parse(tok[p++], NumberStyles.Float | NumberStyles.AllowThousands, CI);
+}
+```

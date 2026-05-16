@@ -1,1 +1,577 @@
-{'__exception__': "Can't run here - we're trying to get this working in codex."}
+Here's a single-file, compilable C# program that implements an adaptive greedy solver for the mining problem you described.
+
+High-level strategy
+- The program reads the voxel stream in the specified x,y,z order (z is innermost) while streaming, so it works for very large inputs without holding the full 3D grid in memory.
+- It keeps only per-(x,y) information needed for surface/top-layer decisions:
+  - surface height (# occupied voxels in that column),
+  - top voxel byte (d) and top voxel z-index (topZ).
+- Two modes depending on horizontal size (XVoxelCount * YVoxelCount):
+  - Small mode (area <= 2,000,000): run a full Dijkstra from the processing plant (0,0) over the XY grid to compute the minimal fuel-per-ton cost from every XY to the plant (respecting the slope constraint). Then pick top-layer ore voxels that provide positive profit (value*1000*mass - fuelCost*mass), sort by profit, and emit operations for as many as remain profitable. The program simulates digging (removing top voxel) and dumping at plant (voxel disappears), updating heights as it goes.
+  - Large mode (area > 2,000,000): avoid global Dijkstra (memory/time heavy). Instead, for each top-layer ore voxel, attempt a fast greedy path to (0,0) by walking to any neighbor that decreases Manhattan distance while respecting slope constraint and preferring non-uphill steps. If a feasible path is found compute fuel cost and accept the move only if profit is positive. This is much faster and memory-light.
+- The solver only digs top-layer voxels that are exposed from above (we track only top-layer voxels). This avoids handling collapse/complex connectivity. It only sends voxels with positive valuePerTonne to the processing plant (0,0). Non-valuable dirt is not dug in this simple solver.
+- Output format: First line M = number of operations. Then one line per operation:
+  N digX digY digZ stepX1 stepY1 ... stepXN stepYN destX destY
+  where N is the number of XY steps (Manhattan steps), digX,Y,Z are coordinates of the voxel dug (0-based), the step pairs are the successive XY cells traversed (first is adjacent to dig cell), and destX destY is the final destination (the last step; for plant operations its (0,0)).
+
+Notes and caveats
+- This is a heuristic solver optimized for correctness and scalability rather than guaranteed global optimality (which is combinatorially hard).
+- It only moves top-layer voxels (no multi-layer digging queued). That is a conservative but safe strategy given collapse constraints.
+- For smaller instances the Dijkstra-based approach produces better results. For large instances it runs a cheap greedy pathfinder.
+- The code is careful to be memory-efficient in the streaming input case.
+
+Code (single-file, compile with csc):
+
+```csharp
+using System;
+using System.IO;
+using System.Collections.Generic;
+using System.Text;
+
+class MiningSolver
+{
+    struct ColumnTop
+    {
+        public int height; // number of occupied voxels in the column
+        public byte topByte; // byte of the topmost voxel (0 if none)
+        public int topZ; // z-index of that top voxel (0-based), -1 if none
+    }
+
+    // Simple int-priority queue (min-heap)
+    class IntHeap
+    {
+        List<(int key, int val)> heap = new List<(int, int)>();
+        public int Count => heap.Count;
+        public void Push(int key, int val)
+        {
+            heap.Add((key, val));
+            int i = heap.Count - 1;
+            while (i > 0)
+            {
+                int p = (i - 1) >> 1;
+                if (heap[p].key <= heap[i].key) break;
+                var tmp = heap[p]; heap[p] = heap[i]; heap[i] = tmp;
+                i = p;
+            }
+        }
+        public (int key, int val) Pop()
+        {
+            var res = heap[0];
+            var last = heap[heap.Count - 1];
+            heap.RemoveAt(heap.Count - 1);
+            if (heap.Count > 0)
+            {
+                heap[0] = last;
+                int i = 0;
+                while (true)
+                {
+                    int l = i * 2 + 1;
+                    if (l >= heap.Count) break;
+                    int r = l + 1;
+                    int smallest = l;
+                    if (r < heap.Count && heap[r].key < heap[l].key) smallest = r;
+                    if (heap[smallest].key >= heap[i].key) break;
+                    var tmp = heap[i]; heap[i] = heap[smallest]; heap[smallest] = tmp;
+                    i = smallest;
+                }
+            }
+            return res;
+        }
+    }
+
+    static int XV, YV, ZV;
+    static double XBlock, YBlock, ZBlock;
+    static ColumnTop[] columns; // size XV*YV
+
+    static int Idx(int x, int y) => x * YV + y;
+
+    static bool InBounds(int x, int y) => x >= 0 && y >= 0 && x < XV && y < YV;
+
+    static void Main(string[] args)
+    {
+        // Read header from stdin (space-delimited line)
+        string header = Console.ReadLine();
+        if (string.IsNullOrWhiteSpace(header))
+        {
+            Console.WriteLine("0");
+            return;
+        }
+        var parts = header.Trim().Split(new char[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length < 6)
+        {
+            Console.WriteLine("0");
+            return;
+        }
+
+        XV = int.Parse(parts[0]);
+        YV = int.Parse(parts[1]);
+        ZV = int.Parse(parts[2]);
+        XBlock = double.Parse(parts[3], System.Globalization.CultureInfo.InvariantCulture);
+        YBlock = double.Parse(parts[4], System.Globalization.CultureInfo.InvariantCulture);
+        ZBlock = double.Parse(parts[5], System.Globalization.CultureInfo.InvariantCulture);
+
+        long area = (long)XV * (long)YV;
+
+        columns = new ColumnTop[XV * YV];
+        for (int i = 0; i < columns.Length; ++i)
+        {
+            columns[i].height = 0;
+            columns[i].topByte = 0;
+            columns[i].topZ = -1;
+        }
+
+        // Read voxel bytes in order x,y,z with z innermost:
+        // for x in range(XVoxelCount):
+        //   for y in range(YVoxelCount):
+        //     for z in range(ZVoxelCount):
+        //       d = readByte(stdin)
+        // We'll stream read bytes; if stdin ends early assume zeros.
+        Stream input = Console.OpenStandardInput();
+        int totalVoxels = XV * YV * ZV;
+        // We'll read using a small buffer
+        byte[] buffer = new byte[1 << 16];
+        int bufferLen = 0, bufferPos = 0;
+        Func<int> ReadByteSafe = () =>
+        {
+            if (bufferPos >= bufferLen)
+            {
+                bufferLen = input.Read(buffer, 0, buffer.Length);
+                bufferPos = 0;
+                if (bufferLen <= 0) return -1;
+            }
+            return buffer[bufferPos++];
+        };
+
+        // Because reading order has z innermost, we can count heights and record last non-zero d as top byte and its z.
+        for (int x = 0; x < XV; ++x)
+        {
+            for (int y = 0; y < YV; ++y)
+            {
+                int nonzeroCount = 0;
+                int lastNonzeroZ = -1;
+                byte lastByte = 0;
+                for (int z = 0; z < ZV; ++z)
+                {
+                    int b = ReadByteSafe();
+                    if (b == -1) // missing bytes => treat as 0
+                    {
+                        b = 0;
+                    }
+                    if (b != 0)
+                    {
+                        nonzeroCount++;
+                        lastNonzeroZ = z;
+                        lastByte = (byte)b;
+                    }
+                }
+                int id = Idx(x, y);
+                columns[id].height = nonzeroCount;
+                columns[id].topZ = lastNonzeroZ;
+                columns[id].topByte = lastByte;
+            }
+        }
+
+        // Prepare list of output operations (strings)
+        List<string> operations = new List<string>();
+
+        // Decide mode
+        long SMALL_MODE_LIMIT = 2_000_000; // area threshold for full Dijkstra
+        if (area <= SMALL_MODE_LIMIT)
+        {
+            RunSmallMode(operations);
+        }
+        else
+        {
+            RunLargeMode(operations);
+        }
+
+        // Emit output
+        StringBuilder sb = new StringBuilder();
+        sb.AppendLine(operations.Count.ToString());
+        foreach (var op in operations) sb.AppendLine(op);
+        Console.Write(sb.ToString());
+    }
+
+    static void RunSmallMode(List<string> operations)
+    {
+        // Build height map and top data arrays
+        int n = XV * YV;
+        int[] height = new int[n];
+        byte[] topByte = new byte[n];
+        int[] topZ = new int[n];
+        for (int x = 0; x < XV; ++x)
+            for (int y = 0; y < YV; ++y)
+            {
+                int id = Idx(x, y);
+                height[id] = columns[id].height;
+                topByte[id] = columns[id].topByte;
+                topZ[id] = columns[id].topZ;
+            }
+
+        // Dijkstra from processing plant (0,0) computing cost per TON to bring mass from any node to plant.
+        // Edge weight from neighbor nb -> cur is:
+        //   if height[cur] - height[nb] > 1 or < -1 => edge disallowed (slope constraint)
+        //   else if height[cur] > height[nb] => uphill for nb->cur => cost 5
+        //   else if equal => cost 1
+        //   else (downhill) => cost 0
+        const int INF = int.MaxValue / 4;
+        int[] dist = new int[n];
+        for (int i = 0; i < n; ++i) dist[i] = INF;
+        int[] prev = new int[n];
+        for (int i = 0; i < n; ++i) prev[i] = -1;
+
+        int src = Idx(0, 0);
+        dist[src] = 0;
+        IntHeap pq = new IntHeap();
+        pq.Push(0, src);
+        var neighbors = new (int dx, int dy)[] { (1, 0), (-1, 0), (0, 1), (0, -1) };
+
+        while (pq.Count > 0)
+        {
+            var top = pq.Pop();
+            int dcur = top.key;
+            int u = top.val;
+            if (dcur != dist[u]) continue;
+            int ux = u / YV, uy = u % YV;
+            int hcur = height[u];
+            foreach (var nb in neighbors)
+            {
+                int vx = ux + nb.dx, vy = uy + nb.dy;
+                if (!InBounds(vx, vy)) continue;
+                int v = Idx(vx, vy);
+                int hv = height[v];
+                int diff = hcur - hv; // note: weight for v->u uses hcur vs hv
+                if (Math.Abs(diff) > 1) continue; // slope too steep (for v->u movement)
+                int w;
+                if (hcur > hv) w = 5;
+                else if (hcur == hv) w = 1;
+                else w = 0;
+                int nd = dcur + w;
+                if (nd < dist[v])
+                {
+                    dist[v] = nd;
+                    prev[v] = u; // moving from v to u (towards plant)
+                    pq.Push(nd, v);
+                }
+            }
+        }
+
+        // Now evaluate profitable top-layer ore voxels
+        var candidates = new List<(long profit, int x, int y, int mass, int value, int z)>();
+
+        for (int x = 0; x < XV; ++x)
+            for (int y = 0; y < YV; ++y)
+            {
+                int id = Idx(x, y);
+                byte d = topByte[id];
+                if (d == 0) continue;
+                int mass = d % 16;
+                int value = d / 16;
+                if (mass <= 0 || value <= 0) continue;
+                int fuelCostPerTon;
+                if (dist[id] >= INF) continue; // unreachable respecting slope constraint
+                fuelCostPerTon = dist[id];
+                long revenue = (long)mass * (long)value * 1000L;
+                long fuelTotal = (long)mass * (long)fuelCostPerTon;
+                long profit = revenue - fuelTotal;
+                if (profit > 0)
+                {
+                    candidates.Add((profit, x, y, mass, value, topZ[id]));
+                }
+            }
+
+        // Sort by descending profit to choose best first
+        candidates.Sort((a, b) => b.profit.CompareTo(a.profit));
+
+        // For each candidate, reconstruct path using prev[] until reaching plant and output operation.
+        // Update heights and topByte/topZ arrays when we remove top voxel (dig) and when we dump to plant (voxel disappears).
+        foreach (var cand in candidates)
+        {
+            int x = cand.x, y = cand.y;
+            int id = Idx(x, y);
+            // Validate that the top voxel is still the same (still top layer) and still ore with same mass/value
+            byte curTop = topByte[id];
+            int curTopZ = topZ[id];
+            if (curTop == 0) continue;
+            int curMass = curTop % 16;
+            int curValue = curTop / 16;
+            if (curMass <= 0 || curValue <= 0) continue;
+
+            if (dist[id] >= INF) continue; // maybe became unreachable
+            // Reconstruct path from this node to plant using prev[] pointers:
+            List<(int, int)> path = new List<(int, int)>();
+            int cur = id;
+            // We will push successive nodes after starting node until reaching plant (expected prev chain to reach src)
+            int stepsLimit = XV * YV + 5;
+            int safety = 0;
+            while (cur != src && prev[cur] != -1 && safety < stepsLimit)
+            {
+                int next = prev[cur];
+                int nx = next / YV, ny = next % YV;
+                path.Add((nx, ny));
+                cur = next;
+                safety++;
+            }
+            if (cur != src) continue; // couldn't find path
+            // Verify slope constraint along path with current heights
+            bool ok = true;
+            int sx = x, sy = y;
+            int startId = Idx(sx, sy);
+            int lastH = height[startId]; // current top-layer height here
+            // Note: We are about to dig the top voxel, which will reduce height by 1 at start column.
+            int afterDigHeightStart = Math.Max(0, lastH - 1);
+            int prevH = afterDigHeightStart; // assume movement starts with start height after dig
+            int currX = sx, currY = sy;
+            foreach (var step in path)
+            {
+                int nx = step.Item1, ny = step.Item2;
+                int nid = Idx(nx, ny);
+                int nh = height[nid];
+                // slope constraint for moving from (currX,currY) to (nx,ny) when carrying: difference between nh and prevH must be <= 1
+                if (Math.Abs(nh - prevH) > 1)
+                {
+                    ok = false; break;
+                }
+                prevH = nh;
+                currX = nx; currY = ny;
+            }
+            if (!ok) continue;
+
+            // Compute fuel cost per ton along this path with current heights
+            int fuelPerTon = 0;
+            prevH = afterDigHeightStart;
+            currX = sx; currY = sy;
+            foreach (var step in path)
+            {
+                int nx = step.Item1, ny = step.Item2;
+                int nid = Idx(nx, ny);
+                int nh = height[nid];
+                if (nh > prevH) fuelPerTon += 5;
+                else if (nh == prevH) fuelPerTon += 1;
+                else fuelPerTon += 0;
+                prevH = nh;
+                currX = nx; currY = ny;
+            }
+
+            long fuelTotal = (long)curMass * (long)fuelPerTon;
+            long revenue = (long)curMass * (long)curValue * 1000L;
+            long profit = revenue - fuelTotal;
+            if (profit <= 0) continue;
+
+            // OK, output operation. Dig coordinates are x y z (z = curTopZ)
+            int N = path.Count;
+            StringBuilder line = new StringBuilder();
+            line.Append(N);
+            line.Append(' ');
+            line.Append(x); line.Append(' ');
+            line.Append(y); line.Append(' ');
+            line.Append(curTopZ >= 0 ? curTopZ : (columns[Idx(x, y)].height - 1));
+            // steps
+            foreach (var s in path)
+            {
+                line.Append(' ');
+                line.Append(s.Item1);
+                line.Append(' ');
+                line.Append(s.Item2);
+            }
+            // dest (plant)
+            line.Append(' ');
+            line.Append(0);
+            line.Append(' ');
+            line.Append(0);
+            operations.Add(line.ToString());
+
+            // Simulate removal: at dig column, height-- and topByte/topZ need update.
+            // We only tracked top byte; after removing top, we don't know the new top byte. Set topByte to 0 and topZ = height-1 (unknown)
+            int id0 = Idx(x, y);
+            height[id0] = Math.Max(0, height[id0] - 1);
+            if (height[id0] == 0)
+            {
+                topByte[id0] = 0;
+                topZ[id0] = -1;
+            }
+            else
+            {
+                // We don't have deeper-layer data in streaming approach, set topByte to 0 (unknown), topZ to height-1.
+                topByte[id0] = 0;
+                topZ[id0] = height[id0] - 1;
+            }
+
+            // Dumping at plant removes voxel (no height change at plant).
+            // But for safety, ensure plant's column topByte/topZ reflect removal/no change: nothing to do.
+
+            // After changing heights, dist[] might become stale, but we do NOT recompute Dijkstra to save time.
+            // This is a heuristic solver that hopes changes don't invalidate many future paths.
+        }
+    }
+
+    static void RunLargeMode(List<string> operations)
+    {
+        // Greedy local pathfinder for large maps: for each top-layer ore voxel, try to walk greedily toward plant.
+        // This avoids global Dijkstra and keeps memory usage low.
+
+        int[] height = new int[XV * YV];
+        byte[] topByte = new byte[XV * YV];
+        int[] topZ = new int[XV * YV];
+        for (int x = 0; x < XV; ++x)
+            for (int y = 0; y < YV; ++y)
+            {
+                int id = Idx(x, y);
+                height[id] = columns[id].height;
+                topByte[id] = columns[id].topByte;
+                topZ[id] = columns[id].topZ;
+            }
+
+        var neighbors = new (int dx, int dy)[] { (1, 0), (-1, 0), (0, 1), (0, -1) };
+
+        // For speed, collect all top-layer ore candidates
+        var candidates = new List<(int x, int y, int mass, int value, int z)>();
+        for (int x = 0; x < XV; ++x)
+            for (int y = 0; y < YV; ++y)
+            {
+                int id = Idx(x, y);
+                byte d = topByte[id];
+                if (d == 0) continue;
+                int mass = d % 16;
+                int value = d / 16;
+                if (mass <= 0 || value <= 0) continue;
+                candidates.Add((x, y, mass, value, topZ[id]));
+            }
+
+        // Sort by potential revenue (mass * value) descending so we try best ore first
+        candidates.Sort((a, b) => (b.mass * b.value).CompareTo(a.mass * a.value));
+
+        foreach (var cand in candidates)
+        {
+            int sx = cand.x, sy = cand.y;
+            int id0 = Idx(sx, sy);
+            byte curTop = topByte[id0];
+            if (curTop == 0) continue;
+            int mass = curTop % 16;
+            int value = curTop / 16;
+            if (mass <= 0 || value <= 0) continue;
+
+            // Greedy path: at each step choose neighbor that reduces Manhattan distance to (0,0),
+            // respects slope constraint vs current carried height, and prefers non-uphill moves.
+            List<(int, int)> path = new List<(int, int)>();
+            HashSet<int> visited = new HashSet<int>();
+            int curX = sx, curY = sy;
+            int startHeight = Math.Max(0, height[id0] - 1); // after dig, starting height
+            int prevH = startHeight;
+            bool failed = false;
+            int maxSteps = XV + YV + 5;
+            for (int iter = 0; iter < maxSteps; ++iter)
+            {
+                if (curX == 0 && curY == 0) break;
+                // consider neighbors that decrease Manhattan distance
+                int bestScore = int.MinValue;
+                int bestNX = 0, bestNY = 0;
+                int bestNh = 0;
+                foreach (var nb in neighbors)
+                {
+                    int nx = curX + nb.dx, ny = curY + nb.dy;
+                    if (!InBounds(nx, ny)) continue;
+                    int nid = Idx(nx, ny);
+                    int nh = height[nid];
+                    if (Math.Abs(nh - prevH) > 1) continue;
+                    // prefer neighbor that reduces manhattan distance
+                    int oldDist = Math.Abs(curX - 0) + Math.Abs(curY - 0);
+                    int newDist = Math.Abs(nx - 0) + Math.Abs(ny - 0);
+                    if (newDist >= oldDist) continue;
+                    // scoring: prefer downhill (0), flat (1), uphill (-1) but uphill allowed (but costs more)
+                    int slopeScore = 0;
+                    if (nh > prevH) slopeScore = -2;
+                    else if (nh == prevH) slopeScore = 1;
+                    else slopeScore = 2;
+                    int score = (oldDist - newDist) * 100 + slopeScore;
+                    // avoid cycles
+                    if (visited.Contains(nid)) score -= 10000;
+                    if (score > bestScore)
+                    {
+                        bestScore = score;
+                        bestNX = nx; bestNY = ny; bestNh = nh;
+                    }
+                }
+                if (bestScore == int.MinValue)
+                {
+                    failed = true; break;
+                }
+                // move
+                path.Add((bestNX, bestNY));
+                visited.Add(Idx(bestNX, bestNY));
+                prevH = bestNh;
+                curX = bestNX; curY = bestNY;
+                if (curX == 0 && curY == 0) break;
+            }
+            if (failed) continue;
+            if (curX != 0 || curY != 0) continue; // didn't reach plant
+
+            // verify slope constraints along path again just in case
+            prevH = startHeight;
+            bool ok = true;
+            foreach (var step in path)
+            {
+                int nid = Idx(step.Item1, step.Item2);
+                int nh = height[nid];
+                if (Math.Abs(nh - prevH) > 1) { ok = false; break; }
+                prevH = nh;
+            }
+            if (!ok) continue;
+
+            // compute fuel per ton
+            int fuelPerTon = 0;
+            prevH = startHeight;
+            foreach (var step in path)
+            {
+                int nh = height[Idx(step.Item1, step.Item2)];
+                if (nh > prevH) fuelPerTon += 5;
+                else if (nh == prevH) fuelPerTon += 1;
+                else fuelPerTon += 0;
+                prevH = nh;
+            }
+
+            long revenue = (long)mass * (long)value * 1000L;
+            long fuelTotal = (long)mass * (long)fuelPerTon;
+            long profit = revenue - fuelTotal;
+            if (profit <= 0) continue;
+
+            // Emit operation
+            int N = path.Count;
+            StringBuilder line = new StringBuilder();
+            line.Append(N);
+            line.Append(' ');
+            line.Append(sx); line.Append(' ');
+            line.Append(sy); line.Append(' ');
+            line.Append(cand.z >= 0 ? cand.z : (columns[Idx(sx, sy)].height - 1));
+            foreach (var s in path)
+            {
+                line.Append(' ');
+                line.Append(s.Item1);
+                line.Append(' ');
+                line.Append(s.Item2);
+            }
+            line.Append(' ');
+            line.Append(0); line.Append(' '); line.Append(0);
+            operations.Add(line.ToString());
+
+            // simulate removal
+            height[id0] = Math.Max(0, height[id0] - 1);
+            if (height[id0] == 0)
+            {
+                topByte[id0] = 0; topZ[id0] = -1;
+            }
+            else
+            {
+                topByte[id0] = 0; topZ[id0] = height[id0] - 1;
+            }
+            // dumping at plant removes the voxel (no heap update)
+        }
+    }
+}
+```
+
+How to use
+- Compile with csc:
+  csc /nologo /optimize MiningSolver.cs
+- Run and provide the input stream exactly as your problem statement describes.
+
+If you want improvements or different heuristics (e.g., allow digging multiple layers, recomputing Dijkstra after each dump, building dedicated dump piles to keep slopes navigable, or more aggressive optimization), tell me the expected typical problem sizes and I can adapt the strategy (e.g., recompute global shortest paths periodically, or do local A* per ore voxel).

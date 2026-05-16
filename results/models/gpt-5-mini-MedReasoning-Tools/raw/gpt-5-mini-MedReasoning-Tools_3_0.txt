@@ -1,1 +1,476 @@
-{'__exception__': "Can't run here - we're trying to get this working in codex."}
+Here's a single-file Rust solver that adapts across graph sizes and densities. It uses:
+
+- Fruchterman–Reingold (force-directed) for small/medium components (good quality, moderate time).
+- A scalable diffusion / randomized spectral embedding for large components (sparse matrix-vector multiplies, linear in edges).
+- Per-component placement on a grid to avoid overlap, handling isolated nodes and disconnected components, ignoring self-loops safely (they are allowed but don't break algorithms), and naturally tolerating parallel edges.
+- Efficient memory usage and no external crates (works with the toolchain you specified).
+
+Copy, compile (rustc 1.92+), and run. It reads from stdin and prints N lines of "x y". The code is commented but kept compact.
+
+```rust
+use std::io::{self, Read};
+use std::time::Instant;
+
+// Simple RNG (splitmix64)
+#[derive(Clone)]
+struct Rng {
+    s: u64,
+}
+impl Rng {
+    fn new(seed: u64) -> Self { Self { s: seed.wrapping_add(0x9e3779b97f4a7c15) } }
+    fn next_u64(&mut self) -> u64 {
+        let mut z = { self.s = self.s.wrapping_add(0x9e3779b97f4a7c15); self.s };
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+        z ^ (z >> 31)
+    }
+    fn next_f64(&mut self) -> f64 {
+        let u = self.next_u64() >> 11;
+        (u as f64) * (1.0 / ((1u64 << 53) as f64))
+    }
+}
+
+fn parse_input() -> (usize, usize, Vec<(usize, usize)>) {
+    let mut s = String::new();
+    io::stdin().read_to_string(&mut s).unwrap();
+    let mut it = s.split_whitespace();
+    let n: usize = it.next().unwrap().parse().unwrap();
+    let m: usize = it.next().unwrap().parse().unwrap();
+    let mut edges = Vec::with_capacity(m);
+    for _ in 0..m {
+        if let (Some(a), Some(b)) = (it.next(), it.next()) {
+            let u: usize = a.parse().unwrap();
+            let v: usize = b.parse().unwrap();
+            edges.push((u, v));
+        }
+    }
+    (n, m, edges)
+}
+
+fn build_adj(n: usize, edges: &[(usize, usize)]) -> Vec<Vec<usize>> {
+    let mut adj = vec![Vec::new(); n];
+    for &(u, v) in edges {
+        if u < n && v < n {
+            adj[u].push(v);
+            if u != v { adj[v].push(u); } // undirected; if self-loop, add once
+        }
+    }
+    adj
+}
+
+fn components(adj: &Vec<Vec<usize>>) -> Vec<Vec<usize>> {
+    let n = adj.len();
+    let mut seen = vec![false; n];
+    let mut comps = Vec::new();
+    let mut stack = Vec::new();
+    for i in 0..n {
+        if !seen[i] {
+            stack.push(i);
+            seen[i] = true;
+            let mut comp = Vec::new();
+            while let Some(u) = stack.pop() {
+                comp.push(u);
+                for &w in &adj[u] {
+                    if !seen[w] {
+                        seen[w] = true;
+                        stack.push(w);
+                    }
+                }
+            }
+            comps.push(comp);
+        }
+    }
+    comps
+}
+
+// Small force-directed layout (Fruchterman-Reingold). Local indices.
+fn layout_force_directed(nodes: &Vec<usize>, adj: &Vec<Vec<usize>>, rng: &mut Rng) -> Vec<(f64, f64)> {
+    let n = nodes.len();
+    if n == 0 { return vec![]; }
+    if n == 1 { return vec![(0.0, 0.0)]; }
+
+    // map global node -> local idx
+    let mut map = std::collections::HashMap::with_capacity(n);
+    for (i, &g) in nodes.iter().enumerate() { map.insert(g, i); }
+    let mut ladj: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (i, &g) in nodes.iter().enumerate() {
+        for &nbr in &adj[g] {
+            if let Some(&li) = map.get(&nbr) {
+                ladj[i].push(li);
+            }
+        }
+    }
+
+    // init positions in random box [-1,1]
+    let mut pos = vec![(0.0f64, 0.0f64); n];
+    for i in 0..n {
+        pos[i].0 = (rng.next_f64() * 2.0 - 1.0) * 0.5;
+        pos[i].1 = (rng.next_f64() * 2.0 - 1.0) * 0.5;
+    }
+
+    let area = (n as f64).max(1.0);
+    let mut k = (area).sqrt();
+    // adapt iterations to size
+    let iters = if n <= 50 { 500 } else if n <= 200 { 300 } else if n <= 1000 { 200 } else { 150 };
+    let mut t = k; // temperature
+    let dt = t / (iters as f64 + 1.0);
+
+    for _ in 0..iters {
+        let mut disp = vec![(0.0f64, 0.0f64); n];
+        // repulsive forces O(n^2)
+        for i in 0..n {
+            for j in (i+1)..n {
+                let dx = pos[i].0 - pos[j].0;
+                let dy = pos[i].1 - pos[j].1;
+                let mut dist2 = dx*dx + dy*dy + 1e-9;
+                let dist = dist2.sqrt();
+                let force = (k * k) / dist;
+                let ux = dx / dist;
+                let uy = dy / dist;
+                disp[i].0 += ux * force;
+                disp[i].1 += uy * force;
+                disp[j].0 -= ux * force;
+                disp[j].1 -= uy * force;
+            }
+        }
+        // attractive forces
+        for u in 0..n {
+            for &v in &ladj[u] {
+                if v <= u { continue; } // edge processed twice if we don't guard
+                let dx = pos[u].0 - pos[v].0;
+                let dy = pos[u].1 - pos[v].1;
+                let dist = (dx*dx + dy*dy + 1e-9).sqrt();
+                let force = (dist * dist) / k;
+                let ux = dx / dist;
+                let uy = dy / dist;
+                disp[u].0 -= ux * force;
+                disp[u].1 -= uy * force;
+                disp[v].0 += ux * force;
+                disp[v].1 += uy * force;
+            }
+        }
+        // apply displacements
+        for i in 0..n {
+            let dx = disp[i].0;
+            let dy = disp[i].1;
+            let dist = (dx*dx + dy*dy).sqrt();
+            if dist > 1e-9 {
+                let minr = dist.min(t);
+                pos[i].0 += dx / dist * minr;
+                pos[i].1 += dy / dist * minr;
+            }
+            // small jitter
+            pos[i].0 += (rng.next_f64() - 0.5) * 1e-6;
+            pos[i].1 += (rng.next_f64() - 0.5) * 1e-6;
+        }
+        t -= dt;
+        if t <= 1e-6 { break; }
+    }
+
+    pos
+}
+
+// Jacobi eigen-decomposition for small symmetric matrix (k x k).
+fn jacobi_eigen(mut a: Vec<Vec<f64>>, eps: f64, max_iter: usize) -> (Vec<f64>, Vec<Vec<f64>>) {
+    let k = a.len();
+    let mut v = vec![vec![0.0f64; k]; k];
+    for i in 0..k { v[i][i] = 1.0; }
+    for _ in 0..max_iter {
+        // find largest off-diagonal
+        let mut p = 0usize;
+        let mut q = 1usize;
+        let mut max_off = 0.0f64;
+        for i in 0..k {
+            for j in (i+1)..k {
+                let val = a[i][j].abs();
+                if val > max_off {
+                    max_off = val;
+                    p = i; q = j;
+                }
+            }
+        }
+        if max_off < eps { break; }
+        let apq = a[p][q];
+        let app = a[p][p];
+        let aqq = a[q][q];
+        let phi = 0.5 * ((2.0 * apq) / (aqq - app)).atan();
+        let c = phi.cos();
+        let s = phi.sin();
+        // rotate
+        for i in 0..k {
+            if i != p && i != q {
+                let aip = a[i][p];
+                let aiq = a[i][q];
+                a[i][p] = c * aip - s * aiq;
+                a[p][i] = a[i][p];
+                a[i][q] = s * aip + c * aiq;
+                a[q][i] = a[i][q];
+            }
+        }
+        let new_pp = c*c*app - 2.0*s*c*apq + s*s*aqq;
+        let new_qq = s*s*app + 2.0*s*c*apq + c*c*aqq;
+        a[p][p] = new_pp;
+        a[q][q] = new_qq;
+        a[p][q] = 0.0;
+        a[q][p] = 0.0;
+        // update eigenvectors
+        for i in 0..k {
+            let vip = v[i][p];
+            let viq = v[i][q];
+            v[i][p] = c * vip - s * viq;
+            v[i][q] = s * vip + c * viq;
+        }
+    }
+    let mut vals = vec![0.0f64; k];
+    for i in 0..k { vals[i] = a[i][i]; }
+    (vals, v)
+}
+
+// Diffusion / randomized spectral embedding for larger components
+fn layout_diffusion(nodes: &Vec<usize>, adj: &Vec<Vec<usize>>, rng: &mut Rng) -> Vec<(f64, f64)> {
+    let n = nodes.len();
+    if n == 0 { return vec![]; }
+    if n == 1 { return vec![(0.0, 0.0)]; }
+    // map global -> local
+    let mut map = vec![usize::MAX; adj.len()];
+    for (i, &g) in nodes.iter().enumerate() { map[g] = i; }
+    let mut ladj: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (i, &g) in nodes.iter().enumerate() {
+        for &nbr in &adj[g] {
+            if map[nbr] != usize::MAX {
+                ladj[i].push(map[nbr]);
+            }
+        }
+    }
+    let mut deg = vec![0usize; n];
+    for i in 0..n { deg[i] = ladj[i].len(); }
+
+    // parameters adapt to size
+    let k = 8usize.min(n); // embedding dim
+    let t_iters = if n < 1000 { 20 } else if n < 10000 { 25 } else { 30 };
+
+    // X: N x k
+    let mut x = vec![vec![0.0f64; k]; n];
+    for i in 0..n {
+        for j in 0..k {
+            x[i][j] = rng.next_f64() * 2.0 - 1.0;
+        }
+    }
+
+    // iterate X <- average(neighbors) ; isolated nodes keep their vector
+    let mut x_new = vec![vec![0.0f64; k]; n];
+    for _ in 0..t_iters {
+        for i in 0..n {
+            if deg[i] == 0 {
+                // keep
+                for j in 0..k { x_new[i][j] = x[i][j]; }
+            } else {
+                for j in 0..k { x_new[i][j] = 0.0; }
+                for &nbr in &ladj[i] {
+                    for j in 0..k {
+                        x_new[i][j] += x[nbr][j];
+                    }
+                }
+                let inv = 1.0f64 / (deg[i] as f64);
+                for j in 0..k { x_new[i][j] *= inv; }
+            }
+        }
+        // swap
+        std::mem::swap(&mut x, &mut x_new);
+
+        // Orthogonalize columns (Gram-Schmidt) across nodes to avoid collapse
+        // We treat x as N x k; orthonormalize its k columns.
+        // We'll perform classical GS on columns by walking through nodes to compute dot products.
+        // Compute col norms and subtract projections.
+        for a in 0..k {
+            // normalize column a
+            let mut norm = 0.0;
+            for i in 0..n { norm += x[i][a] * x[i][a]; }
+            norm = norm.sqrt().max(1e-12);
+            for i in 0..n { x[i][a] /= norm; }
+            // subtract projection from subsequent columns
+            for b in (a+1)..k {
+                let mut dot = 0.0;
+                for i in 0..n { dot += x[i][a] * x[i][b]; }
+                for i in 0..n { x[i][b] -= dot * x[i][a]; }
+            }
+        }
+        // renormalize all columns to unit (optional)
+        for a in 0..k {
+            let mut norm = 0.0;
+            for i in 0..n { norm += x[i][a] * x[i][a]; }
+            norm = norm.sqrt().max(1e-12);
+            for i in 0..n { x[i][a] /= norm; }
+        }
+    }
+
+    // compute covariance C = X^T X (k x k)
+    let mut c = vec![vec![0.0f64; k]; k];
+    for a in 0..k {
+        for b in 0..k {
+            let mut s = 0.0;
+            for i in 0..n { s += x[i][a] * x[i][b]; }
+            c[a][b] = s;
+        }
+    }
+
+    // eigen-decompose C
+    let (vals, vecs) = jacobi_eigen(c, 1e-9, 1000);
+    // pick top two eigenvectors by eigenvalue
+    let mut idxs: Vec<usize> = (0..k).collect();
+    idxs.sort_by(|&i, &j| vals[j].partial_cmp(&vals[i]).unwrap());
+    let comp0 = idxs[0];
+    let comp1 = if k > 1 { idxs[1] } else { comp0 };
+
+    // eigenvectors are columns of vecs (v[i][j] = ith row, jth col)
+    // project X onto these two eigenvectors
+    let mut coords = vec![(0.0f64, 0.0f64); n];
+    for i in 0..n {
+        let mut x0 = 0.0;
+        let mut x1 = 0.0;
+        for a in 0..k {
+            let ev0 = vecs[a][comp0];
+            let ev1 = vecs[a][comp1];
+            x0 += x[i][a] * ev0;
+            x1 += x[i][a] * ev1;
+        }
+        coords[i] = (x0, x1);
+    }
+
+    coords
+}
+
+fn main() {
+    let start_time = Instant::now();
+    let (n, _m, edges) = parse_input();
+    let adj = build_adj(n, &edges);
+    let comps = components(&adj);
+
+    let mut rng = Rng::new((n as u64).wrapping_mul(6364136223846793005u64).wrapping_add(1442695040888963407u64));
+
+    // thresholds
+    let small_threshold = 3000usize; // components <= this use force-directed
+    let mut coords = vec![(0.0f64, 0.0f64); n];
+
+    // layout each component separately
+    let mut comp_boxes = Vec::new(); // (width, height, center_x, center_y)
+    let mut comp_coords: Vec<Vec<(f64,f64)>> = Vec::new();
+
+    for comp in &comps {
+        let compn = comp.len();
+        if compn == 1 {
+            comp_coords.push(vec![(0.0, 0.0)]);
+            comp_boxes.push((1.0, 1.0, 0.0, 0.0));
+            continue;
+        }
+        if compn <= small_threshold {
+            let pts = layout_force_directed(comp, &adj, &mut rng);
+            // compute bounding box
+            let mut minx = pts[0].0;
+            let mut maxx = pts[0].0;
+            let mut miny = pts[0].1;
+            let mut maxy = pts[0].1;
+            for &(x,y) in &pts {
+                if x < minx { minx = x; }
+                if x > maxx { maxx = x; }
+                if y < miny { miny = y; }
+                if y > maxy { maxy = y; }
+            }
+            let w = (maxx - minx).max(1e-6);
+            let h = (maxy - miny).max(1e-6);
+            let cx = (minx + maxx) * 0.5;
+            let cy = (miny + maxy) * 0.5;
+            comp_coords.push(pts);
+            comp_boxes.push((w, h, cx, cy));
+        } else {
+            // large component: diffusion embedding
+            let pts = layout_diffusion(comp, &adj, &mut rng);
+            // compute bounding box
+            let mut minx = pts[0].0;
+            let mut maxx = pts[0].0;
+            let mut miny = pts[0].1;
+            let mut maxy = pts[0].1;
+            for &(x,y) in &pts {
+                if x < minx { minx = x; }
+                if x > maxx { maxx = x; }
+                if y < miny { miny = y; }
+                if y > maxy { maxy = y; }
+            }
+            // normalize scale for better spacing
+            let w = (maxx - minx).max(1e-6);
+            let h = (maxy - miny).max(1e-6);
+            let cx = (minx + maxx) * 0.5;
+            let cy = (miny + maxy) * 0.5;
+            comp_coords.push(pts);
+            comp_boxes.push((w, h, cx, cy));
+        }
+        // quick time cutoff (safety)
+        if start_time.elapsed().as_secs_f64() > 28.0 {
+            break;
+        }
+    }
+
+    // Place components on a coarse grid to avoid overlap
+    let comps_count = comp_coords.len();
+    let mut total_area = 0.0;
+    let mut max_dim = 0.0;
+    for (w,h,_,_) in &comp_boxes {
+        total_area += w * h;
+        max_dim = max_dim.max(w).max(*h);
+    }
+    if max_dim < 1e-8 { max_dim = 1.0; }
+    let grid_spacing = max_dim * 3.0;
+    let cols = (comps_count as f64).sqrt().ceil() as usize;
+    let mut cx = 0usize;
+    let mut cy = 0usize;
+
+    for (ci, comp) in comps.iter().enumerate() {
+        if ci != 0 && ci % cols == 0 { cx = 0; cy += 1; }
+        let offx = (cx as f64) * grid_spacing;
+        let offy = (cy as f64) * grid_spacing;
+        let (w,h,bbcx,bbcy) = comp_boxes[ci];
+        let pts = &comp_coords[ci];
+        // scale small components a bit for visual spacing
+        let scale = 1.0f64.max(1.0 / ((w.max(h)) + 1e-9) * 1.0);
+        for (i, &g) in comp.iter().enumerate() {
+            let px = (pts[i].0 - bbcx) * scale + offx;
+            let py = (pts[i].1 - bbcy) * scale + offy;
+            coords[g] = (px, py);
+        }
+        cx += 1;
+    }
+
+    // If earlier time cutoff occurred and some components weren't processed, assign random positions
+    if comp_coords.len() < comps.len() {
+        for idx in comp_coords.len()..comps.len() {
+            for &g in &comps[idx] {
+                coords[g] = (rng.next_f64() * 1000.0, rng.next_f64() * 1000.0);
+            }
+        }
+    }
+
+    // Output: N lines of x y
+    // optional: print N first? Problem said optional. We'll not print N to be safe.
+    let mut out = String::new();
+    for i in 0..n {
+        out.push_str(&format!("{} {}\n", coords[i].0, coords[i].1));
+    }
+    print!("{}", out);
+}
+```
+
+Notes and rationale:
+- Small components (<= ~3000 nodes) get a direct force-directed layout with a moderate number of iterations for quality.
+- Large components use a diffusion-based embedding (sparse averaging / random-projection + PCA on a small k) which is O(M * k * t) per component and scales linearly with edges. This gives structure-preserving coordinates quickly for huge graphs.
+- Components are placed on a coarse grid to avoid overlapping components.
+- The code is single-file, uses no external crates, and is deterministic with a seed based on N (changeable).
+- Time-safety: there's a soft time-check to avoid running past ~28s; unprocessed components will get random coordinates if a timeout is approached.
+- Robust to isolated nodes (degree 0), self-loops, and parallel edges.
+
+If you'd like:
+- Tuned parameters for a particular size range (more iterations for quality on medium graphs, fewer for speed).
+- Output normalization to a specific bounding box (e.g., [-1,1]²).
+- Deterministic randomness using a fixed seed.
+- Faster/approximate repulsion (Barnes-Hut) for mid-large components.
+
+Tell me what to tune (quality vs. speed), and I can adjust the parameters or add further optimizations.

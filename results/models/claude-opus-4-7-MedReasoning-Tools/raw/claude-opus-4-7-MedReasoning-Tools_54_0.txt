@@ -1,1 +1,398 @@
-{'__exception__': '{"type":"result","subtype":"success","is_error":true,"api_error_status":529,"duration_ms":205697,"duration_api_ms":986,"num_turns":1,"result":"API Error: 529 Overloaded. This is a server-side issue, usually temporary — try again in a moment. If it persists, check status.claude.com.","stop_reason":"stop_sequence","session_id":"80d0fad7-8942-4318-9d68-792db38e4b2a","total_cost_usd":0.000493,"usage":{"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":0,"server_tool_use":{"web_search_requests":0,"web_fetch_requests":0},"service_tier":"standard","cache_creation":{"ephemeral_1h_input_tokens":0,"ephemeral_5m_input_tokens":0},"inference_geo":"","iterations":[],"speed":"standard"},"modelUsage":{"claude-haiku-4-5-20251001":{"inputTokens":428,"outputTokens":13,"cacheReadInputTokens":0,"cacheCreationInputTokens":0,"webSearchRequests":0,"costUSD":0.000493,"contextWindow":200000,"maxOutputTokens":32000}},"permission_denials":[],"terminal_reason":"completed","fast_mode_state":"off","uuid":"947b0eee-2ced-41ab-ad14-88c643c38cfb"}'}
+"""
+Autoland autopilot for ILS approach. Single function autopilot_step
+handles all 25 benchmark scenarios via sensor fusion, phased control
+laws (intercept / approach / flare / rollout), and a go-around branch.
+"""
+
+import math
+
+# Persistent module-level state (sim resets between scenarios / go-arounds)
+_S = {
+    "t": 0.0,
+    "phase": "intercept",
+    "go_arounds": 0,
+    "ga_active": False,
+    "ga_peak_alt": 0.0,
+    "touched_down": False,
+    "td_time": None,
+    "prev_gs": 0.0,
+    "prev_loc": 0.0,
+    "prev_ias_err": 0.0,
+    "i_ias": 0.0,
+    "i_gs": 0.0,
+    "i_loc": 0.0,
+    "last_radio_alt": None,
+    "last_baro_alt": None,
+    "last_vs": 0.0,
+    "gear_down": False,
+}
+
+
+# --- helpers ---------------------------------------------------------------
+def _median(vs):
+    s = sorted(vs)
+    n = len(s)
+    if n == 0:
+        return None
+    return s[n // 2] if n % 2 else 0.5 * (s[n // 2 - 1] + s[n // 2])
+
+
+def _voted(triples, default=None, max_spread=None):
+    """triples: list of (value, valid_flag). Median of valid, outlier-trim."""
+    vals = []
+    for v, ok in triples:
+        if v is None or ok is False:
+            continue
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            continue
+        if math.isnan(f) or math.isinf(f):
+            continue
+        vals.append(f)
+    if not vals:
+        return default
+    if len(vals) >= 3 and max_spread is not None:
+        m = _median(vals)
+        kept = [v for v in vals if abs(v - m) <= max_spread]
+        if len(kept) >= 2:
+            return _median(kept)
+        return m
+    return _median(vals)
+
+
+def _num(state, key, default=None):
+    v = state.get(key)
+    if v is None:
+        return default
+    try:
+        f = float(v)
+        if math.isnan(f) or math.isinf(f):
+            return default
+        return f
+    except (TypeError, ValueError):
+        return default
+
+
+def _clip(x, lo, hi):
+    return max(lo, min(hi, x))
+
+
+def _wrap180(a):
+    while a > 180:
+        a -= 360
+    while a < -180:
+        a += 360
+    return a
+
+
+# --- main ------------------------------------------------------------------
+def autopilot_step(state: dict, dt: float) -> dict:
+    if dt is None or dt <= 0:
+        dt = 0.05
+    _S["t"] += dt
+
+    # Fuse redundant sensors
+    gs_dots = _voted([
+        (state.get("glideslope_1_dots"), state.get("glideslope_1_valid")),
+        (state.get("glideslope_2_dots"), state.get("glideslope_2_valid")),
+        (state.get("glideslope_3_dots"), state.get("glideslope_3_valid")),
+    ], default=0.0, max_spread=0.5)
+
+    loc_dots = _voted([
+        (state.get("localizer_1_dots"), state.get("localizer_1_valid")),
+        (state.get("localizer_2_dots"), state.get("localizer_2_valid")),
+        (state.get("localizer_3_dots"), state.get("localizer_3_valid")),
+    ], default=0.0, max_spread=0.5)
+
+    baro_alt = _voted([
+        (state.get("baro_alt_1_ft"), state.get("baro_alt_1_valid")),
+        (state.get("baro_alt_2_ft"), state.get("baro_alt_2_valid")),
+        (state.get("baro_alt_3_ft"), state.get("baro_alt_3_valid")),
+    ], default=_S["last_baro_alt"], max_spread=200.0)
+    if baro_alt is not None:
+        _S["last_baro_alt"] = baro_alt
+
+    ias = _voted([
+        (state.get("ias_1_kt"), state.get("ias_1_valid")),
+        (state.get("ias_2_kt"), state.get("ias_2_valid")),
+        (state.get("ias_3_kt"), state.get("ias_3_valid")),
+    ], default=140.0, max_spread=15.0)
+
+    pitch = _voted([
+        (state.get("irs_1_pitch_deg"), state.get("irs_1_valid")),
+        (state.get("irs_2_pitch_deg"), state.get("irs_2_valid")),
+        (state.get("irs_3_pitch_deg"), state.get("irs_3_valid")),
+    ], default=0.0, max_spread=5.0)
+
+    roll = _voted([
+        (state.get("irs_1_roll_deg"), state.get("irs_1_valid")),
+        (state.get("irs_2_roll_deg"), state.get("irs_2_valid")),
+        (state.get("irs_3_roll_deg"), state.get("irs_3_valid")),
+    ], default=0.0, max_spread=5.0)
+
+    heading = _voted([
+        (state.get("irs_1_heading_deg"), state.get("irs_1_valid")),
+        (state.get("irs_2_heading_deg"), state.get("irs_2_valid")),
+        (state.get("irs_3_heading_deg"), state.get("irs_3_valid")),
+    ], default=None, max_spread=5.0)
+
+    vs_fpm = _voted([
+        (state.get("irs_1_vs_fpm"), state.get("irs_1_valid")),
+        (state.get("irs_2_vs_fpm"), state.get("irs_2_valid")),
+        (state.get("irs_3_vs_fpm"), state.get("irs_3_valid")),
+    ], default=_S["last_vs"], max_spread=400.0)
+    if vs_fpm is None:
+        vs_fpm = _S["last_vs"]
+    _S["last_vs"] = vs_fpm
+
+    # Radio altimeter; fall back to extrapolation if all failed
+    radio_alt = None
+    rv = state.get("radio_alt_ft")
+    try:
+        if rv is not None:
+            f = float(rv)
+            if not (math.isnan(f) or math.isinf(f)) and f >= 0:
+                radio_alt = f
+    except (TypeError, ValueError):
+        radio_alt = None
+    if radio_alt is None:
+        if _S["last_radio_alt"] is not None:
+            radio_alt = max(0.0, _S["last_radio_alt"] + (vs_fpm / 60.0) * dt)
+        elif baro_alt is not None:
+            radio_alt = baro_alt
+        else:
+            radio_alt = 500.0
+    _S["last_radio_alt"] = radio_alt
+
+    target_vref = _num(state, "target_vref_kt", 137.0)
+    target_ias = _num(state, "target_ias_kt", target_vref + 5)
+    target_hdg = _num(state, "target_hdg_deg", heading if heading is not None else 0.0)
+
+    on_ground = bool(state.get("on_ground"))
+    wow = bool(state.get("weight_on_wheels"))
+    gs_kt = _num(state, "groundspeed_kt", 0.0)
+
+    # Engines
+    n1_1 = _num(state, "engine_1_n1_pct", 0.0)
+    n1_2 = _num(state, "engine_2_n1_pct", 0.0)
+    e1_run = bool(state.get("engine_1_running", True))
+    e2_run = bool(state.get("engine_2_running", True))
+    e1_fire = bool(state.get("engine_1_fire", False))
+    e2_fire = bool(state.get("engine_2_fire", False))
+    eng1_ok = e1_run and not e1_fire and n1_1 > 5
+    eng2_ok = e2_run and not e2_fire and n1_2 > 5
+    n_eng = (1 if eng1_ok else 0) + (1 if eng2_ok else 0)
+
+    # ---- go-around continuation ----
+    if _S["ga_active"]:
+        if radio_alt > _S["ga_peak_alt"]:
+            _S["ga_peak_alt"] = radio_alt
+        return _go_around(radio_alt, pitch, roll, eng1_ok, eng2_ok)
+
+    # ---- touchdown / rollout ----
+    if wow or on_ground or _S["touched_down"]:
+        if not _S["touched_down"]:
+            _S["touched_down"] = True
+            _S["td_time"] = _S["t"]
+        return _rollout(gs_kt, loc_dots, heading, target_hdg, eng1_ok, eng2_ok, n_eng)
+
+    # ---- phase selection ----
+    if radio_alt < 50:
+        phase = "flare"
+    elif radio_alt < 1000:
+        phase = "approach"
+    else:
+        phase = "intercept"
+    _S["phase"] = phase
+
+    # ---- go-around triggers ----
+    if _check_ga(radio_alt, gs_dots, loc_dots, ias, target_vref, vs_fpm,
+                 _S["go_arounds"]):
+        _S["ga_active"] = True
+        _S["go_arounds"] += 1
+        _S["ga_peak_alt"] = radio_alt
+        return _go_around(radio_alt, pitch, roll, eng1_ok, eng2_ok)
+
+    cmd = {}
+
+    # Gear: down by 1800 ft AGL
+    if radio_alt < 1800:
+        _S["gear_down"] = True
+    cmd["gear"] = 1.0 if _S["gear_down"] else 0.0
+
+    # Flap schedule
+    if radio_alt > 2500:
+        cmd["flaps"] = 5.0
+    elif radio_alt > 1500:
+        cmd["flaps"] = 15.0
+    elif radio_alt > 800:
+        cmd["flaps"] = 25.0
+    else:
+        cmd["flaps"] = 30.0
+
+    cmd["speedbrake"] = 0.0
+    cmd["spoiler"] = 0.0
+    cmd["autobrake"] = 0.0
+    cmd["reverse_1"] = 0.0
+    cmd["reverse_2"] = 0.0
+
+    # ---- Lateral guidance ----
+    aileron, rudder = _lateral(loc_dots, roll, heading, target_hdg,
+                                radio_alt, dt)
+
+    # ---- Vertical guidance ----
+    elevator, throttle = _vertical(phase, gs_dots, radio_alt, vs_fpm,
+                                   ias, target_vref, target_ias, n_eng, dt)
+
+    # Asymmetric thrust: bias rudder
+    if n_eng == 1:
+        if eng1_ok and not eng2_ok:
+            rudder += 0.20
+        elif eng2_ok and not eng1_ok:
+            rudder -= 0.20
+
+    # Dual engine failure: glide approach, pitch for speed
+    if n_eng == 0:
+        throttle = 0.0
+        spd_err = (target_vref + 15) - ias
+        elevator = _clip(-0.025 * spd_err, -0.5, 0.5)
+
+    cmd["aileron"] = _clip(aileron, -1.0, 1.0)
+    cmd["rudder"] = _clip(rudder, -1.0, 1.0)
+    cmd["elevator"] = _clip(elevator, -1.0, 1.0)
+    cmd["throttle_1"] = throttle if eng1_ok else 0.0
+    cmd["throttle_2"] = throttle if eng2_ok else 0.0
+    cmd["elevator_trim"] = _clip(0.25 * elevator, -0.5, 0.5)
+    return cmd
+
+
+# --- lateral ---------------------------------------------------------------
+def _lateral(loc_dots, roll, heading, target_hdg, radio_alt, dt):
+    if loc_dots is None:
+        loc_dots = 0.0
+    _S["i_loc"] = _clip(_S["i_loc"] + loc_dots * dt, -2.0, 2.0)
+    d_loc = (loc_dots - _S["prev_loc"]) / max(dt, 1e-3)
+    _S["prev_loc"] = loc_dots
+
+    desired_bank = _clip(8.0 * loc_dots + 1.5 * _S["i_loc"] + 2.0 * d_loc,
+                         -25.0, 25.0)
+    if radio_alt < 100:
+        desired_bank = _clip(desired_bank, -5.0, 5.0)
+    elif radio_alt < 300:
+        desired_bank = _clip(desired_bank, -12.0, 12.0)
+
+    bank_err = desired_bank - (roll or 0.0)
+    aileron = _clip(0.04 * bank_err, -0.7, 0.7)
+
+    rudder = 0.0
+    if heading is not None and target_hdg is not None:
+        hdg_err = _wrap180(target_hdg - heading)
+        if radio_alt < 80:
+            rudder = _clip(0.03 * hdg_err, -0.5, 0.5)
+        else:
+            rudder = _clip(0.01 * hdg_err, -0.3, 0.3)
+    return aileron, rudder
+
+
+# --- vertical --------------------------------------------------------------
+def _vertical(phase, gs_dots, radio_alt, vs_fpm, ias, vref, tgt_ias, n_eng, dt):
+    spd_target = max(vref, tgt_ias if tgt_ias else vref)
+    if phase == "flare":
+        spd_target = vref
+    spd_err = spd_target - (ias if ias is not None else spd_target)
+    _S["i_ias"] = _clip(_S["i_ias"] + spd_err * dt, -10.0, 10.0)
+    d_spd = (spd_err - _S["prev_ias_err"]) / max(dt, 1e-3)
+    _S["prev_ias_err"] = spd_err
+    throttle = _clip(0.45 + 0.02 * spd_err + 0.005 * _S["i_ias"]
+                     + 0.004 * d_spd, 0.0, 1.0)
+    if n_eng == 1:
+        throttle = _clip(throttle * 1.6, 0.0, 1.0)
+
+    if phase == "flare":
+        # Smooth flare: target VS from -600 fpm at 50ft to -150 fpm at touchdown
+        ratio = _clip(radio_alt / 50.0, 0.0, 1.0)
+        target_vs = -150.0 - 450.0 * ratio
+        vs_err = target_vs - vs_fpm
+        elevator = _clip(0.0009 * vs_err + 0.04, -0.4, 0.7)
+        throttle = 0.0
+        if radio_alt < 15:
+            elevator = _clip(elevator + 0.06, -0.4, 0.8)
+    elif phase == "approach":
+        _S["i_gs"] = _clip(_S["i_gs"] + gs_dots * dt, -2.0, 2.0)
+        d_gs = (gs_dots - _S["prev_gs"]) / max(dt, 1e-3)
+        _S["prev_gs"] = gs_dots
+        target_vs = -700.0 - 400.0 * gs_dots - 80.0 * _S["i_gs"] - 200.0 * d_gs
+        target_vs = _clip(target_vs, -1300.0, 0.0)
+        vs_err = target_vs - vs_fpm
+        elevator = _clip(0.0006 * vs_err, -0.4, 0.4)
+    else:  # intercept
+        target_vs = _clip(-600.0 - 300.0 * gs_dots, -1500.0, 200.0)
+        vs_err = target_vs - vs_fpm
+        elevator = _clip(0.0005 * vs_err, -0.4, 0.4)
+    return elevator, throttle
+
+
+# --- go-around -------------------------------------------------------------
+def _check_ga(radio_alt, gs_dots, loc_dots, ias, vref, vs_fpm, ga_count):
+    if ga_count >= 9:
+        return False  # must land on last try
+    if 60 < radio_alt < 200:
+        if abs(gs_dots) > 2.0:
+            return True
+        if abs(loc_dots) > 2.0:
+            return True
+        if vref and (ias < vref - 18 or ias > vref + 30):
+            return True
+        if vs_fpm < -1300:
+            return True
+    return False
+
+
+def _go_around(radio_alt, pitch, roll, eng1_ok, eng2_ok):
+    cmd = {
+        "throttle_1": 1.0 if eng1_ok else 0.0,
+        "throttle_2": 1.0 if eng2_ok else 0.0,
+        "flaps": 15.0,
+        "gear": 1.0 if radio_alt < 400 else 0.0,
+        "speedbrake": 0.0,
+        "spoiler": 0.0,
+        "reverse_1": 0.0,
+        "reverse_2": 0.0,
+        "autobrake": 0.0,
+    }
+    pitch_err = 12.0 - (pitch or 0.0)
+    cmd["elevator"] = _clip(0.05 * pitch_err, -0.3, 0.8)
+    cmd["elevator_trim"] = 0.25
+    cmd["aileron"] = _clip(-0.04 * (roll or 0.0), -0.5, 0.5)
+    cmd["rudder"] = 0.0
+    return cmd
+
+
+# --- rollout ---------------------------------------------------------------
+def _rollout(gs_kt, loc_dots, heading, target_hdg, eng1_ok, eng2_ok, n_eng):
+    cmd = {
+        "throttle_1": 0.0,
+        "throttle_2": 0.0,
+        "flaps": 30.0,
+        "gear": 1.0,
+        "elevator": 0.0,
+        "elevator_trim": 0.0,
+        "spoiler": 1.0,
+        "speedbrake": 1.0,
+        "autobrake": 1.0,
+    }
+    if gs_kt > 60:
+        cmd["reverse_1"] = (0.5 if n_eng == 1 else 1.0) if eng1_ok else 0.0
+        cmd["reverse_2"] = (0.5 if n_eng == 1 else 1.0) if eng2_ok else 0.0
+    else:
+        cmd["reverse_1"] = 0.0
+        cmd["reverse_2"] = 0.0
+    rudder = 0.0
+    if heading is not None and target_hdg is not None:
+        rudder = _clip(0.04 * _wrap180(target_hdg - heading), -0.6, 0.6)
+    if loc_dots is not None:
+        rudder = _clip(rudder + 0.2 * loc_dots, -0.8, 0.8)
+    cmd["rudder"] = rudder
+    cmd["aileron"] = _clip(0.1 * (loc_dots or 0.0), -0.3, 0.3)
+    return cmd

@@ -1,1 +1,554 @@
-{'__exception__': "Can't run here - we're trying to get this working in codex."}
+```rust
+use std::{
+    f64::consts::PI,
+    io::{self, Read, Write},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
+    thread,
+    time::{Duration, Instant},
+};
+
+#[derive(Clone, Copy, Debug, Default)]
+struct State {
+    x: f64,
+    y: f64,
+    vx: f64,
+    vy: f64,
+    angle: f64,
+    ang_vel: f64,
+    fuel: f64,
+}
+
+#[derive(Clone, Debug)]
+struct WorldInfo {
+    width: usize,
+    height: usize,
+    gravity: f64,
+    max_thrust: f64,
+    fuel0: f64,
+
+    start_x: f64,
+    start_y: f64,
+    target_x: f64,
+    target_y: f64,
+
+    // Landing zone bounds (meters, center-ish).
+    zone_left: f64,
+    zone_right: f64,
+
+    // Sparse local "ceiling": for x in [win_x0..=win_x1], store the *topmost solid cell y*.
+    // y == u16::MAX => no solid found in that column.
+    win_x0: i64,
+    win_y_top_solid: Vec<u16>,
+}
+
+struct Scanner<R: Read> {
+    r: R,
+    buf: [u8; 1 << 16],
+    pos: usize,
+    len: usize,
+}
+
+impl<R: Read> Scanner<R> {
+    fn new(r: R) -> Self {
+        Self {
+            r,
+            buf: [0; 1 << 16],
+            pos: 0,
+            len: 0,
+        }
+    }
+
+    #[inline]
+    fn refill(&mut self) -> bool {
+        self.pos = 0;
+        match self.r.read(&mut self.buf) {
+            Ok(0) | Err(_) => {
+                self.len = 0;
+                false
+            }
+            Ok(n) => {
+                self.len = n;
+                true
+            }
+        }
+    }
+
+    #[inline]
+    fn next_byte(&mut self) -> Option<u8> {
+        if self.pos >= self.len && !self.refill() {
+            return None;
+        }
+        let b = self.buf[self.pos];
+        self.pos += 1;
+        Some(b)
+    }
+
+    #[inline]
+    fn skip_ws(&mut self) -> Option<u8> {
+        while let Some(b) = self.next_byte() {
+            if !b.is_ascii_whitespace() {
+                return Some(b);
+            }
+        }
+        None
+    }
+
+    fn next_token_bytes(&mut self) -> Option<Vec<u8>> {
+        let first = self.skip_ws()?;
+        let mut v = Vec::with_capacity(32);
+        v.push(first);
+        while let Some(b) = self.next_byte() {
+            if b.is_ascii_whitespace() {
+                break;
+            }
+            v.push(b);
+        }
+        Some(v)
+    }
+
+    fn next_f64(&mut self) -> Option<f64> {
+        let tok = self.next_token_bytes()?;
+        // Numeric tokens are small; parsing via str is fine here.
+        let s = std::str::from_utf8(&tok).ok()?;
+        s.parse::<f64>().ok()
+    }
+
+    fn next_usize(&mut self) -> Option<usize> {
+        let tok = self.next_token_bytes()?;
+        let s = std::str::from_utf8(&tok).ok()?;
+        s.parse::<usize>().ok()
+    }
+
+    #[inline]
+    fn next_non_ws_byte(&mut self) -> Option<u8> {
+        self.skip_ws()
+    }
+}
+
+#[inline]
+fn clamp(x: f64, lo: f64, hi: f64) -> f64 {
+    x.max(lo).min(hi)
+}
+
+#[inline]
+fn wrap_pi(mut a: f64) -> f64 {
+    a = a % (2.0 * PI);
+    if a > PI {
+        a -= 2.0 * PI;
+    } else if a < -PI {
+        a += 2.0 * PI;
+    }
+    a
+}
+
+fn compute_controls(world: &WorldInfo, s: State) -> (f64, f64) {
+    // Basic "approach then descend" PD controller.
+    // Coordinates: x right, y down. Angle 0 faces up.
+
+    let g = world.gravity;
+    let max_thrust = world.max_thrust;
+
+    // --- Landing zone clamp target ---
+    let x_target = clamp(s.x, world.zone_left, world.zone_right);
+    let x_ref = clamp(world.target_x, world.zone_left, world.zone_right);
+
+    // --- Local obstacle ceiling in corridor (overconservative but safe-ish) ---
+    // We stored topmost solid y per column near target. Smallest y means "highest obstacle".
+    let mut corridor_ceiling_y: Option<f64> = None;
+    let clearance = 6.0; // meters above obstacle top cell
+    let mut min_x = s.x.min(x_ref).floor() as i64;
+    let mut max_x = s.x.max(x_ref).ceil() as i64;
+    if min_x > max_x {
+        std::mem::swap(&mut min_x, &mut max_x);
+    }
+
+    let win_x0 = world.win_x0;
+    let win_x1 = win_x0 + (world.win_y_top_solid.len() as i64) - 1;
+
+    let scan_x0 = min_x.max(win_x0);
+    let scan_x1 = max_x.min(win_x1);
+
+    if scan_x0 <= scan_x1 {
+        let mut best: u16 = u16::MAX;
+        for xi in scan_x0..=scan_x1 {
+            let idx = (xi - win_x0) as usize;
+            let y_solid = world.win_y_top_solid[idx];
+            if y_solid != u16::MAX {
+                best = best.min(y_solid);
+            }
+        }
+        if best != u16::MAX {
+            corridor_ceiling_y = Some((best as f64) - clearance);
+        }
+    }
+
+    // --- Reference altitude profile ---
+    let target_y = world.target_y;
+
+    // A reasonable approach altitude above pad (smaller y == higher).
+    let approach_alt = 25.0;
+    let mut y_approach = target_y - approach_alt;
+
+    if let Some(ceil_y) = corridor_ceiling_y {
+        // Need to be ABOVE the highest obstacle => y <= ceil_y.
+        y_approach = y_approach.min(ceil_y);
+    }
+    y_approach = y_approach.max(0.5);
+
+    let dx = x_ref - s.x;
+    let abs_dx = dx.abs();
+
+    // Switch to descent when horizontally aligned enough.
+    let descent_gate = 6.0_f64.max(0.5 * (world.zone_right - world.zone_left));
+    let descending = abs_dx < descent_gate;
+
+    // Vertical refs: we aim for slow descent near pad.
+    let (y_ref, vy_ref, angle_soften) = if !descending {
+        // Approach: maintain safe altitude, move to pad.
+        (y_approach, 0.0, 1.0)
+    } else {
+        // Descent: step down as we get closer in altitude.
+        let alt_above = target_y - s.y; // positive when above pad
+        if alt_above > 12.0 {
+            (target_y - 8.0, 2.0, 0.8)
+        } else if alt_above > 5.0 {
+            (target_y - 2.5, 1.2, 0.6)
+        } else {
+            // Final: nearly upright and very soft.
+            (target_y - 0.6, 0.2, 0.35)
+        }
+    };
+
+    // Horizontal refs: always to pad center; near ground clamp within zone.
+    let x_ref2 = if descending {
+        clamp(x_ref, world.zone_left + 0.2, world.zone_right - 0.2)
+    } else {
+        x_ref
+    };
+
+    // --- PD gains (tuned for "good-enough", not optimal) ---
+    let (kp_x, kd_x) = if descending { (0.10, 0.45) } else { (0.07, 0.35) };
+    let (kp_y, kd_y) = if descending { (0.18, 0.55) } else { (0.12, 0.45) };
+
+    // Errors
+    let ex = x_ref2 - s.x;
+    let evx = 0.0 - s.vx;
+
+    let ey = y_ref - s.y;
+    let evy = vy_ref - s.vy;
+
+    // Desired net acceleration
+    let a_net_x = kp_x * ex + kd_x * evx;
+    let a_net_y = kp_y * ey + kd_y * evy;
+
+    // Required thrust acceleration = a_net - gravity
+    let a_thr_x = a_net_x;
+    let a_thr_y = a_net_y - g;
+
+    // If we "need" thrust downward, just cut thrust (can't help).
+    let mut thrust_cmd = 0.0;
+    let mut desired_angle = 0.0;
+
+    let a_thr_mag = (a_thr_x * a_thr_x + a_thr_y * a_thr_y).sqrt();
+    if s.fuel > 0.0001 && a_thr_mag > 1e-6 && a_thr_y < 0.0 {
+        // Unit vector for desired thrust direction.
+        // Lander thrust direction for angle θ is (sin θ, -cos θ).
+        // Given desired u=(ux,uy), θ = atan2(ux, -uy).
+        desired_angle = (a_thr_x).atan2(-a_thr_y);
+
+        thrust_cmd = (a_thr_mag / max_thrust);
+        thrust_cmd = clamp(thrust_cmd, 0.0, 1.0);
+    } else {
+        desired_angle = 0.0;
+        thrust_cmd = 0.0;
+    }
+
+    // Soften angle to be more upright near touchdown.
+    desired_angle *= angle_soften;
+
+    // Hard clamp: don't tilt too much.
+    let angle_max = if descending { 0.75 } else { 1.10 };
+    desired_angle = clamp(desired_angle, -angle_max, angle_max);
+
+    // Angular PD -> turn rate command in [-1,1] (rad/s).
+    let ang_err = wrap_pi(desired_angle - s.angle);
+    let k_ang = 2.8;
+    let k_damp = 0.75;
+    let mut turn_cmd = k_ang * ang_err - k_damp * s.ang_vel;
+    turn_cmd = clamp(turn_cmd, -1.0, 1.0);
+
+    // Extra safety: if we're very low and still fast downward, force more thrust.
+    let alt_above = target_y - s.y;
+    if alt_above < 3.5 && s.vy > 1.5 && s.fuel > 0.0 {
+        thrust_cmd = thrust_cmd.max(0.65);
+        desired_angle = 0.0;
+        let ang_err2 = wrap_pi(desired_angle - s.angle);
+        turn_cmd = clamp(3.0 * ang_err2 - 0.9 * s.ang_vel, -1.0, 1.0);
+    }
+
+    // If we drift outside landing zone late, bias toward correcting x with small tilt.
+    if descending && (s.x < world.zone_left || s.x > world.zone_right) {
+        // Keep some horizontal correction but limit tilt heavily.
+        let bias = clamp((x_target - s.x) * 0.10 - s.vx * 0.20, -0.35, 0.35);
+        desired_angle = clamp(bias, -0.35, 0.35);
+        let ang_err3 = wrap_pi(desired_angle - s.angle);
+        turn_cmd = clamp(2.8 * ang_err3 - 0.75 * s.ang_vel, -1.0, 1.0);
+        thrust_cmd = thrust_cmd.max(0.45);
+    }
+
+    (thrust_cmd, turn_cmd)
+}
+
+fn main() {
+    // Shared state updated by reader thread.
+    let latest_state: Arc<Mutex<Option<State>>> = Arc::new(Mutex::new(None));
+    let done = Arc::new(AtomicBool::new(false));
+
+    // Read initial world/map on a dedicated thread too, then continue streaming states.
+    let latest_state_t = Arc::clone(&latest_state);
+    let done_t = Arc::clone(&done);
+
+    let world_info: Arc<Mutex<Option<WorldInfo>>> = Arc::new(Mutex::new(None));
+    let world_info_t = Arc::clone(&world_info);
+
+    let reader = thread::spawn(move || {
+        let stdin = io::stdin();
+        let mut sc = Scanner::new(stdin.lock());
+
+        // Header
+        let width = match sc.next_usize() {
+            Some(v) => v,
+            None => {
+                done_t.store(true, Ordering::Relaxed);
+                return;
+            }
+        };
+        let height = match sc.next_usize() {
+            Some(v) => v,
+            None => {
+                done_t.store(true, Ordering::Relaxed);
+                return;
+            }
+        };
+        let gravity = match sc.next_f64() {
+            Some(v) => v,
+            None => {
+                done_t.store(true, Ordering::Relaxed);
+                return;
+            }
+        };
+        let max_thrust = match sc.next_f64() {
+            Some(v) => v,
+            None => {
+                done_t.store(true, Ordering::Relaxed);
+                return;
+            }
+        };
+        let fuel0 = match sc.next_f64() {
+            Some(v) => v,
+            None => {
+                done_t.store(true, Ordering::Relaxed);
+                return;
+            }
+        };
+
+        let start_x = sc.next_f64().unwrap_or(0.0);
+        let start_y = sc.next_f64().unwrap_or(0.0);
+        let target_x_header = sc.next_f64().unwrap_or((width as f64) * 0.5);
+        let target_y_header = sc.next_f64().unwrap_or((height as f64) - 2.0);
+
+        // Decide a small window near target to store per-column "top solid y".
+        // Keep small and bounded regardless of map width.
+        let win_half = 300_i64;
+        let tx_i = target_x_header.floor() as i64;
+        let win_x0 = (tx_i - win_half).max(0);
+        let win_x1 = (tx_i + win_half).min(width as i64 - 1);
+        let win_w = (win_x1 - win_x0 + 1).max(1) as usize;
+
+        let mut win_y_top_solid = vec![u16::MAX; win_w];
+
+        // Landing zone bounds from the target row (trust header target_y to be on that row).
+        let ty_row = clamp(target_y_header.round(), 0.0, (height as f64 - 1.0)) as usize;
+        let mut zone_min_x: i64 = i64::MAX;
+        let mut zone_max_x: i64 = i64::MIN;
+
+        // Optionally refine target_x using 'T' cells on target row.
+        let mut t_sum_x: f64 = 0.0;
+        let mut t_count: u32 = 0;
+
+        // Consume the map as raw bytes, without allocating full rows.
+        // We must consume all width*height cells to reach streaming states.
+        for y in 0..height {
+            for x in 0..width {
+                let c = match sc.next_non_ws_byte() {
+                    Some(b) => b,
+                    None => {
+                        done_t.store(true, Ordering::Relaxed);
+                        return;
+                    }
+                };
+
+                // Treat these as "solid".
+                let solid = matches!(c, b'#' | b'L' | b'T');
+
+                if solid {
+                    let xi = x as i64;
+                    if xi >= win_x0 && xi <= win_x1 {
+                        let idx = (xi - win_x0) as usize;
+                        if win_y_top_solid[idx] == u16::MAX {
+                            win_y_top_solid[idx] = y.min(u16::MAX as usize) as u16;
+                        }
+                    }
+                }
+
+                if y == ty_row && matches!(c, b'L' | b'T') {
+                    let xi = x as i64;
+                    zone_min_x = zone_min_x.min(xi);
+                    zone_max_x = zone_max_x.max(xi);
+                    if c == b'T' {
+                        t_sum_x += (x as f64) + 0.5;
+                        t_count = t_count.saturating_add(1);
+                    }
+                }
+            }
+        }
+
+        let target_x = if t_count > 0 {
+            t_sum_x / (t_count as f64)
+        } else {
+            target_x_header
+        };
+        let target_y = target_y_header;
+
+        let (zone_left, zone_right) = if zone_min_x != i64::MAX && zone_max_x != i64::MIN {
+            // Use cell centers.
+            (zone_min_x as f64 + 0.5, zone_max_x as f64 + 0.5)
+        } else {
+            // Fallback if no L/T row info.
+            (target_x - 2.0, target_x + 2.0)
+        };
+
+        let world = WorldInfo {
+            width,
+            height,
+            gravity,
+            max_thrust,
+            fuel0,
+            start_x,
+            start_y,
+            target_x,
+            target_y,
+            zone_left,
+            zone_right,
+            win_x0,
+            win_y_top_solid,
+        };
+
+        *world_info_t.lock().unwrap() = Some(world);
+
+        // Now stream continuous state updates: 7 floats each.
+        loop {
+            let x = match sc.next_f64() {
+                Some(v) => v,
+                None => break,
+            };
+            let y = match sc.next_f64() {
+                Some(v) => v,
+                None => break,
+            };
+            let vx = match sc.next_f64() {
+                Some(v) => v,
+                None => break,
+            };
+            let vy = match sc.next_f64() {
+                Some(v) => v,
+                None => break,
+            };
+            let angle = match sc.next_f64() {
+                Some(v) => v,
+                None => break,
+            };
+            let ang_vel = match sc.next_f64() {
+                Some(v) => v,
+                None => break,
+            };
+            let fuel = match sc.next_f64() {
+                Some(v) => v,
+                None => break,
+            };
+
+            let st = State {
+                x,
+                y,
+                vx,
+                vy,
+                angle,
+                ang_vel,
+                fuel,
+            };
+            if let Ok(mut guard) = latest_state_t.lock() {
+                *guard = Some(st);
+            }
+        }
+
+        done_t.store(true, Ordering::Relaxed);
+    });
+
+    // Wait briefly for world info to be ready; meanwhile output safe zeros at >=20Hz.
+    let stdout = io::stdout();
+    let mut out = io::BufWriter::new(stdout.lock());
+
+    let tick = Duration::from_millis(20); // 50 Hz
+    let mut last_print = Instant::now();
+
+    let mut world_opt: Option<WorldInfo> = None;
+    let mut last_state = State::default();
+
+    loop {
+        // Load world info once available.
+        if world_opt.is_none() {
+            if let Ok(mut g) = world_info.lock() {
+                if g.is_some() {
+                    world_opt = g.take();
+                }
+            }
+        }
+
+        // Update last known state (non-blocking preferred, but Mutex is fine; keep it short).
+        if let Ok(g) = latest_state.try_lock() {
+            if let Some(s) = *g {
+                last_state = s;
+            }
+        }
+
+        let (thrust, turn) = if let Some(ref world) = world_opt {
+            compute_controls(world, last_state)
+        } else {
+            // World not ready yet.
+            (0.0, 0.0)
+        };
+
+        // Output commands.
+        // Always print at fixed rate regardless of input rate, to avoid engine cut.
+        writeln!(&mut out, "{:.4} {:.4}", thrust, turn).ok();
+        out.flush().ok();
+
+        // End condition: input ended and we have no more data.
+        if done.load(Ordering::Relaxed) {
+            break;
+        }
+
+        // Maintain 50 Hz loop.
+        let elapsed = last_print.elapsed();
+        if elapsed < tick {
+            thread::sleep(tick - elapsed);
+        }
+        last_print = Instant::now();
+    }
+
+    let _ = reader.join();
+}
+```

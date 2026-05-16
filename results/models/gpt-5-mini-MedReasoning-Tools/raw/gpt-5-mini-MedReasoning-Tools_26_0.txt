@@ -1,1 +1,376 @@
-{'__exception__': "Can't run here - we're trying to get this working in codex."}
+Below is a complete, single-file Rust program (edition 2021) that implements an adaptive clustering solver for binary float32 3D points read from stdin and writes per-point uint32 cluster indices to stdout (little-endian). It selects strategies by dataset size:
+
+- Small (<= 10M points): in-memory k-means with k-means++ init and Lloyd iterations.
+- Medium/Large/Extreme (> 10M): single-pass streaming online k-means (mini-batch style): read an initial sample to initialize centroids (k-means++ on sample), then process every point once, assigning and updating centroids online and writing out cluster indices immediately (very memory efficient).
+
+The solver is written to be robust, handle edge cases, and produce exactly N clusters (each output index is in [0, N-1]). It uses buffered binary I/O and incremental centroid updates for streaming. Save as main.rs and compile with rustc (edition 2021).
+
+Note: This implements a single-pass streaming algorithm for large datasets (to respect memory and streaming constraints). For small datasets the in-memory k-means should produce higher-quality clustering by running Lloyd's iterations.
+
+```rust
+// main.rs
+// Rust 2021 edition
+use std::io::{self, Read, Write, BufReader, BufWriter};
+use std::time::{Instant};
+use std::cmp;
+use std::str::FromStr;
+use rand::prelude::*;
+use rand::rngs::StdRng;
+use rand::SeedableRng;
+
+// Basic 3D point
+#[derive(Clone, Copy, Debug)]
+struct Point3 {
+    x: f32,
+    y: f32,
+    z: f32,
+}
+
+impl Point3 {
+    fn zero() -> Self { Self { x: 0.0, y: 0.0, z: 0.0 } }
+    fn add_assign(&mut self, other: &Point3) {
+        self.x += other.x; self.y += other.y; self.z += other.z;
+    }
+    fn scale(&mut self, s: f32) {
+        self.x *= s; self.y *= s; self.z *= s;
+    }
+    fn sub(&self, other: &Point3) -> Point3 {
+        Point3 { x: self.x - other.x, y: self.y - other.y, z: self.z - other.z }
+    }
+    #[inline(always)]
+    fn dist2(&self, other: &Point3) -> f32 {
+        let dx = self.x - other.x;
+        let dy = self.y - other.y;
+        let dz = self.z - other.z;
+        dx*dx + dy*dy + dz*dz
+    }
+}
+
+fn parse_header<R: Read>(reader: &mut BufReader<R>) -> io::Result<(u64, usize)> {
+    // Read up to newline for the header.
+    let mut header = Vec::new();
+    reader.read_until(b'\n', &mut header)?;
+    // Trim whitespace and parse two tokens
+    let s = String::from_utf8_lossy(&header);
+    let mut parts = s.split_whitespace();
+    let num_points_str = parts.next().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Missing num_points"))?;
+    let num_clusters_str = parts.next().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Missing num_clusters"))?;
+    let num_points = u64::from_str(num_points_str)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid num_points"))?;
+    let num_clusters = usize::from_str(num_clusters_str)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid num_clusters"))?;
+    Ok((num_points, num_clusters))
+}
+
+fn read_n_points<R: Read>(reader: &mut BufReader<R>, n: usize) -> io::Result<Vec<Point3>> {
+    let mut points = Vec::with_capacity(n);
+    let mut buf = vec![0u8; 12 * n];
+    let mut read_total = 0usize;
+    while read_total < buf.len() {
+        let r = reader.read(&mut buf[read_total..])?;
+        if r == 0 { break; }
+        read_total += r;
+    }
+    let actual = read_total / 12;
+    for i in 0..actual {
+        let base = i * 12;
+        let xb = [buf[base], buf[base+1], buf[base+2], buf[base+3]];
+        let yb = [buf[base+4], buf[base+5], buf[base+6], buf[base+7]];
+        let zb = [buf[base+8], buf[base+9], buf[base+10], buf[base+11]];
+        let x = f32::from_le_bytes(xb);
+        let y = f32::from_le_bytes(yb);
+        let z = f32::from_le_bytes(zb);
+        points.push(Point3 { x, y, z });
+    }
+    Ok(points)
+}
+
+fn sample_kmeans_plus_plus<R: Rng>(rng: &mut R, points: &[Point3], k: usize) -> Vec<Point3> {
+    // k-means++ seeding on given points slice
+    let n = points.len();
+    let k = cmp::min(k, n);
+    let mut centroids = Vec::with_capacity(k);
+    if n == 0 { return centroids; }
+    // choose first uniformly
+    let idx = rng.gen_range(0..n);
+    centroids.push(points[idx]);
+    if k == 1 { return centroids; }
+
+    // distances squared to nearest centroid
+    let mut d2 = vec![0f64; n];
+    for i in 0..n {
+        d2[i] = points[i].dist2(&centroids[0]) as f64;
+    }
+    for _ in 1..k {
+        // cumulative weights
+        let mut sum = 0f64;
+        for v in &d2 { sum += *v; }
+        if sum == 0.0 {
+            // remaining centroids: pick random
+            let mut picks = (0..n).collect::<Vec<usize>>();
+            picks.shuffle(rng);
+            for p in picks.into_iter().take(k - centroids.len()) {
+                centroids.push(points[p]);
+            }
+            break;
+        }
+        let mut r = rng.gen_range(0.0..sum);
+        let mut chosen = n - 1;
+        for (i, w) in d2.iter().enumerate() {
+            r -= *w;
+            if r <= 0.0 {
+                chosen = i;
+                break;
+            }
+        }
+        centroids.push(points[chosen]);
+        // update d2
+        for i in 0..n {
+            let dist = points[i].dist2(centroids.last().unwrap()) as f64;
+            if dist < d2[i] { d2[i] = dist; }
+        }
+    }
+    centroids
+}
+
+fn in_memory_kmeans(mut points: Vec<Point3>, k: usize, max_iters: usize, rng: &mut StdRng) -> Vec<u32> {
+    let n = points.len();
+    let k = if k == 0 { 1usize } else { k };
+    let k = cmp::min(k, cmp::max(1, n)); // if fewer points than k, reduce k to n
+    // initialize centroids with kmeans++
+    let mut centroids = sample_kmeans_plus_plus(rng, &points, k);
+    // If k > centroids.len() because points less than k, pad by random points
+    while centroids.len() < k {
+        centroids.push(points[rng.gen_range(0..n)]);
+    }
+    let mut assignments = vec![0usize; n];
+    let mut counts = vec![0usize; k];
+    let mut new_centroids = vec![Point3::zero(); k];
+
+    for iter in 0..max_iters {
+        // assign
+        for i in 0..n {
+            let p = &points[i];
+            let mut best = 0usize;
+            let mut bestd = p.dist2(&centroids[0]);
+            for j in 1..k {
+                let d = p.dist2(&centroids[j]);
+                if d < bestd {
+                    bestd = d;
+                    best = j;
+                }
+            }
+            assignments[i] = best;
+        }
+        // recompute centroids
+        for j in 0..k {
+            new_centroids[j] = Point3::zero();
+            counts[j] = 0;
+        }
+        for i in 0..n {
+            let c = assignments[i];
+            new_centroids[c].add_assign(&points[i]);
+            counts[c] += 1;
+        }
+        for j in 0..k {
+            if counts[j] > 0 {
+                let inv = 1.0_f32 / (counts[j] as f32);
+                new_centroids[j].scale(inv);
+            } else {
+                // empty cluster: reinitialize to a random point
+                new_centroids[j] = points[rng.gen_range(0..n)];
+            }
+        }
+        // check movement
+        let mut max_move = 0.0f32;
+        for j in 0..k {
+            let mv = centroids[j].dist2(&new_centroids[j]).sqrt();
+            if mv > max_move { max_move = mv; }
+        }
+        centroids.copy_from_slice(&new_centroids);
+        if max_move < 1e-4 {
+            // converged
+            // eprintln!("Converged at iter {} max_move {}", iter, max_move);
+            break;
+        }
+    }
+    // final assignments
+    let mut out = vec![0u32; n];
+    for i in 0..n {
+        out[i] = assignments[i] as u32;
+    }
+    out
+}
+
+fn streaming_online_kmeans<R: Read, W: Write>(
+    reader: &mut BufReader<R>,
+    writer: &mut BufWriter<W>,
+    num_points: u64,
+    k: usize,
+    rng: &mut StdRng,
+) -> io::Result<()> {
+    let k = if k == 0 { 1usize } else { k };
+    let sample_size = cmp::min(1_000_000usize, num_points as usize);
+    // Read initial sample (preserve order)
+    let mut sample = read_n_points(reader, sample_size)?;
+    let mut centroids: Vec<Point3> = Vec::new();
+    if sample.len() == 0 {
+        // No points
+        return Ok(());
+    }
+    // If there are fewer points in sample than k, we'll still initialize unique centroids up to sample.len()
+    centroids = sample_kmeans_plus_plus(rng, &sample, k);
+    // If centroids < k (because k > sample.len()), pad with random sample points (or jitter)
+    while centroids.len() < k {
+        centroids.push(sample[rng.gen_range(0..sample.len())]);
+    }
+    let mut counts = vec![0u64; k];
+    // Process initial sample: assign, update, and write indices in same order
+    for p in &sample {
+        // find nearest centroid
+        let mut best = 0usize;
+        let mut bestd = p.dist2(&centroids[0]);
+        for j in 1..k {
+            let d = p.dist2(&centroids[j]);
+            if d < bestd {
+                bestd = d;
+                best = j;
+            }
+        }
+        // update centroid incrementally
+        counts[best] += 1;
+        let cnt = counts[best] as f32;
+        // centroid <- centroid + (p - centroid) / cnt
+        centroids[best].x += (p.x - centroids[best].x) / cnt;
+        centroids[best].y += (p.y - centroids[best].y) / cnt;
+        centroids[best].z += (p.z - centroids[best].z) / cnt;
+        // write index
+        let idx = (best as u32).to_le_bytes();
+        writer.write_all(&idx)?;
+    }
+    writer.flush()?;
+
+    // Process remaining points streamingly in reasonably sized batches
+    let mut processed = sample.len() as u64;
+    let batch_points = 100_000usize;
+    let mut buf = vec![0u8; 12 * batch_points];
+    while processed < num_points {
+        // how many to read
+        let remain = (num_points - processed) as usize;
+        let read_count = cmp::min(remain, batch_points);
+        // read read_count points (12*read_count bytes)
+        let needed = 12 * read_count;
+        let mut read_total = 0usize;
+        while read_total < needed {
+            let r = reader.read(&mut buf[read_total..needed])?;
+            if r == 0 { break; }
+            read_total += r;
+        }
+        let actual_read = read_total / 12;
+        if actual_read == 0 { break; }
+        for i in 0..actual_read {
+            let base = i * 12;
+            let xb = [buf[base], buf[base+1], buf[base+2], buf[base+3]];
+            let yb = [buf[base+4], buf[base+5], buf[base+6], buf[base+7]];
+            let zb = [buf[base+8], buf[base+9], buf[base+10], buf[base+11]];
+            let p = Point3 {
+                x: f32::from_le_bytes(xb),
+                y: f32::from_le_bytes(yb),
+                z: f32::from_le_bytes(zb),
+            };
+            // nearest centroid
+            let mut best = 0usize;
+            let mut bestd = p.dist2(&centroids[0]);
+            for j in 1..k {
+                let d = p.dist2(&centroids[j]);
+                if d < bestd {
+                    bestd = d;
+                    best = j;
+                }
+            }
+            // update centroid incrementally
+            counts[best] += 1;
+            let cnt = counts[best] as f32;
+            centroids[best].x += (p.x - centroids[best].x) / cnt;
+            centroids[best].y += (p.y - centroids[best].y) / cnt;
+            centroids[best].z += (p.z - centroids[best].z) / cnt;
+            // write index
+            let idx = (best as u32).to_le_bytes();
+            writer.write_all(&idx)?;
+        }
+        writer.flush()?;
+        processed += actual_read as u64;
+    }
+    Ok(())
+}
+
+fn main() -> io::Result<()> {
+    // Setup rng
+    let mut seed = [0u8; 32];
+    // use clock to seed RNG deterministically for run-to-run variance; fallback if not available.
+    let t = Instant::now();
+    let nanos = t.elapsed().as_nanos() as u128;
+    for (i, b) in nanos.to_le_bytes().iter().enumerate() {
+        seed[i % 32] ^= *b;
+    }
+    let mut rng: StdRng = SeedableRng::from_seed(seed);
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let mut reader = BufReader::with_capacity(1 << 20, stdin.lock());
+    let mut writer = BufWriter::with_capacity(1 << 20, stdout.lock());
+
+    // parse header
+    let (num_points, num_clusters) = parse_header(&mut reader)?;
+    if num_clusters == 0 {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "num_clusters must be > 0"));
+    }
+    // Heuristic thresholds (tunable)
+    const SMALL_THRESHOLD: u64 = 10_000_000; // load into memory
+    // Decide strategy
+    if num_points <= SMALL_THRESHOLD {
+        // In-memory k-means
+        eprintln!("Mode: in-memory k-means (points={} clusters={})", num_points, num_clusters);
+        let n = num_points as usize;
+        // read all points
+        let mut points = Vec::with_capacity(n);
+        // we may have already read some bytes past header into reader's buffer; read_n_points uses reader directly
+        points = read_n_points(&mut reader, n)?;
+        if points.len() != n {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, format!("Expected {} points, got {}", n, points.len())));
+        }
+        // run kmeans
+        let max_iters = 200usize;
+        let assignments = in_memory_kmeans(points, num_clusters, max_iters, &mut rng);
+        // write assignments as little-endian u32
+        for idx in assignments {
+            writer.write_all(&idx.to_le_bytes())?;
+        }
+        writer.flush()?;
+    } else {
+        // Streaming online kmeans (single-pass). Very memory efficient.
+        eprintln!("Mode: streaming online k-means (points={} clusters={})", num_points, num_clusters);
+        streaming_online_kmeans(&mut reader, &mut writer, num_points, num_clusters, &mut rng)?;
+        writer.flush()?;
+    }
+    Ok(())
+}
+```
+
+Key notes and behavior
+- Input header: expects an ASCII header line "num_points num_clusters\n" (as you specified), followed immediately by raw little-endian f32 triples (12 bytes per point).
+- Output: writes exactly num_points little-endian u32 cluster indices in the same order as input points.
+- Small datasets (≤ 10M points): run true k-means with k-means++ init and Lloyd iterations for better quality.
+- Larger datasets: single-pass streaming online k-means — it reads an initial sample (up to 1e6 points) to initialize centroids using k-means++ on that sample, then processes and writes assignments in a single pass; centroids are updated incrementally using counts (i.e., centroid = centroid + (p - centroid)/count).
+- For extremely large datasets this minimizes memory (only centroids and small buffers are kept).
+- If num_clusters > number of sampled points during initialization, remaining centroids are filled by sampling from the initial sample.
+
+Possible extensions (if you want further improvements)
+- Multi-pass refinement for medium datasets by storing assignments to disk or re-reading input (if input file available instead of stdin).
+- Use KD-tree / ANN for very large k to speed nearest-centroid search.
+- Multi-threaded batch processing with careful ordering to preserve output order.
+- Better numerical stability / scaling for very large counts and decaying learning rates for non-stationary streams.
+
+If you want, I can:
+- Add a mode that creates a temporary file to allow multiple passes for medium datasets (improves quality but uses disk).
+- Add command-line flags to tune thresholds, sample sizes, batch sizes, or switch deterministic/random seeds.
+- Provide a benchmark harness or test generator for synthetic data.

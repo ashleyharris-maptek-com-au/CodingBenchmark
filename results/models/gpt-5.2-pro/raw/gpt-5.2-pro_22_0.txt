@@ -1,1 +1,559 @@
-{'__exception__': "Can't run here - we're trying to get this working in codex."}
+```csharp
+using System;
+using System.Buffers;
+using System.Diagnostics;
+using System.IO;
+using System.Text;
+
+public static class Program
+{
+    // -------- Fast scanner (stdin tokens) --------
+    private sealed class FastScanner
+    {
+        private readonly Stream _s;
+        private readonly byte[] _buf;
+        private int _len, _pos;
+
+        public FastScanner(Stream s, int bufSize = 1 << 16)
+        {
+            _s = s;
+            _buf = new byte[bufSize];
+        }
+
+        private int ReadByte()
+        {
+            if (_pos >= _len)
+            {
+                _len = _s.Read(_buf, 0, _buf.Length);
+                _pos = 0;
+                if (_len <= 0) return -1;
+            }
+            return _buf[_pos++];
+        }
+
+        public string? Next()
+        {
+            int c;
+            do
+            {
+                c = ReadByte();
+                if (c < 0) return null;
+            } while (c <= 32);
+
+            var sb = new StringBuilder(16);
+            while (c > 32)
+            {
+                sb.Append((char)c);
+                c = ReadByte();
+                if (c < 0) break;
+            }
+            return sb.ToString();
+        }
+
+        public int NextInt()
+        {
+            string? t = Next();
+            if (t is null) throw new EndOfStreamException();
+            return int.Parse(t);
+        }
+    }
+
+    // -------- Tetris modeling --------
+    private sealed class Rotation
+    {
+        public int Width;
+        public int Height;
+        // Row masks in piece-local coordinates, py=0 is bottom row of piece.
+        public uint[] RowMasks = Array.Empty<uint>();
+    }
+
+    private sealed class Tetromino
+    {
+        public char Type;
+        public int N;              // rotation matrix size (I=4, O=2, others=3)
+        public bool[,] Spawn = new bool[1, 1]; // [x,y] with y up
+        public Rotation[] R = new Rotation[4]; // rotations 0..3
+    }
+
+    private struct Weights
+    {
+        public double Line;
+        public double TetrisBonus;
+        public double AggHeight;
+        public double MaxHeight;
+        public double Holes;
+        public double Bumpiness;
+        public double Wells;
+    }
+
+    // -------- Globals per game --------
+    private static int W, H;
+    private static uint FULL_MASK;
+    private static uint[] board = Array.Empty<uint>();
+
+    // Scratch buffers (no per-move allocations)
+    private static uint[] tmp1 = Array.Empty<uint>();
+    private static uint[] tmp2 = Array.Empty<uint>();
+    private static int[] heightsBuf = Array.Empty<int>();
+    private static int[] heightsBuf2 = Array.Empty<int>();
+
+    private static readonly Tetromino[] pieces = new Tetromino[7];
+    private static readonly Tetromino[] pieceByIndex = new Tetromino[7];
+    private static readonly int[] pieceIndexByChar = new int[128];
+
+    public static void Main()
+    {
+        Console.InputEncoding = Encoding.ASCII;
+        Console.OutputEncoding = Encoding.ASCII;
+
+        var fs = new FastScanner(Console.OpenStandardInput());
+        var output = new StreamWriter(Console.OpenStandardOutput(), new UTF8Encoding(false)) { AutoFlush = true };
+
+        W = fs.NextInt();
+        H = fs.NextInt();
+        int numPieces = fs.NextInt(); // may be unused if stream ends early
+
+        if (W <= 0 || W > 31) return; // bitmask uses uint; W typically 10-20
+        FULL_MASK = W == 32 ? 0xFFFF_FFFFu : ((1u << W) - 1u);
+
+        board = new uint[H];
+        tmp1 = new uint[H];
+        tmp2 = new uint[H];
+        heightsBuf = new int[W];
+        heightsBuf2 = new int[W];
+
+        InitPieces();
+
+        int played = 0;
+        while (true)
+        {
+            if (numPieces > 0 && played >= numPieces) break;
+
+            string? tok = fs.Next();
+            if (tok is null) break;
+            if (tok.Length == 0) continue;
+
+            char pch = tok[0];
+            int pidx = (pch < 128) ? pieceIndexByChar[pch] : -1;
+            if (pidx < 0) pidx = 0; // default
+            var piece = pieceByIndex[pidx];
+
+            // Decide move
+            (int rot, int col) = ChooseMove(piece);
+
+            // Output
+            output.Write(rot);
+            output.Write(' ');
+            output.WriteLine(col);
+
+            // Read result from engine
+            string? res = fs.Next();
+            if (res is null) break;
+
+            // Update our internal board deterministically using the same move.
+            // (We trust the engine uses the same rotation semantics as defined here.)
+            int cleared;
+            bool gameOver;
+            PlaceInPlace(board, piece.R[rot], col, out cleared, out gameOver);
+
+            if (res == "gameover" || gameOver) break;
+            played++;
+        }
+    }
+
+    // -------- Strategy selection + search --------
+    private static (int rot, int col) ChooseMove(Tetromino piece)
+    {
+        // Compute current danger/max height quickly
+        int curMax = ComputeHeightsAndMax(board, heightsBuf);
+        double danger = (H == 0) ? 1.0 : (double)curMax / H;
+
+        // Adaptive strategy based on game "complexity" (board size) and danger.
+        // - Safer / faster when danger is high.
+        // - Slightly deeper (expectimax over next piece) when the board is stable.
+        int area = W * H;
+        bool useExpectimax1 =
+            danger < 0.65 &&
+            area <= 900 &&                 // avoid too much work on very large boards
+            curMax < H - 2;                // avoid lookahead when near top-out
+
+        // When very safe, lean more into planning; when danger rises, be greedy/survival.
+        double lookaheadFactor = (danger < 0.35) ? 0.85 : (danger < 0.55 ? 0.65 : 0.35);
+
+        Weights w0 = GetWeights(danger, W, H);
+
+        double bestScore = double.NegativeInfinity;
+        int bestRot = 0, bestCol = 0;
+        int bestCleared = -1;
+        int bestMaxAfter = int.MaxValue;
+
+        // Enumerate all placements
+        for (int rot = 0; rot < 4; rot++)
+        {
+            Rotation r = piece.R[rot];
+            if (r.Width <= 0 || r.Height <= 0) continue;
+            int maxCol = W - r.Width;
+            if (maxCol < 0) continue;
+
+            for (int col = 0; col <= maxCol; col++)
+            {
+                Buffer.BlockCopy(board, 0, tmp1, 0, H * sizeof(uint));
+                int cleared;
+                bool gameOver;
+                PlaceInPlace(tmp1, r, col, out cleared, out gameOver);
+                if (gameOver) continue;
+
+                int maxAfter;
+                double score1 = Evaluate(tmp1, cleared, w0, heightsBuf2, out maxAfter);
+
+                double total = score1;
+
+                if (useExpectimax1)
+                {
+                    double exp = 0.0;
+                    // Recompute weights based on new danger after this move (adaptive within search).
+                    double dangerAfter = (double)maxAfter / H;
+                    Weights w1 = GetWeights(dangerAfter, W, H);
+
+                    for (int i = 0; i < 7; i++)
+                    {
+                        exp += BestScoreForNextPiece(pieceByIndex[i], tmp1, w1);
+                    }
+                    exp /= 7.0;
+                    total += lookaheadFactor * exp;
+                }
+
+                // Tie-breaking: prefer (1) higher score, (2) more cleared, (3) lower max height.
+                if (total > bestScore ||
+                    (total == bestScore && cleared > bestCleared) ||
+                    (total == bestScore && cleared == bestCleared && maxAfter < bestMaxAfter))
+                {
+                    bestScore = total;
+                    bestRot = rot;
+                    bestCol = col;
+                    bestCleared = cleared;
+                    bestMaxAfter = maxAfter;
+                }
+            }
+        }
+
+        // Fallback (should rarely happen unless already topped out)
+        return (bestRot, bestCol);
+    }
+
+    private static double BestScoreForNextPiece(Tetromino next, uint[] baseBoard, Weights w)
+    {
+        double best = double.NegativeInfinity;
+        bool any = false;
+
+        for (int rot = 0; rot < 4; rot++)
+        {
+            Rotation r = next.R[rot];
+            int maxCol = W - r.Width;
+            if (maxCol < 0) continue;
+
+            for (int col = 0; col <= maxCol; col++)
+            {
+                Buffer.BlockCopy(baseBoard, 0, tmp2, 0, H * sizeof(uint));
+                int cleared;
+                bool gameOver;
+                PlaceInPlace(tmp2, r, col, out cleared, out gameOver);
+                if (gameOver) continue;
+
+                int maxAfter;
+                double score = Evaluate(tmp2, cleared, w, heightsBuf2, out maxAfter);
+                if (score > best) best = score;
+                any = true;
+            }
+        }
+
+        // If no legal moves, extremely bad.
+        return any ? best : -1e18;
+    }
+
+    // -------- Evaluation --------
+    private static Weights GetWeights(double danger, int width, int height)
+    {
+        // Base heuristic (tuned for general play; adaptive adjustments below).
+        // Scale line reward down slightly on wider boards (lines are easier to form).
+        double lineScale = 10.0 / Math.Max(10, width);
+
+        var w = new Weights
+        {
+            Line = 1.05 * lineScale,
+            TetrisBonus = 2.5 * lineScale,
+            AggHeight = -0.55,
+            MaxHeight = -0.85,
+            Holes = -1.10,
+            Bumpiness = -0.20,
+            Wells = -0.10
+        };
+
+        // Small-board survival tends to require harsher max-height penalty.
+        if (height <= 20) w.MaxHeight *= 1.25;
+
+        // Wider boards: bumpiness matters a bit less.
+        if (width >= 16) w.Bumpiness *= 0.8;
+
+        // Adaptive: switch between "build/score" and "survive" modes smoothly.
+        if (danger < 0.30)
+        {
+            // Stable: prioritize clean stacking + scoring.
+            w.Line *= 1.25;
+            w.TetrisBonus *= 1.15;
+            w.AggHeight *= 0.80;
+            w.MaxHeight *= 0.60;
+            w.Holes *= 0.85;
+            w.Bumpiness *= 1.05;
+        }
+        else if (danger > 0.70)
+        {
+            // Dangerous: prioritize not dying (reduce holes, lower height).
+            w.Line *= 0.70;
+            w.TetrisBonus *= 0.60;
+            w.AggHeight *= 1.25;
+            w.MaxHeight *= 2.10;
+            w.Holes *= 1.70;
+            w.Bumpiness *= 0.90;
+            w.Wells *= 1.30;
+        }
+        else if (danger > 0.55)
+        {
+            // Mild danger.
+            w.Line *= 0.90;
+            w.AggHeight *= 1.10;
+            w.MaxHeight *= 1.35;
+            w.Holes *= 1.25;
+        }
+
+        return w;
+    }
+
+    private static double Evaluate(uint[] rows, int cleared, Weights w, int[] heightsScratch, out int maxHeight)
+    {
+        maxHeight = ComputeHeightsAndMax(rows, heightsScratch);
+
+        long aggHeight = 0;
+        for (int c = 0; c < W; c++) aggHeight += heightsScratch[c];
+
+        long holes = 0;
+        for (int c = 0; c < W; c++)
+        {
+            int hc = heightsScratch[c];
+            // top cell at hc-1 is guaranteed filled if hc>0; holes are empty cells below the topmost filled.
+            for (int r = hc - 2; r >= 0; r--)
+            {
+                if (((rows[r] >> c) & 1u) == 0u) holes++;
+            }
+        }
+
+        long bump = 0;
+        for (int c = 0; c + 1 < W; c++)
+            bump += Math.Abs(heightsScratch[c] - heightsScratch[c + 1]);
+
+        long wells = 0;
+        for (int c = 0; c < W; c++)
+        {
+            int left = (c == 0) ? H : heightsScratch[c - 1];
+            int right = (c == W - 1) ? H : heightsScratch[c + 1];
+            int minSide = Math.Min(left, right);
+            int h = heightsScratch[c];
+            if (h < minSide)
+            {
+                int d = minSide - h;
+                wells += d; // simple well depth sum
+            }
+        }
+
+        double score =
+            w.Line * cleared +
+            (cleared == 4 ? w.TetrisBonus : 0.0) +
+            w.AggHeight * aggHeight +
+            w.MaxHeight * maxHeight +
+            w.Holes * holes +
+            w.Bumpiness * bump +
+            w.Wells * wells;
+
+        return score;
+    }
+
+    private static int ComputeHeightsAndMax(uint[] rows, int[] heightsOut)
+    {
+        int maxH = 0;
+        for (int c = 0; c < W; c++)
+        {
+            int h = 0;
+            for (int r = H - 1; r >= 0; r--)
+            {
+                if (((rows[r] >> c) & 1u) != 0u)
+                {
+                    h = r + 1;
+                    break;
+                }
+            }
+            heightsOut[c] = h;
+            if (h > maxH) maxH = h;
+        }
+        return maxH;
+    }
+
+    // -------- Physics: drop + lock + clear --------
+    private static void PlaceInPlace(uint[] rows, Rotation rot, int col, out int cleared, out bool gameOver)
+    {
+        cleared = 0;
+        gameOver = false;
+
+        int pieceH = rot.Height;
+        int pieceW = rot.Width;
+        if (pieceH <= 0 || pieceW <= 0) { gameOver = true; return; }
+        if (col < 0 || col + pieceW > W) { gameOver = true; return; }
+
+        int yStart = H - pieceH;
+        if (yStart < 0) { gameOver = true; return; }
+
+        // If it collides at the highest allowed position, we top out.
+        if (Collides(rows, rot, col, yStart))
+        {
+            gameOver = true;
+            return;
+        }
+
+        int y = yStart;
+        while (y > 0 && !Collides(rows, rot, col, y - 1)) y--;
+
+        // Lock
+        for (int py = 0; py < pieceH; py++)
+        {
+            uint mask = rot.RowMasks[py] << col;
+            rows[y + py] |= mask;
+        }
+
+        // Clear lines
+        int write = 0;
+        for (int r = 0; r < H; r++)
+        {
+            if (rows[r] == FULL_MASK)
+            {
+                cleared++;
+            }
+            else
+            {
+                rows[write++] = rows[r];
+            }
+        }
+        for (; write < H; write++) rows[write] = 0;
+    }
+
+    private static bool Collides(uint[] rows, Rotation rot, int col, int y)
+    {
+        for (int py = 0; py < rot.Height; py++)
+        {
+            uint mask = rot.RowMasks[py] << col;
+            if ((rows[y + py] & mask) != 0u) return true;
+        }
+        return false;
+    }
+
+    // -------- Piece definitions + rotations --------
+    private static void InitPieces()
+    {
+        // char -> index
+        for (int i = 0; i < pieceIndexByChar.Length; i++) pieceIndexByChar[i] = -1;
+
+        // Create all 7
+        pieces[0] = MakePiece('I', 4, new (int x, int y)[] { (0, 1), (1, 1), (2, 1), (3, 1) });
+        pieces[1] = MakePiece('O', 2, new (int x, int y)[] { (0, 0), (1, 0), (0, 1), (1, 1) });
+        pieces[2] = MakePiece('T', 3, new (int x, int y)[] { (0, 1), (1, 1), (2, 1), (1, 2) });
+        pieces[3] = MakePiece('S', 3, new (int x, int y)[] { (1, 1), (2, 1), (0, 2), (1, 2) });
+        pieces[4] = MakePiece('Z', 3, new (int x, int y)[] { (0, 1), (1, 1), (1, 2), (2, 2) });
+        pieces[5] = MakePiece('J', 3, new (int x, int y)[] { (0, 2), (0, 1), (1, 1), (2, 1) });
+        pieces[6] = MakePiece('L', 3, new (int x, int y)[] { (2, 2), (0, 1), (1, 1), (2, 1) });
+
+        for (int i = 0; i < 7; i++)
+        {
+            pieceByIndex[i] = pieces[i];
+            char c = pieces[i].Type;
+            if (c < 128) pieceIndexByChar[c] = i;
+        }
+    }
+
+    private static Tetromino MakePiece(char type, int n, (int x, int y)[] cells)
+    {
+        var t = new Tetromino
+        {
+            Type = type,
+            N = n,
+            Spawn = new bool[n, n],
+            R = new Rotation[4]
+        };
+
+        foreach (var (x, y) in cells)
+        {
+            if ((uint)x < (uint)n && (uint)y < (uint)n)
+                t.Spawn[x, y] = true;
+        }
+
+        // Build 4 rotations by rotating within NxN, then normalizing to (minX,minY) = (0,0).
+        bool[,] cur = (bool[,])t.Spawn.Clone();
+        for (int rot = 0; rot < 4; rot++)
+        {
+            t.R[rot] = BuildRotationFromMatrix(cur, n);
+            cur = RotateCW(cur, n);
+        }
+
+        return t;
+    }
+
+    private static bool[,] RotateCW(bool[,] m, int n)
+    {
+        // Coordinates are [x,y] with origin at bottom-left, y up.
+        // Clockwise rotation: (x,y) -> (n-1-y, x)
+        var r = new bool[n, n];
+        for (int x = 0; x < n; x++)
+        for (int y = 0; y < n; y++)
+        {
+            if (!m[x, y]) continue;
+            int nx = n - 1 - y;
+            int ny = x;
+            r[nx, ny] = true;
+        }
+        return r;
+    }
+
+    private static Rotation BuildRotationFromMatrix(bool[,] m, int n)
+    {
+        int minX = int.MaxValue, minY = int.MaxValue;
+        int maxX = int.MinValue, maxY = int.MinValue;
+
+        for (int x = 0; x < n; x++)
+        for (int y = 0; y < n; y++)
+        {
+            if (!m[x, y]) continue;
+            if (x < minX) minX = x;
+            if (y < minY) minY = y;
+            if (x > maxX) maxX = x;
+            if (y > maxY) maxY = y;
+        }
+
+        if (minX == int.MaxValue)
+        {
+            return new Rotation { Width = 0, Height = 0, RowMasks = Array.Empty<uint>() };
+        }
+
+        int w = (maxX - minX) + 1;
+        int h = (maxY - minY) + 1;
+
+        var rowMasks = new uint[h];
+        for (int x = minX; x <= maxX; x++)
+        for (int y = minY; y <= maxY; y++)
+        {
+            if (!m[x, y]) continue;
+            int lx = x - minX;
+            int ly = y - minY;
+            rowMasks[ly] |= (1u << lx);
+        }
+
+        return new Rotation { Width = w, Height = h, RowMasks = rowMasks };
+    }
+}
+```

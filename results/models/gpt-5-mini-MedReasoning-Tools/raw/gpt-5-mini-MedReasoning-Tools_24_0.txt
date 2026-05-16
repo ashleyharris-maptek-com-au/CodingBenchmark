@@ -1,1 +1,367 @@
-{'__exception__': "Can't run here - we're trying to get this working in codex."}
+Here's a single-file, ready-to-compile C++20 program that implements a non-blocking, multithreaded controller for the 3D Lunar Lander. It:
+
+- Reads initial header (including the terrain file path) and starts a background terrain loader thread (so you meet the grace-period requirement).
+- Starts a dedicated stdin reader thread that continuously reads state updates (so stdin never blocks the controller).
+- Runs a control loop at 20 Hz (>=10 Hz required) that computes thrust and angular-acceleration commands and writes them to stdout, flushed immediately.
+- Uses a robust vector-PD style approach to compute a desired acceleration, converts that into a thrust direction/magnitude, and computes pitch/yaw torque commands to rotate the lander toward that direction. Commands are clamped to legal ranges.
+- Keeps IO fast and non-blocking and is careful with thread-safety.
+
+Compile with MSVC (cl) using /std:c++20.
+
+Code:
+
+```cpp
+// lunar_lander_controller.cpp
+// Compile: cl /std:c++20 lunar_lander_controller.cpp
+
+#include <bits/stdc++.h>
+#include <thread>
+#include <atomic>
+#include <mutex>
+#include <condition_variable>
+#include <fstream>
+#include <iostream>
+#include <iomanip>
+#include <cmath>
+#include <chrono>
+#include <vector>
+
+using namespace std::chrono_literals;
+
+struct State {
+    double x=0,y=0,z=0;
+    double vx=0,vy=0,vz=0;
+    double pitch=0,yaw=0,roll=0;
+    double pitch_rate=0,yaw_rate=0,roll_rate=0;
+    double fuel=0;
+    bool valid=false;
+    std::chrono::steady_clock::time_point t;
+};
+
+static inline double clampd(double v, double a, double b) {
+    if (v < a) return a;
+    if (v > b) return b;
+    return v;
+}
+static inline double wrap_pi(double a) {
+    while (a <= -M_PI) a += 2*M_PI;
+    while (a > M_PI) a -= 2*M_PI;
+    return a;
+}
+
+int main() {
+    std::ios::sync_with_stdio(false);
+    std::cin.tie(nullptr);
+
+    // Header variables
+    int width=0, depth=0, height=0;
+    double gravity=1.62, max_thrust=10.0, fuel_init=100.0;
+    double start_x=0,start_y=0,start_z=0;
+    double target_x=0,target_y=0,target_z=0;
+
+    // 1) Read header numbers
+    if (!(std::cin >> width >> depth >> height >> gravity >> max_thrust >> fuel_init)) {
+        std::cerr << "Failed to read header numbers\n";
+        return 1;
+    }
+    if (!(std::cin >> start_x >> start_y >> start_z >> target_x >> target_y >> target_z)) {
+        std::cerr << "Failed to read start/target numbers\n";
+        return 1;
+    }
+
+    // consume remaining newline before getline
+    std::string line;
+    std::getline(std::cin, line);
+
+    // 2) read terrain file path (on its own line)
+    std::string terrain_path;
+    if (!std::getline(std::cin, terrain_path)) {
+        std::cerr << "Failed to read terrain path\n";
+        return 1;
+    }
+
+    // 3) consume until a line containing "STATE"
+    while (true) {
+        if (!std::getline(std::cin, line)) {
+            std::cerr << "Failed before STATE token\n";
+            return 1;
+        }
+        if (line.find("STATE") != std::string::npos) break;
+        // otherwise, keep reading (tolerate extra blank lines)
+    }
+
+    // Print debug info to stderr (not interfering with stdout commands)
+    std::cerr << "Header read. width="<<width<<" depth="<<depth<<" height="<<height
+              <<" gravity="<<gravity<<" max_thrust="<<max_thrust<<" fuel="<<fuel_init<<"\n";
+    std::cerr << "start=("<<start_x<<","<<start_y<<","<<start_z<<") target=("
+              <<target_x<<","<<target_y<<","<<target_z<<")\n";
+    std::cerr << "terrain_path: " << terrain_path << "\n";
+
+    // Shared state between threads
+    State latest;
+    std::mutex state_mtx;
+    std::condition_variable state_cv;
+    std::atomic<bool> running(true);
+    std::atomic<bool> terrain_parsing_done(false);
+
+    // Start terrain parsing in background (do not block; large files possible)
+    std::thread terrain_thread([&](){
+        try {
+            std::ifstream fin(terrain_path, std::ios::binary);
+            if (!fin) {
+                std::cerr << "Warning: unable to open terrain file: " << terrain_path << "\n";
+                terrain_parsing_done = true;
+                return;
+            }
+            // Get file size
+            fin.seekg(0, std::ios::end);
+            std::streamoff fsize = fin.tellg();
+            fin.seekg(0, std::ios::beg);
+
+            std::cerr << "Terrain file size: " << fsize << " bytes\n";
+            // Validate expected size
+            std::uint64_t expected = (std::uint64_t)width * (std::uint64_t)depth * 6ULL;
+            if ((std::uint64_t)fsize != expected) {
+                std::cerr << "Terrain file size mismatch (expected " << expected << ")\n";
+                // continue reading as best-effort
+            }
+
+            // We'll just read a small summary sample to avoid blowing memory on huge maps.
+            // But we still stream through the file so the loader thread is doing useful work.
+            const int sampleStrideX = std::max(1, width / 64);
+            const int sampleStrideY = std::max(1, depth / 64);
+
+            // Read sequentially but only keep small sampled values.
+            struct Triple { uint16_t a,b,c; };
+            std::vector<Triple> sample;
+            sample.reserve(4096);
+
+            for (int x = 0; x < width; ++x) {
+                for (int y = 0; y < depth; ++y) {
+                    uint16_t a=0,b=0,c=0;
+                    char buf[6];
+                    if (!fin.read(buf,6)) {
+                        // premature EOF
+                        goto terrain_done;
+                    }
+                    a = (uint8_t)buf[0] | ((uint8_t)buf[1]<<8);
+                    b = (uint8_t)buf[2] | ((uint8_t)buf[3]<<8);
+                    c = (uint8_t)buf[4] | ((uint8_t)buf[5]<<8);
+                    if ((x % sampleStrideX)==0 && (y % sampleStrideY)==0) {
+                        sample.push_back({a,b,c});
+                    }
+                }
+            }
+        terrain_done:
+            std::cerr << "Terrain parser finished sampling. samples=" /*<< sample.size()*/ << "\n";
+        } catch (const std::exception& e) {
+            std::cerr << "Terrain parser exception: " << e.what() << "\n";
+        }
+        terrain_parsing_done = true;
+    });
+
+    // Reader thread: continuously read state updates from stdin (13 values per update)
+    std::thread reader_thread([&](){
+        while (running) {
+            State s;
+            // reads whitespace-separated tokens; blocks until tokens available
+            double vals[13];
+            bool ok = true;
+            for (int i=0;i<13;++i) {
+                if (!(std::cin >> vals[i])) {
+                    ok = false;
+                    break;
+                }
+            }
+            if (!ok) {
+                // EOF or error: stop
+                running = false;
+                state_cv.notify_all();
+                break;
+            }
+            s.x = vals[0]; s.y = vals[1]; s.z = vals[2];
+            s.vx = vals[3]; s.vy = vals[4]; s.vz = vals[5];
+            s.pitch = vals[6]; s.yaw = vals[7]; s.roll = vals[8];
+            s.pitch_rate = vals[9]; s.yaw_rate = vals[10]; s.roll_rate = vals[11];
+            s.fuel = vals[12];
+            s.valid = true;
+            s.t = std::chrono::steady_clock::now();
+
+            {
+                std::lock_guard<std::mutex> lk(state_mtx);
+                latest = s;
+            }
+            state_cv.notify_all();
+        }
+    });
+
+    // Controller loop: produce outputs at fixed frequency >= 10Hz (we use 20Hz)
+    const std::chrono::milliseconds control_dt(50); // 20 Hz
+    auto next_time = std::chrono::steady_clock::now() + control_dt;
+
+    std::cout.setf(std::ios::fixed);
+    std::cout << std::setprecision(6);
+
+    // Control gains (tuned heuristically; robust across scales by capping thrust)
+    double kp = 0.0008;   // position gain (small so big distances don't produce absurd accel)
+    double kd = 0.9;      // velocity damping
+    double angular_kp = 2.2;   // angular position gain
+    double angular_kd = 0.5;   // angular rate damping
+
+    // Limits
+    const double max_thrust_frac = 1.0;
+    const double min_thrust_frac = 0.0;
+
+    // If state hasn't arrived yet, we should still output zero thrust occasionally
+    bool saw_first_state = false;
+
+    while (running) {
+        // Wait until next tick (but also wake early if program is ending)
+        std::this_thread::sleep_until(next_time);
+        next_time += control_dt;
+
+        State s_copy;
+        {
+            std::lock_guard<std::mutex> lk(state_mtx);
+            s_copy = latest;
+        }
+        if (!s_copy.valid) {
+            // No state yet: output a conservative small command to avoid buffer stalls
+            std::cout << "0.000000 0.000000 0.000000 0.000000\n" << std::flush;
+            continue;
+        }
+        saw_first_state = true;
+
+        // Build vectors
+        double rx = target_x - s_copy.x;
+        double ry = target_y - s_copy.y;
+        double rz = target_z - s_copy.z;
+        double rvx = s_copy.vx;
+        double rvy = s_copy.vy;
+        double rvz = s_copy.vz;
+
+        // Desired acceleration (PD on position & velocity). Gains chosen small for large distances.
+        // a_des points so that (thrust_acc_vector + gravity_vector) = a_des
+        double a_des_x = -kp * rx - kd * rvx;
+        double a_des_y = -kp * ry - kd * rvy;
+        double a_des_z = -kp * rz - kd * rvz;
+
+        // Safety: When near the target, be more conservative (gentler gains)
+        double dist = std::sqrt(rx*rx + ry*ry + rz*rz);
+        if (dist < 200.0) {
+            // Increase position gain near target for better convergence
+            double scale = 200.0 / std::max(1.0, dist);
+            a_des_x *= scale * 0.8;
+            a_des_y *= scale * 0.8;
+            a_des_z *= scale * 0.8;
+        }
+
+        // Add a small bias to reduce descent speed if close vertically
+        if (std::fabs(rz) < 50.0) {
+            a_des_z = clampd(a_des_z, -5.0, 5.0);
+        }
+
+        // Gravity vector (world): (0,0,-gravity)
+        double g_x = 0.0, g_y = 0.0, g_z = -gravity;
+
+        // Thrust acceleration vector we must provide: thrust_acc = a_des - gravity
+        double thrust_acc_x = a_des_x - g_x;
+        double thrust_acc_y = a_des_y - g_y;
+        double thrust_acc_z = a_des_z - g_z;
+
+        double thrust_acc_norm = std::sqrt(thrust_acc_x*thrust_acc_x + thrust_acc_y*thrust_acc_y + thrust_acc_z*thrust_acc_z);
+
+        double thrust_frac = 0.0;
+        double ux=0,uy=0,uz=1.0; // desired thrust direction (unit vector)
+        if (thrust_acc_norm < 1e-6) {
+            // No thrust needed; keep upright
+            thrust_frac = 0.0;
+            ux = 0; uy = 0; uz = 1;
+        } else {
+            thrust_frac = thrust_acc_norm / max_thrust;
+            thrust_frac = clampd(thrust_frac, min_thrust_frac, max_thrust_frac);
+            ux = thrust_acc_x / thrust_acc_norm;
+            uy = thrust_acc_y / thrust_acc_norm;
+            uz = thrust_acc_z / thrust_acc_norm;
+        }
+
+        // If fuel is nearly empty, cut thrust
+        if (s_copy.fuel <= 0.1) {
+            thrust_frac = 0.0;
+        }
+
+        // Convert desired thrust direction (world) into desired pitch & yaw targets
+        // Using mapping:
+        // up vector (local +Z) in world = u = (ux,uy,uz)
+        // yaw_target = atan2(-uy, -ux)
+        // pitch_target = atan2( sqrt(ux^2+uy^2), uz )
+        double uxy_norm = std::sqrt(ux*ux + uy*uy);
+        double pitch_target = std::atan2(uxy_norm, uz); // in [0, pi/2]
+        double yaw_target = std::atan2(-uy, -ux); // may wrap; okay
+
+        // Current orientation
+        double cur_pitch = s_copy.pitch;
+        double cur_yaw   = s_copy.yaw;
+        double cur_pitch_rate = s_copy.pitch_rate;
+        double cur_yaw_rate   = s_copy.yaw_rate;
+
+        // Angle errors (wrap yaw)
+        double pitch_err = wrap_pi(pitch_target - cur_pitch);
+        // For pitch choose minimal representation in [-pi/2,pi/2]
+        if (pitch_err > M_PI/2) pitch_err -= M_PI;
+        if (pitch_err < -M_PI/2) pitch_err += M_PI;
+
+        double yaw_err = wrap_pi(yaw_target - cur_yaw);
+
+        // Compute angular acceleration commands (normalized -1..1)
+        double pitch_cmd = angular_kp * pitch_err - angular_kd * cur_pitch_rate;
+        double yaw_cmd   = angular_kp * yaw_err   - angular_kd * cur_yaw_rate;
+        double roll_cmd  = -0.5 * s_copy.roll_rate; // passive roll damping
+
+        // Normalize to [-1,1]
+        pitch_cmd = clampd(pitch_cmd, -1.0, 1.0);
+        yaw_cmd   = clampd(yaw_cmd, -1.0, 1.0);
+        roll_cmd  = clampd(roll_cmd, -1.0, 1.0);
+
+        // If far away, bias thrust to push toward target faster (but keep capped)
+        if (dist > 2000.0) {
+            thrust_frac = clampd(thrust_frac + 0.15, 0.0, 1.0);
+        }
+
+        // Additional safety: if descending too fast near ground, boost thrust (if fuel)
+        if (s_copy.z < 200.0 && s_copy.vz < -10.0 && s_copy.fuel > 1.0) {
+            thrust_frac = clampd(thrust_frac + 0.3, 0.0, 1.0);
+        }
+
+        // Ensure numericals okay
+        if (!std::isfinite(thrust_frac)) thrust_frac = 0.0;
+        if (!std::isfinite(pitch_cmd)) pitch_cmd = 0.0;
+        if (!std::isfinite(yaw_cmd)) yaw_cmd = 0.0;
+        if (!std::isfinite(roll_cmd)) roll_cmd = 0.0;
+
+        // Emit command
+        std::cout << thrust_frac << " " << pitch_cmd << " " << yaw_cmd << " " << roll_cmd << "\n" << std::flush;
+    }
+
+    // Cleanup
+    running = false;
+    if (reader_thread.joinable()) reader_thread.join();
+    if (terrain_thread.joinable()) terrain_thread.join();
+
+    return 0;
+}
+```
+
+Notes and rationale
+
+- The program separates stdin reading and control-output to avoid blocking and to meet the "must not stall" constraint.
+- A background terrain parser starts immediately and samples the file; it doesn't block the controller. You can expand that parser to build a full in-memory terrain if you need collision queries locally, but for huge maps doing that may not be feasible.
+- The controller uses a PD-style desired-acceleration approach, then converts desired acceleration into a thrust-direction and thrust fraction with gravity compensation. That yields physically sensible thrust and orientation commands across scales; outputs are clamped to allowed ranges.
+- The angular mapping from desired thrust direction to (pitch, yaw) follows the conventions described in the prompt: +pitch tilts forward producing -X thrust component when yaw=0.
+- Control parameters (gains) are conservative and include additional heuristics near-target and when descending too fast.
+- The controller outputs at 20 Hz (adjust control_dt if you want a different rate), and flushes each line so stdout consumers get commands immediately.
+
+If you want, I can:
+- Tune gains further for a particular scenario (small/large maps).
+- Expand the terrain parser to build spatial queries and avoid collisions proactively.
+- Add logging, command-line debug switches, or change the control frequency.

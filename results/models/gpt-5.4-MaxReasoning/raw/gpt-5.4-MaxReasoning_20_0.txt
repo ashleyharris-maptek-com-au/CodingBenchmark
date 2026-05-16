@@ -1,0 +1,911 @@
+use std::collections::HashMap;
+use std::io::{self, Read};
+
+const EPS: f64 = 1e-9;
+const EXACT_ROBUST_LIMIT: usize = 200_000;
+const ROBUST_SAMPLE_CAP: usize = 8_192;
+const MAX_REPORTS: usize = 100_000;
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct CellKey {
+    x: i32,
+    y: i32,
+    z: i32,
+}
+
+#[derive(Clone, Copy)]
+enum Strategy {
+    Small,
+    Medium,
+    Large,
+}
+
+#[derive(Clone, Copy)]
+struct StrategyConfig {
+    target_neighbors: usize,
+    max_ring: i32,
+    min_neighbors: usize,
+    cell_size_factor: f64,
+    use_cell_aggregates: bool,
+}
+
+#[derive(Clone, Copy, Default)]
+struct RunningStats {
+    count: usize,
+    mean: f64,
+    m2: f64,
+}
+
+impl RunningStats {
+    fn add(&mut self, value: f64) {
+        self.count += 1;
+        let delta = value - self.mean;
+        self.mean += delta / self.count as f64;
+        let delta2 = value - self.mean;
+        self.m2 += delta * delta2;
+    }
+
+    fn stddev(&self) -> f64 {
+        if self.count > 1 {
+            (self.m2 / (self.count as f64 - 1.0)).sqrt()
+        } else {
+            0.0
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PropertyStats {
+    mean: f64,
+    stddev: f64,
+    median: f64,
+    mad: f64,
+    valid_count: usize,
+}
+
+struct CellBucket {
+    indices: Vec<usize>,
+    counts: Vec<u32>,
+    sums: Vec<f64>,
+    sumsq: Vec<f64>,
+}
+
+impl CellBucket {
+    fn new(num_props: usize) -> Self {
+        Self {
+            indices: Vec::new(),
+            counts: vec![0; num_props],
+            sums: vec![0.0; num_props],
+            sumsq: vec![0.0; num_props],
+        }
+    }
+
+    fn add_sample(&mut self, sample_idx: usize, row: &[f64]) {
+        self.indices.push(sample_idx);
+        for (prop_idx, &value) in row.iter().enumerate() {
+            if value.is_finite() {
+                self.counts[prop_idx] += 1;
+                self.sums[prop_idx] += value;
+                self.sumsq[prop_idx] += value * value;
+            }
+        }
+    }
+}
+
+struct Suspect {
+    hole_idx: usize,
+    sample_idx: usize,
+    prop_idx: usize,
+    confidence: f64,
+}
+
+fn parse_usize_token(token: Option<&str>) -> usize {
+    token.and_then(|s| s.parse::<usize>().ok()).unwrap_or(0)
+}
+
+fn parse_f64_token(token: Option<&str>) -> f64 {
+    token.and_then(|s| s.parse::<f64>().ok()).unwrap_or(f64::NAN)
+}
+
+fn normalize_direction(dx: f64, dy: f64, dz: f64) -> (f64, f64, f64) {
+    let norm = (dx * dx + dy * dy + dz * dz).sqrt();
+    if norm.is_finite() && norm > EPS {
+        (dx / norm, dy / norm, dz / norm)
+    } else {
+        (0.0, 0.0, 0.0)
+    }
+}
+
+fn clamp_depth(depth: f64, length: f64) -> f64 {
+    if !depth.is_finite() {
+        return 0.0;
+    }
+    if length.is_finite() && length >= 0.0 {
+        depth.clamp(0.0, length)
+    } else {
+        depth.max(0.0)
+    }
+}
+
+fn choose_strategy(sample_count: usize, workload: usize) -> (Strategy, StrategyConfig) {
+    if sample_count <= 30_000 && workload <= 800_000 {
+        (
+            Strategy::Small,
+            StrategyConfig {
+                target_neighbors: 48,
+                max_ring: 3,
+                min_neighbors: 4,
+                cell_size_factor: 1.0,
+                use_cell_aggregates: false,
+            },
+        )
+    } else if sample_count <= 500_000 && workload <= 8_000_000 {
+        (
+            Strategy::Medium,
+            StrategyConfig {
+                target_neighbors: 24,
+                max_ring: 2,
+                min_neighbors: 4,
+                cell_size_factor: 1.35,
+                use_cell_aggregates: false,
+            },
+        )
+    } else {
+        (
+            Strategy::Large,
+            StrategyConfig {
+                target_neighbors: 12,
+                max_ring: 1,
+                min_neighbors: 3,
+                cell_size_factor: 2.2,
+                use_cell_aggregates: true,
+            },
+        )
+    }
+}
+
+fn median_of_sorted(values: &[f64]) -> f64 {
+    if values.is_empty() {
+        return f64::NAN;
+    }
+    let mid = values.len() / 2;
+    if values.len() % 2 == 1 {
+        values[mid]
+    } else {
+        (values[mid - 1] + values[mid]) * 0.5
+    }
+}
+
+fn median_and_mad(sample: &mut Vec<f64>) -> (f64, f64) {
+    if sample.is_empty() {
+        return (f64::NAN, f64::NAN);
+    }
+    sample.sort_unstable_by(|a, b| a.total_cmp(b));
+    let median = median_of_sorted(sample);
+    let mut deviations = Vec::with_capacity(sample.len());
+    for &value in sample.iter() {
+        deviations.push((value - median).abs());
+    }
+    deviations.sort_unstable_by(|a, b| a.total_cmp(b));
+    let mad = median_of_sorted(&deviations);
+    (median, mad)
+}
+
+fn sample_property_values(
+    all_values: &[f64],
+    prop_idx: usize,
+    num_props: usize,
+    exact: bool,
+) -> Vec<f64> {
+    if exact {
+        let mut sample = Vec::new();
+        for row in all_values.chunks_exact(num_props) {
+            let value = row[prop_idx];
+            if value.is_finite() {
+                sample.push(value);
+            }
+        }
+        return sample;
+    }
+
+    let mut sample = Vec::with_capacity(ROBUST_SAMPLE_CAP);
+    let mut seen = 0usize;
+    let mut state = 0x9E37_79B9_7F4A_7C15u64 ^ prop_idx as u64;
+    for row in all_values.chunks_exact(num_props) {
+        let value = row[prop_idx];
+        if !value.is_finite() {
+            continue;
+        }
+        seen += 1;
+        if sample.len() < ROBUST_SAMPLE_CAP {
+            sample.push(value);
+        } else {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let replace_idx = (state as usize) % seen;
+            if replace_idx < ROBUST_SAMPLE_CAP {
+                sample[replace_idx] = value;
+            }
+        }
+    }
+    sample
+}
+
+fn build_property_stats(
+    all_values: &[f64],
+    num_props: usize,
+    running: &[RunningStats],
+) -> Vec<PropertyStats> {
+    let mut out = Vec::with_capacity(num_props);
+    for prop_idx in 0..num_props {
+        let count = running[prop_idx].count;
+        let exact = count <= EXACT_ROBUST_LIMIT;
+        let mut sample = sample_property_values(all_values, prop_idx, num_props, exact);
+        let (median, mad) = median_and_mad(&mut sample);
+        out.push(PropertyStats {
+            mean: running[prop_idx].mean,
+            stddev: running[prop_idx].stddev(),
+            median,
+            mad,
+            valid_count: count,
+        });
+    }
+    out
+}
+
+fn effective_global_scale(stats: &PropertyStats) -> f64 {
+    let robust = if stats.mad.is_finite() {
+        stats.mad * 1.4826
+    } else {
+        0.0
+    };
+    let magnitude = stats.median.abs().max(stats.mean.abs()).max(1.0);
+    robust
+        .max(stats.stddev * 0.35)
+        .max(magnitude * 1e-6)
+        .max(1e-9)
+}
+
+fn global_score(value: f64, stats: &PropertyStats) -> f64 {
+    let center = if stats.median.is_finite() {
+        stats.median
+    } else {
+        stats.mean
+    };
+    (value - center).abs() / effective_global_scale(stats)
+}
+
+fn safe_cell_coord(value: f64, origin: f64, cell_size: f64) -> i32 {
+    let raw = ((value - origin) / cell_size).floor();
+    if raw.is_nan() {
+        0
+    } else if raw <= i32::MIN as f64 {
+        i32::MIN
+    } else if raw >= i32::MAX as f64 {
+        i32::MAX
+    } else {
+        raw as i32
+    }
+}
+
+fn make_cell_key(
+    x: f64,
+    y: f64,
+    z: f64,
+    min_x: f64,
+    min_y: f64,
+    min_z: f64,
+    cell_size: f64,
+) -> CellKey {
+    CellKey {
+        x: safe_cell_coord(x, min_x, cell_size),
+        y: safe_cell_coord(y, min_y, cell_size),
+        z: safe_cell_coord(z, min_z, cell_size),
+    }
+}
+
+fn build_cells(
+    xs: &[f64],
+    ys: &[f64],
+    zs: &[f64],
+    values: &[f64],
+    num_props: usize,
+    min_x: f64,
+    min_y: f64,
+    min_z: f64,
+    cell_size: f64,
+) -> (HashMap<CellKey, usize>, Vec<CellBucket>, Vec<CellKey>, Vec<usize>) {
+    let mut cell_map: HashMap<CellKey, usize> =
+        HashMap::with_capacity(xs.len().saturating_mul(2).max(16));
+    let mut cells: Vec<CellBucket> = Vec::new();
+    let mut sample_cells = Vec::with_capacity(xs.len());
+    let mut sample_bucket_indices = Vec::with_capacity(xs.len());
+
+    for sample_idx in 0..xs.len() {
+        let key = make_cell_key(xs[sample_idx], ys[sample_idx], zs[sample_idx], min_x, min_y, min_z, cell_size);
+        let cell_idx = if let Some(&existing) = cell_map.get(&key) {
+            existing
+        } else {
+            let created = cells.len();
+            cell_map.insert(key, created);
+            cells.push(CellBucket::new(num_props));
+            created
+        };
+        sample_cells.push(key);
+        sample_bucket_indices.push(cell_idx);
+        let row = &values[sample_idx * num_props..(sample_idx + 1) * num_props];
+        cells[cell_idx].add_sample(sample_idx, row);
+    }
+
+    (cell_map, cells, sample_cells, sample_bucket_indices)
+}
+
+fn collect_knn(
+    sample_idx: usize,
+    sample_cell: CellKey,
+    cell_map: &HashMap<CellKey, usize>,
+    cells: &[CellBucket],
+    xs: &[f64],
+    ys: &[f64],
+    zs: &[f64],
+    target_neighbors: usize,
+    max_ring: i32,
+) -> Vec<(usize, f64)> {
+    let mut out = Vec::with_capacity(target_neighbors.saturating_mul(4).max(16));
+    let sx = xs[sample_idx];
+    let sy = ys[sample_idx];
+    let sz = zs[sample_idx];
+
+    for ddx in -max_ring..=max_ring {
+        for ddy in -max_ring..=max_ring {
+            for ddz in -max_ring..=max_ring {
+                let neighbor_key = CellKey {
+                    x: sample_cell.x.saturating_add(ddx),
+                    y: sample_cell.y.saturating_add(ddy),
+                    z: sample_cell.z.saturating_add(ddz),
+                };
+                if let Some(&cell_idx) = cell_map.get(&neighbor_key) {
+                    for &other_idx in &cells[cell_idx].indices {
+                        if other_idx == sample_idx {
+                            continue;
+                        }
+                        let dx = xs[other_idx] - sx;
+                        let dy = ys[other_idx] - sy;
+                        let dz = zs[other_idx] - sz;
+                        out.push((other_idx, dx * dx + dy * dy + dz * dz));
+                    }
+                }
+                if out.len() > target_neighbors.saturating_mul(32).max(64) {
+                    out.sort_unstable_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+                    out.truncate(target_neighbors.saturating_mul(4).max(16));
+                }
+            }
+        }
+    }
+
+    out.sort_unstable_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+    if out.len() > target_neighbors {
+        out.truncate(target_neighbors);
+    }
+    out
+}
+
+fn collect_neighbor_cells(
+    sample_idx: usize,
+    sample_cell: CellKey,
+    cell_map: &HashMap<CellKey, usize>,
+    xs: &[f64],
+    ys: &[f64],
+    zs: &[f64],
+    min_x: f64,
+    min_y: f64,
+    min_z: f64,
+    cell_size: f64,
+    max_ring: i32,
+) -> Vec<(usize, f64)> {
+    let mut out = Vec::with_capacity(((2 * max_ring + 1).pow(3) as usize).max(16));
+    let sx = xs[sample_idx];
+    let sy = ys[sample_idx];
+    let sz = zs[sample_idx];
+
+    for ddx in -max_ring..=max_ring {
+        for ddy in -max_ring..=max_ring {
+            for ddz in -max_ring..=max_ring {
+                let cell_x = sample_cell.x.saturating_add(ddx);
+                let cell_y = sample_cell.y.saturating_add(ddy);
+                let cell_z = sample_cell.z.saturating_add(ddz);
+                let neighbor_key = CellKey {
+                    x: cell_x,
+                    y: cell_y,
+                    z: cell_z,
+                };
+                if let Some(&cell_idx) = cell_map.get(&neighbor_key) {
+                    let center_x = min_x + (cell_x as f64 + 0.5) * cell_size;
+                    let center_y = min_y + (cell_y as f64 + 0.5) * cell_size;
+                    let center_z = min_z + (cell_z as f64 + 0.5) * cell_size;
+                    let dx = center_x - sx;
+                    let dy = center_y - sy;
+                    let dz = center_z - sz;
+                    out.push((cell_idx, dx * dx + dy * dy + dz * dz));
+                }
+            }
+        }
+    }
+
+    out.sort_unstable_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+    out
+}
+
+fn summarize_neighbors(
+    neighbors: &[(usize, f64)],
+    prop_idx: usize,
+    num_props: usize,
+    values: &[f64],
+    nominal_spacing: f64,
+    min_neighbors: usize,
+    global_scale: f64,
+) -> Option<(f64, f64, usize)> {
+    let mut weight_sum = 0.0;
+    let mut weighted_sum = 0.0;
+    let mut weighted_sum_sq = 0.0;
+    let mut support = 0usize;
+
+    for &(neighbor_idx, dist_sq) in neighbors {
+        let value = values[neighbor_idx * num_props + prop_idx];
+        if !value.is_finite() {
+            continue;
+        }
+        let weight = 1.0 / (dist_sq.sqrt() + nominal_spacing);
+        weight_sum += weight;
+        weighted_sum += weight * value;
+        weighted_sum_sq += weight * value * value;
+        support += 1;
+    }
+
+    if support < min_neighbors || weight_sum <= 0.0 {
+        return None;
+    }
+
+    let mean = weighted_sum / weight_sum;
+    let variance = (weighted_sum_sq / weight_sum - mean * mean).max(0.0);
+    let scale = variance
+        .sqrt()
+        .max(global_scale * 0.18)
+        .max(mean.abs().max(1.0) * 1e-6);
+    Some((mean, scale, support))
+}
+
+fn summarize_cells(
+    sample_idx: usize,
+    sample_bucket_idx: usize,
+    neighbor_cells: &[(usize, f64)],
+    prop_idx: usize,
+    num_props: usize,
+    values: &[f64],
+    cells: &[CellBucket],
+    cell_size: f64,
+    global_scale: f64,
+) -> Option<(f64, f64, usize)> {
+    let sample_value = values[sample_idx * num_props + prop_idx];
+    let mut weight_sum = 0.0;
+    let mut weighted_sum = 0.0;
+    let mut weighted_second_moment = 0.0;
+    let mut support = 0usize;
+
+    for &(cell_idx, dist_sq) in neighbor_cells {
+        let bucket = &cells[cell_idx];
+        let mut count = bucket.counts[prop_idx] as i64;
+        if count <= 0 {
+            continue;
+        }
+
+        let mut sum = bucket.sums[prop_idx];
+        let mut sumsq = bucket.sumsq[prop_idx];
+        if cell_idx == sample_bucket_idx && sample_value.is_finite() {
+            count -= 1;
+            sum -= sample_value;
+            sumsq -= sample_value * sample_value;
+        }
+        if count <= 0 {
+            continue;
+        }
+
+        let count_f = count as f64;
+        let mean = sum / count_f;
+        let variance = (sumsq / count_f - mean * mean).max(0.0);
+        let weight = count_f.sqrt() / (dist_sq.sqrt() + cell_size);
+        weight_sum += weight;
+        weighted_sum += weight * mean;
+        weighted_second_moment += weight * (variance + mean * mean);
+        support = support.saturating_add(count as usize);
+    }
+
+    if support < 3 || weight_sum <= 0.0 {
+        return None;
+    }
+
+    let mean = weighted_sum / weight_sum;
+    let variance = (weighted_second_moment / weight_sum - mean * mean).max(0.0);
+    let scale = variance
+        .sqrt()
+        .max(global_scale * 0.22)
+        .max(mean.abs().max(1.0) * 1e-6);
+    Some((mean, scale, support))
+}
+
+fn same_hole_score(
+    sample_idx: usize,
+    prop_idx: usize,
+    num_props: usize,
+    values: &[f64],
+    depths: &[f64],
+    prev_sorted: &[Option<usize>],
+    next_sorted: &[Option<usize>],
+    global_scale: f64,
+) -> Option<(f64, usize)> {
+    let value = values[sample_idx * num_props + prop_idx];
+    if !value.is_finite() {
+        return None;
+    }
+
+    let prev_idx = prev_sorted[sample_idx];
+    let next_idx = next_sorted[sample_idx];
+
+    if let (Some(a), Some(b)) = (prev_idx, next_idx) {
+        let va = values[a * num_props + prop_idx];
+        let vb = values[b * num_props + prop_idx];
+        if va.is_finite() && vb.is_finite() {
+            let da = depths[a];
+            let db = depths[b];
+            let d = depths[sample_idx];
+            let t = if da.is_finite() && db.is_finite() && (db - da).abs() > EPS {
+                ((d - da) / (db - da)).clamp(0.0, 1.0)
+            } else {
+                0.5
+            };
+            let predicted = va + (vb - va) * t;
+            let span = (vb - va).abs();
+            let scale = (span * 0.30)
+                .max(global_scale * 0.20)
+                .max(predicted.abs().max(value.abs()).max(1.0) * 1e-6);
+            return Some(((value - predicted).abs() / scale, 2));
+        }
+    }
+
+    let neighbor_idx = prev_idx.or(next_idx)?;
+    let neighbor_value = values[neighbor_idx * num_props + prop_idx];
+    if !neighbor_value.is_finite() {
+        return None;
+    }
+    let scale = (neighbor_value.abs().max(value.abs()).max(1.0) * 0.02)
+        .max(global_scale * 0.35)
+        .max(1e-9);
+    Some(((value - neighbor_value).abs() / scale, 1))
+}
+
+fn main() {
+    let mut input = String::new();
+    if io::stdin().read_to_string(&mut input).is_err() {
+        println!("0");
+        return;
+    }
+
+    let mut tokens = input.split_ascii_whitespace();
+    let num_holes = parse_usize_token(tokens.next());
+    let num_props = parse_usize_token(tokens.next());
+
+    if num_holes == 0 || num_props == 0 {
+        println!("0");
+        return;
+    }
+
+    let mut property_names = Vec::with_capacity(num_props);
+    for prop_idx in 0..num_props {
+        let name = tokens
+            .next()
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("prop_{}", prop_idx));
+        property_names.push(name);
+    }
+
+    let mut hole_ids = Vec::with_capacity(num_holes);
+    let mut xs = Vec::<f64>::new();
+    let mut ys = Vec::<f64>::new();
+    let mut zs = Vec::<f64>::new();
+    let mut depths = Vec::<f64>::new();
+    let mut hole_of_sample = Vec::<usize>::new();
+    let mut sample_local_indices = Vec::<usize>::new();
+    let mut prev_sorted = Vec::<Option<usize>>::new();
+    let mut next_sorted = Vec::<Option<usize>>::new();
+    let mut values = Vec::<f64>::new();
+    let mut running = vec![RunningStats::default(); num_props];
+
+    let mut min_x = f64::INFINITY;
+    let mut min_y = f64::INFINITY;
+    let mut min_z = f64::INFINITY;
+    let mut max_x = f64::NEG_INFINITY;
+    let mut max_y = f64::NEG_INFINITY;
+    let mut max_z = f64::NEG_INFINITY;
+    let mut spacing_sum = 0.0;
+    let mut spacing_count = 0usize;
+
+    for hole_idx in 0..num_holes {
+        let hole_id = tokens
+            .next()
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("hole_{}", hole_idx));
+        hole_ids.push(hole_id);
+
+        let start_x = parse_f64_token(tokens.next());
+        let start_y = parse_f64_token(tokens.next());
+        let start_z = parse_f64_token(tokens.next());
+        let dir_x = parse_f64_token(tokens.next());
+        let dir_y = parse_f64_token(tokens.next());
+        let dir_z = parse_f64_token(tokens.next());
+        let length = parse_f64_token(tokens.next());
+        let num_samples = parse_usize_token(tokens.next());
+        let (ux, uy, uz) = normalize_direction(dir_x, dir_y, dir_z);
+
+        let mut hole_samples = Vec::with_capacity(num_samples);
+        for sample_idx in 0..num_samples {
+            let depth = clamp_depth(parse_f64_token(tokens.next()), length);
+            let x = start_x + ux * depth;
+            let y = start_y + uy * depth;
+            let z = start_z + uz * depth;
+
+            let global_idx = xs.len();
+            xs.push(x);
+            ys.push(y);
+            zs.push(z);
+            depths.push(depth);
+            hole_of_sample.push(hole_idx);
+            sample_local_indices.push(sample_idx);
+            prev_sorted.push(None);
+            next_sorted.push(None);
+            hole_samples.push(global_idx);
+
+            min_x = min_x.min(x);
+            min_y = min_y.min(y);
+            min_z = min_z.min(z);
+            max_x = max_x.max(x);
+            max_y = max_y.max(y);
+            max_z = max_z.max(z);
+
+            for prop_idx in 0..num_props {
+                let value = parse_f64_token(tokens.next());
+                if value.is_finite() {
+                    running[prop_idx].add(value);
+                }
+                values.push(value);
+            }
+        }
+
+        hole_samples.sort_unstable_by(|&a, &b| {
+            let da = depths[a];
+            let db = depths[b];
+            match (da.is_finite(), db.is_finite()) {
+                (true, true) => da.total_cmp(&db),
+                (true, false) => std::cmp::Ordering::Less,
+                (false, true) => std::cmp::Ordering::Greater,
+                (false, false) => a.cmp(&b),
+            }
+        });
+
+        for window in hole_samples.windows(2) {
+            let a = window[0];
+            let b = window[1];
+            prev_sorted[b] = Some(a);
+            next_sorted[a] = Some(b);
+            let da = depths[a];
+            let db = depths[b];
+            if da.is_finite() && db.is_finite() {
+                let spacing = (db - da).abs();
+                if spacing > EPS {
+                    spacing_sum += spacing;
+                    spacing_count += 1;
+                }
+            }
+        }
+    }
+
+    let sample_count = xs.len();
+    if sample_count == 0 {
+        println!("0");
+        return;
+    }
+
+    let property_stats = build_property_stats(&values, num_props, &running);
+    let diag = ((max_x - min_x).powi(2) + (max_y - min_y).powi(2) + (max_z - min_z).powi(2)).sqrt();
+    let density_spacing = if sample_count > 1 && diag.is_finite() && diag > 0.0 {
+        diag / (sample_count as f64).cbrt().max(1.0)
+    } else {
+        1.0
+    };
+    let nominal_spacing = if spacing_count > 0 {
+        spacing_sum / spacing_count as f64
+    } else {
+        density_spacing
+    };
+    let spacing_floor = diag.abs().max(1.0) * 1e-6;
+    let base_cell_size = nominal_spacing
+        .max(density_spacing * 0.8)
+        .max(spacing_floor)
+        .max(1e-6);
+
+    let workload = sample_count.saturating_mul(num_props.max(1));
+    let (_strategy, config) = choose_strategy(sample_count, workload);
+    let cell_size = base_cell_size * config.cell_size_factor;
+
+    let (cell_map, cells, sample_cells, sample_bucket_indices) = build_cells(
+        &xs,
+        &ys,
+        &zs,
+        &values,
+        num_props,
+        min_x,
+        min_y,
+        min_z,
+        cell_size,
+    );
+
+    let mut suspects = Vec::<Suspect>::new();
+
+    for sample_idx in 0..sample_count {
+        let spatial_neighbors = if config.use_cell_aggregates {
+            None
+        } else {
+            Some(collect_knn(
+                sample_idx,
+                sample_cells[sample_idx],
+                &cell_map,
+                &cells,
+                &xs,
+                &ys,
+                &zs,
+                config.target_neighbors,
+                config.max_ring,
+            ))
+        };
+
+        let neighboring_cells = if config.use_cell_aggregates {
+            Some(collect_neighbor_cells(
+                sample_idx,
+                sample_cells[sample_idx],
+                &cell_map,
+                &xs,
+                &ys,
+                &zs,
+                min_x,
+                min_y,
+                min_z,
+                cell_size,
+                config.max_ring,
+            ))
+        } else {
+            None
+        };
+
+        for prop_idx in 0..num_props {
+            let value = values[sample_idx * num_props + prop_idx];
+            if !value.is_finite() {
+                continue;
+            }
+
+            let stats = &property_stats[prop_idx];
+            if stats.valid_count < 2 {
+                continue;
+            }
+
+            let global = global_score(value, stats);
+            let global_scale = effective_global_scale(stats);
+
+            let (spatial_score, spatial_support) = if let Some(neighbors) = spatial_neighbors.as_deref() {
+                if let Some((mean, scale, support)) = summarize_neighbors(
+                    neighbors,
+                    prop_idx,
+                    num_props,
+                    &values,
+                    nominal_spacing.max(spacing_floor),
+                    config.min_neighbors,
+                    global_scale,
+                ) {
+                    (((value - mean).abs() / scale), support)
+                } else {
+                    (f64::NAN, 0usize)
+                }
+            } else if let Some(neighbor_cells) = neighboring_cells.as_deref() {
+                if let Some((mean, scale, support)) = summarize_cells(
+                    sample_idx,
+                    sample_bucket_indices[sample_idx],
+                    neighbor_cells,
+                    prop_idx,
+                    num_props,
+                    &values,
+                    &cells,
+                    cell_size,
+                    global_scale,
+                ) {
+                    (((value - mean).abs() / scale), support)
+                } else {
+                    (f64::NAN, 0usize)
+                }
+            } else {
+                (f64::NAN, 0usize)
+            };
+
+            let same_hole = same_hole_score(
+                sample_idx,
+                prop_idx,
+                num_props,
+                &values,
+                &depths,
+                &prev_sorted,
+                &next_sorted,
+                global_scale,
+            );
+            let same_hole_score = same_hole.map(|(score, _)| score).unwrap_or(f64::NAN);
+            let same_hole_support = same_hole.map(|(_, support)| support).unwrap_or(0usize);
+
+            let strong_spatial = spatial_score.is_finite() && spatial_score >= 3.2;
+            let strong_same_hole = same_hole_score.is_finite() && same_hole_score >= 3.8;
+            let corroborated = (spatial_score.is_finite() && spatial_score >= 2.6 && global >= 4.0)
+                || (same_hole_score.is_finite() && same_hole_score >= 3.0 && global >= 4.0);
+            let extreme_global = !spatial_score.is_finite() && !same_hole_score.is_finite() && global >= 8.0;
+
+            if !(strong_spatial || strong_same_hole || corroborated || extreme_global) {
+                continue;
+            }
+
+            let combined = match (spatial_score.is_finite(), same_hole_score.is_finite()) {
+                (true, true) => 0.55 * spatial_score + 0.30 * same_hole_score + 0.15 * global.min(12.0),
+                (true, false) => 0.80 * spatial_score + 0.20 * global.min(12.0),
+                (false, true) => 0.70 * same_hole_score + 0.30 * global.min(12.0),
+                (false, false) => global.min(12.0),
+            };
+
+            let support_ratio = if spatial_score.is_finite() {
+                (spatial_support as f64 / config.target_neighbors.max(1) as f64).clamp(0.0, 1.0)
+            } else {
+                (same_hole_support as f64 / 2.0).clamp(0.0, 1.0)
+            };
+            let adjusted = combined * (0.70 + 0.30 * support_ratio);
+            if adjusted < 3.2 {
+                continue;
+            }
+
+            let confidence = 1.0 / (1.0 + (-1.1 * (adjusted - 3.5)).exp());
+            suspects.push(Suspect {
+                hole_idx: hole_of_sample[sample_idx],
+                sample_idx: sample_local_indices[sample_idx],
+                prop_idx,
+                confidence,
+            });
+        }
+    }
+
+    suspects.sort_unstable_by(|a, b| {
+        b.confidence
+            .total_cmp(&a.confidence)
+            .then_with(|| hole_ids[a.hole_idx].cmp(&hole_ids[b.hole_idx]))
+            .then_with(|| a.sample_idx.cmp(&b.sample_idx))
+            .then_with(|| property_names[a.prop_idx].cmp(&property_names[b.prop_idx]))
+    });
+
+    if suspects.len() > MAX_REPORTS {
+        suspects.truncate(MAX_REPORTS);
+    }
+
+    let mut output = String::new();
+    output.push_str(&format!("{}\n", suspects.len()));
+    for suspect in suspects {
+        output.push_str(&format!(
+            "{} {} {} {:.6}\n",
+            hole_ids[suspect.hole_idx],
+            suspect.sample_idx,
+            property_names[suspect.prop_idx],
+            suspect.confidence
+        ));
+    }
+    print!("{output}");
+}

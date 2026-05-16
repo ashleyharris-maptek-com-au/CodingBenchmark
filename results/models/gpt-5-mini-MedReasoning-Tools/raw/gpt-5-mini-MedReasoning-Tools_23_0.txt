@@ -1,1 +1,450 @@
-{'__exception__': "Can't run here - we're trying to get this working in codex."}
+Here's a complete, compilable Rust program that implements a simple real-time lunar lander controller. It spawns a background reader to parse the initial map and the continuous state stream from stdin, and a controller thread that outputs thrust/turn commands at 50 Hz (>= 20 Hz required). The autopilot uses a simple PD-style controller that computes a desired acceleration vector, converts that into a desired thrust magnitude and angle, and then issues thrust and angular-rate commands.
+
+Copy this into a file (e.g., main.rs) and build with the specified Rust toolchain.
+
+```rust
+use std::io::{self, Read, Write, BufRead, BufReader};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
+use std::f64::consts::PI;
+
+/// Shared latest state updated by the reader thread.
+#[derive(Clone, Debug)]
+struct LanderState {
+    x: f64,
+    y: f64,
+    vx: f64,
+    vy: f64,
+    angle: f64,
+    angular_vel: f64,
+    fuel_remaining: f64,
+    valid: bool,
+}
+
+/// Lightweight whitespace scanner over blocking stdin.
+/// It's used only in the reader thread.
+struct Scanner<R: Read> {
+    reader: BufReader<R>,
+    buf: Vec<u8>,
+    pos: usize,
+}
+
+impl<R: Read> Scanner<R> {
+    fn new(inner: R) -> Scanner<R> {
+        Scanner {
+            reader: BufReader::with_capacity(1 << 16, inner),
+            buf: Vec::new(),
+            pos: 0,
+        }
+    }
+
+    /// Fill buffer with more bytes if needed.
+    fn refill(&mut self) -> io::Result<bool> {
+        if self.pos >= self.buf.len() {
+            self.buf.clear();
+            self.pos = 0;
+            let n = self.reader.read_until(b'\n', &mut self.buf)?;
+            // read_until returns 0 on EOF
+            Ok(n != 0)
+        } else {
+            Ok(true)
+        }
+    }
+
+    /// Get next token (blocking until available).
+    fn next_token(&mut self) -> io::Result<String> {
+        let mut token = Vec::with_capacity(32);
+        loop {
+            if !self.refill()? {
+                // EOF; if we have some token, return it, else return empty string
+                if !token.is_empty() {
+                    break;
+                } else {
+                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "EOF"));
+                }
+            }
+            while self.pos < self.buf.len() {
+                let b = self.buf[self.pos];
+                self.pos += 1;
+                if b.is_ascii_whitespace() {
+                    if !token.is_empty() {
+                        // end token
+                        return Ok(String::from_utf8_lossy(&token).into_owned());
+                    } else {
+                        // skip leading whitespace
+                        continue;
+                    }
+                } else {
+                    token.push(b);
+                }
+            }
+            // buffer exhausted, loop to refill
+            // but keep token if partial
+        }
+    }
+
+    /// Parse next token as f64
+    fn next_f64(&mut self) -> io::Result<f64> {
+        let s = self.next_token()?;
+        s.parse::<f64>().map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    }
+
+    /// Parse next token as usize
+    fn next_usize(&mut self) -> io::Result<usize> {
+        let s = self.next_token()?;
+        s.parse::<usize>().map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    }
+
+    /// Parse next token as i64
+    fn next_i64(&mut self) -> io::Result<i64> {
+        let s = self.next_token()?;
+        s.parse::<i64>().map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    }
+
+    /// Parse next token as String (non-whitespace sequence)
+    fn next_string(&mut self) -> io::Result<String> {
+        self.next_token()
+    }
+}
+
+fn clamp(v: f64, a: f64, b: f64) -> f64 {
+    if v.is_nan() {
+        a
+    } else if v < a {
+        a
+    } else if v > b {
+        b
+    } else {
+        v
+    }
+}
+
+fn normalize_angle(mut a: f64) -> f64 {
+    while a > PI { a -= 2.0 * PI; }
+    while a <= -PI { a += 2.0 * PI; }
+    a
+}
+
+fn main() {
+    // Shared state between reader and controller
+    let state = Arc::new(Mutex::new(LanderState {
+        x: 0.0, y: 0.0, vx: 0.0, vy: 0.0, angle: 0.0, angular_vel: 0.0, fuel_remaining: 0.0, valid: false
+    }));
+
+    // We'll store environment constants read from initial map here
+    let env = Arc::new(Mutex::new(None::<(usize, usize, f64, f64, f64, f64, f64)>));
+    // (width, height, gravity, max_thrust, fuel, start_x, start_y, target_x, target_y) - but to keep as tuple length 7 use two mutexes? Use Option of tuple of 9 -> use Vec?
+    // We'll instead store a struct-like tuple variant with 9 fields:
+    let env = Arc::new(Mutex::new(None::<(usize, usize, f64, f64, f64, f64, f64, f64, f64)>));
+    // Spawn reader thread
+    {
+        let state = Arc::clone(&state);
+        let env = Arc::clone(&env);
+        thread::spawn(move || {
+            let stdin = io::stdin();
+            let mut scanner = Scanner::new(stdin.lock());
+
+            // Read initial map header:
+            // width height gravity max_thrust fuel
+            let width = match scanner.next_usize() {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+            let height = match scanner.next_usize() {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+            let gravity = match scanner.next_f64() {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+            let max_thrust = match scanner.next_f64() {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+            let fuel = match scanner.next_f64() {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+
+            // start_x start_y target_x target_y
+            let start_x = match scanner.next_f64() {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+            let start_y = match scanner.next_f64() {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+            let target_x = match scanner.next_f64() {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+            let target_y = match scanner.next_f64() {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+
+            // Read map rows (height rows). Each row is a token string (no whitespace within)
+            // For large maps we don't store them; just consume tokens.
+            for _ in 0..height {
+                match scanner.next_string() {
+                    Ok(_row) => { /* ignore to save memory */ },
+                    Err(_) => return,
+                }
+            }
+
+            // Publish environment
+            {
+                let mut e = env.lock().unwrap();
+                *e = Some((width, height, gravity, max_thrust, fuel, start_x, start_y, target_x, target_y));
+            }
+
+            // Initialize state with start position
+            {
+                let mut s = state.lock().unwrap();
+                s.x = start_x;
+                s.y = start_y;
+                s.vx = 0.0;
+                s.vy = 0.0;
+                s.angle = 0.0;
+                s.angular_vel = 0.0;
+                s.fuel_remaining = fuel;
+                s.valid = true;
+            }
+
+            // Now continuously read state updates: x y vx vy angle angular_vel fuel_remaining
+            loop {
+                let x = match scanner.next_f64() {
+                    Ok(v) => v,
+                    Err(_) => break,
+                };
+                let y = match scanner.next_f64() {
+                    Ok(v) => v,
+                    Err(_) => break,
+                };
+                let vx = match scanner.next_f64() {
+                    Ok(v) => v,
+                    Err(_) => break,
+                };
+                let vy = match scanner.next_f64() {
+                    Ok(v) => v,
+                    Err(_) => break,
+                };
+                let angle = match scanner.next_f64() {
+                    Ok(v) => v,
+                    Err(_) => break,
+                };
+                let angular_vel = match scanner.next_f64() {
+                    Ok(v) => v,
+                    Err(_) => break,
+                };
+                let fuel_remaining = match scanner.next_f64() {
+                    Ok(v) => v,
+                    Err(_) => break,
+                };
+
+                {
+                    let mut s = state.lock().unwrap();
+                    s.x = x;
+                    s.y = y;
+                    s.vx = vx;
+                    s.vy = vy;
+                    s.angle = angle;
+                    s.angular_vel = angular_vel;
+                    s.fuel_remaining = fuel_remaining;
+                    s.valid = true;
+                }
+            }
+        });
+    }
+
+    // Controller thread (in main) will output at 50 Hz (every 20ms)
+    let mut stdout = io::stdout();
+    let mut handle = stdout.lock();
+
+    // We'll wait until env is set
+    let mut local_env: (usize, usize, f64, f64, f64, f64, f64, f64, f64);
+    loop {
+        if let Some(v) = env.lock().unwrap().clone() {
+            local_env = v;
+            break;
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+
+    let (_width, _height, gravity, max_thrust, _fuel_initial, _start_x, _start_y, target_x, target_y) = local_env;
+
+    // Controller parameters (tuned heuristically)
+    let kpx = 0.02; // position->acc contribution (x)
+    let kdx = 0.8;  // velocity damping (x)
+    let kpy = 0.06; // position->acc contribution (y)
+    let kdy = 1.0;  // velocity damping (y)
+
+    let ang_kp = 2.2; // turn gains (angle error -> desired angular rate)
+    let ang_kd = 0.5;
+
+    // Output loop rate
+    let dt = Duration::from_millis(20); // 50 Hz
+
+    // Track last valid state time for safety
+    let mut last_state_time = Instant::now();
+
+    loop {
+        let loop_start = Instant::now();
+
+        // fetch latest state
+        let s = {
+            let s_lock = state.lock().unwrap();
+            s_lock.clone()
+        };
+
+        if s.valid {
+            last_state_time = Instant::now();
+
+            // Compute desired accelerations to approach target and reduce velocity
+            // AX_des tries to reduce horizontal error and velocity
+            let dx = target_x - s.x;
+            let dy = target_y - s.y;
+
+            // Desired accelerations (net accelerations including gravity)
+            let ax_des = kpx * dx + kdx * (-s.vx);
+            let ay_des = kpy * dy + kdy * (-s.vy);
+
+            // Emergency heuristics:
+            // If very close to ground and high downward speed, prioritize vertical braking
+            let alt = dy; // since y increases downwards, dy = target_y - y; when positive -> target is below
+            let vertical_speed = s.vy;
+            let horizontal_speed = s.vx.abs();
+
+            let mut ax_use = ax_des;
+            let mut ay_use = ay_des;
+
+            if alt.abs() < 10.0 {
+                // tighten vertical control near target
+                ay_use = clamp(ay_use - (vertical_speed * 0.6), -50.0, 50.0);
+                // reduce horizontal aggression near ground
+                ax_use *= 0.6;
+            }
+
+            // Convert desired net acceleration (ax_use, ay_use) into thrust and angle
+            // Relationship:
+            // ax = thrust*max_thrust * sin(angle)
+            // ay = -thrust*max_thrust * cos(angle) + gravity
+            // Solve:
+            // T_needed = sqrt(ax^2 + (ay - gravity)^2)
+            let ay_minus_g = ay_use - gravity;
+            let t_force = (ax_use * ax_use + ay_minus_g * ay_minus_g).sqrt();
+            let mut thrust = if max_thrust > 0.0 { t_force / max_thrust } else { 0.0 };
+            // if thrust is very tiny, set to 0
+            if thrust < 1e-4 {
+                thrust = 0.0;
+            }
+
+            // Desired angle:
+            // sin(angle) proportional to ax, cos(angle) proportional to -(ay - gravity)
+            // angle = atan2(ax, -(ay - gravity))
+            let angle_des = {
+                // guard against divide by zero
+                let denom = -(ay_minus_g);
+                angle_from_components(ax_use, denom)
+            };
+
+            // Limit requested thrust if fuel is low
+            let fuel = s.fuel_remaining.max(0.0);
+            if fuel <= 0.05 {
+                // conserve fuel: reduce thrust substantially if near zero fuel
+                thrust *= 0.3;
+            }
+
+            // Clamp thrust
+            thrust = clamp(thrust, 0.0, 1.0);
+
+            // Additional safety: if altitude negative (we've passed target) or we see terrain collision potential,
+            // attempt to zero thrust/angle to avoid flipping. (Conservative)
+            // Not having map collision data means rely on simple heuristics only.
+
+            // Angle control: compute error between desired angle and current angle
+            let mut angle_err = normalize_angle(angle_des - s.angle);
+            // Limit angle_err to ±pi/2 (we don't want to try to pitch fully upside-down)
+            angle_err = clamp(angle_err, -PI / 2.0, PI / 2.0);
+
+            // PD control for angular velocity command (turn)
+            let desired_ang_vel = ang_kp * angle_err - ang_kd * s.angular_vel;
+            // turn command is angular velocity in rad/s clamped to [-1, 1]
+            let turn_cmd = clamp(desired_ang_vel, -1.0, 1.0);
+
+            // If fuel exhausted, force thrust to 0
+            let thrust_out = if s.fuel_remaining <= 0.0 { 0.0 } else { thrust };
+
+            // If very close and nearly stopped, reduce thrust slowly
+            let speed = (s.vx * s.vx + s.vy * s.vy).sqrt();
+            let close_x = (s.x - target_x).abs() < 1.0;
+            let close_y = (s.y - target_y).abs() < 1.0;
+            if close_x && close_y && speed < 1.5 {
+                // very gentle thrust to settle
+                // reduce thrust to compensate for small altitude offsets
+                // prefer pointing up (angle ~ 0)
+                // Set angle target to 0 gently by reducing turn magnitude
+                // Already handled by PD; just reduce thrust moderately
+                // but ensure not to cut thrust to zero if gravity > 0
+                let min_needed = clamp((gravity * 0.5) / max_thrust, 0.0, 0.2);
+                let final_thrust = thrust_out.max(min_needed);
+                write_output(&mut handle, final_thrust, clamp(turn_cmd * 0.7, -1.0, 1.0));
+            } else {
+                write_output(&mut handle, thrust_out, turn_cmd);
+            }
+        } else {
+            // No valid state yet — output safe neutral commands at regular rate
+            let _ = write_output(&mut handle, 0.0, 0.0);
+        }
+
+        // If we haven't received state for a while, output zeros (safety)
+        if last_state_time.elapsed() > Duration::from_millis(200) {
+            // continue outputting but with zero thrust
+            let _ = write_output(&mut handle, 0.0, 0.0);
+        }
+
+        // Sleep to maintain loop rate, account for time spent computing
+        let elapsed = loop_start.elapsed();
+        if elapsed < dt {
+            thread::sleep(dt - elapsed);
+        } else {
+            // if our loop took longer than dt, don't sleep (we missed a tick)
+            // continue immediately to try to catch up
+        }
+    }
+}
+
+/// Small helper to compute angle from components ax (numerator) and denom (used as -ay_minus_g)
+fn angle_from_components(ax: f64, denom: f64) -> f64 {
+    // angle = atan2(ax, denom)
+    // denom corresponds to - (ay - gravity)
+    ax.atan2(denom)
+}
+
+/// Write thrust and turn to stdout and flush immediately.
+/// Returns io::Result<()>, but we ignore it in the main loop to keep running.
+fn write_output(out: &mut impl Write, thrust: f64, turn: f64) -> io::Result<()> {
+    // Format with reasonable precision
+    // The required format is two decimal numbers separated by a space and newline
+    // We'll print as full-precision floats (the judge accepts decimals).
+    // But keep output compact.
+    let s = format!("{:.5} {:.5}\n", thrust, turn);
+    out.write_all(s.as_bytes())?;
+    out.flush()?;
+    Ok(())
+}
+```
+
+Notes and design choices:
+- Reader runs in its own thread and blocks on stdin parsing using a small buffered scanner. This avoids blocking the output loop.
+- The controller runs at 50 Hz (20 ms per output) and always flushes stdout. If no new state is available it outputs a safe neutral command.
+- The control law is a simple PD-style controller mapping desired accelerations into thrust magnitude and angle, then converting angle error into a turn command (angular velocity). This is intentionally conservative and prioritizes safety.
+- The code avoids storing the full map contents (consumes the map rows but doesn't keep them), which helps memory usage for very large maps.
+- Only standard library is used; no external crates.
+
+If you'd like:
+- I can tune the controller gains for a particular scenario or add explicit state estimation (e.g., integrate control to predict next state).
+- I can change output rate, add more conservative emergency behaviors, or include a mode that aggressively brakes when near the pad.

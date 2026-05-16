@@ -1,1 +1,531 @@
-{'__exception__': "Can't run here - we're trying to get this working in codex."}
+```csharp
+// Mining solver (heuristic) for simplified 3D voxel space.
+// Strategy is adaptive:
+//  - Small/medium inputs: read entire voxel stream, keep only 2D surface (top solid voxel per (x,y)),
+//    then greedily move profitable *surface* valuable voxels to the plant at (0,0) along simple Manhattan paths,
+//    respecting per-step slope constraint using surface heights.
+//  - Huge inputs: read only the first column (x=0,y=0) and, if its surface voxel is valuable, process it in-place.
+//
+// Notes:
+//  - This is a conservative solver: it only digs exposed top voxels (always legal) and only dumps valuable ore at plant.
+//  - It avoids dumping junk at the plant (negative revenue) and does not attempt complex excavation/ramping.
+//  - Output format: M operations, then each op:
+//        N digX digY digZ  (N pairs dx dy)  destX destY
+//    where steps are relative Manhattan moves (dx,dy) in {-1,0,1} with 4-connectivity.
+//
+// Build: csc Program.cs
+// Run:  Program < input > output
+
+using System;
+using System.Buffers;
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+using System.Text;
+
+public static class Program
+{
+    // Tuning knobs
+    private const long ReadAllVoxelLimit = 80_000_000;      // if total voxels <= this, read all
+    private const int MaxColumnsLimitForArrays = 35_000_000; // if X*Y > this, avoid allocating huge arrays
+    private const int MaxOps = 5000;                        // cap output size
+
+    public static void Main()
+    {
+        using var input = Console.OpenStandardInput();
+        var fs = new FastScanner(input);
+
+        int xCount = fs.ReadInt();
+        int yCount = fs.ReadInt();
+        int zCount = fs.ReadInt();
+        _ = fs.ReadDouble(); // XBlockSize (unused)
+        _ = fs.ReadDouble(); // YBlockSize (unused)
+        _ = fs.ReadDouble(); // ZBlockSize (unused)
+
+        // Consume header newline if present (do NOT skip arbitrary whitespace: voxel bytes are raw and may equal whitespace).
+        fs.ConsumeSingleLineBreakIfPresent();
+
+        long totalVoxels;
+        try
+        {
+            checked
+            {
+                totalVoxels = (long)xCount * yCount * zCount;
+            }
+        }
+        catch
+        {
+            // Overflow => absurdly large; do minimal.
+            RunMinimal(fs, zCount);
+            return;
+        }
+
+        long columnsLong = (long)xCount * yCount;
+        bool canAllocateColumns = columnsLong <= int.MaxValue && columnsLong <= MaxColumnsLimitForArrays;
+        bool readAll = totalVoxels >= 0 && totalVoxels <= ReadAllVoxelLimit && canAllocateColumns;
+
+        if (!readAll)
+        {
+            RunMinimal(fs, zCount);
+            return;
+        }
+
+        int columns = (int)columnsLong;
+        var heights = new int[columns];  // surface "ground height" in voxels = (topZ+1), 0 if empty column
+        var topByte = new byte[columns]; // byte for the top solid voxel (mass>0)
+
+        ReadSurfaceOnly(fs, xCount, yCount, zCount, heights, topByte);
+
+        var ops = PlanSurfaceOpsToPlant(xCount, yCount, heights, topByte);
+
+        using var writer = new StreamWriter(Console.OpenStandardOutput(), new UTF8Encoding(false), 1 << 20);
+        writer.WriteLine(ops.Count);
+        foreach (var op in ops)
+        {
+            WriteOperation(writer, op);
+        }
+    }
+
+    private static void RunMinimal(FastScanner fs, int zCount)
+    {
+        // Read only the first column (x=0,y=0), which is first in the stream order.
+        int topZ = -1;
+        byte topD = 0;
+
+        for (int z = 0; z < zCount; z++)
+        {
+            byte d = fs.ReadRawByte();
+            int mass = d & 0x0F;
+            if (mass != 0)
+            {
+                topZ = z;
+                topD = d;
+            }
+        }
+
+        int topMass = topD & 0x0F;
+        int topValue = topD >> 4;
+
+        using var writer = new StreamWriter(Console.OpenStandardOutput(), new UTF8Encoding(false), 1 << 16);
+
+        if (topZ >= 0 && topMass > 0 && topValue > 0)
+        {
+            // N=0, dig at (0,0,topZ), dump at plant (0,0).
+            writer.WriteLine(1);
+            writer.Write("0 0 0 ");
+            writer.Write(topZ.ToString(CultureInfo.InvariantCulture));
+            writer.WriteLine(" 0 0");
+        }
+        else
+        {
+            writer.WriteLine(0);
+        }
+    }
+
+    private static void ReadSurfaceOnly(
+        FastScanner fs,
+        int xCount, int yCount, int zCount,
+        int[] heights,
+        byte[] topByte)
+    {
+        // Stream through all voxel bytes; for each (x,y) column, track only the last (highest z) solid voxel (mass>0).
+        // Layout: for x in [0..X): for y in [0..Y): for z in [0..Z): read byte.
+        for (int x = 0; x < xCount; x++)
+        {
+            int xBase = x * yCount;
+            for (int y = 0; y < yCount; y++)
+            {
+                int idx = xBase + y;
+                int h = 0;
+                byte tb = 0;
+
+                for (int z = 0; z < zCount; z++)
+                {
+                    byte d = fs.ReadRawByte();
+                    if ((d & 0x0F) != 0)
+                    {
+                        h = z + 1;
+                        tb = d;
+                    }
+                }
+
+                heights[idx] = h;
+                topByte[idx] = tb;
+            }
+        }
+    }
+
+    private struct Candidate
+    {
+        public int X, Y;
+        public int DigZ;
+        public byte Mass;
+        public byte Value;
+        public bool XFirst;  // true: move in -x then -y; false: -y then -x
+        public int Steps;
+        public long Profit;
+        public long Fuel;
+        public long Revenue;
+    }
+
+    private static List<Candidate> PlanSurfaceOpsToPlant(int xCount, int yCount, int[] heights, byte[] topByte)
+    {
+        // Search near the plant for profitable surface ore.
+        // Because we only allow simple Manhattan routes (x-first or y-first), we can check feasibility quickly from surface heights.
+        // We keep best MaxOps by profit.
+
+        int cols = heights.Length;
+
+        // Choose a radius based on 2D size (keeps runtime bounded).
+        long totalCols = (long)xCount * yCount;
+        int radius = totalCols <= 500_000 ? 1500 : 450;
+        radius = Math.Min(radius, (xCount - 1) + (yCount - 1));
+        radius = Math.Max(radius, 0);
+
+        var pq = new PriorityQueue<Candidate, long>(); // min-heap by Profit
+
+        // Helper to consider a candidate, maintaining a bounded heap.
+        void Consider(in Candidate c)
+        {
+            if (c.Profit <= 0) return;
+            if (pq.Count < MaxOps)
+            {
+                pq.Enqueue(c, c.Profit);
+            }
+            else
+            {
+                pq.TryPeek(out _, out long minProfit);
+                if (c.Profit > minProfit)
+                {
+                    pq.Dequeue();
+                    pq.Enqueue(c, c.Profit);
+                }
+            }
+        }
+
+        // Always consider plant column itself (0,0): N=0, no fuel.
+        {
+            int idx00 = 0;
+            int h00 = heights[idx00];
+            if (h00 > 0)
+            {
+                byte d = topByte[idx00];
+                byte mass = (byte)(d & 0x0F);
+                byte value = (byte)(d >> 4);
+                if (mass != 0 && value != 0)
+                {
+                    long revenue = 1000L * mass * value;
+                    var c = new Candidate
+                    {
+                        X = 0,
+                        Y = 0,
+                        DigZ = h00 - 1,
+                        Mass = mass,
+                        Value = value,
+                        XFirst = true,
+                        Steps = 0,
+                        Fuel = 0,
+                        Revenue = revenue,
+                        Profit = revenue
+                    };
+                    Consider(in c);
+                }
+            }
+        }
+
+        // Enumerate (x,y) with x+y <= radius (a diamond in the first quadrant; we use triangle since x,y>=0).
+        int maxX = Math.Min(xCount - 1, radius);
+        for (int x = 0; x <= maxX; x++)
+        {
+            int maxY = Math.Min(yCount - 1, radius - x);
+            int xBase = x * yCount;
+
+            for (int y = 0; y <= maxY; y++)
+            {
+                if (x == 0 && y == 0) continue;
+
+                int idx = xBase + y;
+                int h = heights[idx];
+                if (h <= 0) continue;
+
+                byte d = topByte[idx];
+                byte mass = (byte)(d & 0x0F);
+                byte value = (byte)(d >> 4);
+
+                if (mass == 0 || value == 0) continue; // only valuable ore at plant
+
+                long revenue = 1000L * mass * value;
+
+                // Evaluate both simple routes; choose feasible with min fuel.
+                bool okX = EvaluateRouteFuel(heights, yCount, x, y, mass, xFirst: true, out long fuelX);
+                bool okY = EvaluateRouteFuel(heights, yCount, x, y, mass, xFirst: false, out long fuelY);
+
+                if (!okX && !okY) continue;
+
+                bool xFirstBest;
+                long fuel;
+                if (okX && okY)
+                {
+                    if (fuelX <= fuelY) { xFirstBest = true; fuel = fuelX; }
+                    else { xFirstBest = false; fuel = fuelY; }
+                }
+                else if (okX)
+                {
+                    xFirstBest = true; fuel = fuelX;
+                }
+                else
+                {
+                    xFirstBest = false; fuel = fuelY;
+                }
+
+                long profit = revenue - fuel;
+                if (profit <= 0) continue;
+
+                var c = new Candidate
+                {
+                    X = x,
+                    Y = y,
+                    DigZ = h - 1,
+                    Mass = mass,
+                    Value = value,
+                    XFirst = xFirstBest,
+                    Steps = x + y,
+                    Fuel = fuel,
+                    Revenue = revenue,
+                    Profit = profit
+                };
+                Consider(in c);
+            }
+        }
+
+        // Extract and sort by descending profit.
+        var list = new List<Candidate>(pq.Count);
+        while (pq.Count > 0) list.Add(pq.Dequeue());
+        list.Sort((a, b) => b.Profit.CompareTo(a.Profit));
+
+        return list;
+    }
+
+    private static bool EvaluateRouteFuel(int[] heights, int yCount, int startX, int startY, int mass, bool xFirst, out long fuel)
+    {
+        // Route from (startX,startY) to (0,0) along a fixed Manhattan order.
+        // Slope constraint: per step, abs(deltaHeight) <= 1 using surface heights (ground height).
+        // Fuel:
+        //  - flat: $1/ton per step
+        //  - uphill (+1): $5/ton per step
+        //  - downhill: free
+        //
+        // We approximate that after digging the top voxel at the start cell, its surface height drops by 1.
+        fuel = 0;
+
+        int x = startX, y = startY;
+        int idx = x * yCount + y;
+
+        int currentH = heights[idx] - 1;
+        if (currentH < 0) currentH = 0;
+
+        if (xFirst)
+        {
+            // Move -x then -y
+            for (int i = 0; i < startX; i++)
+            {
+                int nx = x - 1;
+                int ny = y;
+                int nh = heights[nx * yCount + ny];
+
+                int dh = nh - currentH;
+                if (dh < -1 || dh > 1) return false;
+                if (dh > 0) fuel += 5L * mass;
+                else if (dh == 0) fuel += 1L * mass;
+
+                x = nx;
+                currentH = nh;
+            }
+            for (int i = 0; i < startY; i++)
+            {
+                int nx = x;
+                int ny = y - 1;
+                int nh = heights[nx * yCount + ny];
+
+                int dh = nh - currentH;
+                if (dh < -1 || dh > 1) return false;
+                if (dh > 0) fuel += 5L * mass;
+                else if (dh == 0) fuel += 1L * mass;
+
+                y = ny;
+                currentH = nh;
+            }
+        }
+        else
+        {
+            // Move -y then -x
+            for (int i = 0; i < startY; i++)
+            {
+                int nx = x;
+                int ny = y - 1;
+                int nh = heights[nx * yCount + ny];
+
+                int dh = nh - currentH;
+                if (dh < -1 || dh > 1) return false;
+                if (dh > 0) fuel += 5L * mass;
+                else if (dh == 0) fuel += 1L * mass;
+
+                y = ny;
+                currentH = nh;
+            }
+            for (int i = 0; i < startX; i++)
+            {
+                int nx = x - 1;
+                int ny = y;
+                int nh = heights[nx * yCount + ny];
+
+                int dh = nh - currentH;
+                if (dh < -1 || dh > 1) return false;
+                if (dh > 0) fuel += 5L * mass;
+                else if (dh == 0) fuel += 1L * mass;
+
+                x = nx;
+                currentH = nh;
+            }
+        }
+
+        return true;
+    }
+
+    private static void WriteOperation(StreamWriter writer, in Candidate op)
+    {
+        // Format:
+        // N digX digY digZ stepX1 stepY1 ... destX destY
+        //
+        // Steps are (dx,dy) pairs.
+        writer.Write(op.Steps.ToString(CultureInfo.InvariantCulture));
+        writer.Write(' ');
+        writer.Write(op.X.ToString(CultureInfo.InvariantCulture));
+        writer.Write(' ');
+        writer.Write(op.Y.ToString(CultureInfo.InvariantCulture));
+        writer.Write(' ');
+        writer.Write(op.DigZ.ToString(CultureInfo.InvariantCulture));
+
+        if (op.Steps > 0)
+        {
+            if (op.XFirst)
+            {
+                for (int i = 0; i < op.X; i++) { writer.Write(" -1 0"); }
+                for (int i = 0; i < op.Y; i++) { writer.Write(" 0 -1"); }
+            }
+            else
+            {
+                for (int i = 0; i < op.Y; i++) { writer.Write(" 0 -1"); }
+                for (int i = 0; i < op.X; i++) { writer.Write(" -1 0"); }
+            }
+        }
+
+        // dump at plant
+        writer.Write(" 0 0");
+        writer.WriteLine();
+    }
+
+    private sealed class FastScanner
+    {
+        private readonly Stream _stream;
+        private readonly byte[] _buffer;
+        private int _pos, _len;
+
+        public FastScanner(Stream stream, int bufferSize = 1 << 20)
+        {
+            _stream = stream;
+            _buffer = ArrayPool<byte>.Shared.Rent(bufferSize);
+        }
+
+        ~FastScanner()
+        {
+            ArrayPool<byte>.Shared.Return(_buffer);
+        }
+
+        private int ReadFromStream()
+        {
+            _len = _stream.Read(_buffer, 0, _buffer.Length);
+            _pos = 0;
+            return _len;
+        }
+
+        private byte ReadByteInternal()
+        {
+            if (_pos >= _len)
+            {
+                if (ReadFromStream() <= 0) return 0;
+            }
+            return _buffer[_pos++];
+        }
+
+        private byte PeekByteInternal()
+        {
+            if (_pos >= _len)
+            {
+                if (ReadFromStream() <= 0) return 0;
+            }
+            return _buffer[_pos];
+        }
+
+        private void SkipAsciiWhitespace()
+        {
+            while (true)
+            {
+                byte b = PeekByteInternal();
+                if (b == 0) return;
+                if (b > (byte)' ') return;
+                _pos++;
+            }
+        }
+
+        public int ReadInt()
+        {
+            SkipAsciiWhitespace();
+            int sign = 1;
+            byte b = PeekByteInternal();
+            if (b == (byte)'-') { sign = -1; _pos++; }
+
+            int val = 0;
+            while (true)
+            {
+                b = PeekByteInternal();
+                if (b < (byte)'0' || b > (byte)'9') break;
+                _pos++;
+                val = val * 10 + (b - (byte)'0');
+            }
+            return val * sign;
+        }
+
+        public double ReadDouble()
+        {
+            // Read token as ASCII and parse invariant.
+            SkipAsciiWhitespace();
+            var sb = new StringBuilder(32);
+            while (true)
+            {
+                byte b = PeekByteInternal();
+                if (b == 0 || b <= (byte)' ') break;
+                _pos++;
+                sb.Append((char)b);
+            }
+            return double.Parse(sb.ToString(), CultureInfo.InvariantCulture);
+        }
+
+        public void ConsumeSingleLineBreakIfPresent()
+        {
+            byte b = PeekByteInternal();
+            if (b == (byte)'\r')
+            {
+                _pos++;
+                if (PeekByteInternal() == (byte)'\n') _pos++;
+            }
+            else if (b == (byte)'\n')
+            {
+                _pos++;
+            }
+        }
+
+        public byte ReadRawByte() => ReadByteInternal();
+    }
+}
+```

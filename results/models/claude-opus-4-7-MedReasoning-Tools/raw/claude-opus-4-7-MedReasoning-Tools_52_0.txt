@@ -1,1 +1,471 @@
-{'__exception__': '{"type":"result","subtype":"success","is_error":true,"api_error_status":529,"duration_ms":206627,"duration_api_ms":996,"num_turns":1,"result":"API Error: 529 Overloaded. This is a server-side issue, usually temporary — try again in a moment. If it persists, check status.claude.com.","stop_reason":"stop_sequence","session_id":"63154ec6-727e-4ebb-9f18-a2088da5312d","total_cost_usd":0.000498,"usage":{"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":0,"server_tool_use":{"web_search_requests":0,"web_fetch_requests":0},"service_tier":"standard","cache_creation":{"ephemeral_1h_input_tokens":0,"ephemeral_5m_input_tokens":0},"inference_geo":"","iterations":[],"speed":"standard"},"modelUsage":{"claude-haiku-4-5-20251001":{"inputTokens":428,"outputTokens":14,"cacheReadInputTokens":0,"cacheCreationInputTokens":0,"webSearchRequests":0,"costUSD":0.000498,"contextWindow":200000,"maxOutputTokens":32000}},"permission_denials":[],"terminal_reason":"completed","fast_mode_state":"off","uuid":"73368eb2-a223-4999-86b0-ed83e1e5e3a4"}'}
+import math
+
+# ---------------------------------------------------------------------------
+# Persistent state (module-level) for filtering, PID controllers, history.
+# ---------------------------------------------------------------------------
+_state = {
+    "init": False,
+    "speed_kmh": 0.0,
+    "yaw_rate_dps": 0.0,
+    "accel_long": 0.0,
+    "accel_lat": 0.0,
+    "lane_offset": 0.0,
+    "left_dist": 1.8,
+    "right_dist": 1.8,
+    "curvature": 0.0,
+    "speed_limit": 110.0,
+    "heading": 0.0,
+    "speed_int": 0.0,
+    "speed_prev_err": 0.0,
+    "lat_int": 0.0,
+    "lat_prev_err": 0.0,
+    "last_steering": 0.0,
+    "last_throttle": 0.0,
+    "last_brake": 0.0,
+    "obstacle_dist": float("inf"),
+    "obstacle_rel_kmh": 0.0,
+    "obstacle_present": False,
+    "obstacle_persist": 0,
+    "vision_bad_count": 0,
+    "gps_bad_count": 0,
+    "throttle_stuck_count": 0,
+    "brake_fail_count": 0,
+    "prev_obstacle_dist": None,
+    "prev_sim_time": None,
+}
+
+
+def _clamp(x, lo, hi):
+    if x < lo:
+        return lo
+    if x > hi:
+        return hi
+    return x
+
+
+def _isnan(x):
+    try:
+        return x != x
+    except Exception:
+        return False
+
+
+def _median(vals):
+    v = [x for x in vals if x is not None and not _isnan(x)]
+    if not v:
+        return None
+    v = sorted(v)
+    n = len(v)
+    if n % 2 == 1:
+        return v[n // 2]
+    return 0.5 * (v[n // 2 - 1] + v[n // 2])
+
+
+def _valid_get(state, key, default=None):
+    v = state.get(key, default)
+    if v is None or _isnan(v):
+        return default
+    return v
+
+
+def _lowpass(prev, new, alpha):
+    if new is None:
+        return prev
+    return prev + alpha * (new - prev)
+
+
+# ---------------------------------------------------------------------------
+# Sensor fusion
+# ---------------------------------------------------------------------------
+def _fuse_speed(state):
+    wheels = []
+    for w in ("fl", "fr", "rl", "rr"):
+        v = state.get(f"wheel_speed_{w}_kmh")
+        ok = state.get(f"wheel_speed_{w}_valid", True)
+        if v is not None and ok and not _isnan(v):
+            wheels.append(v)
+    wheel_med = _median(wheels)
+    if wheel_med is not None and len(wheels) >= 2:
+        wheels = [x for x in wheels if abs(x - wheel_med) < 8.0]
+        wheel_speed = sum(wheels) / len(wheels) if wheels else wheel_med
+    else:
+        wheel_speed = wheel_med
+
+    vs = []
+    for k in ("vehicle_speed_1_kmh", "vehicle_speed_2_kmh"):
+        v = state.get(k)
+        if v is not None and not _isnan(v):
+            vs.append(v)
+
+    gps_speeds = []
+    for i in (1, 2):
+        v = state.get(f"gps_{i}_speed_kmh")
+        ok = state.get(f"gps_{i}_valid", True)
+        if ok and v is not None and not _isnan(v):
+            gps_speeds.append(v)
+
+    candidates = []
+    if wheel_speed is not None:
+        candidates.append(wheel_speed)
+    candidates.extend(vs)
+    candidates.extend(gps_speeds)
+    if not candidates:
+        return None
+    return _median(candidates)
+
+
+def _fuse_yaw_rate(state):
+    vals = []
+    for i in (1, 2, 3):
+        v = state.get(f"gyro_{i}_yaw_rate_dps")
+        ok = state.get(f"gyro_{i}_valid", True)
+        if ok and v is not None and not _isnan(v):
+            vals.append(v)
+    return _median(vals) if vals else None
+
+
+def _fuse_accel(state):
+    lat, lon = [], []
+    for i in (1, 2, 3):
+        ok = state.get(f"accel_{i}_valid", True)
+        if not ok:
+            continue
+        la = state.get(f"accel_{i}_lateral_ms2")
+        lo = state.get(f"accel_{i}_longitudinal_ms2")
+        if la is not None and not _isnan(la):
+            lat.append(la)
+        if lo is not None and not _isnan(lo):
+            lon.append(lo)
+    return (_median(lat), _median(lon))
+
+
+def _fuse_vision(state):
+    offs, lefts, rights, curvs, lims = [], [], [], [], []
+    obstacle_votes = 0
+    obs_dists, obs_rels = [], []
+    valid_count = 0
+    for i in (1, 2, 3):
+        lv = state.get(f"vision_{i}_left_line_valid", True)
+        rv = state.get(f"vision_{i}_right_line_valid", True)
+        ov = state.get(f"vision_{i}_obstacle_valid", True)
+        if lv or rv or ov:
+            valid_count += 1
+        off = state.get(f"vision_{i}_lane_offset_m")
+        ld = state.get(f"vision_{i}_left_line_dist_m")
+        rd = state.get(f"vision_{i}_right_line_dist_m")
+        cv = state.get(f"vision_{i}_road_curvature_1pm")
+        sl = state.get(f"vision_{i}_speed_limit_kmh")
+        sv = state.get(f"vision_{i}_speed_limit_valid", True)
+        if lv and ld is not None and not _isnan(ld):
+            lefts.append(ld)
+        if rv and rd is not None and not _isnan(rd):
+            rights.append(rd)
+        if (lv or rv) and off is not None and not _isnan(off):
+            offs.append(off)
+        if cv is not None and not _isnan(cv):
+            curvs.append(cv)
+        if sv and sl is not None and not _isnan(sl) and sl > 0:
+            lims.append(sl)
+        det = state.get(f"vision_{i}_obstacle_detected", False)
+        od = state.get(f"vision_{i}_obstacle_dist_m")
+        orel = state.get(f"vision_{i}_obstacle_rel_speed_kmh")
+        if ov and det:
+            obstacle_votes += 1
+            if od is not None and not _isnan(od):
+                obs_dists.append(od)
+            if orel is not None and not _isnan(orel):
+                obs_rels.append(orel)
+    return {
+        "lane_offset": _median(offs),
+        "left_dist": _median(lefts),
+        "right_dist": _median(rights),
+        "curvature": _median(curvs),
+        "speed_limit": _median(lims),
+        "obstacle_votes": obstacle_votes,
+        "obstacle_dist": _median(obs_dists),
+        "obstacle_rel_kmh": _median(obs_rels),
+        "valid_count": valid_count,
+    }
+
+
+def _fuse_lidar(state):
+    front, left, right = [], [], []
+    for ang_key, bucket in (
+        ("+005", "f"), ("-005", "f"),
+        ("+015", "f"), ("-015", "f"),
+        ("+030", "l"), ("+045", "l"), ("+060", "l"), ("+090", "l"),
+        ("-030", "r"), ("-045", "r"), ("-060", "r"), ("-090", "r"),
+    ):
+        r = state.get(f"lidar_{ang_key}_deg_range_m")
+        ok = state.get(f"lidar_{ang_key}_deg_valid", True)
+        if not ok or r is None or _isnan(r) or r <= 0:
+            continue
+        if bucket == "f":
+            front.append(r)
+        elif bucket == "l":
+            left.append(r)
+        else:
+            right.append(r)
+    front_min = min(front) if front else None
+    left_min = min(left) if left else None
+    right_min = min(right) if right else None
+    return front_min, left_min, right_min
+
+
+# ---------------------------------------------------------------------------
+# Main control function
+# ---------------------------------------------------------------------------
+def autopilot_step(state: dict, dt: float) -> dict:
+    s = _state
+    if not s["init"]:
+        s["init"] = True
+
+    if dt is None or dt <= 0 or _isnan(dt):
+        dt = state.get("dt", 0.02) or 0.02
+    dt = _clamp(dt, 1e-3, 0.2)
+
+    # Speed fusion
+    speed = _fuse_speed(state)
+    if speed is None:
+        speed = s["speed_kmh"]
+    s["speed_kmh"] = _lowpass(s["speed_kmh"], speed, 0.5)
+    speed_mps = s["speed_kmh"] / 3.6
+
+    yaw = _fuse_yaw_rate(state)
+    if yaw is not None:
+        s["yaw_rate_dps"] = _lowpass(s["yaw_rate_dps"], yaw, 0.4)
+
+    lat_a, lon_a = _fuse_accel(state)
+    if lat_a is not None:
+        s["accel_lat"] = _lowpass(s["accel_lat"], lat_a, 0.4)
+    if lon_a is not None:
+        s["accel_long"] = _lowpass(s["accel_long"], lon_a, 0.4)
+
+    vis = _fuse_vision(state)
+    if vis["lane_offset"] is not None:
+        s["lane_offset"] = _lowpass(s["lane_offset"], vis["lane_offset"], 0.45)
+    if vis["left_dist"] is not None:
+        s["left_dist"] = _lowpass(s["left_dist"], vis["left_dist"], 0.45)
+    if vis["right_dist"] is not None:
+        s["right_dist"] = _lowpass(s["right_dist"], vis["right_dist"], 0.45)
+    if vis["curvature"] is not None:
+        s["curvature"] = _lowpass(s["curvature"], vis["curvature"], 0.3)
+    if vis["speed_limit"] is not None and 20 <= vis["speed_limit"] <= 200:
+        s["speed_limit"] = vis["speed_limit"]
+    if vis["valid_count"] < 2:
+        s["vision_bad_count"] = min(50, s["vision_bad_count"] + 1)
+    else:
+        s["vision_bad_count"] = max(0, s["vision_bad_count"] - 1)
+
+    front_min, left_min, right_min = _fuse_lidar(state)
+
+    # Obstacle fusion (vision + lidar)
+    obstacle_dist = None
+    obstacle_rel_kmh = None
+    if vis["obstacle_votes"] >= 2 and vis["obstacle_dist"] is not None:
+        obstacle_dist = vis["obstacle_dist"]
+        obstacle_rel_kmh = vis["obstacle_rel_kmh"] if vis["obstacle_rel_kmh"] is not None else 0.0
+    elif vis["obstacle_votes"] >= 1 and vis["obstacle_dist"] is not None:
+        if front_min is not None and front_min < 80 and abs(front_min - vis["obstacle_dist"]) < 15:
+            obstacle_dist = min(front_min, vis["obstacle_dist"])
+            obstacle_rel_kmh = vis["obstacle_rel_kmh"] if vis["obstacle_rel_kmh"] is not None else 0.0
+        elif front_min is not None and front_min < 40:
+            obstacle_dist = front_min
+            obstacle_rel_kmh = 0.0
+    elif front_min is not None and front_min < 60:
+        obstacle_dist = front_min
+        sim_t = state.get("sim_time_s")
+        if s["prev_obstacle_dist"] is not None and s["prev_sim_time"] is not None and sim_t is not None:
+            dT = sim_t - s["prev_sim_time"]
+            if dT > 1e-3:
+                closing_mps = (s["prev_obstacle_dist"] - front_min) / dT
+                obstacle_rel_kmh = -closing_mps * 3.6
+            else:
+                obstacle_rel_kmh = 0.0
+        else:
+            obstacle_rel_kmh = 0.0
+
+    if obstacle_dist is not None:
+        s["obstacle_dist"] = obstacle_dist
+        s["obstacle_rel_kmh"] = obstacle_rel_kmh if obstacle_rel_kmh is not None else 0.0
+        s["obstacle_present"] = True
+        s["obstacle_persist"] = min(20, s["obstacle_persist"] + 1)
+    else:
+        s["obstacle_persist"] = max(0, s["obstacle_persist"] - 1)
+        if s["obstacle_persist"] == 0:
+            s["obstacle_present"] = False
+            s["obstacle_dist"] = float("inf")
+            s["obstacle_rel_kmh"] = 0.0
+
+    s["prev_obstacle_dist"] = front_min if front_min is not None else s["prev_obstacle_dist"]
+    s["prev_sim_time"] = state.get("sim_time_s", s["prev_sim_time"])
+
+    # Traction
+    mu = _valid_get(state, "estimated_mu", 1.0)
+    if mu is None or mu <= 0:
+        mu = 1.0
+    rain = bool(state.get("rain_sensor", False))
+    low_traction = mu < 0.5
+    very_low_traction = mu < 0.3
+
+    # Targets
+    target_speed = _valid_get(state, "target_speed_kmh", 100.0) or 100.0
+    target_lane = _valid_get(state, "target_lane", _valid_get(state, "current_lane", 1))
+    current_lane = _valid_get(state, "current_lane", target_lane)
+
+    speed_limit = s["speed_limit"] if s["speed_limit"] else 130.0
+    desired_speed = min(target_speed, speed_limit)
+
+    # Curvature-limited cornering speed: v <= sqrt(mu*g*R)
+    curv = abs(s["curvature"])
+    if curv > 1e-4:
+        radius = 1.0 / curv
+        v_curve = math.sqrt(max(0.05, 0.7 * mu) * 9.81 * radius)
+        desired_speed = min(desired_speed, v_curve * 3.6)
+
+    if very_low_traction:
+        desired_speed = min(desired_speed, 45.0)
+    elif low_traction:
+        desired_speed = min(desired_speed, 75.0)
+    if rain:
+        desired_speed = min(desired_speed, max(60.0, 0.85 * desired_speed))
+
+    # Lane-change decision
+    desired_lane = target_lane
+    if s["obstacle_present"] and s["obstacle_dist"] < 35.0:
+        if left_min is not None and left_min > 25 and current_lane is not None and current_lane > 0:
+            desired_lane = current_lane - 1
+        elif right_min is not None and right_min > 25 and current_lane is not None and current_lane < 2:
+            desired_lane = current_lane + 1
+
+    # Lateral controller
+    if s["left_dist"] is not None and s["right_dist"] is not None and vis["valid_count"] >= 1:
+        lane_err = 0.5 * (s["left_dist"] - s["right_dist"])
+    else:
+        lane_err = s["lane_offset"] if s["lane_offset"] is not None else 0.0
+
+    if desired_lane is not None and current_lane is not None and desired_lane != current_lane:
+        bias = (desired_lane - current_lane) * 1.2
+        lane_err -= bias
+
+    curv_signed = s["curvature"]
+    kp_lat = 0.35
+    ki_lat = 0.02
+    kd_lat = 0.15
+    if low_traction:
+        kp_lat *= 0.6
+        kd_lat *= 0.7
+    err = lane_err
+    s["lat_int"] = _clamp(s["lat_int"] + err * dt, -2.0, 2.0)
+    derr = (err - s["lat_prev_err"]) / dt
+    s["lat_prev_err"] = err
+    steering = -(kp_lat * err + ki_lat * s["lat_int"] + kd_lat * derr)
+    steering += curv_signed * (1.5 + 0.02 * s["speed_kmh"])
+    steering -= 0.01 * s["yaw_rate_dps"]
+    steering -= 0.03 * s["accel_lat"] / 9.81
+
+    # Partially jammed steering: escalate command if no yaw response
+    if abs(steering) > 0.3 and s["speed_kmh"] > 30 and abs(s["yaw_rate_dps"]) < 1.0:
+        steering = _clamp(steering * 1.8, -1.0, 1.0)
+
+    steering = _clamp(steering, -1.0, 1.0)
+
+    # Longitudinal PID
+    speed_err = desired_speed - s["speed_kmh"]
+    kp_v = 0.05
+    ki_v = 0.005
+    kd_v = 0.01
+    s["speed_int"] = _clamp(s["speed_int"] + speed_err * dt, -50.0, 50.0)
+    dv = (speed_err - s["speed_prev_err"]) / dt
+    s["speed_prev_err"] = speed_err
+    drive = kp_v * speed_err + ki_v * s["speed_int"] + kd_v * dv
+
+    throttle = 0.0
+    brake = 0.0
+    if drive >= 0:
+        throttle = _clamp(drive, 0.0, 1.0)
+    else:
+        brake = _clamp(-drive * 0.8, 0.0, 1.0)
+
+    # Collision avoidance
+    if s["obstacle_present"]:
+        d = s["obstacle_dist"]
+        a_max = max(0.5, mu * 9.5)
+        v = max(0.0, speed_mps)
+        closing_mps = v
+        if s["obstacle_rel_kmh"] is not None:
+            rel_mps = -s["obstacle_rel_kmh"] / 3.6
+            if rel_mps > 0:
+                closing_mps = max(rel_mps, 0.3 * v)
+            else:
+                closing_mps = max(0.0, v + rel_mps)
+        stop_dist = (closing_mps * closing_mps) / (2.0 * a_max) + closing_mps * 0.6
+        safety = 6.0 + 0.4 * v
+        follow_dist = max(15.0, 2.0 * v)
+
+        if d < safety + stop_dist:
+            brake = max(brake, 1.0 if d < safety + 0.4 * stop_dist else 0.85)
+            throttle = 0.0
+        elif d < follow_dist + stop_dist:
+            brake = max(brake, _clamp(0.6 * (1.0 - (d - safety) / max(1.0, follow_dist)), 0.0, 0.6))
+            throttle = min(throttle, 0.2)
+        if s["obstacle_rel_kmh"] is not None and s["obstacle_rel_kmh"] < 0:
+            leader_speed = max(0.0, s["speed_kmh"] + s["obstacle_rel_kmh"])
+            if leader_speed < desired_speed - 2:
+                throttle = min(throttle, 0.15)
+
+    # Lidar-only emergency (debris)
+    if front_min is not None and front_min < 8.0:
+        brake = max(brake, 1.0)
+        throttle = 0.0
+    elif front_min is not None and front_min < 18.0 and s["speed_kmh"] > 30:
+        brake = max(brake, 0.6)
+        throttle = min(throttle, 0.1)
+
+    # Brake-failure detection
+    if brake > 0.5 and s["accel_long"] > -0.5 and s["speed_kmh"] > 30:
+        s["brake_fail_count"] = min(20, s["brake_fail_count"] + 1)
+    else:
+        s["brake_fail_count"] = max(0, s["brake_fail_count"] - 1)
+    brake_failed = s["brake_fail_count"] > 8
+    if brake_failed:
+        throttle = 0.0
+
+    # Throttle-stuck detection
+    if s["speed_kmh"] > desired_speed + 25 and brake > 0.3:
+        s["throttle_stuck_count"] = min(20, s["throttle_stuck_count"] + 1)
+    else:
+        s["throttle_stuck_count"] = max(0, s["throttle_stuck_count"] - 1)
+    if s["throttle_stuck_count"] > 6:
+        throttle = 0.0
+        brake = max(brake, 0.7)
+
+    # Traction-aware command smoothing
+    if very_low_traction:
+        steering *= 0.5
+        throttle *= 0.35
+        brake = min(brake, 0.5)
+    elif low_traction:
+        steering *= 0.75
+        throttle *= 0.65
+        brake = min(brake, 0.7)
+
+    # Rate limits
+    max_d_steer = 0.15 if not very_low_traction else 0.07
+    max_d_throt = 0.20 if not very_low_traction else 0.08
+    max_d_brake = 0.40
+    steering = _clamp(steering, s["last_steering"] - max_d_steer, s["last_steering"] + max_d_steer)
+    throttle = _clamp(throttle, s["last_throttle"] - max_d_throt, s["last_throttle"] + max_d_throt)
+    brake = _clamp(brake, s["last_brake"] - max_d_brake, s["last_brake"] + max_d_brake)
+
+    steering = _clamp(steering, -1.0, 1.0)
+    throttle = _clamp(throttle, 0.0, 1.0)
+    brake = _clamp(brake, 0.0, 1.0)
+    if brake > 0.2:
+        throttle = 0.0
+
+    s["last_steering"] = steering
+    s["last_throttle"] = throttle
+    s["last_brake"] = brake
+
+    return {"steering": steering, "throttle": throttle, "brake": brake}

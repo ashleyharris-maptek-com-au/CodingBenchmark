@@ -1,0 +1,615 @@
+use std::io::{self, Read, Write};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
+
+const INPUT_BUFFER_SIZE: usize = 64 * 1024;
+const CONTROL_DT: Duration = Duration::from_millis(50);
+
+#[derive(Clone, Copy, Debug)]
+struct DynamicState {
+    x: f64,
+    y: f64,
+    vx: f64,
+    vy: f64,
+    angle: f64,
+    angular_vel: f64,
+    fuel_remaining: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ControlOutput {
+    thrust: f64,
+    turn: f64,
+}
+
+#[derive(Clone, Debug)]
+struct SharedState {
+    latest: Option<DynamicState>,
+    eof: bool,
+}
+
+#[derive(Debug)]
+struct MapSummary {
+    height: usize,
+    gravity: f64,
+    max_thrust: f64,
+    pad_x: f64,
+    pad_y: f64,
+    pad_row: usize,
+    landing_left: f64,
+    landing_right: f64,
+    corridor_left: Vec<i32>,
+    corridor_right: Vec<i32>,
+    corridor_center: Vec<f64>,
+}
+
+struct FastInput<R: Read> {
+    reader: R,
+    buf: Vec<u8>,
+    pos: usize,
+    len: usize,
+}
+
+impl<R: Read> FastInput<R> {
+    fn new(reader: R) -> Self {
+        Self {
+            reader,
+            buf: vec![0; INPUT_BUFFER_SIZE],
+            pos: 0,
+            len: 0,
+        }
+    }
+
+    fn refill(&mut self) -> io::Result<bool> {
+        self.len = self.reader.read(&mut self.buf)?;
+        self.pos = 0;
+        Ok(self.len > 0)
+    }
+
+    fn next_token_bytes(&mut self) -> io::Result<Option<Vec<u8>>> {
+        let mut token = Vec::with_capacity(32);
+
+        loop {
+            if self.pos == self.len && !self.refill()? {
+                return Ok(None);
+            }
+            while self.pos < self.len && self.buf[self.pos].is_ascii_whitespace() {
+                self.pos += 1;
+            }
+            if self.pos < self.len {
+                break;
+            }
+        }
+
+        loop {
+            if self.pos == self.len {
+                if !self.refill()? {
+                    break;
+                }
+            }
+
+            while self.pos < self.len {
+                let b = self.buf[self.pos];
+                if b.is_ascii_whitespace() {
+                    return Ok(Some(token));
+                }
+                token.push(b);
+                self.pos += 1;
+            }
+        }
+
+        Ok(Some(token))
+    }
+
+    fn next_f64(&mut self) -> io::Result<Option<f64>> {
+        match self.next_token_bytes()? {
+            Some(bytes) => {
+                let text = std::str::from_utf8(&bytes).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "non-utf8 numeric token")
+                })?;
+                let value = text.parse::<f64>().map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "failed to parse float")
+                })?;
+                Ok(Some(value))
+            }
+            None => Ok(None),
+        }
+    }
+}
+
+fn clamp_row(y: f64, height: usize) -> usize {
+    if height == 0 {
+        return 0;
+    }
+    let max_row = (height - 1) as f64;
+    y.floor().clamp(0.0, max_row) as usize
+}
+
+fn interval_bounds(left: i32, right: i32) -> (f64, f64) {
+    (left as f64 + 0.5, right as f64 + 0.5)
+}
+
+fn safe_interval(left: i32, right: i32) -> (f64, f64) {
+    let (mut l, mut r) = interval_bounds(left, right);
+    let width = (right - left + 1).max(1) as f64;
+    let margin = if width >= 8.0 {
+        0.65
+    } else if width >= 4.0 {
+        0.35
+    } else {
+        0.05
+    };
+    if r - l > 2.0 * margin {
+        l += margin;
+        r -= margin;
+    }
+    (l, r)
+}
+
+fn clamp_to_interval(value: f64, left: i32, right: i32) -> f64 {
+    let (l, r) = interval_bounds(left, right);
+    if l <= r {
+        value.clamp(l, r)
+    } else {
+        value
+    }
+}
+
+fn choose_interval(row: &[u8], reference_x: f64, target_x: f64, progress: f64) -> Option<(i32, i32)> {
+    let mut i = 0usize;
+    let mut best: Option<(i32, i32, f64)> = None;
+
+    while i < row.len() {
+        while i < row.len() && row[i] == b'#' {
+            i += 1;
+        }
+        if i >= row.len() {
+            break;
+        }
+
+        let start = i as i32;
+        while i < row.len() && row[i] != b'#' {
+            i += 1;
+        }
+        let end = i as i32 - 1;
+        let (left, right) = interval_bounds(start, end);
+        let center = 0.5 * (left + right);
+        let width = (end - start + 1).max(1) as f64;
+
+        let dist_to_ref = if reference_x < left {
+            left - reference_x
+        } else if reference_x > right {
+            reference_x - right
+        } else {
+            0.0
+        };
+
+        let dist_to_target = (center - target_x).abs();
+        let width_bonus = width * (0.03 + 0.03 * progress);
+        let cost = dist_to_ref * 3.0 + dist_to_target * (0.1 + 0.9 * progress) - width_bonus;
+
+        match best {
+            None => best = Some((start, end, cost)),
+            Some((_, _, best_cost)) if cost < best_cost => best = Some((start, end, cost)),
+            _ => {}
+        }
+    }
+
+    best.map(|(left, right, _)| (left, right))
+}
+
+fn find_landing_run(row: &[u8], target_x: f64) -> Option<(i32, i32)> {
+    let mut i = 0usize;
+    let mut best: Option<(i32, i32, f64)> = None;
+
+    while i < row.len() {
+        while i < row.len() && row[i] != b'L' && row[i] != b'T' {
+            i += 1;
+        }
+        if i >= row.len() {
+            break;
+        }
+
+        let start = i as i32;
+        while i < row.len() && (row[i] == b'L' || row[i] == b'T') {
+            i += 1;
+        }
+        let end = i as i32 - 1;
+        let (left, right) = interval_bounds(start, end);
+        let center = 0.5 * (left + right);
+        let score = (center - target_x).abs() - (end - start + 1) as f64 * 0.01;
+
+        match best {
+            None => best = Some((start, end, score)),
+            Some((_, _, best_score)) if score < best_score => best = Some((start, end, score)),
+            _ => {}
+        }
+    }
+
+    best.map(|(left, right, _)| (left, right))
+}
+
+fn parse_map<R: Read>(scanner: &mut FastInput<R>) -> io::Result<Option<MapSummary>> {
+    let width = match scanner.next_f64()? {
+        Some(v) => v.max(0.0) as usize,
+        None => return Ok(None),
+    };
+    let height = scanner
+        .next_f64()?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "missing height"))?
+        .max(0.0) as usize;
+    let gravity = scanner
+        .next_f64()?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "missing gravity"))?;
+    let max_thrust = scanner
+        .next_f64()?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "missing max_thrust"))?;
+    let _initial_fuel = scanner
+        .next_f64()?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "missing fuel"))?;
+
+    let start_x = scanner
+        .next_f64()?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "missing start_x"))?;
+    let start_y = scanner
+        .next_f64()?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "missing start_y"))?;
+    let target_x = scanner
+        .next_f64()?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "missing target_x"))?;
+    let target_y = scanner
+        .next_f64()?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "missing target_y"))?;
+
+    let mut corridor_left = vec![0_i32; height];
+    let mut corridor_right = vec![width.saturating_sub(1) as i32; height];
+    let mut corridor_center = vec![target_x; height];
+
+    let span = (target_y - start_y).abs().max(1.0);
+    let mut path_center = start_x;
+    let target_row = clamp_row(target_y, height);
+
+    let mut landing_choice: Option<(f64, usize, i32, i32)> = None;
+    let mut target_row_free_interval: Option<(i32, i32)> = None;
+
+    for y in 0..height {
+        let row = scanner
+            .next_token_bytes()?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "missing map row"))?;
+
+        if let Some((left, right)) = find_landing_run(&row, target_x) {
+            let center = 0.5 * (left as f64 + right as f64) + 0.5;
+            let score = ((y as f64) - target_y).abs() * 12.0 + (center - target_x).abs();
+            match landing_choice {
+                None => landing_choice = Some((score, y, left, right)),
+                Some((best_score, _, _, _)) if score < best_score => {
+                    landing_choice = Some((score, y, left, right))
+                }
+                _ => {}
+            }
+        }
+
+        if y == target_row {
+            target_row_free_interval = choose_interval(&row, target_x, target_x, 1.0);
+        }
+
+        let progress = if target_y >= start_y {
+            ((y as f64 - start_y) / span).clamp(0.0, 1.0)
+        } else {
+            ((start_y - y as f64) / span).clamp(0.0, 1.0)
+        };
+        let bias_x = start_x + (target_x - start_x) * progress;
+        let reference_x = path_center * 0.75 + bias_x * 0.25;
+
+        if let Some((left, right)) = choose_interval(&row, reference_x, target_x, progress) {
+            corridor_left[y] = left;
+            corridor_right[y] = right;
+            let desired_here = clamp_to_interval(bias_x, left, right);
+            path_center = clamp_to_interval(path_center * 0.65 + desired_here * 0.35, left, right);
+            corridor_center[y] = path_center;
+        } else {
+            corridor_center[y] = path_center;
+        }
+    }
+
+    let (pad_row, landing_left, landing_right) = if let Some((_, row, left, right)) = landing_choice {
+        let (landing_left, landing_right) = interval_bounds(left, right);
+        (row, landing_left, landing_right)
+    } else if let Some((left, right)) = target_row_free_interval {
+        let (landing_left, landing_right) = interval_bounds(left, right);
+        (target_row, landing_left, landing_right)
+    } else {
+        (target_row, target_x - 0.5, target_x + 0.5)
+    };
+
+    if height > 0 {
+        corridor_center[pad_row] = clamp_to_interval(target_x, corridor_left[pad_row], corridor_right[pad_row]);
+
+        for y in (0..pad_row).rev() {
+            let blended = corridor_center[y] * 0.35 + corridor_center[y + 1] * 0.65;
+            corridor_center[y] = clamp_to_interval(blended, corridor_left[y], corridor_right[y]);
+        }
+
+        for y in (pad_row + 1)..height {
+            let blended = corridor_center[y] * 0.45 + corridor_center[y - 1] * 0.55;
+            corridor_center[y] = clamp_to_interval(blended, corridor_left[y], corridor_right[y]);
+        }
+    }
+
+    Ok(Some(MapSummary {
+        height,
+        gravity,
+        max_thrust: max_thrust.max(0.001),
+        pad_x: target_x,
+        pad_y: target_y,
+        pad_row,
+        landing_left,
+        landing_right,
+        corridor_left,
+        corridor_right,
+        corridor_center,
+    }))
+}
+
+fn normalize_angle(mut angle: f64) -> f64 {
+    while angle > std::f64::consts::PI {
+        angle -= 2.0 * std::f64::consts::PI;
+    }
+    while angle < -std::f64::consts::PI {
+        angle += 2.0 * std::f64::consts::PI;
+    }
+    angle
+}
+
+fn desired_corridor(nav: &MapSummary, y: f64, vx: f64, vy: f64) -> (f64, f64, f64) {
+    let row = clamp_row(y, nav.height);
+    let speed_hint = vx.abs() * 0.7 + vy.abs() * 1.2;
+    let lookahead = speed_hint.round().clamp(6.0, 36.0) as usize;
+
+    let mut best_row = row;
+    let (mut left, mut right) = safe_interval(nav.corridor_left[row], nav.corridor_right[row]);
+    let mut current_left = left;
+    let mut current_right = right;
+
+    let end_row = if row <= nav.pad_row {
+        (row + lookahead).min(nav.pad_row)
+    } else {
+        (row + lookahead).min(nav.height.saturating_sub(1))
+    };
+
+    for probe in (row + 1)..=end_row {
+        let (probe_left, probe_right) = safe_interval(nav.corridor_left[probe], nav.corridor_right[probe]);
+        let next_left = current_left.max(probe_left);
+        let next_right = current_right.min(probe_right);
+        if next_left <= next_right {
+            current_left = next_left;
+            current_right = next_right;
+            left = current_left;
+            right = current_right;
+            best_row = probe;
+        } else {
+            break;
+        }
+    }
+
+    let pad_center = nav.pad_x.clamp(nav.landing_left, nav.landing_right);
+    let preferred = if (nav.pad_y - y) < 18.0 {
+        pad_center
+    } else {
+        nav.corridor_center[best_row] * 0.7 + pad_center * 0.3
+    };
+
+    (preferred.clamp(left, right), left, right)
+}
+
+fn compute_command(nav: &MapSummary, state: &DynamicState) -> ControlOutput {
+    let altitude_to_pad = (nav.pad_y - state.y).max(0.0);
+    let (desired_x, safe_left, safe_right) = desired_corridor(nav, state.y, state.vx, state.vy);
+    let corridor_width = (safe_right - safe_left).max(1.0);
+
+    let landing_center = nav.pad_x.clamp(nav.landing_left, nav.landing_right);
+    let target_x = if altitude_to_pad < 22.0 {
+        landing_center.clamp(safe_left, safe_right)
+    } else {
+        desired_x
+    };
+
+    let max_vx = if altitude_to_pad > 120.0 {
+        8.5
+    } else if altitude_to_pad > 45.0 {
+        5.5
+    } else {
+        1.8 + 0.08 * altitude_to_pad
+    };
+
+    let mut target_vx = ((target_x - state.x) * 0.45).clamp(-max_vx, max_vx);
+    let x_prediction = state.x + state.vx * 1.2;
+
+    if x_prediction < safe_left + 0.35 {
+        target_vx = target_vx.max(0.8 + (safe_left + 0.35 - x_prediction) * 0.8);
+    }
+    if x_prediction > safe_right - 0.35 {
+        target_vx = target_vx.min(-0.8 - (x_prediction - (safe_right - 0.35)) * 0.8);
+    }
+    if altitude_to_pad < 18.0 {
+        target_vx = target_vx.clamp(-1.4, 1.4);
+    }
+
+    let mut ax = ((target_vx - state.vx) * 1.5).clamp(-nav.max_thrust * 0.7, nav.max_thrust * 0.7);
+
+    let braking_accel = (nav.max_thrust - nav.gravity).max(0.1);
+    let mut desired_vy = if altitude_to_pad > 140.0 {
+        (2.0 + 0.55 * altitude_to_pad.sqrt()).min(18.0)
+    } else if altitude_to_pad > 50.0 {
+        (1.0 + 0.35 * altitude_to_pad.sqrt()).min(8.5)
+    } else {
+        0.45 + 0.07 * altitude_to_pad
+    };
+
+    if (state.x - target_x).abs() > corridor_width * 0.22 || state.vx.abs() > max_vx * 0.8 {
+        desired_vy = desired_vy.min(3.0);
+    }
+    if corridor_width < 6.0 {
+        desired_vy = desired_vy.min(2.0);
+    }
+
+    let safe_braking_speed = (2.0 * braking_accel * (altitude_to_pad - 0.5).max(0.0)).sqrt() * 0.9 + 0.2;
+    desired_vy = desired_vy.min(safe_braking_speed.max(0.35));
+    if altitude_to_pad < 10.0 {
+        desired_vy = desired_vy.min(0.75 + altitude_to_pad * 0.08);
+    }
+
+    let mut up_accel = nav.gravity + 1.35 * (state.vy - desired_vy);
+    if state.vy > safe_braking_speed {
+        up_accel += 1.6 * (state.vy - safe_braking_speed);
+    }
+    if altitude_to_pad < 4.0 {
+        up_accel += 0.7 * (4.0 - altitude_to_pad);
+    }
+
+    if state.fuel_remaining < 1.5 && altitude_to_pad > 20.0 {
+        up_accel = up_accel.min(nav.gravity + braking_accel * 0.65);
+    }
+
+    up_accel = up_accel.clamp(0.0, nav.max_thrust * 0.98);
+
+    let max_tilt: f64 = if altitude_to_pad < 15.0 { 0.45 } else { 0.90 };
+    let max_horizontal_from_tilt = up_accel * max_tilt.tan();
+    ax = ax.clamp(-max_horizontal_from_tilt, max_horizontal_from_tilt);
+
+    let mut thrust_accel = (ax * ax + up_accel * up_accel).sqrt();
+    if thrust_accel > nav.max_thrust * 0.98 {
+        let scale = nav.max_thrust * 0.98 / thrust_accel;
+        ax *= scale;
+        up_accel *= scale;
+        thrust_accel = nav.max_thrust * 0.98;
+    }
+
+    let desired_angle = if thrust_accel > 1e-6 {
+        ax.atan2(up_accel)
+    } else {
+        0.0
+    };
+
+    let angle_error = normalize_angle(desired_angle - state.angle);
+    let turn = (3.2 * angle_error - 0.85 * state.angular_vel).clamp(-1.0, 1.0);
+    let thrust = (thrust_accel / nav.max_thrust).clamp(0.0, 1.0);
+
+    ControlOutput { thrust, turn }
+}
+
+fn input_loop<R: Read + Send + 'static>(mut scanner: FastInput<R>, shared: Arc<Mutex<SharedState>>) {
+    loop {
+        let x = match scanner.next_f64() {
+            Ok(Some(v)) => v,
+            Ok(None) => break,
+            Err(_) => break,
+        };
+        let y = match scanner.next_f64() {
+            Ok(Some(v)) => v,
+            _ => break,
+        };
+        let vx = match scanner.next_f64() {
+            Ok(Some(v)) => v,
+            _ => break,
+        };
+        let vy = match scanner.next_f64() {
+            Ok(Some(v)) => v,
+            _ => break,
+        };
+        let angle = match scanner.next_f64() {
+            Ok(Some(v)) => v,
+            _ => break,
+        };
+        let angular_vel = match scanner.next_f64() {
+            Ok(Some(v)) => v,
+            _ => break,
+        };
+        let fuel_remaining = match scanner.next_f64() {
+            Ok(Some(v)) => v,
+            _ => break,
+        };
+
+        let state = DynamicState {
+            x,
+            y,
+            vx,
+            vy,
+            angle,
+            angular_vel,
+            fuel_remaining,
+        };
+
+        if let Ok(mut guard) = shared.lock() {
+            guard.latest = Some(state);
+        } else {
+            break;
+        }
+    }
+
+    if let Ok(mut guard) = shared.lock() {
+        guard.eof = true;
+    }
+}
+
+fn main() -> io::Result<()> {
+    let stdin = io::stdin();
+    let mut scanner = FastInput::new(stdin);
+    let Some(nav) = parse_map(&mut scanner)? else {
+        return Ok(());
+    };
+
+    let shared = Arc::new(Mutex::new(SharedState {
+        latest: None,
+        eof: false,
+    }));
+
+    let input_shared = Arc::clone(&shared);
+    let _input_thread = thread::spawn(move || {
+        input_loop(scanner, input_shared);
+    });
+
+    let stdout = io::stdout();
+    let mut out = io::BufWriter::new(stdout.lock());
+    let mut last_command = ControlOutput {
+        thrust: (nav.gravity / nav.max_thrust).clamp(0.0, 1.0),
+        turn: 0.0,
+    };
+
+    let mut last_tick = Instant::now();
+
+    loop {
+        let snapshot = shared
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or(SharedState {
+                latest: None,
+                eof: true,
+            });
+
+        if let Some(state) = snapshot.latest {
+            last_command = compute_command(&nav, &state);
+        } else {
+            last_command.thrust = (nav.gravity / nav.max_thrust * 1.03).clamp(0.0, 1.0);
+            last_command.turn = 0.0;
+        }
+
+        writeln!(out, "{:.3} {:.3}", last_command.thrust, last_command.turn)?;
+        out.flush()?;
+
+        if snapshot.eof {
+            break;
+        }
+
+        last_tick += CONTROL_DT;
+        let now = Instant::now();
+        if last_tick > now {
+            thread::sleep(last_tick - now);
+        } else {
+            last_tick = now;
+        }
+    }
+
+    Ok(())
+}

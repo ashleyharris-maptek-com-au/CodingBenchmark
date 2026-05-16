@@ -1,1 +1,441 @@
-{'__exception__': '{"type":"result","subtype":"success","is_error":true,"api_error_status":529,"duration_ms":324673,"duration_api_ms":129504,"num_turns":4,"result":"API Error: 529 Overloaded. This is a server-side issue, usually temporary — try again in a moment. If it persists, check status.claude.com.","stop_reason":"stop_sequence","session_id":"834fa7b8-e897-472e-a89a-23feb3fceb02","total_cost_usd":0.54206175,"usage":{"input_tokens":8,"cache_creation_input_tokens":21515,"cache_read_input_tokens":99560,"output_tokens":14291,"server_tool_use":{"web_search_requests":0,"web_fetch_requests":0},"service_tier":"standard","cache_creation":{"ephemeral_1h_input_tokens":21515,"ephemeral_5m_input_tokens":0},"inference_geo":"","iterations":[{"input_tokens":1,"output_tokens":6431,"cache_read_input_tokens":42907,"cache_creation_input_tokens":163,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":163},"type":"message"}],"speed":"standard"},"modelUsage":{"claude-haiku-4-5-20251001":{"inputTokens":428,"outputTokens":14,"cacheReadInputTokens":0,"cacheCreationInputTokens":0,"webSearchRequests":0,"costUSD":0.000498,"contextWindow":200000,"maxOutputTokens":32000},"claude-opus-4-7":{"inputTokens":8,"outputTokens":14291,"cacheReadInputTokens":99560,"cacheCreationInputTokens":21515,"webSearchRequests":0,"costUSD":0.5415637499999999,"contextWindow":1000000,"maxOutputTokens":64000}},"permission_denials":[],"terminal_reason":"completed","fast_mode_state":"off","uuid":"91284f00-651b-43ba-9441-4f5f0c565849"}'}
+"""
+Autopilot for a twin-engine A320-class airliner.
+
+Design overview
+---------------
+* Sensor fusion: For every redundant triple we (a) use the *_valid flag as a
+  hint only, (b) cross-check the three values against the median, (c) reject
+  outliers, and (d) cross-check between sensor families (baro vs GPS vs radar
+  altitude, IRS vs GPS ground speed, etc.).
+* Cascaded PID control:
+    - Outer:  heading -> bank cmd ;  altitude -> VS cmd ;  IAS -> thrust.
+    - Mid:    bank cmd -> aileron ; VS cmd -> pitch cmd ; pitch cmd -> elevator.
+    - Yaw damper (washed-out yaw-rate feedback) on rudder.
+    - Auto-trim drains steady-state elevator into elevator_trim.
+* Protections:
+    - Stall protection (AoA / low IAS) overrides pitch and adds thrust.
+    - Overspeed (Vne ~365 KIAS / M0.82) reduces thrust, adds speedbrake.
+    - Bank-angle limiting (tighter when slow / on approach).
+    - Asymmetric thrust handling: rudder bias on engine failure, throttle limit.
+    - Engine fire / flameout latches engine as failed.
+* Configuration management: gear / flap / speedbrake scheduling by phase.
+* Persistence: PID integrators and last commands stored in module-level _S.
+"""
+
+import math
+
+# ---------------------------------------------------------------------------
+# Persistent state
+# ---------------------------------------------------------------------------
+_S = {
+    "i_ias": 0.0, "i_vs": 0.0, "i_pitch": 0.0, "i_roll": 0.0,
+    "p_ias": None, "p_vs": None, "p_pitch": None, "p_roll": None,
+    "last_trim": 0.0, "last_flaps": 0, "last_sb": 0.0, "last_gear": 1,
+    "f_yaw_rate": 0.0, "f_yaw_rate_prev": 0.0,
+    "phase": "GROUND", "t": 0.0,
+    "eng1_failed": False, "eng2_failed": False,
+}
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def _finite(x):
+    try:
+        return x is not None and math.isfinite(float(x))
+    except Exception:
+        return False
+
+
+def _median(vals):
+    s = sorted(vals)
+    n = len(s)
+    if n == 0:
+        return None
+    if n % 2 == 1:
+        return s[n // 2]
+    return 0.5 * (s[n // 2 - 1] + s[n // 2])
+
+
+def _fuse(state, keys, valid_keys=None, sane=None, cross=None):
+    """Fuse a redundant set of sensors with outlier rejection."""
+    candidates = []
+    for i, k in enumerate(keys):
+        v = state.get(k)
+        if not _finite(v):
+            continue
+        v = float(v)
+        if sane is not None and not (sane[0] <= v <= sane[1]):
+            continue
+        valid = True
+        if valid_keys is not None:
+            vf = state.get(valid_keys[i])
+            if vf is False or vf == 0:
+                valid = False
+        candidates.append((v, valid))
+    if not candidates:
+        return None
+
+    vals = [v for v, _ in candidates]
+    m = _median(vals)
+    spread = max(1e-6, max(vals) - min(vals))
+    tol = max(spread * 0.5, abs(m) * 0.1 + 5.0)
+    kept = [(v, ok) for v, ok in candidates if abs(v - m) <= tol] or candidates
+
+    if cross is not None and _finite(cross):
+        kept2 = [(v, ok) for v, ok in kept
+                 if abs(v - cross) < max(abs(cross) * 0.3 + 100.0, 200.0)]
+        if kept2:
+            kept = kept2
+
+    num = 0.0
+    den = 0.0
+    for v, ok in kept:
+        w = 1.0 if ok else 0.3
+        num += w * v
+        den += w
+    return num / den if den > 0 else m
+
+
+def _clip(x, lo, hi):
+    return lo if x < lo else hi if x > hi else x
+
+
+def _wrap180(a):
+    while a > 180.0:
+        a -= 360.0
+    while a < -180.0:
+        a += 360.0
+    return a
+
+
+def _pid(name, err, kp, ki, kd, dt, ilim=1.0, deadband=0.0):
+    if abs(err) < deadband:
+        err = 0.0
+    pkey, ikey = "p_" + name, "i_" + name
+    prev = _S.get(pkey)
+    derr = 0.0 if prev is None else (err - prev) / max(dt, 1e-3)
+    _S[pkey] = err
+    _S[ikey] = _clip(_S[ikey] + err * dt, -ilim, ilim)
+    return kp * err + ki * _S[ikey] + kd * derr
+
+
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
+def autopilot_step(state: dict, dt: float) -> dict:
+    if not _finite(dt) or dt <= 0:
+        dt = float(state.get("dt", 0.05) or 0.05)
+    dt = _clip(dt, 0.005, 0.5)
+    _S["t"] += dt
+
+    # --- Fuse sensors ---
+    baro_alt = _fuse(state,
+        ["baro_alt_1_ft", "baro_alt_2_ft", "baro_alt_3_ft"],
+        ["baro_alt_1_valid", "baro_alt_2_valid", "baro_alt_3_valid"],
+        sane=(-2000.0, 60000.0))
+    gps_alt = _fuse(state,
+        ["gps_1_alt_ft", "gps_2_alt_ft", "gps_3_alt_ft"],
+        ["gps_1_valid", "gps_2_valid", "gps_3_valid"],
+        sane=(-2000.0, 60000.0))
+    radar_alt = _fuse(state,
+        ["radar_alt_1_ft", "radar_alt_2_ft", "radar_alt_3_ft"],
+        ["radar_alt_1_valid", "radar_alt_2_valid", "radar_alt_3_valid"],
+        sane=(-50.0, 5000.0))
+
+    # Altitude fusion: prefer baro, cross-check with GPS, fall back to radar.
+    alt = None
+    if _finite(baro_alt) and _finite(gps_alt):
+        if abs(baro_alt - gps_alt) > 500.0:
+            if _finite(radar_alt) and radar_alt < 2500.0:
+                alt = baro_alt if abs(baro_alt - radar_alt) < abs(gps_alt - radar_alt) else gps_alt
+            else:
+                alt = 0.5 * (baro_alt + gps_alt)
+        else:
+            alt = 0.5 * (baro_alt + gps_alt)
+    elif _finite(baro_alt):
+        alt = baro_alt
+    elif _finite(gps_alt):
+        alt = gps_alt
+    elif _finite(radar_alt):
+        alt = radar_alt
+    if not _finite(alt):
+        alt = 10000.0
+
+    ias = _fuse(state,
+        ["ias_1_kt", "ias_2_kt", "ias_3_kt"],
+        ["ias_1_valid", "ias_2_valid", "ias_3_valid"],
+        sane=(0.0, 500.0))
+    mach = _fuse(state, ["mach_1", "mach_2", "mach_3"], sane=(0.0, 1.2))
+    tas = _fuse(state, ["tas_1_kt", "tas_2_kt", "tas_3_kt"], sane=(0.0, 700.0))
+    aoa = _fuse(state,
+        ["aoa_1_deg", "aoa_2_deg", "aoa_3_deg"],
+        ["aoa_1_valid", "aoa_2_valid", "aoa_3_valid"],
+        sane=(-20.0, 40.0))
+
+    pitch = _fuse(state,
+        ["irs_1_pitch_deg", "irs_2_pitch_deg", "irs_3_pitch_deg"],
+        ["irs_1_valid", "irs_2_valid", "irs_3_valid"],
+        sane=(-90.0, 90.0))
+    roll = _fuse(state,
+        ["irs_1_roll_deg", "irs_2_roll_deg", "irs_3_roll_deg"],
+        ["irs_1_valid", "irs_2_valid", "irs_3_valid"],
+        sane=(-180.0, 180.0))
+    heading = _fuse(state,
+        ["irs_1_heading_deg", "irs_2_heading_deg", "irs_3_heading_deg"],
+        ["irs_1_valid", "irs_2_valid", "irs_3_valid"],
+        sane=(-360.0, 720.0))
+    if not _finite(heading):
+        heading = state.get("magnetic_heading_deg") or state.get("true_heading_deg") or 0.0
+    heading = heading % 360.0
+    if not _finite(pitch):
+        pitch = 0.0
+    if not _finite(roll):
+        roll = 0.0
+
+    vs = _fuse(state,
+        ["irs_1_vs_fpm", "irs_2_vs_fpm", "irs_3_vs_fpm"],
+        ["irs_1_valid", "irs_2_valid", "irs_3_valid"],
+        sane=(-15000.0, 15000.0))
+    if not _finite(vs):
+        vs = state.get("vertical_speed_fpm", 0.0) or 0.0
+
+    pitch_rate = _fuse(state,
+        ["gyro_1_pitch_rate_dps", "gyro_2_pitch_rate_dps", "gyro_3_pitch_rate_dps"],
+        ["gyro_1_valid", "gyro_2_valid", "gyro_3_valid"], sane=(-60.0, 60.0)) or 0.0
+    roll_rate = _fuse(state,
+        ["gyro_1_roll_rate_dps", "gyro_2_roll_rate_dps", "gyro_3_roll_rate_dps"],
+        ["gyro_1_valid", "gyro_2_valid", "gyro_3_valid"], sane=(-180.0, 180.0)) or 0.0
+    yaw_rate = _fuse(state,
+        ["gyro_1_yaw_rate_dps", "gyro_2_yaw_rate_dps", "gyro_3_yaw_rate_dps"],
+        ["gyro_1_valid", "gyro_2_valid", "gyro_3_valid"], sane=(-60.0, 60.0)) or 0.0
+
+    gs = _fuse(state,
+        ["gps_1_gs_kt", "gps_2_gs_kt", "gps_3_gs_kt"],
+        ["gps_1_valid", "gps_2_valid", "gps_3_valid"], sane=(0.0, 700.0))
+    if not _finite(gs):
+        gs = _fuse(state,
+            ["irs_1_gs_kt", "irs_2_gs_kt", "irs_3_gs_kt"],
+            ["irs_1_valid", "irs_2_valid", "irs_3_valid"], sane=(0.0, 700.0))
+    if not _finite(gs):
+        gs = state.get("ground_speed_kt", 0.0) or 0.0
+
+    if not _finite(ias):
+        ias = tas if _finite(tas) else gs
+    if not _finite(ias):
+        ias = 250.0
+
+    wow = bool(state.get("weight_on_wheels_left") or state.get("weight_on_wheels_right")
+               or state.get("weight_on_wheels_nose"))
+    rad = radar_alt if _finite(radar_alt) else (alt if alt < 3000 else 3000.0)
+
+    # --- Targets ---
+    tgt_alt = state.get("target_alt_ft", alt)
+    if not _finite(tgt_alt):
+        tgt_alt = alt
+    tgt_hdg = state.get("target_hdg_deg", heading)
+    if not _finite(tgt_hdg):
+        tgt_hdg = heading
+    tgt_hdg = tgt_hdg % 360.0
+    tgt_ias = state.get("target_ias_kt", 250.0)
+    if not _finite(tgt_ias):
+        tgt_ias = 250.0
+    tgt_vs_cmd = state.get("target_vs_fpm", None)
+
+    # --- Engine health latches ---
+    e1_run = state.get("engine_1_running", True)
+    e2_run = state.get("engine_2_running", True)
+    e1_fire = bool(state.get("engine_1_fire"))
+    e2_fire = bool(state.get("engine_2_fire"))
+    n1_1 = state.get("engine_1_n1_pct", 0.0) or 0.0
+    n1_2 = state.get("engine_2_n1_pct", 0.0) or 0.0
+    if e1_fire or (e1_run is False) or n1_1 < 5.0:
+        _S["eng1_failed"] = True
+    if e2_fire or (e2_run is False) or n1_2 < 5.0:
+        _S["eng2_failed"] = True
+    eng1_ok = not _S["eng1_failed"]
+    eng2_ok = not _S["eng2_failed"]
+
+    # --- Phase state machine ---
+    phase = _S["phase"]
+    if wow and ias < 60:
+        phase = "GROUND"
+    elif wow and ias >= 60:
+        phase = "TAKEOFF"
+    elif not wow and rad < 50 and phase in ("GROUND", "TAKEOFF"):
+        phase = "TAKEOFF"
+    elif not wow and tgt_alt < 3000 and alt < 3000 and vs < 0:
+        phase = "APPROACH"
+    elif not wow and rad < 200 and vs < -200:
+        phase = "LANDING"
+    elif not wow and alt < tgt_alt - 500 and vs > -100:
+        phase = "CLIMB"
+    elif not wow and alt > tgt_alt + 500:
+        phase = "DESCENT"
+    else:
+        if not wow and abs(alt - tgt_alt) < 500:
+            phase = "CRUISE"
+    _S["phase"] = phase
+
+    # --- Protections ---
+    stall_warn = (_finite(aoa) and aoa > 14.0) or (ias < 130.0 and rad > 100.0 and not wow)
+    overspeed = (ias > 350.0) or (_finite(mach) and mach > 0.80)
+
+    eff_tgt_ias = tgt_ias
+    if stall_warn:
+        eff_tgt_ias = max(eff_tgt_ias, 200.0)
+    if overspeed:
+        eff_tgt_ias = min(eff_tgt_ias, 320.0)
+
+    # --- Speed -> thrust ---
+    ias_err = eff_tgt_ias - ias
+    thr_cmd = _pid("ias", ias_err, kp=0.020, ki=0.005, kd=0.002, dt=dt, ilim=1.0)
+    thr_bias = {"TAKEOFF": 0.85, "CLIMB": 0.80, "CRUISE": 0.55,
+                "DESCENT": 0.35, "APPROACH": 0.45, "LANDING": 0.30,
+                "GROUND": 0.20}.get(phase, 0.40)
+    base_thr = _clip(thr_bias + thr_cmd, 0.0, 1.0)
+    if overspeed:
+        base_thr = min(base_thr, 0.20)
+    if stall_warn:
+        base_thr = max(base_thr, 0.85)
+
+    # --- Vertical: altitude -> VS -> pitch -> elevator ---
+    if _finite(tgt_vs_cmd):
+        vs_cmd = float(tgt_vs_cmd)
+    else:
+        alt_err = tgt_alt - alt
+        vs_cmd = _clip(alt_err * 6.0, -2500.0, 2500.0)
+        if phase == "CLIMB":
+            vs_cmd = _clip(vs_cmd, -500.0, 2200.0)
+        if phase == "LANDING":
+            vs_cmd = _clip(vs_cmd, -800.0, 200.0)
+
+    vs_err = vs_cmd - vs
+    pitch_cmd = _pid("vs", vs_err, kp=0.0030, ki=0.0006, kd=0.0008, dt=dt, ilim=8.0)
+    pitch_cmd = _clip(pitch_cmd, -10.0, 15.0)
+    if stall_warn:
+        pitch_cmd = min(pitch_cmd, 5.0)
+    if overspeed:
+        pitch_cmd = max(pitch_cmd, 2.0)
+
+    pitch_err = pitch_cmd - pitch
+    elev_cmd = _pid("pitch", pitch_err, kp=0.07, ki=0.01, kd=0.015, dt=dt, ilim=1.0)
+    elev_cmd -= 0.015 * pitch_rate
+    elev_cmd = _clip(elev_cmd, -1.0, 1.0)
+
+    # Auto-trim drains steady-state elevator slowly into trim.
+    trim_cmd = _clip(_S["last_trim"] + _clip(elev_cmd * 0.05 * dt, -0.02, 0.02), -1.0, 1.0)
+
+    # --- Lateral: heading -> bank -> aileron ---
+    hdg_err = _wrap180(tgt_hdg - heading)
+    bank_cmd = _clip(hdg_err * 1.2, -25.0, 25.0)
+    bank_lim = 15.0 if (phase in ("APPROACH", "LANDING") or ias < 180.0) else 25.0
+    bank_cmd = _clip(bank_cmd, -bank_lim, bank_lim)
+
+    roll_err = bank_cmd - roll
+    ail_cmd = _pid("roll", roll_err, kp=0.035, ki=0.005, kd=0.010, dt=dt, ilim=0.5)
+    ail_cmd -= 0.010 * roll_rate
+    ail_cmd = _clip(ail_cmd, -1.0, 1.0)
+
+    # --- Yaw damper + asymmetric thrust compensation ---
+    tau = 1.0
+    alpha = tau / (tau + dt)
+    wash = alpha * (_S["f_yaw_rate"] + yaw_rate - _S["f_yaw_rate_prev"])
+    _S["f_yaw_rate"] = wash
+    _S["f_yaw_rate_prev"] = yaw_rate
+    rud_cmd = -0.05 * wash
+
+    thr1 = base_thr if eng1_ok else 0.0
+    thr2 = base_thr if eng2_ok else 0.0
+    if eng1_ok and not eng2_ok:
+        rud_cmd += 0.35   # right engine dead: nose yaws right, push right rudder? actually live=left, yaws right -> need left rudder
+        rud_cmd -= 0.70   # correction: live engine on left creates yaw to the right, counter with left rudder (negative)
+        thr1 = min(thr1, 0.90)
+    elif eng2_ok and not eng1_ok:
+        rud_cmd += 0.35   # live engine on the right -> yaws left -> right rudder positive
+        thr2 = min(thr2, 0.90)
+    rud_cmd += 0.15 * ail_cmd   # turn coordination
+    rud_cmd = _clip(rud_cmd, -1.0, 1.0)
+
+    # --- Configuration: flaps, gear, speedbrake ---
+    flaps = _S["last_flaps"]
+    gear = _S["last_gear"]
+    sb = _S["last_sb"]
+
+    if phase == "GROUND":
+        flaps = 10 if ias > 30 else 0
+        gear = 1
+        sb = 1.0 if (ias > 80 and wow) else 0.0
+    elif phase == "TAKEOFF":
+        flaps = 15
+        gear = 1 if rad < 50 else 0
+        sb = 0.0
+    elif phase == "CLIMB":
+        if rad > 400 and ias > 180:
+            flaps = 0
+            gear = 0
+        sb = 0.0
+    elif phase == "CRUISE":
+        flaps = 0
+        gear = 0
+        sb = 0.0
+    elif phase == "DESCENT":
+        flaps = 0
+        gear = 0
+        sb = 0.5 if (ias > tgt_ias + 20 or (alt - tgt_alt) > 2000) else 0.0
+    elif phase == "APPROACH":
+        if ias < 220:
+            flaps = 15
+        if ias < 180:
+            flaps = 25
+        if rad < 1500:
+            gear = 1
+        sb = 0.0
+    elif phase == "LANDING":
+        flaps = 40
+        gear = 1
+        sb = 1.0 if wow else 0.0
+
+    # Don't extend flaps/gear at high speed.
+    if ias > 240 and flaps > 0:
+        flaps = 0
+    if ias > 260 and gear == 1 and not wow:
+        gear = 0
+    if overspeed:
+        sb = max(sb, 0.7)
+
+    # --- Ground handling ---
+    if wow and ias < 80:
+        elev_cmd = 0.0
+        ail_cmd = -0.05 * roll
+        rud_cmd = _clip(hdg_err * 0.05, -1.0, 1.0)
+        if phase == "LANDING":
+            thr1 = 0.0
+            thr2 = 0.0
+
+    # --- Final clipping & persist ---
+    elev_cmd = _clip(elev_cmd, -1.0, 1.0)
+    ail_cmd = _clip(ail_cmd, -1.0, 1.0)
+    rud_cmd = _clip(rud_cmd, -1.0, 1.0)
+    thr1 = _clip(thr1, 0.0, 1.0)
+    thr2 = _clip(thr2, 0.0, 1.0)
+    flaps = int(_clip(flaps, 0, 40))
+    sb = _clip(sb, 0.0, 1.0)
+    gear = 1 if gear else 0
+
+    _S["last_trim"] = trim_cmd
+    _S["last_flaps"] = flaps
+    _S["last_sb"] = sb
+    _S["last_gear"] = gear
+
+    return {
+        "elevator": elev_cmd,
+        "aileron": ail_cmd,
+        "rudder": rud_cmd,
+        "throttle_1": thr1,
+        "throttle_2": thr2,
+        "elevator_trim": trim_cmd,
+        "flaps": flaps,
+        "speedbrake": sb,
+        "gear": gear,
+    }
