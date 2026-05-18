@@ -1,0 +1,245 @@
+```python
+import math
+
+# Module-level persistent state for PIDs, filters, and failure memory
+_persistent = {
+    'alt_i': 0.0, 'alt_prev': 0.0,
+    'spd_i': 0.0, 'spd_prev': 0.0,
+    'hdg_i': 0.0, 'hdg_prev': 0.0,
+    'vs_i': 0.0, 'vs_prev': 0.0,
+    'last_good_ias': 250.0,
+    'last_good_alt': 10000.0,
+    'last_good_hdg': 0.0,
+    'last_good_pitch': 0.0,
+    'last_good_roll': 0.0,
+    'eng_fail_timer': 0.0,
+    'sensor_fault_count': 0,
+    'phase': 'cruise'
+}
+
+def _median(values):
+    """Robust median selection for triple-redundant sensors."""
+    s = sorted(values)
+    return s[1]
+
+def _fused_alt(state):
+    alts = [state['baro_alt_1_ft'], state['baro_alt_2_ft'], state['baro_alt_3_ft']]
+    valids = [state.get('baro_alt_1_valid', True), 
+              state.get('baro_alt_2_valid', True), 
+              state.get('baro_alt_3_valid', True)]
+    
+    # Use only valid if possible, else median of all (handles silent failures)
+    good = [a for a, v in zip(alts, valids) if v]
+    if len(good) >= 2:
+        return _median(good)
+    return _median(alts)
+
+def _fused_ias(state):
+    iass = [state['ias_1_kt'], state['ias_2_kt'], state['ias_3_kt']]
+    valids = [state.get('ias_1_valid', True), 
+              state.get('ias_2_valid', True), 
+              state.get('ias_3_valid', True)]
+    good = [v for v, valid in zip(iass, valids) if valid]
+    if len(good) >= 2:
+        return _median(good)
+    ias = _median(iass)
+    # Sanity check against Mach and ground speed
+    mach = _median([state['mach_1'], state['mach_2'], state['mach_3']])
+    gs = state.get('ground_speed_kt', ias)
+    if abs(ias - gs) > 80 or ias > 450 or ias < 40:
+        return _persistent['last_good_ias']
+    return ias
+
+def _fused_mach(state):
+    machs = [state['mach_1'], state['mach_2'], state['mach_3']]
+    return _median(machs)
+
+def _fused_hdg(state):
+    hdgs = [state['magnetic_heading_deg']]
+    irs_hdgs = [state['irs_1_heading_deg'], state['irs_2_heading_deg'], state['irs_3_heading_deg']]
+    return _median(irs_hdgs + hdgs)
+
+def _fused_pitch(state):
+    pitches = [state['irs_1_pitch_deg'], state['irs_2_pitch_deg'], state['irs_3_pitch_deg']]
+    return _median(pitches)
+
+def _fused_roll(state):
+    rolls = [state['irs_1_roll_deg'], state['irs_2_roll_deg'], state['irs_3_roll_deg']]
+    return _median(rolls)
+
+def _fused_vs(state):
+    vss = [state['irs_1_vs_fpm'], state['irs_2_vs_fpm'], state['irs_3_vs_fpm']]
+    return _median(vss)
+
+def _pid(error, dt, i_key, prev_key, kp, ki, kd, i_limit=50.0):
+    """Simple PID with integral windup protection."""
+    i = _persistent[i_key]
+    prev = _persistent[prev_key]
+    
+    i += error * dt
+    i = max(-i_limit, min(i_limit, i))
+    d = (error - prev) / dt if dt > 0 else 0.0
+    
+    _persistent[i_key] = i
+    _persistent[prev_key] = error
+    
+    return kp * error + ki * i + kd * d
+
+def autopilot_step(state: dict, dt: float) -> dict:
+    # === Sensor Fusion ===
+    alt = _fused_alt(state)
+    ias = _fused_ias(state)
+    mach = _fused_mach(state)
+    hdg = _fused_hdg(state)
+    pitch = _fused_pitch(state)
+    roll = _fused_roll(state)
+    vs = _fused_vs(state)
+    
+    # Update last good values
+    if 50 < ias < 400:
+        _persistent['last_good_ias'] = ias
+    if 0 < alt < 50000:
+        _persistent['last_good_alt'] = alt
+    _persistent['last_good_hdg'] = hdg
+    _persistent['last_good_pitch'] = pitch
+    _persistent['last_good_roll'] = roll
+    
+    # === Flight Phase Detection ===
+    wow = (state.get('weight_on_wheels_nose', 0) + 
+           state.get('weight_on_wheels_left', 0) + 
+           state.get('weight_on_wheels_right', 0)) / 3
+    on_ground = wow > 0.5 or alt < 30
+    
+    if on_ground:
+        _persistent['phase'] = 'ground'
+    elif alt < 1500 and ias < 220:
+        _persistent['phase'] = 'approach'
+    elif alt > 5000 and abs(vs) < 500:
+        _persistent['phase'] = 'cruise'
+    elif ias > 180 and alt > 100:
+        _persistent['phase'] = 'climb'
+    
+    # === Targets ===
+    tgt_alt = state.get('target_alt_ft', alt)
+    tgt_hdg = state.get('target_hdg_deg', hdg)
+    tgt_ias = state.get('target_ias_kt', ias)
+    
+    # === Failure Detection & Degradation Modes ===
+    controls = {}
+    fault = False
+    
+    # Airspeed fault (pitot/ADC failure)
+    if abs(ias - _persistent['last_good_ias']) > 60 or ias > 420 or ias < 60:
+        fault = True
+        _persistent['sensor_fault_count'] += 1
+        # Attitude + thrust hold mode
+        controls['elevator'] = 0.0
+        controls['aileron'] = 0.0
+        # Maintain last known good speed via thrust
+        spd_error = _persistent['last_good_ias'] - ias
+        thrust = 0.6 + spd_error * 0.002
+        controls['throttle_1'] = max(0.3, min(0.95, thrust))
+        controls['throttle_2'] = controls['throttle_1']
+        controls['rudder'] = 0.0
+        return controls
+    
+    # Attitude sensor fault
+    if abs(pitch) > 45 or abs(roll) > 60:
+        fault = True
+        controls['elevator'] = max(-0.8, min(0.8, -pitch * 0.03))
+        controls['aileron'] = max(-0.6, min(0.6, -roll * 0.04))
+    
+    # === Normal Control Laws ===
+    if not fault:
+        # --- Speed Control (Throttle) ---
+        spd_error = tgt_ias - ias
+        spd_cmd = _pid(spd_error, dt, 'spd_i', 'spd_prev', 
+                       kp=0.008, ki=0.0003, kd=0.002)
+        throttle = 0.55 + spd_cmd
+        # Mach protection
+        if mach > 0.82:
+            throttle = min(throttle, 0.65)
+        if ias > 365:
+            throttle = min(throttle, 0.4)
+        controls['throttle_1'] = max(0.0, min(1.0, throttle))
+        controls['throttle_2'] = controls['throttle_1']
+        
+        # --- Heading / Lateral Control ---
+        hdg_error = tgt_hdg - hdg
+        if hdg_error > 180: hdg_error -= 360
+        if hdg_error < -180: hdg_error += 360
+        
+        bank_cmd = max(-25, min(25, hdg_error * 0.6))
+        roll_error = bank_cmd - roll
+        aileron = _pid(roll_error, dt, 'hdg_i', 'hdg_prev',
+                       kp=0.12, ki=0.01, kd=0.08)
+        controls['aileron'] = max(-1.0, min(1.0, aileron))
+        
+        # Yaw damper / asymmetric thrust
+        rudder = 0.0
+        e1_n1 = state.get('engine_1_n1_pct', 90)
+        e2_n1 = state.get('engine_2_n1_pct', 90)
+        if abs(e1_n1 - e2_n1) > 30:
+            # Engine failure compensation
+            if e1_n1 < e2_n1:
+                rudder = 0.25   # Right rudder for left engine failure
+            else:
+                rudder = -0.25
+        controls['rudder'] = rudder
+        
+        # --- Vertical Control (Altitude + VS) ---
+        alt_error = tgt_alt - alt
+        vs_target = max(-1500, min(1500, alt_error * 0.8))
+        
+        vs_error = vs_target - vs
+        pitch_cmd = _pid(vs_error, dt, 'vs_i', 'vs_prev',
+                         kp=0.004, ki=0.0002, kd=0.001)
+        pitch_cmd = max(-8, min(12, pitch_cmd))
+        
+        pitch_error = pitch_cmd - pitch
+        elevator = _pid(pitch_error, dt, 'alt_i', 'alt_prev',
+                        kp=0.18, ki=0.015, kd=0.09)
+        
+        # AoA protection (stall prevention)
+        aoa = max(state.get('aoa_1_deg', 0), 
+                  state.get('aoa_2_deg', 0), 
+                  state.get('aoa_3_deg', 0))
+        if aoa > 12:
+            elevator = min(elevator, -0.6)
+        
+        controls['elevator'] = max(-1.0, min(1.0, elevator))
+        
+        # Trim: slowly reduce steady-state elevator demand
+        controls['elevator_trim'] = max(-0.8, min(0.8, elevator * 0.15))
+    
+    # === Configuration Management ===
+    # Flaps
+    if _persistent['phase'] == 'approach' or alt < 2000:
+        controls['flaps'] = 20 if ias < 180 else 10
+    elif _persistent['phase'] == 'ground' and ias < 120:
+        controls['flaps'] = 10
+    else:
+        controls['flaps'] = 0
+    
+    # Gear
+    if _persistent['phase'] == 'approach' and alt < 800 and ias < 200:
+        controls['gear'] = 1
+    elif _persistent['phase'] == 'ground':
+        controls['gear'] = 1 if alt < 20 else 0
+    else:
+        controls['gear'] = 0
+    
+    # Speedbrake
+    if ias > 320 or (alt < 3000 and vs < -800):
+        controls['speedbrake'] = 0.6
+    else:
+        controls['speedbrake'] = 0.0
+    
+    # Vne protection
+    if ias > 365 or mach > 0.82:
+        controls['speedbrake'] = max(controls.get('speedbrake', 0), 0.4)
+        controls['throttle_1'] = min(controls.get('throttle_1', 0.6), 0.5)
+        controls['throttle_2'] = controls['throttle_1']
+    
+    return controls
+```

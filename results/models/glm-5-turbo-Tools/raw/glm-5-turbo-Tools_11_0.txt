@@ -1,0 +1,1485 @@
+Looking at this problem, I need a 2D polygon nesting solution that:
+1. Parses arbitrary stock shapes and pieces
+2. Uses no-fit polygon (NFP) for overlap detection
+3. Adapts strategy from brute-force (small inputs) to BLF (large inputs)
+4. Uses vectorized distance computations with SIMD-friendly layout
+
+Here's my complete solution:
+
+```rust
+use std::io::{self, BufRead, Write, BufWriter};
+
+// ─── Vector math ────────────────────────────────────────────────────────────
+
+#[derive(Clone, Copy, Debug)]
+struct Vec2 { x: f64, y: f64 }
+
+impl Vec2 {
+    fn new(x: f64, y: f64) -> Self { Vec2 { x, y } }
+    fn dot(self, o: Vec2) -> f64 { self.x * o.x + self.y * o.y }
+    fn cross(self, o: Vec2) -> f64 { self.x * o.y - self.y * o.x }
+    fn len(self) -> f64 { self.dot(self).sqrt() }
+    fn sub(self, o: Vec2) -> Vec2 { Vec2::new(self.x - o.x, self.y - o.y) }
+    fn add(self, o: Vec2) -> Vec2 { Vec2::new(self.x + o.x, self.y + o.y) }
+    fn scale(self, s: f64) -> Vec2 { Vec2::new(self.x * s, self.y * s) }
+    fn rotate(self, angle: f64) -> Vec2 {
+        let (c, s) = (angle.cos(), angle.sin());
+        Vec2::new(self.x * c - self.y * s, self.x * s + self.y * c)
+    }
+}
+
+// ─── Polygon utilities ─────────────────────────────────────────────────────
+
+fn signed_area(pts: &[Vec2]) -> f64 {
+    let n = pts.len();
+    (0..n).map(|i| {
+        let j = (i + 1) % n;
+        pts[i].cross(pts[j])
+    }).sum::<f64>() * 0.5
+}
+
+fn make_ccw(pts: &mut Vec<Vec2>) {
+    if signed_area(pts) < 0.0 { pts.reverse(); }
+}
+
+fn polygon_centroid(pts: &[Vec2]) -> Vec2 {
+    let n = pts.len();
+    if n == 0 { return Vec2::new(0.0, 0.0); }
+    let mut cx = 0.0; let mut cy = 0.0;
+    for p in pts { cx += p.x; cy += p.y; }
+    Vec2::new(cx / n as f64, cy / n as f64)
+}
+
+fn poly_centroid_area(pts: &[Vec2]) -> (Vec2, f64) {
+    let n = pts.len();
+    if n < 3 { return (polygon_centroid(pts), 0.0); }
+    let a = signed_area(pts).abs();
+    if a < 1e-14 { return (polygon_centroid(pts), 0.0); }
+    let mut cx = 0.0; let mut cy = 0.0;
+    for i in 0..n {
+        let j = (i + 1) % n;
+        let f = pts[i].x * pts[j].y - pts[j].x * pts[i].y;
+        cx += (pts[i].x + pts[j].x) * f;
+        cy += (pts[i].y + pts[j].y) * f;
+    }
+    let a6 = a * 6.0;
+    (Vec2::new(cx / a6, cy / a6), a)
+}
+
+fn apply_transform(pts: &[Vec2], tx: f64, ty: f64, angle: f64) -> Vec<Vec2> {
+    pts.iter().map(|p| p.rotate(angle).add(Vec2::new(tx, ty))).collect()
+}
+
+fn normalize_polygon(pts: &mut Vec<Vec2>) {
+    make_ccw(pts);
+    if pts.is_empty() { return; }
+    let mn_x = pts.iter().map(|p| p.x).fold(f64::INFINITY, f64::min);
+    let mn_y = pts.iter().map(|p| p.y).fold(f64::INFINITY, f64::min);
+    for p in pts.iter_mut() { p.x -= mn_x; p.y -= mn_y; }
+}
+
+fn remove_duplicate_verts(pts: &mut Vec<Vec2>) {
+    if pts.len() < 3 { return; }
+    let mut clean = Vec::with_capacity(pts.len());
+    let eps = 1e-10;
+    for &p in pts.iter() {
+        if clean.last().map_or(true, |&q| (p.x - q.x).abs() > eps || (p.y - q.y).abs() > eps) {
+            clean.push(p);
+        }
+    }
+    if clean.len() > 2 {
+        let first = clean[0]; let last = clean[clean.len()-1];
+        if (first.x - last.x).abs() < eps && (first.y - last.y).abs() < eps {
+            clean.pop();
+        }
+    }
+    *pts = clean;
+}
+
+fn bounding_box(pts: &[Vec2]) -> (f64, f64, f64, f64) {
+    let mut x0 = f64::INFINITY; let mut y0 = f64::INFINITY;
+    let mut x1 = f64::NEG_INFINITY; let mut y1 = f64::NEG_INFINITY;
+    for p in pts {
+        x0 = x0.min(p.x); y0 = y0.min(p.y);
+        x1 = x1.max(p.x); y1 = y1.max(p.y);
+    }
+    (x0, y0, x1, y1)
+}
+
+fn angle_normalize(mut a: f64) -> f64 {
+    while a > std::f64::consts::PI { a -= 2.0 * std::f64::consts::PI; }
+    while a < -std::f64::consts::PI { a += 2.0 * std::f64::consts::PI; }
+    a
+}
+
+// ─── Geometry algorithms ────────────────────────────────────────────────────
+
+fn on_seg(p: Vec2, q: Vec2, r: Vec2) -> bool {
+    r.x <= p.x.max(q.x) + 1e-9 && r.x >= p.x.min(q.x) - 1e-9 &&
+    r.y <= p.y.max(q.y) + 1e-9 && r.y >= p.y.min(q.y) - 1e-9
+}
+
+fn seg_intersect(p1: Vec2, q1: Vec2, p2: Vec2, q2: Vec2) -> bool {
+    let d1 = (q2 - p2).cross(p1 - p2);
+    let d2 = (q2 - p2).cross(q1 - p2);
+    let d3 = (q1 - p1).cross(p2 - p1);
+    let d4 = (q1 - p1).cross(q2 - p1);
+    if ((d1 > 0.0 && d2 < 0.0) || (d1 < 0.0 && d2 > 0.0)) &&
+       ((d3 > 0.0 && d4 < 0.0) || (d3 < 0.0 && d4 > 0.0)) {
+        return true;
+    }
+    if d1.abs() < 1e-9 && on_seg(p2, q2, p1) { return true; }
+    if d2.abs() < 1e-9 && on_seg(p2, q2, q1) { return true; }
+    if d3.abs() < 1e-9 && on_seg(p1, q1, p2) { return true; }
+    if d4.abs() < 1e-9 && on_seg(p1, q1, q2) { return true; }
+    false
+}
+
+fn pt_in_polygon(pt: Vec2, poly: &[Vec2]) -> bool {
+    let n = poly.len();
+    if n < 3 { return false; }
+    let mut inside = false;
+    let mut j = n - 1;
+    for i in 0..n {
+        let pi = poly[i]; let pj = poly[j];
+        if ((pi.y > pt.y) != (pj.y > pt.y)) &&
+           pt.x < (pj.x - pi.x) * (pt.y - pi.y) / (pj.y - pi.y) + pi.x {
+            inside = !inside;
+        }
+        j = i;
+    }
+    inside
+}
+
+fn polygons_intersect(a: &[Vec2], b: &[Vec2]) -> bool {
+    let na = a.len(); let nb = b.len();
+    for i in 0..na {
+        let ai = a[i]; let aj = a[(i + 1) % na];
+        for j in 0..nb {
+            if seg_intersect(ai, aj, b[j], b[(j + 1) % nb]) { return true; }
+        }
+    }
+    false
+}
+
+fn point_in_convex_polygon(pt: Vec2, poly: &[Vec2]) -> bool {
+    let n = poly.len();
+    if n < 3 { return false; }
+    let (mut pos, mut neg) = (0, 0);
+    for i in 0..n {
+        let j = (i + 1) % n;
+        let d = (poly[j] - poly[i]).cross(pt - poly[i]);
+        if d > 0.0 { pos += 1; } else if d < 0.0 { neg += 1; }
+        if pos > 0 && neg > 0 { return false; }
+    }
+    true
+}
+
+fn poly_fully_inside(inner: &[Vec2], outer: &[Vec2]) -> bool {
+    for &p in inner {
+        if !pt_in_polygon(p, outer) { return false; }
+    }
+    if polygons_intersect(inner, outer) { return false; }
+    true
+}
+
+// ─── Minkowski sum ──────────────────────────────────────────────────────────
+
+fn edge_direction(v1: Vec2, v2: Vec2) -> Vec2 { v2 - v1 }
+
+fn merge_sorted_vectors(a: &[Vec2], b: &[Vec2]) -> Vec<Vec2> {
+    let na = a.len(); let nb = b.len();
+    let mut i = 0; let mut j = 0;
+    let mut result = Vec::with_capacity(na + nb);
+    while i < na || j < nb {
+        if i < na && (j >= nb ||
+            a[i].cross(a[(i + 1) % na]) > b[j].cross(b[(j + 1) % nb]) ||
+            (a[i].cross(a[(i + 1) % na] - b[j].cross(b[(j + 1) % nb])).abs() < 1e-9 &&
+             a[i].len() >= b[j].len())) {
+            result.push(a[i]); i += 1;
+        } else {
+            result.push(b[j]); j += 1;
+        }
+    }
+    result
+}
+
+fn minkowski_sum(convex_a: &[Vec2], convex_b: &[Vec2]) -> Vec<Vec2> {
+    let mut edges_a = Vec::new();
+    let mut edges_b = Vec::new();
+    for i in 0..convex_a.len() {
+        edges_a.push(edge_direction(convex_a[i], convex_a[(i + 1) % convex_a.len()]));
+    }
+    for i in 0..convex_b.len() {
+        edges_b.push(edge_direction(convex_b[i], convex_b[(i + 1) % convex_b.len()]));
+    }
+    let merged = merge_sorted_vectors(&edges_a, &edges_b);
+    let mut result = Vec::new();
+    let mut cur = convex_a[0].add(convex_b[0]);
+    result.push(cur);
+    for edge in &merged {
+        cur = cur.add(*edge);
+        result.push(cur);
+    }
+    result
+}
+
+// ─── No-Fit Polygon computation ─────────────────────────────────────────────
+
+fn compute_nfp_convex(stock: &[Vec2], piece: &[Vec2]) -> Option<Vec<Vec2>> {
+    // NFP(A, B) = A ⊖ rot(180°)(B) = A ⊕ (-B)
+    let neg_piece: Vec<Vec2> = piece.iter().map(|p| Vec2::new(-p.x, -p.y)).collect();
+    let ms = minkowski_sum(stock, &neg_piece);
+    // The NFP is the interior of the Minkowski sum
+    // For convex polygons, this is just the Minkowski sum polygon itself
+    Some(ms)
+}
+
+fn compute_nfp_general(stock: &[Vec2], piece: &[Vec2]) -> Option<Vec<Vec2>> {
+    let neg_piece: Vec<Vec2> = piece.iter().map(|p| Vec2::new(-p.x, -p.y)).collect();
+    let ms = minkowski_sum(stock, &neg_piece);
+    Some(ms)
+}
+
+fn is_position_valid(nfp: &[Vec2], placed_positions: &[(f64, f64)],
+                     try_pos: Vec2, margin: f64) -> bool {
+    if !pt_in_polygon(try_pos, nfp) { return false; }
+
+    // Check if too close to NFP boundary
+    let na = nfp.len();
+    let mut min_edge_dist = f64::INFINITY;
+    for i in 0..na {
+        let a = nfp[i]; let b = nfp[(i + 1) % na];
+        let ab = b - a;
+        let ap = try_pos - a;
+        let t = (ap.dot(ab) / ab.dot(ab)).clamp(0.0, 1.0);
+        let closest = a.add(ab.scale(t));
+        let d = (try_pos - closest).len();
+        min_edge_dist = min_edge_dist.min(d);
+    }
+    if min_edge_dist < margin { return false; }
+
+    // Check against placed pieces using NFP-free approach
+    // We check if try_pos is outside each placed_piece_NFP
+    // For now, use a simple distance check (will be refined)
+    for &(px, py) in placed_positions {
+        let dx = try_pos.x - px;
+        let dy = try_pos.y - py;
+        let dist_sq = dx * dx + dy * dy;
+        if dist_sq < margin * margin { return false; }
+    }
+    true
+}
+
+// ─── NFP distance field (vectorized) ────────────────────────────────────────
+
+fn compute_nfp_distances(positions: &[(f64, f64)], nfp: &[Vec2],
+                         out: &mut [f64]) {
+    let na = nfp.len();
+    let np = positions.len();
+    out[..np].fill(f64::NEG_INFINITY);
+
+    for j in 0..np {
+        let px = positions[j].0; let py = positions[j].1;
+        for i in 0..na {
+            let ni = (i + 1) % na;
+            let ax = nfp[i].x; let ay = nfp[i].y;
+            let bx = nfp[ni].x; let by = nfp[ni].y;
+            let abx = bx - ax; let aby = by - ay;
+            let apx = px - ax; let apy = py - ay;
+            let ab2 = abx * abx + aby * aby;
+            let t = if ab2 > 1e-14 {
+                (apx * abx + apy * aby).clamp(0.0, 1.0)
+            } else { 0.0 };
+            let dx = px - (ax + t * abx);
+            let dy = py - (ay + t * aby);
+            out[j] = out[j].max(-(dx * dx + dy * dy));
+        }
+    }
+}
+
+// ─── Convexity check ────────────────────────────────────────────────────────
+
+fn is_convex_polygon(pts: &[Vec2]) -> bool {
+    let n = pts.len();
+    if n < 3 { return false; }
+    let (mut pos, mut neg) = (0, 0);
+    for i in 0..n {
+        let j = (i + 1) % n;
+        let cross = (pts[j] - pts[i]).cross(pts[(j + 1) % n] - pts[j]);
+        if cross > 1e-9 { pos += 1; } else if cross < -1e-9 { neg += 1; }
+        if pos > 0 && neg > 0 { return false; }
+    }
+    true
+}
+
+// ─── Piece ↔ Piece overlap check via bounding boxes ─────────────────────────
+
+fn pieces_overlap_bb(poly_a: &[Vec2], bb_a: (f64,f64,f64,f64),
+                     poly_b: &[Vec2], bb_b: (f64,f64,f64,f64),
+                     margin: f64) -> bool {
+    // Quick BB check
+    if bb_a.2 + margin < bb_b.0 || bb_b.2 + margin < bb_a.0 { return false; }
+    if bb_a.3 + margin < bb_b.1 || bb_b.3 + margin < bb_a.1 { return false; }
+    // Full check
+    if polygons_intersect(poly_a, poly_b) { return true; }
+    // Check if one contains a vertex of the other
+    for &p in poly_a { if pt_in_polygon(p, poly_b) { return true; } }
+    for &p in poly_b { if pt_in_polygon(p, poly_a) { return true; } }
+    false
+}
+
+// ─── Placement: large-scale Bottom-Left-Fill ────────────────────────────────
+
+fn solve_large(stock_verts: &[Vec2], pieces: &[Vec<Vec2>], margin: f64)
+               -> Vec<(usize, f64, f64, f64)> {
+    let stock_bb = bounding_box(stock_verts);
+    let sw = stock_bb.2 - stock_bb.0;
+    let sh = stock_bb.3 - stock_bb.1;
+
+    let piece_areas: Vec<f64> = pieces.iter().map(|p| signed_area(p).abs()).collect();
+    let stock_area = signed_area(stock_verts).abs();
+
+    let n = pieces.len();
+    let mut result: Vec<(usize, f64, f64, f64)> = Vec::with_capacity(n);
+    let mut used_piece = vec![false; n];
+
+    let cell = sw.min(sh) / 500.0;
+    let nx = (sw / cell) as usize + 2;
+    let ny = (sh / cell) as usize + 2;
+
+    let total_possible_area = stock_area * ((n as f64 * 2.0).max(20.0).ceil());
+    let max_stocks_est = ((piece_areas.iter().sum::<f64>() / stock_area).ceil()
+        .max(1.0) * 1.5) as usize;
+
+    let mut all_stock_polys: Vec<Vec<Vec2>> = Vec::new();
+
+    for _ in 0..max_stocks_est {
+        all_stock_polys.push(stock_verts.to_vec());
+    }
+
+    let mut placed_this_stock: Vec<(Vec<Vec2>, (f64,f64,f64,f64))> = Vec::new();
+
+    // Sort pieces by area descending for better packing
+    let mut piece_order: Vec<usize> = (0..n).collect();
+    piece_order.sort_by(|&a, &b| piece_areas[b].partial_cmp(&piece_areas[a]).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut grid = vec![0u8; nx * ny];
+
+    for &pi in &piece_order {
+        if used_piece[pi] { continue; }
+
+        let piece_bb = bounding_box(&pieces[pi]);
+        let pw = piece_bb.2 - piece_bb.0;
+        let ph = piece_bb.3 - piece_bb.1;
+
+        let mut best_stock = result.len();
+        let mut best_pos = None;
+        let mut best_score = f64::INFINITY;
+
+        for si in 0..=result.len() {
+            if si == result.len() {
+                if best_pos.is_some() { break; }
+                // Try new stock
+                let sx = stock_bb.0 - piece_bb.0 + margin;
+                let sy = stock_bb.1 - piece_bb.1 + margin;
+                let transformed = apply_transform(&pieces[pi], sx, sy, 0.0);
+                if poly_fully_inside(&transformed, stock_verts) {
+                    best_pos = Some((sx, sy));
+                    best_stock = si;
+                    best_score = sy;
+                }
+                break;
+            }
+
+            // Search grid for placement position
+            let mut found_for_stock = false;
+            for gy in 0..ny {
+                for gx in 0..nx {
+                    let wx = stock_bb.0 + gx as f64 * cell;
+                    let wy = stock_bb.1 + gy as f64 * cell;
+                    let tx = wx - piece_bb.0 + margin;
+                    let ty = wy - piece_bb.1 + margin;
+
+                    // Quick bounds check
+                    let tbb = (tx + piece_bb.0, ty + piece_bb.1,
+                               tx + piece_bb.2, ty + piece_bb.3);
+                    if tbb.2 > stock_bb.2 - margin || tbb.3 > stock_bb.3 - margin {
+                        continue;
+                    }
+                    if tbb.0 < stock_bb.0 + margin || tbb.1 < stock_bb.1 + margin {
+                        continue;
+                    }
+
+                    // Check against placed pieces BB first
+                    let mut bb_ok = true;
+                    for &(ref pp, ref pbb) in &placed_this_stock {
+                        if tbb.2 + margin >= pbb.0 && tbb.0 - margin <= pbb.2 &&
+                           tbb.3 + margin >= pbb.1 && tbb.0 - margin <= pbb.3 {
+                            bb_ok = false;
+                            break;
+                        }
+                    }
+                    if !bb_ok { continue; }
+
+                    let transformed = apply_transform(&pieces[pi], tx, ty, 0.0);
+                    if !poly_fully_inside(&transformed, stock_verts) { continue; }
+
+                    // Full overlap check
+                    let mut overlaps = false;
+                    for &(ref pp, ref pbb) in &placed_this_stock {
+                        if pieces_overlap_bb(&transformed, tbb, pp, *pbb, margin) {
+                            overlaps = true; break;
+                        }
+                    }
+                    if overlaps { continue; }
+
+                    let score = ty * 1000.0 + tx;
+                    if score < best_score {
+                        best_score = score;
+                        best_pos = Some((tx, ty));
+                        best_stock = si;
+                        found_for_stock = true;
+                    }
+                    if found_for_stock { break; } // Take first good in this stock
+                }
+                if found_for_stock { break; }
+            }
+            if found_for_stock { break; }
+        }
+
+        if let Some((tx, ty)) = best_pos {
+            result.push((best_stock, tx, ty, 0.0));
+            used_piece[pi] = true;
+            if best_stock == result.len() - 1 {
+                // New stock — clear placed
+                let transformed = apply_transform(&pieces[pi], tx, ty, 0.0);
+                let tbb = bounding_box(&transformed);
+                placed_this_stock = vec![(transformed, tbb)];
+                grid.fill(0);
+            } else {
+                // Rebuild placed_this_stock for this stock
+                placed_this_stock.clear();
+                for (k, &(si, sx, sy, ang)) in result.iter().enumerate() {
+                    if si == best_stock {
+                        let orig = pieces[piece_order[k]];
+                        let tf = apply_transform(&orig, sx, sy, ang);
+                        let bb = bounding_box(&tf);
+                        placed_this_stock.push((tf, bb));
+                    }
+                }
+                let transformed = apply_transform(&pieces[pi], tx, ty, 0.0);
+                let tbb = bounding_box(&transformed);
+                placed_this_stock.push((transformed, tbb));
+            }
+        }
+    }
+
+    // Ensure all pieces placed
+    for (i, &used) in used_piece.iter().enumerate() {
+        if !used {
+            // Force place on new stock
+            let new_si = if result.is_empty() { 0 } else {
+                result.iter().map(|&(s,_,_,_)| s).max().unwrap() + 1
+            };
+            let piece_bb = bounding_box(&pieces[i]);
+            let sx = stock_bb.0 - piece_bb.0 + margin;
+            let sy = stock_bb.1 - piece_bb.1 + margin;
+            result.push((new_si, sx, sy, 0.0));
+        }
+    }
+
+    // Re-map stock indices to contiguous 0..N
+    let max_si = result.iter().map(|&(s,_,_,_)| s).max().unwrap_or(0);
+    let num_stocks = max_si + 1;
+    for r in result.iter_mut() { /* stock_index already contiguous */ }
+    result
+}
+
+// ─── Placement: small problem (brute-force with NFP) ────────────────────────
+
+fn solve_small(stock_verts: &[Vec2], pieces: &[Vec<Vec2>], margin: f64)
+               -> Vec<(usize, f64, f64, f64)> {
+    let n = pieces.len();
+    let stock_is_convex = is_convex_polygon(stock_verts);
+    let stock_bb = bounding_box(stock_verts);
+
+    // Compute piece areas and sort descending
+    let mut piece_order: Vec<usize> = (0..n).collect();
+    let areas: Vec<f64> = pieces.iter().map(|p| signed_area(p).abs()).collect();
+    piece_order.sort_by(|&a, &b| areas[b].partial_cmp(&areas[a]).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut result: Vec<(usize, f64, f64, f64)> = Vec::with_capacity(n);
+    let mut used = vec![false; n];
+
+    // Try rotations: 0, π/4, π/2, 3π/4, π
+    let angle_set: Vec<f64> = vec![0.0, std::f64::consts::PI/4.0,
+        std::f64::consts::PI/2.0, 3.0*std::f64::consts::PI/4.0, std::f64::consts::PI];
+
+    // For each stock
+    let mut stock_idx = 0usize;
+    let mut current_stock_placed: Vec<Vec<Vec2>> = Vec::new();
+
+    for &pi in &piece_order {
+        if used[pi] { continue; }
+        used[pi] = true;
+
+        let mut placed = false;
+
+        // Try existing stocks
+        for si in 0..=stock_idx {
+            if placed { break; }
+            let mut try_stock_placed = if si < stock_idx {
+                // Rebuild from result
+                result.iter().filter_map(|&(s, tx, ty, ang)| {
+                    if s == si {
+                        let op = pieces.iter().position(|p| true)?; // need to track
+                        None // We'll rebuild differently
+                    } else { None }
+                }).collect::<Vec<_>>()
+            } else {
+                current_stock_placed.clone()
+            };
+
+            // Try angles
+            for &angle in &angle_set {
+                if placed { break; }
+                let rotated = pieces[pi].iter().map(|p| p.rotate(angle)).collect::<Vec<_>>();
+                let rbb = bounding_box(&rotated);
+
+                // Sample candidate positions from NFP vertices + grid
+                let mut candidates: Vec<Vec2> = Vec::new();
+
+                if stock_is_convex && is_convex_polygon(&rotated) {
+                    if let Some(nfp) = compute_nfp_convex(stock_verts, &rotated) {
+                        for &v in &nfp { candidates.push(v); }
+                        // Sample interior of NFP
+                        let nfp_bb = bounding_box(&nfp);
+                        let nx = 30usize; let ny = 30usize;
+                        let dx = (nfp_bb.2 - nfp_bb.0) / (nx as f64);
+                        let dy = (nfp_bb.3 - nfp_bb.1) / (ny as f64);
+                        for iy in 0..=ny {
+                            for ix in 0..=nx {
+                                let px = nfp_bb.0 + ix as f64 * dx;
+                                let py = nfp_bb.1 + iy as f64 * dy;
+                                candidates.push(Vec2::new(px, py));
+                            }
+                        }
+                    }
+                }
+
+                // Also add grid-based candidates
+                let sx = stock_bb.0 - rbb.0 + margin;
+                let sy = stock_bb.1 - rbb.1 + margin;
+                let ex = stock_bb.2 - rbb.2 - margin;
+                let ey = stock_bb.3 - rbb.3 - margin;
+                let step = (stock_bb.2 - stock_bb.0).max(stock_bb.3 - stock_bb.1) / 40.0;
+                let mut cy = sy;
+                while cy <= ey {
+                    let mut cx = sx;
+                    while cx <= ex {
+                        candidates.push(Vec2::new(cx, cy));
+                        cx += step;
+                    }
+                    cy += step;
+                }
+
+                // Sort by bottom-left score
+                candidates.sort_by(|a, b| {
+                    let sa = a.y * 1000.0 + a.x;
+                    let sb = b.y * 1000.0 + b.x;
+                    sa.partial_cmp(&sb).unwrap_or(std::cmp::Ordering::Equal)
+                });
+
+                for &cand in &candidates {
+                    if placed { break; }
+                    let tx = cand.x; let ty = cand.y;
+                    let transformed = apply_transform(&rotated, tx, ty, 0.0);
+
+                    if !poly_fully_inside(&transformed, stock_verts) { continue; }
+
+                    // Check overlap with placed pieces
+                    let mut overlaps = false;
+                    for pp in &try_stock_placed {
+                        if pieces_overlap_bb(&transformed, bounding_box(&transformed),
+                                            pp, bounding_box(pp), margin) {
+                            overlaps = true; break;
+                        }
+                    }
+                    if overlaps { continue; }
+
+                    // Valid placement found
+                    result.push((si, tx, ty, angle));
+                    try_stock_placed.push(transformed);
+                    if si == stock_idx {
+                        current_stock_placed = try_stock_placed;
+                    }
+                    placed = true;
+                    break;
+                }
+            }
+        }
+
+        if !placed {
+            // New stock
+            stock_idx += 1;
+            current_stock_placed.clear();
+            let piece_bb = bounding_box(&pieces[pi]);
+            let sx = stock_bb.0 - piece_bb.0 + margin;
+            let sy = stock_bb.1 - piece_bb.1 + margin;
+            let transformed = apply_transform(&pieces[pi], sx, sy, 0.0);
+            current_stock_placed.push(transformed);
+            result.push((stock_idx, sx, sy, 0.0));
+        }
+    }
+
+    result
+}
+
+// ─── Fast placement using NFP distance field ────────────────────────────────
+
+fn solve_medium(stock_verts: &[Vec2], pieces: &[Vec<Vec2>], margin: f64)
+                -> Vec<(usize, f64, f64, f64)> {
+    let n = pieces.len();
+    let stock_is_convex = is_convex_polygon(stock_verts);
+    let stock_bb = bounding_box(stock_verts);
+    let sw = stock_bb.2 - stock_bb.0;
+    let sh = stock_bb.3 - stock_bb.1;
+
+    let areas: Vec<f64> = pieces.iter().map(|p| signed_area(p).abs()).collect();
+    let mut piece_order: Vec<usize> = (0..n).collect();
+    piece_order.sort_by(|&a, &b| areas[b].partial_cmp(&areas[a]).unwrap_or(std::cmp::Ordering::Equal));
+
+    let num_candidates = 2500usize;
+    let cell = sw.min(sh) / 50.0;
+
+    let angle_set: Vec<f64> = if n <= 30 {
+        vec![0.0, std::f64::consts::PI/6.0, std::f64::consts::PI/4.0,
+             std::f64::consts::PI/3.0, std::f64::consts::PI/2.0]
+    } else {
+        vec![0.0, std::f64::consts::PI/2.0]
+    };
+
+    let mut result: Vec<(usize, f64, f64, f64)> = Vec::with_capacity(n);
+    let mut used = vec![false; n];
+    let mut stock_idx = 0usize;
+
+    for &pi in &piece_order {
+        if used[pi] { continue; }
+        used[pi] = true;
+
+        let mut placed = false;
+
+        for si in 0..=stock_idx {
+            if placed { break; }
+
+            // Get placed pieces on this stock
+            let mut stock_placed: Vec<Vec<Vec2>> = Vec::new();
+            for &(s, tx, ty, ang) in &result {
+                if s == si {
+                    // Find which piece this was
+                    for (k, &(s2, _, _, _)) in result.iter().enumerate() {
+                        if s2 == si && k < result.len() {
+                            // We need to store piece index... let me restructure
+                        }
+                    }
+                    // Actually, let's just rebuild
+                }
+            }
+
+            // Rebuild stock_placed properly
+            stock_placed.clear();
+            for &(s, tx, ty, ang) in &result {
+                if s != si { continue; }
+                // Find corresponding piece — this is tricky without storing piece_idx
+                // Let me use a different approach: store placed polys directly
+            }
+
+            // We need to restructure — let's track placed polys per stock
+            // For now, use the simpler approach from solve_large
+
+            let mut candidates: Vec<(f64, f64, f64)> = Vec::new(); // (score, tx, ty)
+
+            for &angle in &angle_set {
+                let rotated: Vec<Vec2> = pieces[pi].iter().map(|p| p.rotate(angle)).collect();
+                let rbb = bounding_box(&rotated);
+                let rw = rbb.2 - rbb.0;
+                let rh = rbb.3 - rbb.1;
+
+                // Generate candidate positions along bottom and left edges
+                let margin_pos = margin + 1.0;
+                let x_start = stock_bb.0 - rbb.0 + margin_pos;
+                let y_start = stock_bb.1 - rbb.1 + margin_pos;
+                let x_end = stock_bb.2 - rbb.2 - margin_pos;
+                let y_end = stock_bb.3 - rbb.3 - margin_pos;
+
+                if x_start > x_end || y_start > y_end { continue; }
+
+                // Sample positions
+                let nx_cand = 50usize.min(((x_end - x_start) / cell) as usize + 1);
+                let ny_cand = 50usize.min(((y_end - y_start) / cell) as usize + 1);
+                let dx = if nx_cand > 1 { (x_end - x_start) / (nx_cand - 1) as f64 } else { 0.0 };
+                let dy = if ny_cand > 1 { (y_end - y_start) / (ny_cand - 1) as f64 } else { 0.0 };
+
+                for iy in 0..ny_cand {
+                    for ix in 0..nx_cand {
+                        let tx = x_start + ix as f64 * dx;
+                        let ty = y_start + iy as f64 * dy;
+                        let score = ty * 10000.0 + tx;
+                        candidates.push((score, tx, ty));
+                    }
+                }
+            }
+
+            candidates.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+            candidates.truncate(num_candidates);
+
+            // Build list of placed polygons on this stock
+            let mut placed_polys: Vec<Vec<Vec2>> = Vec::new();
+            // We need a mapping... let me use the approach of storing full state
+
+            for &(_score, tx, ty) in &candidates {
+                if placed { break; }
+                // Use angle 0 for now
+                let transformed = apply_transform(&pieces[pi], tx, ty, 0.0);
+                if !poly_fully_inside(&transformed, stock_verts) { continue; }
+
+                let mut overlaps = false;
+                for pp in &placed_polys {
+                    if pieces_overlap_bb(&transformed, bounding_box(&transformed),
+                                        pp, bounding_box(pp), margin) {
+                        overlaps = true; break;
+                    }
+                }
+                if overlaps { continue; }
+
+                result.push((si, tx, ty, 0.0));
+                placed_polys.push(transformed);
+                placed = true;
+                break;
+            }
+        }
+
+        if !placed {
+            let new_si = stock_idx + 1;
+            stock_idx = new_si;
+            let piece_bb = bounding_box(&pieces[pi]);
+            let sx = stock_bb.0 - piece_bb.0 + margin + 1.0;
+            let sy = stock_bb.1 - piece_bb.1 + margin + 1.0;
+            result.push((new_si, sx, sy, 0.0));
+        }
+    }
+
+    // Ensure all pieces placed
+    let mut max_si = 0usize;
+    for &(s,_,_,_) in &result { max_si = max_si.max(s); }
+    let num_stocks = max_si + 1;
+    result
+}
+
+// ─── Unified solver ─────────────────────────────────────────────────────────
+
+fn solve(stock_verts: &mut Vec<Vec2>, pieces_raw: &mut [Vec<Vec2>],
+         margin: f64) -> Vec<(usize, f64, f64, f64)> {
+    normalize_polygon(stock_verts);
+    for p in pieces_raw.iter_mut() {
+        normalize_polygon(p);
+        remove_duplicate_verts(p);
+    }
+
+    let n = pieces_raw.len();
+    let total_verts: usize = pieces_raw.iter().map(|p| p.len()).sum();
+    let complexity = n * 100 + total_verts;
+
+    let result = if n <= 10 && total_verts <= 200 {
+        solve_small(stock_verts, pieces_raw, margin)
+    } else if n <= 100 && total_verts <= 5000 {
+        solve_medium(stock_verts, pieces_raw, margin)
+    } else {
+        solve_large(stock_verts, pieces_raw, margin)
+    };
+
+    result
+}
+
+// ─── Main ───────────────────────────────────────────────────────────────────
+
+fn main() {
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let mut out = BufWriter::new(stdout.lock());
+
+    let mut lines = stdin.lock().lines();
+
+    let first = lines.next().unwrap().unwrap();
+    let mut parts = first.split_whitespace();
+    let sv: usize = parts.next().unwrap().parse().unwrap();
+    let np: usize = parts.next().unwrap().parse().unwrap();
+
+    let mut stock_verts = Vec::with_capacity(sv);
+    for _ in 0..sv {
+        let line = lines.next().unwrap().unwrap();
+        let mut p = line.split_whitespace();
+        let x: f64 = p.next().unwrap().parse().unwrap();
+        let y: f64 = p.next().unwrap().parse().unwrap();
+        stock_verts.push(Vec2::new(x, y));
+    }
+
+    let mut pieces = Vec::with_capacity(np);
+    for _ in 0..np {
+        let line = lines.next().unwrap().unwrap();
+        let pv: usize = line.trim().parse().unwrap();
+        let mut piece = Vec::with_capacity(pv);
+        for _ in 0..pv {
+            let line = lines.next().unwrap().unwrap();
+            let mut p = line.split_whitespace();
+            let x: f64 = p.next().unwrap().parse().unwrap();
+            let y: f64 = p.next().unwrap().parse().unwrap();
+            piece.push(Vec2::new(x, y));
+        }
+        pieces.push(piece);
+    }
+
+    let margin = 1.0;
+    let result = solve(&mut stock_verts, &mut pieces, margin);
+
+    let num_stocks = result.iter().map(|&(s,_,_,_)| s).max().map_or(0, |m| m + 1);
+
+    writeln!(out, "{}", num_stocks).unwrap();
+    for &(_si, tx, ty, angle) in &result {
+        writeln!(out, "{:.6} {:.6} {:.6}", tx, ty, angle).unwrap();
+    }
+}
+```
+
+Wait, I realize the solve_medium function has a bug - it doesn't properly track which piece indices correspond to placements. Let me restructure the whole thing more cleanly. Let me rewrite with a clean architecture:
+
+```rust
+use std::io::{self, BufRead, Write, BufWriter};
+
+struct Vec2 { x: f64, y: f64 }
+impl Vec2 {
+    fn new(x: f64, y: f64) -> Self { Vec2 { x, y } }
+    fn dot(self, o: Vec2) -> f64 { self.x*o.x + self.y*o.y }
+    fn cross(self, o: Vec2) -> f64 { self.x*o.y - self.y*o.x }
+    fn len(self) -> f64 { self.dot(self).sqrt() }
+    fn sub(self, o: Vec2) -> Vec2 { Vec2::new(self.x-o.x, self.y-o.y) }
+    fn add(self, o: Vec2) -> Vec2 { Vec2::new(self.x+o.x, self.y+o.y) }
+    fn scale(self, s: f64) -> Vec2 { Vec2::new(self.x*s, self.y*s) }
+    fn rotate(self, a: f64) -> Vec2 {
+        let (c,s) = (a.cos(), a.sin());
+        Vec2::new(self.x*c - self.y*s, self.x*s + self.y*c)
+    }
+}
+
+fn signed_area(pts: &[Vec2]) -> f64 {
+    let n = pts.len();
+    (0..n).map(|i| pts[i].cross(pts[(i+1)%n])).sum::<f64>() * 0.5
+}
+
+fn make_ccw(pts: &mut Vec<Vec2>) {
+    if signed_area(pts) < 0.0 { pts.reverse(); }
+}
+
+fn poly_centroid(pts: &[Vec2]) -> Vec2 {
+    if pts.is_empty() { return Vec2::new(0.0, 0.0); }
+    let (mut cx, mut cy) = (0.0, 0.0);
+    for p in pts { cx += p.x; cy += p.y; }
+    Vec2::new(cx/pts.len() as f64, cy/pts.len() as f64)
+}
+
+fn normalize_poly(pts: &mut Vec<Vec2>) {
+    make_ccw(pts);
+    if pts.is_empty() { return; }
+    let mx = pts.iter().map(|p|p.x).fold(f64::INFINITY,f64::min);
+    let my = pts.iter().map(|p|p.y).fold(f64::INFINITY,f64::min);
+    for p in pts.iter_mut() { p.x -= mx; p.y -= my; }
+}
+
+fn remove_dups(pts: &mut Vec<Vec2>) {
+    if pts.len() < 3 { return; }
+    let eps = 1e-10;
+    let mut c = Vec::with_capacity(pts.len());
+    for &p in pts.iter() {
+        if c.last().map_or(true, |&q| (p.x-q.x).abs()>eps||(p.y-q.y).abs()>eps) {
+            c.push(p);
+        }
+    }
+    if c.len()>2 {
+        let f=c[0]; let l=c[c.len()-1];
+        if (f.x-l.x).abs()<eps && (f.y-l.y).abs()<eps { c.pop(); }
+    }
+    *pts = c;
+}
+
+fn apply_tf(pts: &[Vec2], tx: f64, ty: f64, ang: f64) -> Vec<Vec2> {
+    pts.iter().map(|p| p.rotate(ang).add(Vec2::new(tx,ty))).collect()
+}
+
+fn bbox(pts: &[Vec2]) -> (f64,f64,f64,f64) {
+    let (mut x0,mut y0) = (f64::INFINITY, f64::INFINITY);
+    let (mut x1,mut y1) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+    for p in pts {
+        x0=x0.min(p.x); y0=y0.min(p.y);
+        x1=x1.max(p.x); y1=y1.max(p.y);
+    }
+    (x0,y0,x1,y1)
+}
+
+fn on_seg(p:Vec2,q:Vec2,r:Vec2) -> bool {
+    r.x<=p.x.max(q.x)+1e-9 && r.x>=p.x.min(q.x)-1e-9 &&
+    r.y<=p.y.max(q.y)+1e-9 && r.y>=p.y.min(q.y)-1e-9
+}
+
+fn seg_x(p1:Vec2,q1:Vec2,p2:Vec2,q2:Vec2) -> bool {
+    let d1=(q2-p2).cross(p1-p2); let d2=(q2-p2).cross(q1-p2);
+    let d3=(q1-p1).cross(p2-p1); let d4=(q1-p1).cross(q2-p1);
+    if ((d1>0.&&d2<0.)||(d1<0.&&d2>0.))&&((d3>0.&&d4<0.)||(d3<0.&&d4>0.)) { return true; }
+    if d1.abs()<1e-9&&on_seg(p2,q2,p1){return true}
+    if d2.abs()<1e-9&&on_seg(p2,q2,q1){return true}
+    if d3.abs()<1e-9&&on_seg(p1,q1,p2){return true}
+    if d4.abs()<1e-9&&on_seg(p1,q1,q2){return true}
+    false
+}
+
+fn pt_in_poly(pt:Vec2,poly:&[Vec2]) -> bool {
+    let n=poly.len(); if n<3{return false}
+    let mut inside=false; let mut j=n-1;
+    for i in 0..n {
+        let pi=poly[i]; let pj=poly[j];
+        if ((pi.y>pt.y)!=(pj.y>pt.y))&&
+           pt.x<(pj.x-pi.x)*(pt.y-pi.y)/(pj.y-pi.y)+pi.x {inside=!inside;}
+        j=i;
+    }
+    inside
+}
+
+fn polys_x(a:&[Vec2],b:&[Vec2]) -> bool {
+    let na=a.len(); let nb=b.len();
+    for i in 0..na {
+        let ai=a[i]; let aj=a[(i+1)%na];
+        for j in 0..nb {
+            if seg_x(ai,aj,b[j],b[(j+1)%nb]){return true}
+        }
+    }
+    false
+}
+
+fn fully_inside(inner:&[Vec2],outer:&[Vec2]) -> bool {
+    for &p in inner { if !pt_in_poly(p,outer){return false} }
+    !polys_x(inner,outer)
+}
+
+fn overlap_check(a:&[Vec2],bba:(f64,f64,f64,f64),b:&[Vec2],bbb:(f64,f64,f64,f64),m:f64)->bool{
+    if bba.2+m<bbb.0||bbb.2+m<bba.0{return false}
+    if bba.3+m<bbb.1||bbb.3+m<bba.1{return false}
+    if polys_x(a,b){return true}
+    for &p in a{if pt_in_poly(p,b){return true}}
+    for &p in b{if pt_in_poly(p,a){return true}}
+    false
+}
+
+fn is_convex(pts:&[Vec2])->bool{
+    let n=pts.len(); if n<3{return false}
+    let (mut pos,mut neg)=(0,0);
+    for i in 0..n{
+        let j=(i+1)%n;
+        let cr=(pts[j]-pts[i]).cross(pts[(j+1)%n]-pts[j]);
+        if cr>1e-9{pos+=1}else if cr<-1e-9{neg+=1}
+        if pos>0&&neg>0{return false}
+    }
+    true
+}
+
+// Minkowski sum of two CCW convex polygons
+fn minkowski_sum(ca:&[Vec2],cb:&[Vec2])->Vec<Vec2>{
+    let mut ea=Vec::new(); let mut eb=Vec::new();
+    for i in 0..ca.len(){ea.push(ca[(i+1)%ca.len()]-ca[i])}
+    for i in 0..cb.len(){eb.push(cb[(i+1)%cb.len()]-cb[i])}
+    let (mut i,mut j)=(0,0);
+    let (na,nb)=(ea.len(),eb.len());
+    let mut merged=Vec::with_capacity(na+nb);
+    loop {
+        merged.push(ea[i]+eb[j]);
+        let ca2=ea[i].cross(ea[(i+1)%na]);
+        let cb2=eb[j].cross(eb[(j+1)%nb]);
+        if ca2>cb2+1e-12{i=(i+1)%na}
+        else if cb2>ca2+1e-12{j=(j+1)%nb}
+        else{i=(i+1)%na;j=(j+1)%nb}
+        if merged.len()>=na+nb{break}
+    }
+    let mut cur=ca[0]+cb[0];
+    let mut result=vec![cur];
+    for e in &merged{cur=cur+*e;result.push(cur)}
+    result
+}
+
+// NFP for convex stock and convex piece: NFP = Minkowski(stock, -piece)
+fn nfp_convex(stock:&[Vec2],piece:&[Vec2])->Vec<Vec2>{
+    let neg:Vec<Vec2>=piece.iter().map(|p|Vec2::new(-p.x,-p.y)).collect();
+    minkowski_sum(stock,&neg)
+}
+
+fn solve(stock:&[Vec2],pieces:&[Vec2],margin:f64)->Vec<(usize,f64,f64,f64)>{
+    let n=pieces.len();
+    let sbb=bbox(stock);
+    let sw=sbb.2-sbb.0; let sh=sbb.3-sbb.1;
+    let stock_convex=is_convex(stock);
+
+    // Sort pieces by area descending
+    let areas:Vec<f64>=(0..n).map(|i|signed_area(pieces[i]).abs()).collect();
+    let mut order:Vec<usize>=(0..n).collect();
+    order.sort_by(|&a,&b|areas[b].partial_cmp(&areas[a]).unwrap_or(std::cmp::Ordering::Equal));
+
+    let angles:Vec<f64>=if n<=20{
+        vec![0.,std::f64::consts::PI/4.,std::f64::consts::PI/2.,
+             3.*std::f64::consts::PI/4.,std::f64::consts::PI]
+    } else {vec![0.,std::f64::consts::PI/2.]};
+
+    // Per-stock state
+    struct StockState {
+        index: usize,
+        placed_polys: Vec<Vec<Vec2>>,
+        placed_bbs: Vec<(f64,f64,f64,f64)>,
+    }
+    let mut stocks: Vec<StockState> = Vec::new();
+
+    let mut result: Vec<(usize,f64,f64,f64)> = vec![(0,0.,0.,0.); n]; // piece_idx -> (stock,tx,ty,angle)
+
+    for &pi in &order {
+        let piece = &pieces[pi];
+        let mut best_stock = None;
+        let mut best_pos = None;
+        let mut best_score = f64::INFINITY;
+
+        for si in 0..stocks.len() {
+            let st = &stocks[si];
+            for &ang in &angles {
+                let rotated: Vec<Vec2> = piece.iter().map(|p|p.rotate(ang)).collect();
+                let rbb = bbox(&rotated);
+
+                // Generate candidate positions
+                let x_lo = sbb.0 - rbb.0 + margin + 0.5;
+                let y_lo = sbb.1 - rbb.1 + margin + 0.5;
+                let x_hi = sbb.2 - rbb.2 - margin - 0.5;
+                let y_hi = sbb.3 - rbb.3 - margin - 0.5;
+
+                if x_lo > x_hi || y_lo > y_hi { continue; }
+
+                let step = if n <= 50 { (sw.min(sh))/60.0 }
+                           else { (sw.min(sh))/30.0 };
+                let nx = ((x_hi-x_lo)/step) as usize + 1;
+                let ny = ((y_hi-y_lo)/step) as usize + 1;
+                let actual_nx = nx.min(80);
+                let actual_ny = ny.min(80);
+                let dx = if actual_nx>1{(x_hi-x_lo)/(actual_nx-1) as f64}else{0.};
+                let dy = if actual_ny>1{(y_hi-y_lo)/(actual_ny-1) as f64}else{0.};
+
+                // If both stock and piece are convex, use NFP to restrict candidates
+                let piece_convex = is_convex(piece);
+                let use_nfp = stock_convex && piece_convex && rotated.len() >= 3;
+
+                for iy in 0..actual_ny {
+                    'outer: for ix in 0..actual_nx {
+                        let tx = x_lo + ix as f64 * dx;
+                        let ty = y_lo + iy as f64 * dy;
+
+                        let score = ty * 10000.0 + tx;
+                        if score >= best_score { continue; }
+
+                        let transformed = apply_tf(&rotated, tx, ty, 0.0);
+
+                        if use_nfp {
+                            if !pt_in_poly(Vec2::new(tx,ty), &nfp_convex(stock, &rotated)) {
+                                // Check if inside stock at all
+                                if !fully_inside(&transformed, stock) { continue; }
+                            }
+                        } else {
+                            if !fully_inside(&transformed, stock) { continue; }
+                        }
+
+                        // BB overlap check
+                        let tbb = bbox(&transformed);
+                        let mut bb_ok = true;
+                        for &pbb in &st.placed_bbs {
+                            if tbb.2+margin>=pbb.0 && tbb.0-margin<=pbb.2 &&
+                               tbb.3+margin>=pbb.1 && tbb.0-margin<=pbb.3 {
+                                bb_ok=false; break;
+                            }
+                        }
+                        if !bb_ok { continue; }
+
+                        // Full overlap check
+                        let mut ov = false;
+                        for pp in &st.placed_polys {
+                            if overlap_check(&transformed,tbb,pp,bbox(pp),margin){
+                                ov=true; break;
+                            }
+                        }
+                        if ov { continue; }
+
+                        best_score = score;
+                        best_pos = Some((tx, ty, ang));
+                        best_stock = Some(si);
+                        break 'outer;
+                    }
+                    if best_stock.is_some() { break; }
+                }
+            }
+            if best_stock.is_some() { break; }
+        }
+
+        if let Some((tx, ty, ang)) = best_pos {
+            let si = best_stock.unwrap();
+            result[pi] = (si, tx, ty, ang);
+            let transformed = apply_tf(piece, tx, ty, ang);
+            stocks[si].placed_polys.push(transformed);
+            stocks[si].placed_bbs.push(bbox(&transformed));
+        } else {
+            // New stock
+            let new_idx = stocks.len();
+            let piece_bb = bbox(piece);
+            let sx = sbb.0 - piece_bb.0 + margin + 0.5;
+            let sy = sbb.1 - piece_bb.1 + margin + 0.5;
+            result[pi] = (new_idx, sx, sy, 0.0);
+            let transformed = apply_tf(piece, sx, sy, 0.0);
+            stocks.push(StockState {
+                index: new_idx,
+                placed_polys: vec![transformed.clone()],
+                placed_bbs: vec![bbox(&transformed)],
+            });
+        }
+    }
+
+    result
+}
+
+fn main(){
+    let stdin=io::stdin();let stdout=io::stdout();
+    let mut out=BufWriter::new(stdout.lock());
+    let mut lines=stdin.lock().lines();
+    let first=lines.next().unwrap().unwrap();
+    let mut parts=first.split_whitespace();
+    let sv:usize=parts.next().unwrap().parse().unwrap();
+    let np:usize=parts.next().unwrap().parse().unwrap();
+    let mut stock=Vec::with_capacity(sv);
+    for _ in 0..sv{
+        let l=lines.next().unwrap().unwrap();
+        let mut p=l.split_whitespace();
+        let x:f64=p.next().unwrap().parse().unwrap();
+        let y:f64=p.next().unwrap().parse().unwrap();
+        stock.push(Vec2::new(x,y));
+    }
+    let mut pieces=Vec::with_capacity(np);
+    for _ in 0..np{
+        let l=lines.next().unwrap().unwrap();
+        let pv:usize=l.trim().parse().unwrap();
+        let mut piece=Vec::with_capacity(pv);
+        for _ in 0..pv{
+            let l=lines.next().unwrap().unwrap();
+            let mut p=l.split_whitespace();
+            let x:f64=p.next().unwrap().parse().unwrap();
+            let y:f64=p.next().unwrap().parse().unwrap();
+            piece.push(Vec2::new(x,y));
+        }
+        pieces.push(piece);
+    }
+
+    normalize_poly(&mut stock);
+    for p in pieces.iter_mut(){
+        normalize_poly(p);
+        remove_dups(p);
+        if p.len()<3{p.push(p[0])} // ensure at least 3 points
+    }
+
+    let margin=1.0;
+    let result=solve(&stock,&pieces,margin);
+    let num_stocks=result.iter().map(|&(s,_,_,_)|s).max().map_or(0,|m|m+1);
+    writeln!(out,"{}",num_stocks).unwrap();
+    for &(si,tx,ty,ang) in &result{
+        writeln!(out,"{:.6} {:.6} {:.6}",tx,ty,ang).unwrap();
+    }
+}
+```
+
+Hmm, this is getting quite messy with all the iterations. Let me write the final clean version properly:
+
+```rust
+use std::io::{self, BufRead, Write, BufWriter};
+
+#[derive(Clone, Copy)]
+struct V2 { x: f64, y: f64 }
+
+impl V2 {
+    fn new(x: f64, y: f64) -> Self { Self { x, y } }
+    fn cross(self, o: Self) -> f64 { self.x * o.y - self.y * o.x }
+    fn dot(self, o: Self) -> f64 { self.x * o.x + self.y * o.y }
+    fn len(self) -> f64 { self.dot(self).sqrt() }
+    fn sub(self, o: Self) -> Self { Self::new(self.x - o.x, self.y - o.y) }
+    fn add(self, o: Self) -> Self { Self::new(self.x + o.x, self.y + o.y) }
+    fn neg(self) -> Self { Self::new(-self.x, -self.y) }
+    fn rot(self, a: f64) -> Self {
+        let (c, s) = (a.cos(), a.sin());
+        Self::new(self.x * c - self.y * s, self.x * s + self.y * c)
+    }
+}
+
+fn signed_area(pts: &[V2]) -> f64 {
+    (0..pts.len()).map(|i| pts[i].cross(pts[(i + 1) % pts.len()])).sum::<f64>() * 0.5
+}
+
+fn make_ccw(pts: &mut [V2]) {
+    if signed_area(pts) < 0.0 { pts.reverse(); }
+}
+
+fn normalize(pts: &mut Vec<V2>) {
+    make_ccw(pts);
+    let mx = pts.iter().map(|p| p.x).fold(f64::INFINITY, f64::min);
+    let my = pts.iter().map(|p| p.y).fold(f64::INFINITY, f64::min);
+    for p in pts.iter_mut() { p.x -= mx; p.y -= my; }
+}
+
+fn dedup(pts: &mut Vec<V2>) {
+    let eps = 1e-10;
+    pts.dedup_by(|a, b| (a.x - b.x).abs() < eps && (a.y - b.y).abs() < eps);
+    if pts.len() > 1 && (pts[0].x - pts.last().unwrap().x).abs() < eps
+        && (pts[0].y - pts.last().unwrap().y).abs() < eps {
+        pts.pop();
+    }
+}
+
+fn transform(pts: &[V2], tx: f64, ty: f64, a: f64) -> Vec<V2> {
+    pts.iter().map(|p| p.rot(a) + V2::new(tx, ty)).collect()
+}
+
+fn bbox(pts: &[V2]) -> (f64, f64, f64, f64) {
+    let mut x0 = f64::INFINITY, y0 = f64::INFINITY;
+    let mut x1 = f64::NEG_INFINITY, y1 = f64::NEG_INFINITY;
+    for p in pts { x0 = x0.min(p.x); y0 = y0.min(p.y); x1 = x1.max(p.x); y1 = y1.max(p.y); }
+    (x0, y0, x1, y1)
+}
+
+fn on_seg(p: V2, q: V2, r: V2) -> bool {
+    r.x <= p.x.max(q.x) + 1e-9 && r.x >= p.x.min(q.x) - 1e-9
+        && r.y <= p.y.max(q.y) + 1e-9 && r.y >= p.y.min(q.y) - 1e-9
+}
+
+fn segs_x(a1: V2, a2: V2, b1: V2, b2: V2) -> bool {
+    let d1 = (b2 - b1).cross(a1 - b1);
+    let d2 = (b2 - b1).cross(a2 - b1);
+    let d3 = (a2 - a1).cross(b1 - a1);
+    let d4 = (a2 - a1).cross(b2 - a1);
+    if ((d1 > 0. && d2 < 0.) || (d1 < 0. && d2 > 0.))
+        && ((d3 > 0. && d4 < 0.) || (d3 < 0. && d4 > 0.)) { return true; }
+    if d1.abs() < 1e-9 && on_seg(b1, b2, a1) { return true; }
+    if d2.abs() < 1e-9 && on_seg(b1, b2, a2) { return true; }
+    if d3.abs() < 1e-9 && on_seg(a1, a2, b1) { return true; }
+    if d4.abs() < 1e-9 && on_seg(a1, a2, b2) { return true; }
+    false
+}
+
+fn pt_in_poly(pt: V2, poly: &[V2]) -> bool {
+    let n = poly.len(); if n < 3 { return false; }
+    let mut inside = false; let mut j = n - 1;
+    for i in 0..n {
+        let (pi, pj) = (poly[i], poly[j]);
+        if (pi.y > pt.y) != (pj.y > pt.y)
+            && pt.x < (pj.x - pi.x) * (pt.y - pi.y) / (pj.y - pi.y) + pi.x {
+            inside = !inside;
+        }
+        j = i;
+    }
+    inside
+}
+
+fn edges_x(a: &[V2], b: &[V2]) -> bool {
+    let (na, nb) = (a.len(), b.len());
+    for i in 0..na {
+        let (ai, aj) = (a[i], a[(i + 1) % na]);
+        for j in 0..nb {
+            if segs_x(ai, aj, b[j], b[(j + 1) % nb]) { return true; }
+        }
+    }
+    false
+}
+
+fn fully_inside(inner: &[V2], outer: &[V2]) -> bool {
+    inner.iter().all(|p| pt_in_poly(*p, outer)) && !edges_x(inner, outer)
+}
+
+fn overlap(a: &[V2], ba: (f64, f64, f64, f64), b: &[V2], bb: (f64, f64, f64, f64), m: f64) -> bool {
+    if ba.2 + m < bb.0 || bb.2 + m < ba.0 { return false; }
+    if ba.3 + m < bb.1 || bb.3 + m < ba.1 { return false; }
+    if edges_x(a, b) { return true; }
+    if a.iter().any(|p| pt_in_poly(*p, b)) { return true; }
+    if b.iter().any(|p| pt_in_poly(*p, a)) { return true; }
+    false
+}
+
+fn is_convex(pts: &[V2]) -> bool {
+    let n = pts.len(); if n < 3 { return false; }
+    let (mut pos, mut neg) = (0, 0);
+    for i in 0..n {
+        let j = (i + 1) % n;
+        let c = (pts[j] - pts[i]).cross(pts[(j + 1) % n] - pts[j]);
+        if c > 1e-9 { pos += 1; } else if c < -1e-9 { neg += 1; }
+        if pos > 0 && neg > 0 { return false; }
+    }
+    true
+}
+
+fn minkowski(ca: &[V2], cb: &[V2]) -> Vec<V2> {
+    let (na, nb) = (ca.len(), cb.len());
+    let ea: Vec<V2> = (0..na).map(|i| ca[(i + 1) % na] - ca[i]).collect();
+    let eb: Vec<V2> = (0..nb).map(|i| cb[(i + 1) % nb] - cb[i]).collect();
+    let mut merged = Vec::with_capacity(na + nb);
+    let (mut i, mut j) = (0, 0);
+    for _ in 0..na + nb {
+        merged.push(ea[i] + eb[j]);
+        let ca2 = if i + 1 < na { ea[i].cross(ea[i + 1]) } else { ea[i].cross(ea[0]) };
+        let cb2 = if j + 1 < nb { eb[j].cross(eb[j + 1]) } else { eb[j].cross(eb[0]) };
+        if ca2 > cb2 + 1e-12 { i = (i + 1) % na; }
+        else if cb2 > ca2 + 1e-12 { j = (j + 1) % nb; }
+        else { i = (i + 1) % na; j = (j + 1) % nb; }
+    }
+    let mut cur = ca[0] + cb[0];
+    let mut out = vec![cur];
+    for e in &merged { cur = cur + *e; out.push(cur); }
+    out
+}
+
+fn nfp_convex(stock: &[V2], piece: &[V2]) -> Vec<V2> {
+    let neg: Vec<V2> = piece.iter().map(|p| p.neg()).collect();
+    minkowski(stock, &neg)
+}
+
+fn solve(stock: &[V2], pieces: &[Vec<V2>], margin: f64) -> Vec<(usize, f64, f64, f64)> {
+    let n = pieces.len();
+    let sbb = bbox(stock);
+    let sw = sbb.2 - sbb.0;
+    let sh = sbb.3 - sbb.1;
+    let sconv = is_convex(stock);
+
+    let areas: Vec<f64> = pieces.iter().map(|p| signed_area(p).abs()).collect();
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| areas[b].partial_cmp(&areas[a]).unwrap_or(std::cmp::Ordering::Equal));
+
+    let angles: Vec<f64> = if n <= 30 {
+        vec![0., std::f64::consts::PI / 4., std::f64::consts::PI / 2.,
+             3. * std::f64::consts::PI / 4., std::f64::consts::PI]
+    } else {
+        vec![0., std::f64::consts::PI / 2.]
+    };
+
+    let grid_n = if n <= 20 { 50 } else if n <= 200 { 35 } else { 20 };
+
+    // Per-stock placed data
+    let mut stock_placed_polys: Vec<Vec<Vec<V2>>> = vec![];
+    let mut stock_placed_bbs: Vec<Vec<(f64, f64, f64, f64)>> = vec![];
+
+    let mut result = vec![(0usize, 0.0f64, 0.0f64, 0.0f64); n];
+
+    for &pi in &order {
+        let piece = &pieces[pi];
+        let pconv = is_convex(piece);
+        let mut placed = false;
+
+        for si in 0..stock_placed_polys.len() {
+            if placed { break; }
+            let sp = &stock_placed_polys[si];
+            let sb = &stock_placed_bbs[si];
+
+            for &ang in &angles {
+                if placed { break; }
+                let rotated: Vec<V2> = piece.iter().map(|p| p.rot(ang)).collect();
+                let rbb = bbox(&rotated);
+
+                let x0 = sbb.0 - rbb.0 + margin + 0.5;
+                let y0 = sbb.1 - rbb.1 + margin + 0.5;
+                let x1 = sbb.2 - rbb.2 - margin - 0.5;
+                let y1 = sbb.3 - rbb.3 - margin - 0.5;
+                if x0 > x1 || y0 > y1 { continue; }
+
+                let dx = if grid_n > 1 { (x1 - x0) / (grid_n - 1) as f64 } else { 0.0 };
+                let dy = if grid_n > 1 { (y1 - y0) / (grid_n - 1) as f64 } else { 0.0 };
+
+                // If both convex, compute NFP once
+                let nfp = if sconv && pconv {
+                    Some(nfp_convex(stock, &rotated))
+                } else { None };
+
+                'done: for iy in 0..grid_n {
+                    for ix in 0..grid_n {
+                        let tx = x0 + ix as f64 * dx;
+                        let ty = y0 + iy as f64 * dy;
+
+                        // NFP check
+                        if let Some(ref nfp_poly) = nfp {
+                            if !pt_in_poly(V2::new(tx, ty), nfp_poly) {
+                                continue;
+                            }
+                        }
+
+                        let tf = transform(&rotated, tx, ty, 0.0);
+
+                        // Containment check
+                        if !fully_inside(&tf, stock) { continue; }
+
+                        let tbb = bbox(&tf);
+
+                        // BB pre-check
+                        let mut bb_ok = true;
+                        for &pbb in sb {
+                            if tbb.2 + margin >= pbb.0 && tbb.0 - margin <= pbb.2
+                                && tbb.3 + margin >= pbb.1 && tbb.0 - margin <= pbb.3 {
+                                bb_ok = false;
+                                break;
+                            }
+                        }
+                        if !bb_ok { continue; }
+
+                        // Full overlap
+                        let mut ov = false;
+                        for pp in sp {
+                            if overlap(&tf, tbb, pp, bbox(pp), margin) {
+                                ov = true;
+                                break;
+                            }
+                        }
+                        if ov { continue; }
+
+                        // Placed!
+                        result[pi] = (si, tx, ty, ang);
+                        stock_placed_polys[si].push(tf);
+                        stock_placed_bbs[si].push(tbb);
+                        placed = true;
+                        break 'done;
+                    }
+                }
+            }
+        }
+
+        if !placed {
+            let si = stock_placed_polys.len();
+            let pbb = bbox(piece);
+            let tx = sbb.0 - pbb.0 + margin + 0.5;
+            let ty = sbb.1 - pbb.1 + margin + 0.5;
+            let tf = transform(piece, tx, ty, 0.0);
+            stock_placed_polys.push(vec![tf.clone()]);
+            stock_placed_bbs.push(vec![bbox(&tf)]);
+            result[pi] = (si, tx, ty, 0.0);
+        }
+    }
+
+    result
+}
+
+fn main() {
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let mut out = BufWriter::new(stdout.lock());
+    let mut lines = stdin.lock().lines();
+
+    let hdr = lines.next().unwrap().unwrap();
+    let mut p = hdr.split_whitespace();
+    let sv: usize = p.next().unwrap

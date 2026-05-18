@@ -1,0 +1,348 @@
+```cpp
+#include <iostream>
+#include <string>
+#include <vector>
+#include <thread>
+#include <mutex>
+#include <atomic>
+#include <cmath>
+#include <fstream>
+#include <algorithm>
+#include <chrono>
+#include <sstream>
+#include <cstring>
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+struct Config {
+    int width = 0, depth = 0, height = 0;
+    double gravity = 1.62;
+    double max_thrust = 0.0;
+    double fuel = 0.0;
+    double start_x = 0, start_y = 0, start_z = 0;
+    double target_x = 0, target_y = 0, target_z = 0;
+    double landing_radius = 5.0;
+};
+
+struct State {
+    double x = 0, y = 0, z = 0;
+    double vx = 0, vy = 0, vz = 0;
+    double pitch = 0, yaw = 0, roll = 0;
+    double pitch_rate = 0, yaw_rate = 0, roll_rate = 0;
+    double fuel = 0;
+};
+
+// Globals
+Config g_config;
+State g_state;
+std::mutex g_state_mutex;
+
+std::vector<uint16_t> g_terrain_ground;
+std::vector<uint16_t> g_terrain_float_bot;
+std::vector<uint16_t> g_terrain_float_top;
+std::atomic<bool> g_terrain_ready{false};
+
+void load_terrain(const std::string& path) {
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file.is_open()) {
+        g_terrain_ready = true;
+        return;
+    }
+    auto size = file.tellg();
+    file.seekg(0, std::ios::beg);
+
+    int total_cells = g_config.width * g_config.depth;
+    g_terrain_ground.resize(total_cells);
+    g_terrain_float_bot.resize(total_cells);
+    g_terrain_float_top.resize(total_cells);
+
+    if (size > 0) {
+        std::vector<uint8_t> buffer(size);
+        if (file.read(reinterpret_cast<char*>(buffer.data()), size)) {
+            int idx = 0;
+            for (int i = 0; i < total_cells; ++i) {
+                g_terrain_ground[i] = buffer[idx] | (buffer[idx + 1] << 8);
+                g_terrain_float_bot[i] = buffer[idx + 2] | (buffer[idx + 3] << 8);
+                g_terrain_float_top[i] = buffer[idx + 4] | (buffer[idx + 5] << 8);
+                idx += 6;
+            }
+        }
+    }
+    g_terrain_ready = true;
+}
+
+double get_ground_height(double x, double y) {
+    int ix = static_cast<int>(std::floor(x));
+    int iy = static_cast<int>(std::floor(y));
+    ix = std::max(0, std::min(g_config.width - 1, ix));
+    iy = std::max(0, std::min(g_config.depth - 1, iy));
+    int idx = ix * g_config.depth + iy;
+    return static_cast<double>(g_terrain_ground[idx]);
+}
+
+double get_terrain_ceiling(double x, double y) {
+    if (!g_terrain_ready) return g_config.height;
+    int ix = static_cast<int>(std::floor(x));
+    int iy = static_cast<int>(std::floor(y));
+    if (ix < 0 || ix >= g_config.width || iy < 0 || iy >= g_config.depth) return g_config.height;
+    int idx = ix * g_config.depth + iy;
+    if (g_terrain_float_bot[idx] < g_terrain_float_top[idx]) {
+        return static_cast<double>(g_terrain_float_bot[idx]);
+    }
+    return g_config.height;
+}
+
+bool is_solid(double x, double y, double z) {
+    if (!g_terrain_ready) return false;
+    int ix = static_cast<int>(std::floor(x));
+    int iy = static_cast<int>(std::floor(y));
+    if (ix < 0 || ix >= g_config.width || iy < 0 || iy >= g_config.depth) return true;
+    if (z < 0 || z >= g_config.height) return true;
+    int idx = ix * g_config.depth + iy;
+    double a = g_terrain_ground[idx];
+    double b = g_terrain_float_bot[idx];
+    double c = g_terrain_float_top[idx];
+    if (z < a) return true;
+    if (b < c && z >= b && z < c) return true;
+    return false;
+}
+
+struct Vec3 {
+    double x, y, z;
+    Vec3() : x(0), y(0), z(0) {}
+    Vec3(double x_, double y_, double z_) : x(x_), y(y_), z(z_) {}
+    Vec3 operator+(const Vec3& o) const { return { x + o.x, y + o.y, z + o.z }; }
+    Vec3 operator-(const Vec3& o) const { return { x - o.x, y - o.y, z - o.z }; }
+    Vec3 operator*(double s) const { return { x * s, y * s, z * s }; }
+    double dot(const Vec3& o) const { return x * o.x + y * o.y + z * o.z; }
+    double length() const { return std::sqrt(x * x + y * y + z * z); }
+};
+
+Vec3 compute_thrust_vector(double thrust_frac, double pitch, double yaw) {
+    double cp = std::cos(pitch), sp = std::sin(pitch);
+    double cy = std::cos(yaw), sy = std::sin(yaw);
+    return Vec3(-thrust_frac * sp, thrust_frac * cp * sy, thrust_frac * cp * cy);
+}
+
+struct Control {
+    double thrust = 0;
+    double pitch_cmd = 0;
+    double yaw_cmd = 0;
+    double roll_cmd = 0;
+};
+
+Control compute_control() {
+    State s;
+    {
+        std::lock_guard<std::mutex> lock(g_state_mutex);
+        s = g_state;
+    }
+
+    Control ctrl;
+    double dt = 0.1;
+
+    Vec3 pos(s.x, s.y, s.z);
+    Vec3 vel(s.vx, s.vy, s.vz);
+    Vec3 target(g_config.target_x, g_config.target_y, g_config.target_z);
+
+    double horizontal_dist = Vec3(pos.x - target.x, pos.y - target.y, 0).length();
+    double vertical_dist = std::abs(pos.z - target.z);
+    double total_dist = (pos - target).length();
+    double speed = vel.length();
+
+    double desired_vx = 0, desired_vy = 0, desired_vz = 0;
+    double max_horiz_speed = 15.0;
+    double max_vert_speed = 20.0;
+
+    // Phased approach
+    if (horizontal_dist > g_config.landing_radius * 2) {
+        // Approach phase
+        double dir_x = target.x - pos.x;
+        double dir_y = target.y - pos.y;
+        double h_dir_len = std::sqrt(dir_x * dir_x + dir_y * dir_y);
+        if (h_dir_len > 0.01) {
+            dir_x /= h_dir_len;
+            dir_y /= h_dir_len;
+        }
+        double approach_speed = std::min(max_horiz_speed, std::sqrt(2.0 * 3.0 * horizontal_dist));
+        desired_vx = dir_x * approach_speed;
+        desired_vy = dir_y * approach_speed;
+    }
+
+    // Vertical: maintain altitude above terrain + margin, then descend to target
+    double clearance = 20.0;
+    double min_alt = target.z + clearance;
+    
+    // Check terrain clearance ahead
+    double look_dist = std::min(50.0, horizontal_dist);
+    if (look_dist > 1.0 && horizontal_dist > 1.0) {
+        double frac = look_dist / horizontal_dist;
+        double ahead_x = pos.x + (target.x - pos.x) * frac;
+        double ahead_y = pos.y + (target.y - pos.y) * frac;
+        double ahead_ground = get_ground_height(ahead_x, ahead_y);
+        double ahead_ceil = get_terrain_ceiling(ahead_x, ahead_y);
+        double needed_alt = ahead_ground + clearance;
+        if (needed_alt > min_alt && needed_alt < ahead_ceil - 5.0) {
+            min_alt = needed_alt;
+        }
+    }
+
+    if (pos.z < min_alt && vertical_dist > 5.0) {
+        // Altitude maintain/ascend
+        desired_vz = std::min(max_vert_speed, std::sqrt(2.0 * 4.0 * (min_alt - pos.z)));
+    } else if (pos.z > target.z + 2.0) {
+        // Descend
+        desired_vz = -std::min(max_vert_speed, std::sqrt(2.0 * 3.0 * (pos.z - target.z)));
+    } else {
+        desired_vz = -std::min(1.5, std::sqrt(2.0 * 1.5 * std::abs(pos.z - target.z)));
+    }
+
+    // Near target: fine alignment
+    if (horizontal_dist < g_config.landing_radius * 3 && pos.z < target.z + 15.0) {
+        double brake_dist = horizontal_dist;
+        double h_vel = std::sqrt(s.vx * s.vx + s.vy * s.vy);
+        if (h_vel > 1.0) {
+            double slow_v = std::min(2.0, std::sqrt(2.0 * 1.5 * brake_dist));
+            desired_vx = s.vx / h_vel * slow_v;
+            desired_vy = s.vy / h_vel * slow_v;
+        } else {
+            desired_vx = (target.x - pos.x) * 0.5;
+            desired_vy = (target.y - pos.y) * 0.5;
+        }
+        desired_vz = -std::min(2.0, std::max(0.3, (pos.z - target.z) * 0.5));
+    }
+
+    // Compute desired acceleration
+    double kp = 2.0;
+    double ax = kp * (desired_vx - s.vx);
+    double ay = kp * (desired_vy - s.vy);
+    double az = kp * (desired_vz - s.vz) + g_config.gravity;
+
+    // Convert to thrust and attitude
+    double a_mag = std::sqrt(ax * ax + ay * ay + az * az);
+    double thrust_frac = a_mag / g_config.max_thrust;
+    thrust_frac = std::clamp(thrust_frac, 0.0, 1.0);
+
+    // If out of fuel, zero thrust
+    if (s.fuel <= 0) thrust_frac = 0.0;
+
+    // Compute desired pitch and yaw
+    double desired_pitch = 0, desired_yaw = s.yaw;
+    if (a_mag > 0.01) {
+        double ax_h = std::sqrt(ax * ax + ay * ay);
+        desired_pitch = -std::atan2(ax_h, az);
+        if (ax_h > 0.01) {
+            desired_yaw = std::atan2(ay, ax);
+        }
+    }
+
+    // Normalize yaw error
+    double yaw_error = desired_yaw - s.yaw;
+    while (yaw_error > M_PI) yaw_error -= 2 * M_PI;
+    while (yaw_error < -M_PI) yaw_error += 2 * M_PI;
+
+    // PD control for angles
+    double pitch_error = desired_pitch - s.pitch;
+    double kp_angle = 6.0;
+    double kd_angle = 3.0;
+
+    ctrl.pitch_cmd = kp_angle * pitch_error - kd_angle * s.pitch_rate;
+    ctrl.yaw_cmd = kp_angle * yaw_error - kd_angle * s.yaw_rate;
+    ctrl.roll_cmd = -2.0 * s.roll_rate; // Dampen roll
+
+    // Clamp commands
+    ctrl.pitch_cmd = std::clamp(ctrl.pitch_cmd, -1.0, 1.0);
+    ctrl.yaw_cmd = std::clamp(ctrl.yaw_cmd, -1.0, 1.0);
+    ctrl.roll_cmd = std::clamp(ctrl.roll_cmd, -1.0, 1.0);
+
+    // Anti-crash terrain avoidance: if very close to ground and descending fast, override
+    double ground_at_pos = get_ground_height(pos.x, pos.y);
+    double alt_above_ground = pos.z - ground_at_pos;
+    if (alt_above_ground < 5.0 && s.vz < -5.0) {
+        thrust_frac = 1.0;
+        desired_pitch = 0;
+        desired_yaw = s.yaw;
+        ctrl.pitch_cmd = 5.0 * (0 - s.pitch) - 3.0 * s.pitch_rate;
+        ctrl.yaw_cmd = 5.0 * (0 - yaw_error) - 3.0 * s.yaw_rate;
+        ctrl.pitch_cmd = std::clamp(ctrl.pitch_cmd, -1.0, 1.0);
+        ctrl.yaw_cmd = std::clamp(ctrl.yaw_cmd, -1.0, 1.0);
+    }
+
+    ctrl.thrust = thrust_frac;
+    return ctrl;
+}
+
+void input_thread_func() {
+    std::string line;
+    // Read header
+    std::getline(std::cin, line);
+    std::istringstream iss(line);
+    iss >> g_config.width >> g_config.depth >> g_config.height
+        >> g_config.gravity >> g_config.max_thrust >> g_config.fuel;
+
+    std::getline(std::cin, line);
+    std::istringstream iss2(line);
+    iss2 >> g_config.start_x >> g_config.start_y >> g_config.start_z
+        >> g_config.target_x >> g_config.target_y >> g_config.target_z;
+
+    // Terrain path - read the entire line
+    std::string terrain_path;
+    std::getline(std::cin, terrain_path);
+
+    // Read "STATE" line
+    std::getline(std::cin, line);
+
+    g_config.landing_radius = std::max(5.0, std::min(static_cast<double>(g_config.width), static_cast<double>(g_config.depth)) * 0.02);
+
+    // Start terrain loading
+    std::thread terrain_loader(load_terrain, terrain_path);
+    terrain_loader.detach();
+
+    // Read state updates
+    while (std::cin) {
+        std::getline(std::cin, line);
+        if (line.empty()) continue;
+        std::istringstream state_iss(line);
+        State new_state;
+        if (state_iss >> new_state.x >> new_state.y >> new_state.z
+            >> new_state.vx >> new_state.vy >> new_state.vz
+            >> new_state.pitch >> new_state.yaw >> new_state.roll
+            >> new_state.pitch_rate >> new_state.yaw_rate >> new_state.roll_rate
+            >> new_state.fuel) {
+            std::lock_guard<std::mutex> lock(g_state_mutex);
+            g_state = new_state;
+        }
+    }
+}
+
+int main() {
+    std::ios_base::sync_with_stdio(false);
+    std::cin.tie(nullptr);
+
+    // Start input thread
+    std::thread input_thread(input_thread_func);
+    input_thread.detach();
+
+    // Give a moment for initial state to load
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+    while (true) {
+        auto start = std::chrono::steady_clock::now();
+
+        Control ctrl = compute_control();
+        std::cout << ctrl.thrust << " " << ctrl.pitch_cmd << " " << ctrl.yaw_cmd << " " << ctrl.roll_cmd << "\n";
+        std::cout.flush();
+
+        auto end = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+        auto sleep_time = std::chrono::milliseconds(80) - elapsed;
+        if (sleep_time > std::chrono::milliseconds(0)) {
+            std::this_thread::sleep_for(sleep_time);
+        }
+    }
+
+    return 0;
+}
+```

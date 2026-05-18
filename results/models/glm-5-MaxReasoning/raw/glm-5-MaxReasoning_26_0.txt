@@ -1,0 +1,318 @@
+Looking at this problem, I need to implement an adaptive clustering algorithm that handles datasets from millions to billions of points with streaming capability. The key challenges are:
+
+1. **Memory constraints**: Can't load billions of points into memory
+2. **Single-pass requirement**: stdin isn't seekable
+3. **Performance**: Must complete within 5 minutes
+
+My approach:
+- **Small datasets (≤50M points)**: Standard k-means in memory
+- **Large datasets (>50M points)**: Streaming mini-batch k-means with online centroid updates
+
+For streaming, I use "online k-means" where centroids update incrementally: `centroid += lr * (point - centroid)` with learning rate `lr = 1/visit_count`. This converges well over large datasets.
+
+```rust
+use std::io::{self, BufReader, BufWriter, Read, Write, BufRead};
+
+const BATCH_SIZE: usize = 1_000_000;
+const MAX_IN_MEMORY_POINTS: usize = 50_000_000;
+const MAX_ITERATIONS: usize = 100;
+
+#[derive(Clone, Copy, Default)]
+struct Point {
+    x: f32,
+    y: f32,
+    z: f32,
+}
+
+impl Point {
+    fn read_batch<R: Read>(reader: &mut R, buffer: &mut Vec<Point>, count: usize) -> io::Result<usize> {
+        buffer.clear();
+        let byte_count = count * 12;
+        let mut bytes = vec![0u8; byte_count];
+        
+        let n = reader.read(&mut bytes)?;
+        let num_read = n / 12;
+        
+        for i in 0..num_read {
+            let off = i * 12;
+            buffer.push(Point {
+                x: f32::from_le_bytes(bytes[off..off+4].try_into().unwrap()),
+                y: f32::from_le_bytes(bytes[off+4..off+8].try_into().unwrap()),
+                z: f32::from_le_bytes(bytes[off+8..off+12].try_into().unwrap()),
+            });
+        }
+        Ok(num_read)
+    }
+
+    #[inline]
+    fn distance_squared(&self, other: &Point) -> f32 {
+        let dx = self.x - other.x;
+        let dy = self.y - other.y;
+        let dz = self.z - other.z;
+        dx * dx + dy * dy + dz * dz
+    }
+
+    #[inline]
+    fn nearest_centroid(&self, centroids: &[Point]) -> usize {
+        let mut min_dist = f32::MAX;
+        let mut min_idx = 0;
+        for (i, c) in centroids.iter().enumerate() {
+            let d = self.distance_squared(c);
+            if d < min_dist {
+                min_dist = d;
+                min_idx = i;
+            }
+        }
+        min_idx
+    }
+}
+
+struct XorShift64 {
+    state: u64,
+}
+
+impl XorShift64 {
+    fn new() -> Self {
+        XorShift64 { state: 88172645463325252 }
+    }
+    
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.state = x;
+        x
+    }
+    
+    fn next_usize(&mut self, bound: usize) -> usize {
+        (self.next_u64() as usize) % bound
+    }
+}
+
+fn kmeanspp_init(points: &[Point], k: usize, rng: &mut XorShift64) -> Vec<Point> {
+    let n = points.len();
+    if n == 0 || k == 0 {
+        return Vec::new();
+    }
+    
+    let mut centroids = Vec::with_capacity(k);
+    centroids.push(points[rng.next_usize(n)]);
+    
+    let mut distances = vec![f32::MAX; n];
+    
+    for _ in 1..k {
+        let last = centroids.last().unwrap();
+        let mut total_dist: f64 = 0.0;
+        
+        for (i, p) in points.iter().enumerate() {
+            let d = p.distance_squared(last);
+            distances[i] = distances[i].min(d);
+            total_dist += distances[i] as f64;
+        }
+        
+        if total_dist == 0.0 {
+            centroids.push(points[rng.next_usize(n)]);
+            continue;
+        }
+        
+        let threshold = (rng.next_u64() as f64 / u64::MAX as f64) * total_dist;
+        let mut cumsum = 0.0;
+        let mut next_idx = n - 1;
+        
+        for (i, &d) in distances.iter().enumerate() {
+            cumsum += d as f64;
+            if cumsum >= threshold {
+                next_idx = i;
+                break;
+            }
+        }
+        centroids.push(points[next_idx]);
+    }
+    centroids
+}
+
+fn main() {
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let mut reader = BufReader::with_capacity(16 * 1024 * 1024, stdin.lock());
+    let mut writer = BufWriter::with_capacity(16 * 1024 * 1024, stdout.lock());
+    
+    let mut header = String::new();
+    reader.read_line(&mut header).expect("Failed to read header");
+    let parts: Vec<&str> = header.trim().split_whitespace().collect();
+    let num_points: u64 = parts[0].parse().expect("Invalid num_points");
+    let num_clusters: usize = parts[1].parse().expect("Invalid num_clusters");
+    
+    if num_clusters == 0 || num_points == 0 {
+        writer.flush().unwrap();
+        return;
+    }
+    
+    if (num_points as usize) <= MAX_IN_MEMORY_POINTS {
+        standard_kmeans(&mut reader, &mut writer, num_points as usize, num_clusters);
+    } else {
+        streaming_kmeans(&mut reader, &mut writer, num_points, num_clusters);
+    }
+    
+    writer.flush().unwrap();
+}
+
+fn standard_kmeans<R: Read, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    num_points: usize,
+    num_clusters: usize,
+) {
+    let mut points = Vec::with_capacity(num_points);
+    let mut buffer = Vec::new();
+    let mut remaining = num_points;
+    
+    while remaining > 0 {
+        let to_read = remaining.min(BATCH_SIZE);
+        match Point::read_batch(reader, &mut buffer, to_read) {
+            Ok(count) if count > 0 => {
+                points.extend(buffer.drain(..count));
+                remaining -= count;
+            }
+            _ => break,
+        }
+    }
+    
+    let actual_points = points.len();
+    if actual_points == 0 {
+        return;
+    }
+    
+    let k = num_clusters.min(actual_points);
+    let mut rng = XorShift64::new();
+    let mut centroids = kmeanspp_init(&points, k, &mut rng);
+    
+    if centroids.is_empty() {
+        for _ in 0..actual_points {
+            writer.write_all(&0u32.to_le_bytes()).unwrap();
+        }
+        return;
+    }
+    
+    let mut assignments = vec![0u32; actual_points];
+    
+    for _ in 0..MAX_ITERATIONS {
+        let mut changed = false;
+        
+        for (i, p) in points.iter().enumerate() {
+            let new_assign = p.nearest_centroid(&centroids) as u32;
+            if assignments[i] != new_assign {
+                assignments[i] = new_assign;
+                changed = true;
+            }
+        }
+        
+        if !changed {
+            break;
+        }
+        
+        let mut sums = vec![[0.0f64; 3]; k];
+        let mut counts = vec![0u64; k];
+        
+        for (i, p) in points.iter().enumerate() {
+            let c = assignments[i] as usize;
+            sums[c][0] += p.x as f64;
+            sums[c][1] += p.y as f64;
+            sums[c][2] += p.z as f64;
+            counts[c] += 1;
+        }
+        
+        // Handle empty clusters by reinitializing
+        for (i, c) in centroids.iter_mut().enumerate() {
+            if counts[i] > 0 {
+                c.x = (sums[i][0] / counts[i] as f64) as f32;
+                c.y = (sums[i][1] / counts[i] as f64) as f32;
+                c.z = (sums[i][2] / counts[i] as f64) as f32;
+            } else {
+                let idx = rng.next_usize(actual_points);
+                *c = points[idx];
+            }
+        }
+    }
+    
+    for &a in &assignments {
+        writer.write_all(&a.to_le_bytes()).unwrap();
+    }
+}
+
+fn streaming_kmeans<R: Read, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    num_points: u64,
+    num_clusters: usize,
+) {
+    let mut rng = XorShift64::new();
+    let mut buffer = Vec::new();
+    
+    // Read initialization batch
+    let init_size = (num_clusters * 10).min(BATCH_SIZE);
+    let init_count = Point::read_batch(reader, &mut buffer, init_size).unwrap_or(0);
+    
+    if init_count == 0 {
+        return;
+    }
+    
+    // Initialize centroids
+    let k = num_clusters.min(init_count);
+    let mut centroids = kmeanspp_init(&buffer, k, &mut rng);
+    
+    if centroids.is_empty() {
+        centroids.push(Point::default());
+    }
+    
+    let mut counts = vec![1u64; centroids.len()];
+    
+    // Process initialization batch - output assignments
+    for p in &buffer {
+        let idx = p.nearest_centroid(&centroids);
+        counts[idx] += 1;
+        let lr = 1.0 / counts[idx] as f32;
+        centroids[idx].x += lr * (p.x - centroids[idx].x);
+        centroids[idx].y += lr * (p.y - centroids[idx].y);
+        centroids[idx].z += lr * (p.z - centroids[idx].z);
+        writer.write_all(&(idx as u32).to_le_bytes()).unwrap();
+    }
+    
+    let mut processed = init_count as u64;
+    
+    // Continue streaming
+    while processed < num_points {
+        let remaining = (num_points - processed) as usize;
+        let to_read = remaining.min(BATCH_SIZE);
+        
+        let count = match Point::read_batch(reader, &mut buffer, to_read) {
+            Ok(c) if c > 0 => c,
+            _ => break,
+        };
+        
+        for p in &buffer[..count] {
+            let idx = p.nearest_centroid(&centroids);
+            counts[idx] += 1;
+            let lr = 1.0 / counts[idx] as f32;
+            centroids[idx].x += lr * (p.x - centroids[idx].x);
+            centroids[idx].y += lr * (p.y - centroids[idx].y);
+            centroids[idx].z += lr * (p.z - centroids[idx].z);
+            writer.write_all(&(idx as u32).to_le_bytes()).unwrap();
+        }
+        
+        processed += count as u64;
+    }
+}
+```
+
+This solution:
+
+1. **Adapts strategy based on dataset size**: Standard k-means for ≤50M points, streaming for larger
+2. **Uses k-means++ initialization** for better starting centroids
+3. **Implements online k-means** for streaming: centroids update incrementally with decreasing learning rate
+4. **Handles edge cases**: Empty clusters get reinitialized, missing data handled gracefully
+5. **Uses efficient binary I/O**: Large buffers (16MB) for throughput, batch reading
+6. **Custom RNG**: XorShift64 for fast, deterministic initialization without external dependencies
+
+The streaming algorithm outputs assignments immediately as points are processed, using centroids that converge over time. While not as optimal as multi-pass k-means, it provides reasonable clustering quality within memory constraints.

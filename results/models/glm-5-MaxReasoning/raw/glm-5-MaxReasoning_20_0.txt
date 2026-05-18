@@ -1,0 +1,394 @@
+Looking at this problem, I need to build a system that:
+1. Parses drillhole assay data with 3D spatial positions
+2. Finds spatial neighbors efficiently using adaptive strategies
+3. Detects outliers using robust statistics (median/MAD instead of mean/std)
+4. Scales from small to massive datasets
+
+Here's my complete solution:
+
+```rust
+use std::io::{self, BufRead, Write, BufWriter};
+use std::collections::HashMap;
+use std::cmp::Ordering;
+use std::sync::{Arc, Mutex};
+use std::thread;
+
+#[derive(Clone, Debug)]
+struct Sample {
+    hole_id: u64,
+    sample_idx: usize,
+    position: [f64; 3],
+    properties: Vec<f64>,
+}
+
+struct AnalysisContext {
+    all_samples: Vec<Sample>,
+    grid: HashMap<(i64, i64, i64), Vec<usize>>,
+    global_stats: Vec<(f64, f64)>,
+    property_names: Vec<String>,
+    cell_size: f64,
+    search_radius: f64,
+    min_neighbors: usize,
+    z_threshold: f64,
+}
+
+fn median(values: &mut [f64]) -> f64 {
+    if values.is_empty() {
+        return f64::NAN;
+    }
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+    let n = values.len();
+    if n % 2 == 0 {
+        (values[n / 2 - 1] + values[n / 2]) / 2.0
+    } else {
+        values[n / 2]
+    }
+}
+
+fn robust_stats(values: &mut [f64]) -> (f64, f64) {
+    if values.is_empty() {
+        return (f64::NAN, 1.0);
+    }
+    let med = median(values);
+    if !med.is_finite() {
+        return (f64::NAN, 1.0);
+    }
+    let deviations: Vec<f64> = values.iter().filter_map(|v| {
+        if v.is_finite() { Some((v - med).abs()) } else { None }
+    }).collect();
+    let mut deviations = deviations;
+    let mad = median(&mut deviations);
+    let scale = mad * 1.4826; // Scale factor for consistency with std
+    (med, if scale > 1e-10 { scale } else { 1.0 })
+}
+
+fn parse_f64(s: &str) -> f64 {
+    s.parse::<f64>()
+        .ok()
+        .filter(|v| v.is_finite())
+        .unwrap_or(f64::NAN)
+}
+
+fn build_spatial_grid(samples: &[Sample], cell_size: f64) -> HashMap<(i64, i64, i64), Vec<usize>> {
+    let mut grid: HashMap<(i64, i64, i64), Vec<usize>> = HashMap::new();
+    for (idx, sample) in samples.iter().enumerate() {
+        let cell = (
+            (sample.position[0] / cell_size).floor() as i64,
+            (sample.position[1] / cell_size).floor() as i64,
+            (sample.position[2] / cell_size).floor() as i64,
+        );
+        grid.entry(cell).or_default().push(idx);
+    }
+    grid
+}
+
+fn compute_global_stats(samples: &[Sample], num_properties: usize) -> Vec<(f64, f64)> {
+    (0..num_properties)
+        .map(|prop_idx| {
+            let mut values: Vec<f64> = samples.iter()
+                .map(|s| s.properties[prop_idx])
+                .filter(|v| v.is_finite())
+                .collect();
+            robust_stats(&mut values)
+        })
+        .collect()
+}
+
+fn find_neighbors(sample: &Sample, samples: &[Sample], grid: &HashMap<(i64, i64, i64), Vec<usize>>, 
+                  cell_size: f64, search_radius_sq: f64) -> Vec<usize> {
+    let mut neighbors = Vec::new();
+    let cell = (
+        (sample.position[0] / cell_size).floor() as i64,
+        (sample.position[1] / cell_size).floor() as i64,
+        (sample.position[2] / cell_size).floor() as i64,
+    );
+    
+    // Check 27 neighboring cells (3x3x3)
+    for dx in -1i64..=1 {
+        for dy in -1i64..=1 {
+            for dz in -1i64..=1 {
+                let neighbor_cell = (cell.0 + dx, cell.1 + dy, cell.2 + dz);
+                if let Some(indices) = grid.get(&neighbor_cell) {
+                    for &idx in indices {
+                        let other = &samples[idx];
+                        // Skip samples from same hole (want cross-hole neighbors)
+                        if other.hole_id != sample.hole_id {
+                            let dist_sq = 
+                                (sample.position[0] - other.position[0]).powi(2) +
+                                (sample.position[1] - other.position[1]).powi(2) +
+                                (sample.position[2] - other.position[2]).powi(2);
+                            if dist_sq <= search_radius_sq && dist_sq > 0.0 {
+                                neighbors.push(idx);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    neighbors
+}
+
+fn analyze_sample(idx: usize, ctx: &AnalysisContext) -> Vec<(u64, usize, String, f64)> {
+    let mut results = Vec::new();
+    let sample = &ctx.all_samples[idx];
+    let search_radius_sq = ctx.search_radius * ctx.search_radius;
+    
+    let neighbors = find_neighbors(sample, &ctx.all_samples, &ctx.grid, ctx.cell_size, search_radius_sq);
+    
+    for prop_idx in 0..ctx.property_names.len() {
+        let value = sample.properties[prop_idx];
+        if !value.is_finite() {
+            continue;
+        }
+        
+        // Collect neighbor values for this property
+        let mut neighbor_values: Vec<f64> = neighbors.iter()
+            .map(|&i| ctx.all_samples[i].properties[prop_idx])
+            .filter(|v| v.is_finite())
+            .collect();
+        
+        let (med, scale) = if neighbor_values.len() >= ctx.min_neighbors {
+            robust_stats(&mut neighbor_values)
+        } else {
+            // Fall back to global statistics if not enough local neighbors
+            ctx.global_stats[prop_idx]
+        };
+        
+        if !med.is_finite() {
+            continue;
+        }
+        
+        let deviation = (value - med).abs();
+        let z_score = deviation / scale;
+        
+        if z_score > ctx.z_threshold {
+            results.push((
+                sample.hole_id,
+                sample.sample_idx,
+                ctx.property_names[prop_idx].clone(),
+                z_score,
+            ));
+        }
+    }
+    results
+}
+
+fn analyze_sequential(ctx: &AnalysisContext) -> Vec<(u64, usize, String, f64)> {
+    let mut results = Vec::new();
+    for idx in 0..ctx.all_samples.len() {
+        results.extend(analyze_sample(idx, ctx));
+    }
+    results
+}
+
+fn analyze_parallel(ctx: Arc<AnalysisContext>) -> Vec<(u64, usize, String, f64)> {
+    let total_samples = ctx.all_samples.len();
+    let num_threads = thread::available_parallelism()
+        .map(|p| p.get().min(64))
+        .unwrap_or(4);
+    
+    let chunk_size = (total_samples + num_threads - 1) / num_threads;
+    let results = Arc::new(Mutex::new(Vec::new()));
+    
+    let handles: Vec<_> = (0..num_threads)
+        .map(|t| {
+            let ctx = Arc::clone(&ctx);
+            let results = Arc::clone(&results);
+            thread::spawn(move || {
+                let start = t * chunk_size;
+                let end = (start + chunk_size).min(total_samples);
+                let mut local_results = Vec::new();
+                
+                for idx in start..end {
+                    local_results.extend(analyze_sample(idx, &ctx));
+                }
+                
+                let mut guard = results.lock().unwrap();
+                guard.extend(local_results);
+            })
+        })
+        .collect();
+    
+    for handle in handles {
+        handle.join().expect("Thread panicked");
+    }
+    
+    Arc::try_unwrap(results)
+        .expect("Arc unwrap failed")
+        .into_inner()
+        .expect("Mutex unwrap failed")
+}
+
+fn main() {
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let mut stdout = BufWriter::new(stdout.lock());
+    
+    let mut lines = stdin.lock().lines().filter_map(|l| l.ok());
+    
+    // Parse header
+    let header: Vec<&str> = lines.next()
+        .expect("Missing header line")
+        .split_whitespace()
+        .collect();
+    
+    let num_holes: usize = header.get(0)
+        .and_then(|s| s.parse().ok())
+        .expect("Invalid num_holes");
+    let num_properties: usize = header.get(1)
+        .and_then(|s| s.parse().ok())
+        .expect("Invalid num_properties");
+    
+    // Parse property names
+    let property_names: Vec<String> = lines.next()
+        .expect("Missing property names line")
+        .split_whitespace()
+        .map(|s| s.to_string())
+        .collect();
+    
+    // Parse all holes and samples
+    let mut all_samples: Vec<Sample> = Vec::new();
+    let mut bounds_min = [f64::MAX, f64::MAX, f64::MAX];
+    let mut bounds_max = [f64::MIN, f64::MIN, f64::MIN];
+    
+    for _ in 0..num_holes {
+        let hole_line = lines.next().expect("Missing hole line");
+        let parts: Vec<&str> = hole_line.split_whitespace().collect();
+        
+        if parts.len() < 9 {
+            continue; // Skip malformed lines
+        }
+        
+        let hole_id: u64 = parts[0].parse().expect("Invalid hole_id");
+        let start_x: f64 = parts[1].parse().expect("Invalid start_x");
+        let start_y: f64 = parts[2].parse().expect("Invalid start_y");
+        let start_z: f64 = parts[3].parse().expect("Invalid start_z");
+        let dir_x: f64 = parts[4].parse().expect("Invalid dir_x");
+        let dir_y: f64 = parts[5].parse().expect("Invalid dir_y");
+        let dir_z: f64 = parts[6].parse().expect("Invalid dir_z");
+        let num_samples: usize = parts[8].parse().expect("Invalid num_samples");
+        
+        // Normalize direction vector
+        let dir_mag = (dir_x * dir_x + dir_y * dir_y + dir_z * dir_z).sqrt();
+        let dir = if dir_mag > 1e-10 {
+            [dir_x / dir_mag, dir_y / dir_mag, dir_z / dir_mag]
+        } else {
+            [0.0, 0.0, 1.0] // Default to vertical if direction is zero
+        };
+        
+        for sample_idx in 0..num_samples {
+            let sample_line = match lines.next() {
+                Some(l) => l,
+                None => break,
+            };
+            let sample_parts: Vec<&str> = sample_line.split_whitespace().collect();
+            
+            if sample_parts.is_empty() {
+                continue;
+            }
+            
+            let depth: f64 = parse_f64(sample_parts.get(0).unwrap_or(&"0"));
+            let position = [
+                start_x + dir[0] * depth,
+                start_y + dir[1] * depth,
+                start_z + dir[2] * depth,
+            ];
+            
+            // Update bounds
+            for i in 0..3 {
+                bounds_min[i] = bounds_min[i].min(position[i]);
+                bounds_max[i] = bounds_max[i].max(position[i]);
+            }
+            
+            let properties: Vec<f64> = (0..num_properties)
+                .map(|i| parse_f64(sample_parts.get(i + 1).unwrap_or(&"nan")))
+                .collect();
+            
+            all_samples.push(Sample {
+                hole_id,
+                sample_idx,
+                position,
+                properties,
+            });
+        }
+    }
+    
+    let total_samples = all_samples.len();
+    
+    // Adaptive parameters based on dataset size
+    let (cell_size, search_radius, min_neighbors, z_threshold) = {
+        let span = [
+            bounds_max[0] - bounds_min[0],
+            bounds_max[1] - bounds_min[1],
+            bounds_max[2] - bounds_min[2],
+        ];
+        let max_span = span.iter().cloned().fold(0.0_f64, f64::max).max(1.0);
+        
+        match total_samples {
+            0..=999 => (max_span / 50.0, max_span / 20.0, 2, 2.5),
+            1_000..=9_999 => (max_span / 30.0, max_span / 10.0, 3, 3.0),
+            10_000..=99_999 => (max_span / 20.0, max_span / 5.0, 5, 3.0),
+            100_000..=999_999 => (max_span / 15.0, max_span / 4.0, 5, 3.5),
+            _ => (max_span / 10.0, max_span / 3.0, 5, 4.0),
+        }
+    };
+    
+    // Ensure minimum values
+    let cell_size = cell_size.max(1.0);
+    let search_radius = search_radius.max(cell_size * 2.0);
+    
+    // Build spatial grid
+    let grid = build_spatial_grid(&all_samples, cell_size);
+    
+    // Compute global statistics for fallback
+    let global_stats = compute_global_stats(&all_samples, num_properties);
+    
+    let ctx = AnalysisContext {
+        all_samples,
+        grid,
+        global_stats,
+        property_names,
+        cell_size,
+        search_radius,
+        min_neighbors,
+        z_threshold,
+    };
+    
+    // Run analysis - choose parallel or sequential based on dataset size
+    let mut results = if total_samples > 10_000 {
+        analyze_parallel(Arc::new(ctx))
+    } else {
+        analyze_sequential(&ctx)
+    };
+    
+    // Sort by confidence descending
+    results.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(Ordering::Equal));
+    
+    // Limit output for extremely large result sets
+    let max_results = 100_000;
+    let results_to_output = if results.len() > max_results {
+        &results[..max_results]
+    } else {
+        &results
+    };
+    
+    // Output results
+    writeln!(stdout, "{}", results_to_output.len()).unwrap();
+    for (hole_id, sample_idx, prop_name, confidence) in results_to_output {
+        writeln!(stdout, "{} {} {} {:.6}", hole_id, sample_idx, prop_name, confidence).unwrap();
+    }
+    
+    stdout.flush().unwrap();
+}
+```
+
+**Key Design Decisions:**
+
+1. **Spatial Hashing**: Uses a 3D grid for O(1) neighbor lookups instead of O(n²) brute force
+2. **Robust Statistics**: Uses Median Absolute Deviation (MAD) instead of standard deviation, which is resistant to outliers affecting the outlier detection itself
+3. **Adaptive Parameters**: Cell size, search radius, and thresholds automatically adjust based on dataset size and spatial extent
+4. **Cross-Hole Analysis**: Only considers neighbors from *different* holes to find true spatial anomalies
+5. **Parallel Processing**: Uses threads for datasets >10,000 samples
+6. **Memory Efficient**: Single allocation for all samples with indices for spatial lookups
+7. **Edge Case Handling**: Gracefully handles missing data (NaN), malformed lines, and degenerate cases

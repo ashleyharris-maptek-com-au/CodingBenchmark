@@ -1,0 +1,1637 @@
+Looking at this problem, I need to build a real-time Lunar Lander controller that:
+1. Continuously reads state updates without blocking or stalling
+2. Navigates around obstacles using a pre-computed potential field
+3. Controls descent using a PD controller for smooth landing
+
+Here's my approach:
+- **Async I/O with two threads**: Reader thread fills a shared state, control thread runs the PD loop at 20+ Hz
+- **Obstacle navigation**: Pre-compute a distance field (BFS from target) to know if direct paths are blocked, plus a simple vector field pushing away from nearby obstacles
+- **PD control**: Target angle and thrust computed from desired horizontal/vertical accelerations, with phase-dependent fuel budgets
+
+```rust
+use std::io::{self, BufRead, BufReader, Write, BufWriter};
+use std::sync::{Arc, Mutex};
+use std::collections::VecDeque;
+
+const PI: f64 = std::f64::consts::PI;
+const DT: f64 = 0.05; // 20Hz control loop
+const MAX_DIST_FIELD: u16 = 60;
+
+struct SharedState {
+    initialized: bool,
+    gravity: f64,
+    max_thrust: f64,
+    target_x: f64,
+    target_y: f64,
+    start_x: f64,
+    start_y: f64,
+    width: usize,
+    height: usize,
+    x: f64,
+    y: f64,
+    vx: f64,
+    vy: f64,
+    angle: f64,
+    angular_vel: f64,
+    fuel: f64,
+    // Navigation data (computed once after map read)
+    target_dist: Vec<u16>,       // BFS distance from target (obstacles block)
+    obstacle_clear: Vec<u16>,    // BFS distance from empty space (closer = more dangerous)
+    has_obstacles: bool,
+}
+
+fn main() {
+    let stdout = io::stdout();
+    let mut out = BufWriter::new(stdout.lock());
+    let stdin = io::stdin();
+    let mut reader = BufReader::new(stdin.lock());
+
+    let shared = Arc::new(Mutex::new(SharedState {
+        initialized: false,
+        gravity: 0.0,
+        max_thrust: 0.0,
+        target_x: 0.0,
+        target_y: 0.0,
+        start_x: 0.0,
+        start_y: 0.0,
+        width: 0,
+        height: 0,
+        x: 0.0, y: 0.0, vx: 0.0, vy: 0.0,
+        angle: 0.0, angular_vel: 0.0, fuel: 0.0,
+        target_dist: Vec::new(),
+        obstacle_clear: Vec::new(),
+        has_obstacles: false,
+    }));
+
+    let shared_r = Arc::clone(&shared);
+    let shared_c = Arc::clone(&shared);
+
+    // Reader thread: continuously reads from stdin and updates shared state
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let mut phase = 0; // 0=waiting for header, 1=reading map, 2=state updates
+        let mut map_lines_left = 0;
+
+        loop {
+            line.clear();
+            if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                break; // EOF
+            }
+            let trimmed = line.trim();
+            if trimmed.is_empty() { continue; }
+
+            if phase == 0 {
+                // Header line
+                let parts: Vec<f64> = trimmed.split_whitespace()
+                    .map(|s| s.parse().unwrap())
+                    .collect();
+                let mut s = shared_r.lock().unwrap();
+                s.width = parts[0] as usize;
+                s.height = parts[1] as usize;
+                s.gravity = parts[2];
+                s.max_thrust = parts[3];
+                map_lines_left = s.height;
+                phase = 1;
+            } else if phase == 1 {
+                if map_lines_left == s.height {
+                    // Start/target line
+                    let parts: Vec<f64> = trimmed.split_whitespace()
+                        .map(|s| s.parse().unwrap())
+                        .collect();
+                    let s2 = shared_r.lock().unwrap();
+                    // Don't overwrite if already set
+                    drop(s2);
+                    let mut s = shared_r.lock().unwrap();
+                    s.start_x = parts[0];
+                    s.start_y = parts[1];
+                    s.target_x = parts[2];
+                    s.target_y = parts[3];
+                    map_lines_left -= 1;
+                    if map_lines_left == 0 { phase = 2; }
+                } else {
+                    // Map row
+                    let s2 = shared_r.lock().unwrap();
+                    // We process map inline - check for obstacles
+                    let has_obs = trimmed.contains('#');
+                    if has_obs { s2.has_obstacles = true; }
+                    map_lines_left -= 1;
+                    if map_lines_left == 0 {
+                        phase = 2;
+                    }
+                    drop(s2);
+                }
+            } else {
+                // State update
+                let parts: Vec<f64> = trimmed.split_whitespace()
+                    .map(|s| s.parse().unwrap())
+                    .collect();
+                if parts.len() >= 7 {
+                    let mut s = shared_r.lock().unwrap();
+                    s.x = parts[0];
+                    s.y = parts[1];
+                    s.vx = parts[2];
+                    s.vy = parts[3];
+                    s.angle = parts[4];
+                    s.angular_vel = parts[5];
+                    s.fuel = parts[6];
+                    s.initialized = true;
+                }
+            }
+        }
+    });
+
+    // Control thread: runs the PD controller at 20Hz
+    let mut last_fuel = f64::MAX;
+    let mut prev_x = 0.0f64;
+    let mut prev_y = 0.0f64;
+    let mut first_iteration = true;
+    let mut map_processed = false;
+    let mut obstacle_field: Vec<(f64, f64)> = Vec::new(); // Vector field for obstacle avoidance
+
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        let mut state = shared_c.lock().unwrap();
+        if !state.initialized { continue; }
+
+        // Process map once after initialization
+        if !map_processed && state.width > 0 && state.height > 0 {
+            // For very large maps, we skip detailed BFS and use local obstacle detection
+            // For small maps, we compute full distance fields
+            if state.width * state.height <= 10_000_000 && state.has_obstacles {
+                compute_navigation_fields(&mut state);
+            }
+            map_processed = true;
+        }
+
+        // Detect if we're stuck (velocity very low, not at target)
+        let dx_target = state.target_x - state.x;
+        let dy_target = state.target_y - state.y;
+        let dist_to_target = (dx_target * dx_target + dy_target * dy_target).sqrt();
+
+        if first_iteration {
+            prev_x = state.x;
+            prev_y = state.y;
+            first_iteration = false;
+        }
+
+        // --- PD Controller ---
+        let g = state.gravity;
+        let max_t = state.max_thrust;
+        let fuel = state.fuel;
+        let x = state.x;
+        let y = state.y;
+        let vx = state.vx;
+        let vy = state.vy;
+        let angle = state.angle;
+        let angular_vel = state.angular_vel;
+        let tx = state.target_x;
+        let ty = state.target_y;
+
+        // Horizontal control
+        let kp_h = 0.6;
+        let kd_h = 1.6;
+        let desired_ax = kp_h * dx_target - kd_h * vx;
+
+        // Vertical control - phase dependent
+        let dy = ty - y; // positive = target is below
+        let desired_ay;
+        let speed = (vx * vx + vy * vy).sqrt();
+
+        // Check if we need obstacle avoidance
+        let (obs_ax, obs_ay) = compute_obstacle_avoidance(&state, &obstacle_field);
+
+        let mut final_ax = desired_ax + obs_ax;
+        let final_ay_no_margin;
+
+        if dist_to_target < 5.0 && speed < 3.0 {
+            // Landing phase - very gentle
+            desired_ay = g + 0.4 * dy - 1.8 * vy;
+            final_ay_no_margin = desired_ay + obs_ay;
+        } else if dy > 30.0 {
+            // Far above target - descend with fuel margin
+            let descend_rate = (-dy / 3.5).max(-18.0).min(-2.0);
+            desired_ay = g + 0.5 * (descend_rate - vy);
+            final_ay_no_margin = desired_ay + obs_ay;
+        } else if dy > 5.0 {
+            // Medium distance
+            let descend_rate = (-dy / 3.0).max(-12.0).min(-1.5);
+            desired_ay = g + 0.6 * (descend_rate - vy);
+            final_ay_no_margin = desired_ay + obs_ay;
+        } else {
+            // Close to target height
+            desired_ay = g + 0.6 * dy - 2.0 * vy;
+            final_ay_no_margin = desired_ay + obs_ay;
+        }
+
+        // Fuel budgeting
+        let height_to_land = if dy > 0.0 { dy } else { 5.0 };
+        let fuel_needed_to_land = height_to_land / 3.0 + 3.0;
+        let fuel_margin = fuel - fuel_needed_to_land;
+
+        let desired_ay_final = if fuel_margin < 5.0 && fuel_margin > 0.0 {
+            // Reduce thrust to save fuel
+            let scale = 0.3 + 0.7 * (fuel_margin / 5.0).min(1.0);
+            g + (final_ay_no_margin - g) * scale
+        } else if fuel_margin <= 0.0 {
+            // Critical - only thrust if we're going too fast toward ground
+            if vy > 4.0 {
+                final_ay_no_margin.min(g + max_t * 0.5)
+            } else {
+                g // Freefall
+            }
+        } else {
+            final_ay_no_margin
+        };
+
+        // Compute desired angle from desired accelerations
+        // ax = max_t * sin(angle), ay = -max_t * cos(angle) + g
+        // => sin(angle) = ax/max_t, cos(angle) = (g - ay)/max_t
+        let thrust = (final_ax * final_ax + (desired_ay_final - g) * (desired_ay_final - g)).sqrt();
+        let target_angle = (final_ax).atan2(-(desired_ay_final - g));
+
+        // Clamp thrust
+        let thrust_frac = (thrust / max_t).clamp(0.0, 1.0);
+
+        // Angle PD control
+        let angle_error = normalize_angle(target_angle - angle);
+        let desired_angular_vel = 4.0 * angle_error - 3.0 * angular_vel;
+        let turn = desired_angular_vel.clamp(-1.0, 1.0);
+
+        // Safety: if very close to ground and moving too fast, emergency brake
+        let ground_check = check_ground_proximity(&state);
+        if ground_check < 8.0 && vy > 3.0 {
+            // Emergency: point straight up and thrust
+            let emergency_angle_error = normalize_angle(0.0 - angle);
+            let emergency_turn = (5.0 * emergency_angle_error - 3.0 * angular_vel).clamp(-1.0, 1.0);
+            let emergency_thrust = if emergency_angle_error.abs() < 0.3 {
+                ((vy * vy) / (2.0 * ground_check) + g) / max_t
+            } else {
+                0.3
+            };
+            let _ = writeln!(out, "{:.6} {:.6}", emergency_thrust.clamp(0.0, 1.0), emergency_turn);
+        } else {
+            let _ = writeln!(out, "{:.6} {:.6}", thrust_frac, turn);
+        }
+
+        out.flush().ok();
+        last_fuel = fuel;
+        prev_x = x;
+        prev_y = y;
+    }
+}
+
+fn normalize_angle(a: f64) -> f64 {
+    let mut a = a;
+    while a > PI { a -= 2.0 * PI; }
+    while a < -PI { a += 2.0 * PI; }
+    a
+}
+
+fn compute_obstacle_avoidance(state: &SharedState, _field: &Vec<(f64, f64)>) -> (f64, f64) {
+    if !state.has_obstacles || state.width == 0 || state.height == 0 {
+        return (0.0, 0.0);
+    }
+
+    let mut ax = 0.0;
+    let mut ay = 0.0;
+    let radius = 15.0;
+    let ix = state.x as i32;
+    let iy = state.y as i32;
+    let r = radius as i32;
+
+    // Check a grid of points around the lander for obstacles
+    // Use larger step for efficiency
+    let step = 2;
+    for dy in -r..=r step step {
+        for dx in -r..=r step step {
+            let cx = ix + dx;
+            let cy = iy + dy;
+            if cx < 0 || cy < 0 || cx >= state.width as i32 || cy >= state.height as i32 {
+                // Treat out of bounds as wall
+                let dist = ((dx * dx + dy * dy) as f64).sqrt().max(1.0);
+                if dist < radius {
+                    let strength = (1.0 - dist / radius).powi(2);
+                    ax -= (dx as f64 / dist) * strength * 8.0;
+                    ay -= (dy as f64 / dist) * strength * 8.0;
+                }
+                continue;
+            }
+            // We can't check the actual map here since we didn't store it
+            // Instead, use the distance fields if available
+            let idx = (cy as usize) * state.width + (cx as usize);
+            if idx < state.obstacle_clear.len() {
+                let clearance = state.obstacle_clear[idx];
+                if clearance < 8 {
+                    let dist = ((dx * dx + dy * dy) as f64).sqrt().max(1.0);
+                    let strength = (1.0 - clearance as f64 / 8.0).powi(2);
+                    ax -= (dx as f64 / dist) * strength * 6.0;
+                    ay -= (dy as f64 / dist) * strength * 6.0;
+                }
+            }
+        }
+    }
+
+    (ax, ay)
+}
+
+fn check_ground_proximity(state: &SharedState) -> f64 {
+    // Check how far below the lander is from the nearest surface
+    if state.width == 0 || state.height == 0 {
+        // No map data, estimate from target position
+        return (state.target_y - state.y).max(0.0);
+    }
+
+    let ix = state.x as usize;
+    if ix >= state.width {
+        return 10.0;
+    }
+
+    // Check obstacle_clear field below lander
+    if !state.obstacle_clear.is_empty() {
+        let mut min_dist = f64::MAX;
+        for dy in 0..30.min(state.height - state.y as usize) {
+            let cy = state.y as usize + dy;
+            let idx = cy * state.width + ix;
+            if idx < state.obstacle_clear.len() && state.obstacle_clear[idx] == 0 {
+                min_dist = dy as f64;
+                break;
+            }
+            // Also check adjacent columns
+            for &dx in &[0usize, 1] {
+                let cx = (ix + dx).min(state.width - 1);
+                let idx2 = cy * state.width + cx;
+                if idx2 < state.obstacle_clear.len() && state.obstacle_clear[idx2] == 0 {
+                    min_dist = min_dist.min(dy as f64);
+                    break;
+                }
+            }
+            if min_dist < f64::MAX { break; }
+        }
+        if min_dist < f64::MAX { return min_dist; }
+    }
+
+    // Fallback
+    (state.target_y - state.y).max(1.0)
+}
+
+fn compute_navigation_fields(state: &mut SharedState) {
+    let w = state.width;
+    let h = state.height;
+    if w == 0 || h == 0 { return; }
+
+    // We need to re-read the map from stdin isn't possible, so we'll compute
+    // based on what we know. Since we didn't store the map, we'll skip this
+    // for now and rely on local obstacle detection.
+    // Actually, we should have stored the map. Let's compute empty fields.
+
+    // Initialize obstacle_clear with max values (treat everything as clear)
+    state.obstacle_clear = vec![MAX_DIST_FIELD; w * h];
+    state.target_dist = vec![MAX_DIST_FIELD; w * h];
+}
+```
+
+Wait, I realize I have a fundamental problem: I'm not storing the map data, so I can't compute the distance fields or check for obstacles. Let me fix this properly.
+
+```rust
+use std::io::{self, BufRead, BufReader, Write, BufWriter};
+use std::sync::{Arc, Mutex};
+use std::collections::VecDeque;
+
+const PI: f64 = std::f64::consts::PI;
+const INF_DIST: u16 = 255;
+
+struct SharedState {
+    initialized: bool,
+    map_ready: bool,
+    gravity: f64,
+    max_thrust: f64,
+    target_x: f64,
+    target_y: f64,
+    width: usize,
+    height: usize,
+    x: f64,
+    y: f64,
+    vx: f64,
+    vy: f64,
+    angle: f64,
+    angular_vel: f64,
+    fuel: f64,
+    obstacle_map: Vec<bool>,  // true = obstacle
+    target_dist: Vec<u16>,    // BFS distance from target through free space
+}
+
+fn main() {
+    let stdout = io::stdout();
+    let mut out = BufWriter::new(stdout.lock());
+    let stdin_handle = io::stdin();
+    let reader = BufReader::new(stdin_handle.lock());
+
+    let shared = Arc::new(Mutex::new(SharedState {
+        initialized: false,
+        map_ready: false,
+        gravity: 0.0,
+        max_thrust: 0.0,
+        target_x: 0.0,
+        target_y: 0.0,
+        width: 0,
+        height: 0,
+        x: 0.0, y: 0.0, vx: 0.0, vy: 0.0,
+        angle: 0.0, angular_vel: 0.0, fuel: 0.0,
+        obstacle_map: Vec::new(),
+        target_dist: Vec::new(),
+    }));
+
+    let shared_reader = Arc::clone(&shared);
+    let shared_control = Arc::clone(&shared);
+
+    // === READER THREAD ===
+    std::thread::spawn(move || {
+        let mut lines = reader.lines();
+        let mut map_lines: Vec<String> = Vec::new();
+        let mut phase = 0u8;
+        let mut width = 0usize;
+        let mut height = 0usize;
+
+        loop {
+            match lines.next() {
+                Some(Ok(line)) => {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() { continue; }
+
+                    if phase == 0 {
+                        // Header: width height gravity max_thrust fuel
+                        let parts: Vec<f64> = trimmed.split_whitespace()
+                            .filter_map(|s| s.parse().ok())
+                            .collect();
+                        if parts.len() >= 5 {
+                            width = parts[0] as usize;
+                            height = parts[1] as usize;
+                            let mut s = shared_reader.lock().unwrap();
+                            s.width = width;
+                            s.height = height;
+                            s.gravity = parts[2];
+                            s.max_thrust = parts[3];
+                            // parts[4] is initial fuel - not needed separately
+                        }
+                        phase = 1;
+                    } else if phase == 1 {
+                        // Start/target line
+                        let parts: Vec<f64> = trimmed.split_whitespace()
+                            .filter_map(|s| s.parse().ok())
+                            .collect();
+                        if parts.len() >= 4 {
+                            let mut s = shared_reader.lock().unwrap();
+                            s.target_x = parts[2];
+                            s.target_y = parts[3];
+                        }
+                        phase = 2;
+                        map_lines.clear();
+                    } else if phase == 2 {
+                        // Map lines
+                        map_lines.push(trimmed.to_string());
+                        if map_lines.len() == height {
+                            // Process map and compute navigation
+                            let mut s = shared_reader.lock().unwrap();
+                            let w = s.width;
+                            let h = s.height;
+
+                            // Build obstacle map (downsampled if too large)
+                            let max_cells = 5_000_000;
+                            let scale = if w * h > max_cells {
+                                ((w * h) / max_cells).sqrt().ceil() as usize
+                            } else {
+                                1
+                            };
+                            let sw = (w + scale - 1) / scale;
+                            let sh = (h + scale - 1) / scale;
+
+                            let mut obs = vec![false; sw * sh];
+                            for (row_idx, line) in map_lines.iter().enumerate() {
+                                if row_idx >= h { break; }
+                                let sr = row_idx / scale;
+                                for (col_idx, ch) in line.chars().enumerate() {
+                                    if col_idx >= w { break; }
+                                    let sc = col_idx / scale;
+                                    if ch == '#' {
+                                        obs[sr * sw + sc] = true;
+                                    }
+                                }
+                            }
+
+                            s.obstacle_map = obs;
+                            s.width = sw; // Use scaled dimensions for nav
+                            s.height = sh;
+
+                            // BFS from target to compute target_dist
+                            let ti = (s.target_y as usize / scale).min(sh - 1);
+                            let tj = (s.target_x as usize / scale).min(sw - 1);
+                            let mut dist = vec![INF_DIST; sw * sh];
+
+                            if ti < sh && tj < sw && !s.obstacle_map[ti * sw + tj] {
+                                let mut queue = VecDeque::new();
+                                dist[ti * sw + tj] = 0;
+                                queue.push_back((ti, tj));
+
+                                while let Some((r, c)) = queue.pop_front() {
+                                    let d = dist[r * sw + c];
+                                    if d >= 60 { continue; } // Limit BFS range
+                                    for &(dr, dc) in &[(-1i32, 0i32), (1, 0), (0, -1), (0, 1),
+                                                        (-1, -1), (-1, 1), (1, -1), (1, 1)] {
+                                        let nr = r as i32 + dr;
+                                        let nc = c as i32 + dc;
+                                        if nr >= 0 && nr < sh as i32 && nc >= 0 && nc < sw as i32 {
+                                            let nr = nr as usize;
+                                            let nc = nc as usize;
+                                            let nidx = nr * sw + nc;
+                                            if !s.obstacle_map[nidx] && dist[nidx] == INF_DIST {
+                                                dist[nidx] = d + 1;
+                                                queue.push_back((nr, nc));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            s.target_dist = dist;
+                            s.map_ready = true;
+                            phase = 3;
+                            map_lines.clear();
+                        }
+                    } else {
+                        // State updates
+                        let parts: Vec<f64> = trimmed.split_whitespace()
+                            .filter_map(|s| s.parse().ok())
+                            .collect();
+                        if parts.len() >= 7 {
+                            let mut s = shared_reader.lock().unwrap();
+                            s.x = parts[0];
+                            s.y = parts[1];
+                            s.vx = parts[2];
+                            s.vy = parts[3];
+                            s.angle = parts[4];
+                            s.angular_vel = parts[5];
+                            s.fuel = parts[6];
+                            s.initialized = true;
+                        }
+                    }
+                }
+                _ => break,
+            }
+        }
+    });
+
+    // === CONTROL THREAD ===
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        let state = shared_control.lock().unwrap();
+        if !state.initialized { continue; }
+
+        let g = state.gravity;
+        let max_t = state.max_thrust;
+        let fuel = state.fuel;
+        let x = state.x;
+        let y = state.y;
+        let vx = state.vx;
+        let vy = state.vy;
+        let angle = state.angle;
+        let angular_vel = state.angular_vel;
+        let tx = state.target_x;
+        let ty = state.target_y;
+        let map_ready = state.map_ready;
+        let sw = state.width;
+        let sh = state.height;
+
+        let dx_t = tx - x;
+        let dy_t = ty - y;
+        let dist_to_target = (dx_t * dx_t + dy_t * dy_t).sqrt();
+        let speed = (vx * vx + vy * vy).sqrt();
+
+        // Obstacle avoidance force
+        let mut obs_ax = 0.0f64;
+        let mut obs_ay = 0.0f64;
+        let mut ground_clearance = 50.0f64;
+
+        if map_ready && !state.obstacle_map.is_empty() {
+            let scale = if sw > 0 && state.target_dist.len() == sw * sh {
+                1.0 // Already scaled
+            } else {
+                1.0
+            };
+
+            // Check nearby cells for obstacles
+            let ci = (y as i32).max(0).min(sh as i32 - 1) as usize;
+            let cj = (x as i32).max(0).min(sw as i32 - 1) as usize;
+            let radius = 20i32;
+
+            for dr in -radius..=radius {
+                for dc in -radius..=radius {
+                    let nr = ci as i32 + dr;
+                    let nc = cj as i32 + dc;
+                    if nr < 0 || nr >= sh as i32 || nc < 0 || nc >= sw as i32 {
+                        let dist = ((dr * dr + dc * dc) as f64).sqrt().max(1.0);
+                        if dist < radius as f64 {
+                            let strength = (1.0 - dist / radius as f64).powi(2) * 3.0;
+                            obs_ax -= (dc as f64 / dist) * strength;
+                            obs_ay -= (dr as f64 / dist) * strength;
+                        }
+                        continue;
+                    }
+                    let nr = nr as usize;
+                    let nc = nc as usize;
+                    let idx = nr * sw + nc;
+
+                    if state.obstacle_map[idx] {
+                        let dist = ((dr * dr + dc * dc) as f64).sqrt().max(1.0);
+                        if dist < radius as f64 {
+                            let strength = (1.0 - dist / radius as f64).powi(2) * 12.0;
+                            obs_ax -= (dc as f64 / dist) * strength;
+                            obs_ay -= (dr as f64 / dist) * strength;
+                        }
+                    }
+                }
+            }
+
+            // Check ground clearance (find closest obstacle below)
+            for dy in 0..50.min(sh - ci) {
+                let idx = (ci + dy) * sw + cj;
+                if idx < state.obstacle_map.len() && state.obstacle_map[idx] {
+                    ground_clearance = dy as f64;
+                    break;
+                }
+                // Check adjacent columns too
+                let mut found = false;
+                for &ddc in &[-1i32, 0, 1] {
+                    let nc2 = cj as i32 + ddc;
+                    if nc2 >= 0 && nc2 < sw as i32 {
+                        let idx2 = (ci + dy) * sw + nc2 as usize;
+                        if idx2 < state.obstacle_map.len() && state.obstacle_map[idx2] {
+                            ground_clearance = (dy as f64).min(ground_clearance);
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+                if found { break; }
+            }
+
+            // Navigation bias: if target_dist is high at our position, we need to navigate
+            let my_dist_idx = ci * sw + cj.min(sw - 1);
+            if my_dist_idx < state.target_dist.len() {
+                let my_target_dist = state.target_dist[my_dist_idx];
+                if my_target_dist > 5 {
+                    // Look for the gradient of target_dist (steepest descent)
+                    let mut best_grad_x = 0.0f64;
+                    let mut best_grad_y = 0.0f64;
+                    for &ddc in &[-2i32, -1, 1, 2] {
+                        let nc2 = cj as i32 + ddc;
+                        if nc2 >= 0 && nc2 < sw as i32 {
+                            let idx2 = ci * sw + nc2 as usize;
+                            if idx2 < state.target_dist.len() {
+                                let dd = state.target_dist[my_dist_idx] as i32 - state.target_dist[idx2] as i32;
+                                best_grad_x += dd as f64 * (ddc as f64).signum();
+                            }
+                        }
+                    }
+                    for &ddr in &[-2i32, -1, 1, 2] {
+                        let nr2 = ci as i32 + ddr;
+                        if nr2 >= 0 && nr2 < sh as i32 {
+                            let idx2 = nr2 as usize * sw + cj;
+                            if idx2 < state.target_dist.len() {
+                                let dd = state.target_dist[my_dist_idx] as i32 - state.target_dist[idx2] as i32;
+                                best_grad_y += dd as f64 * (ddr as f64).signum();
+                            }
+                        }
+                    }
+                    let grad_mag = (best_grad_x * best_grad_x + best_grad_y * best_grad_y).sqrt().max(1.0);
+                    let nav_strength = (my_target_dist as f64 * 0.3).min(6.0);
+                    obs_ax += best_grad_x / grad_mag * nav_strength;
+                    obs_ay += best_grad_y / grad_mag * nav_strength;
+                }
+            }
+        }
+
+        // === PD Controller ===
+        // Horizontal
+        let kp_h = 0.5;
+        let kd_h = 1.5;
+        let mut desired_ax = kp_h * dx_t - kd_h * vx;
+
+        // Vertical
+        let kp_v = 0.5;
+        let kd_v = 2.0;
+        let desired_vy;
+
+        if dist_to_target < 8.0 && speed < 4.0 {
+            // Final landing approach
+            desired_vy = 0.3 * dy_t; // Very gentle
+        } else if dy_t > 20.0 {
+            // Far above
+            desired_vy = (-dy_t / 4.0).max(-15.0).min(-3.0);
+        } else if dy_t > 0.0 {
+            // Above target
+            desired_vy = (-dy_t / 3.0).max(-10.0).min(-1.5);
+        } else {
+            // Below target - need to slow descent or ascend
+            desired_vy = dy_t * 0.5; // Positive = descend, so if dy_t<0, ascend
+        }
+
+        let mut desired_ay = g + kp_v * (desired_vy - vy) - kd_v * 0.0; // vy damping built in
+
+        // Actually, let me redo vertical control more carefully
+        desired_ay = g + 0.6 * (desired_vy - vy);
+
+        // Add obstacle forces
+        desired_ax += obs_ax;
+        desired_ay += obs_ay;
+
+        // Ground proximity safety
+        if ground_clearance < 10.0 && vy > 2.0 {
+            let brake_ay = g + vy * vy / (2.0 * ground_clearance.max(1.0)) * 1.2;
+            desired_ay = desired_ay.max(brake_ay);
+        }
+
+        // Fuel budgeting
+        let est_fuel_to_land = (dy_t.abs() / 3.0 + 5.0).max(3.0);
+        let fuel_margin = fuel - est_fuel_to_land;
+
+        if fuel_margin < 3.0 {
+            let scale = if fuel_margin < 0.0 {
+                0.0
+            } else {
+                0.2 + 0.8 * (fuel_margin / 3.0)
+            };
+            desired_ay = g + (desired_ay - g) * scale;
+            desired_ax *= scale;
+        }
+
+        // Compute target angle and thrust
+        let rel_ay = desired_ay - g; // Acceleration due to thrust (vertical component)
+        let target_angle = desired_ax.atan2(-rel_ay);
+        let thrust_needed = (desired_ax * desired_ax + rel_ay * rel_ay).sqrt();
+        let thrust_frac = (thrust_needed / max_t).clamp(0.0, 1.0);
+
+        // Angle control
+        let angle_err = normalize_angle(target_angle - angle);
+        let desired_av = 5.0 * angle_err - 4.0 * angular_vel;
+        let turn = desired_av.clamp(-1.0, 1.0);
+
+        // Emergency override
+        if ground_clearance < 5.0 && vy > 4.0 {
+            let emerg_angle_err = normalize_angle(0.0 - angle);
+            let emerg_turn = (6.0 * emerg_angle_err - 4.0 * angular_vel).clamp(-1.0, 1.0);
+            let emerg_thrust = if emerg_angle_err.abs() < 0.4 { 1.0 } else { 0.5 };
+            let _ = writeln!(out, "{:.6} {:.6}", emerg_thrust, emerg_turn);
+        } else if ground_clearance < 3.0 && vy > 2.0 {
+            let _ = writeln!(out, "1.0 0.0");
+        } else {
+            let _ = writeln!(out, "{:.6} {:.6}", thrust_frac, turn);
+        }
+
+        drop(state);
+        let _ = out.flush();
+    }
+}
+
+fn normalize_angle(a: f64) -> f64 {
+    let mut a = a;
+    while a > PI { a -= 2.0 * PI; }
+    while a < -PI { a += 2.0 * PI; }
+    a
+}
+```
+
+Hmm, I have an issue with the obstacle map check loop. The `for dr in -radius..=radius` loop runs 41*41 = 1681 iterations per control step at 20Hz which is fine. But wait, I'm doing `for dr in -radius..=radius step step` but I didn't define `step` properly. Also the loop is very hot.
+
+Actually wait, there's a bigger issue. The `for dr in -radius..=radius` nested loop runs inside a mutex lock, which could be slow. Let me think about this differently.
+
+Actually, 1681 iterations is nothing. The issue is more that I'm holding the mutex lock while doing all these computations AND writing to stdout. Let me restructure to copy the state, release the lock, then compute and write.
+
+Also, I realized I have a bug: the obstacle map loop uses `step` syntax incorrectly for range. In Rust, range step is `.step_by()` on the iterator, but I can also just use a regular loop.
+
+Let me also think about the map storage more carefully. If the map is multi-GB, I can't store it all in memory. I should only store a downsampled version. But even 5000x2500 downsampled by 4 = 1250x625 = ~780K cells, which is fine.
+
+Actually, for multi-GB maps at 1 byte per cell, that's billions of cells. I need aggressive downsampling. Let me cap the nav grid at something reasonable.
+
+Let me also reconsider my control law. The current one might not work well because:
+1. The horizontal and vertical controllers are coupled through the angle
+2. I need to make sure the desired angle and thrust are physically achievable
+3. The fuel budgeting needs to be more careful
+
+Let me rewrite with a cleaner architecture:
+
+```rust
+use std::io::{self, BufRead, BufReader, Write, BufWriter};
+use std::sync::{Arc, Mutex};
+use std::collections::VecDeque;
+
+const PI: f64 = std::f64::consts::PI;
+const INF_DIST: u16 = 200;
+
+struct MapData {
+    width: usize,       // Scaled width
+    height: usize,      // Scaled height
+    scale: usize,       // Downscaling factor
+    obstacles: Vec<bool>,
+    nav_dist: Vec<u16>, // BFS distance to target through free space
+}
+
+struct State {
+    x: f64, y: f64, vx: f64, vy: f64,
+    angle: f64, angular_vel: f64, fuel: f64,
+}
+
+struct Shared {
+    map: Option<MapData>,
+    state: Option<State>,
+    gravity: f64,
+    max_thrust: f64,
+    target_x: f64,
+    target_y: f64,
+}
+
+fn main() {
+    let stdout = io::stdout();
+    let mut out = BufWriter::new(stdout.lock());
+
+    let shared = Arc::new(Mutex::new(Shared {
+        map: None,
+        state: None,
+        gravity: 0.0,
+        max_thrust: 0.0,
+        target_x: 0.0,
+        target_y: 0.0,
+    }));
+
+    // Spawn reader thread
+    let sr = Arc::clone(&shared);
+    std::thread::spawn(move || {
+        let stdin = io::stdin();
+        let mut reader = BufReader::new(stdin.lock());
+        let mut line = String::new();
+        let mut phase = 0u8;
+        let mut width = 0usize;
+        let mut height = 0usize;
+        let mut map_lines: Vec<String> = Vec::new();
+
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(_) => break,
+            }
+            let trimmed = line.trim();
+            if trimmed.is_empty() { continue; }
+
+            if phase == 0 {
+                // Header
+                let p: Vec<f64> = trimmed.split_whitespace()
+                    .filter_map(|s| s.parse().ok()).collect();
+                if p.len() >= 5 {
+                    let mut g = sr.lock().unwrap();
+                    width = p[0] as usize;
+                    height = p[1] as usize;
+                    g.gravity = p[2];
+                    g.max_thrust = p[3];
+                }
+                phase = 1;
+            } else if phase == 1 {
+                // Start/target
+                let p: Vec<f64> = trimmed.split_whitespace()
+                    .filter_map(|s| s.parse().ok()).collect();
+                if p.len() >= 4 {
+                    let mut g = sr.lock().unwrap();
+                    g.target_x = p[2];
+                    g.target_y = p[3];
+                }
+                phase = 2;
+            } else if phase == 2 {
+                // Map rows
+                map_lines.push(trimmed.to_string());
+                if map_lines.len() >= height {
+                    // Process map
+                    let max_nav_cells = 2_000_000;
+                    let total = width * height;
+                    let scale = if total > max_nav_cells {
+                        ((total + max_nav_cells - 1) / max_nav_cells).sqrt().ceil() as usize
+                    } else {
+                        1
+                    };
+                    let sw = (width + scale - 1) / scale;
+                    let sh = (height + scale - 1) / scale;
+
+                    let mut obstacles = vec![false; sw * sh];
+                    for (ri, row) in map_lines.iter().enumerate().take(height) {
+                        let sr = ri / scale;
+                        for (ci, ch) in row.chars().enumerate().take(width) {
+                            if ch == '#' {
+                                let sc = ci / scale;
+                                obstacles[sr * sw + sc] = true;
+                            }
+                        }
+                    }
+
+                    // BFS from target
+                    let g = sr.lock().unwrap();
+                    let ti = (g.target_y as usize / scale).min(sh - 1);
+                    let tj = (g.target_x as usize / scale).min(sw - 1);
+                    drop(g);
+
+                    let mut nav_dist = vec![INF_DIST; sw * sh];
+                    let mut queue = VecDeque::new();
+                    if ti < sh && tj < sw && !obstacles[ti * sw + tj] {
+                        nav_dist[ti * sw + tj] = 0;
+                        queue.push_back((ti, tj));
+                        while let Some((r, c)) = queue.pop_front() {
+                            let d = nav_dist[r * sw + c];
+                            for &(dr, dc) in &[(-1i32,0i32),(1,0),(0,-1),(0,1),(-1,-1),(-1,1),(1,-1),(1,1)] {
+                                let nr = r as i32 + dr;
+                                let nc = c as i32 + dc;
+                                if nr >= 0 && nr < sh as i32 && nc >= 0 && nc < sw as i32 {
+                                    let nr = nr as usize;
+                                    let nc = nc as usize;
+                                    let ni = nr * sw + nc;
+                                    if !obstacles[ni] && nav_dist[ni] == INF_DIST {
+                                        nav_dist[ni] = d + 1;
+                                        queue.push_back((nr, nc));
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    let mut g = sr.lock().unwrap();
+                    g.map = Some(MapData {
+                        width: sw, height: sh, scale,
+                        obstacles, nav_dist,
+                    });
+                    drop(g);
+                    phase = 3;
+                    map_lines.clear();
+                }
+            } else {
+                // State updates
+                let p: Vec<f64> = trimmed.split_whitespace()
+                    .filter_map(|s| s.parse().ok()).collect();
+                if p.len() >= 7 {
+                    let mut g = sr.lock().unwrap();
+                    g.state = Some(State {
+                        x: p[0], y: p[1], vx: p[2], vy: p[3],
+                        angle: p[4], angular_vel: p[5], fuel: p[6],
+                    });
+                }
+            }
+        }
+    });
+
+    // Control loop
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        let (state, map, gravity, max_thrust, target_x, target_y) = {
+            let g = shared.lock().unwrap();
+            let s = match &g.state {
+                Some(s) => s,
+                None => continue,
+            };
+            (s.clone(), g.map.as_ref().map(|m| m.clone()), g.gravity, g.max_thrust, g.target_x, g.target_y)
+            // Note: MapData doesn't derive Clone... need to fix
+        };
+
+        // ... compute control ...
+    }
+}
+```
+
+OK I need MapData to be clonable, or better yet, use Arc. Let me just use `Arc<MapData>` and clone the arc.
+
+Actually, let me simplify. I'll wrap the map in Arc and the control loop can just read from it. Since the map is written once and read many times, this is safe.
+
+Let me just write the final clean version now. I'll be more careful this time.
+
+Key insight: for the control law, I should use a well-tuned PD controller that handles the coupling between horizontal and vertical motion properly. The main challenge is:
+
+1. When far from target, navigate to a position above the target
+2. When above target, descend slowly
+3. When close, reduce all velocities for soft landing
+
+The angle control needs to be responsive but not oscillate. Let me use a critically damped response.
+
+For the target angle computation:
+- desired_ax = Kp_h * (target_x - x) + Kd_h * (0 - vx) + obstacle_avoidance_x
+- desired_ay = gravity + Kp_v * (desired_vy - vy) + obstacle_avoidance_y
+  where desired_vy depends on the phase
+
+Then:
+- target_angle = atan2(desired_ax, -(desired_ay - gravity))
+- thrust_magnitude = sqrt(desired_ax^2 + (desired_ay - gravity)^2)
+
+Let me finalize the code now.
+
+```rust
+use std::io::{self, BufRead, BufReader, Write, BufWriter};
+use std::sync::{Arc, Mutex};
+use std::collections::VecDeque;
+
+const PI: f64 = std::f64::consts::PI;
+
+struct MapData {
+    width: usize,
+    height: usize,
+    scale: usize,
+    obstacles: Vec<bool>,
+    nav_dist: Vec<u16>,
+}
+
+struct Snapshot {
+    x: f64, y: f64, vx: f64, vy: f64,
+    angle: f64, angular_vel: f64, fuel: f64,
+    gravity: f64, max_thrust: f64, target_x: f64, target_y: f64,
+    map: Option<Arc<MapData>>,
+}
+
+fn main() {
+    let stdout = io::stdout();
+    let mut out = BufWriter::new(stdout.lock());
+
+    let map_arc: Arc<Mutex<Option<Arc<MapData>>>> = Arc::new(Mutex::new(None));
+    let state_arc: Arc<Mutex<Option<Snapshot>>> = Arc::new(Mutex::new(None));
+    let params_arc: Arc<Mutex<(f64, f64, f64, f64)>> = Arc::new(Mutex::new((0.0, 0.0, 0.0, 0.0)));
+
+    // Reader thread
+    let r_map = Arc::clone(&map_arc);
+    let r_state = Arc::clone(&state_arc);
+    let r_params = Arc::clone(&params_arc);
+    
+    std::thread::spawn(move || {
+        let stdin = io::stdin();
+        let mut reader = BufReader::new(stdin.lock());
+        let mut line = String::new();
+        let mut phase = 0u8;
+        let mut width = 0usize;
+        let mut height = 0usize;
+        let mut map_lines: Vec<String> = Vec::new();
+
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                _ => {}
+            }
+            let trimmed = line.trim();
+            if trimmed.is_empty() { continue; }
+
+            match phase {
+                0 => {
+                    let p: Vec<f64> = trimmed.split_whitespace()
+                        .filter_map(|s| s.parse().ok()).collect();
+                    if p.len() >= 4 {
+                        width = p[0] as usize;
+                        height = p[1] as usize;
+                        *r_params.lock().unwrap() = (p[2], p[3], 0.0, 0.0);
+                    }
+                    phase = 1;
+                }
+                1 => {
+                    let p: Vec<f64> = trimmed.split_whitespace()
+                        .filter_map(|s| s.parse().ok()).collect();
+                    if p.len() >= 4 {
+                        let mut params = r_params.lock().unwrap();
+                        params.2 = p[2]; // target_x
+                        params.3 = p[3]; // target_y
+                    }
+                    phase = 2;
+                }
+                2 => {
+                    map_lines.push(trimmed.to_string());
+                    if map_lines.len() >= height {
+                        // Process map
+                        let max_cells = 2_000_000;
+                        let total = width.saturating_mul(height);
+                        let scale = if total > max_cells {
+                            ((total + max_cells - 1) / max_cells) as usize
+                        } else {
+                            1
+                        };
+                        // Actually compute proper scale
+                        let scale = if total <= max_cells { 1 } else {
+                            let mut s = 2;
+                            while (width/s) * (height/s) > max_cells { s += 1; }
+                            s
+                        };
+                        let sw = (width + scale - 1) / scale;
+                        let sh = (height + scale - 1) / scale;
+
+                        let mut obstacles = vec![false; sw * sh];
+                        for (ri, row) in map_lines.iter().enumerate().take(height) {
+                            let sr = ri / scale;
+                            for (ci, ch) in row.chars().enumerate().take(width) {
+                                if ch == '#' {
+                                    let sc = ci / scale;
+                                    obstacles[sr * sw + sc] = true;
+                                }
+                            }
+                        }
+
+                        let params = r_params.lock().unwrap();
+                        let tx = params.2;
+                        let ty = params.3;
+                        drop(params);
+
+                        let ti = ((ty as usize) / scale).min(sh.saturating_sub(1));
+                        let tj = ((tx as usize) / scale).min(sw.saturating_sub(1));
+
+                        let mut nav_dist = vec![200u16; sw * sh];
+                        if ti < sh && tj < sw && !obstacles[ti * sw + tj] {
+                            let mut queue = VecDeque::with_capacity(sw * sh / 4);
+                            nav_dist[ti * sw + tj] = 0;
+                            queue.push_back((ti, tj));
+                            while let Some((r, c)) = queue.pop_front() {
+                                let d = nav_dist[r * sw + c];
+                                for &(dr, dc) in &[(-1i32,0i32),(1,0),(0,-1),(0,1),(-1,-1),(-1,1),(1,-1),(1,1)] {
+                                    let nr = r as i32 + dr;
+                                    let nc = c as i32 + dc;
+                                    if nr >= 0 && nr < sh as i32 && nc >= 0 && nc < sw as i32 {
+                                        let nr = nr as usize;
+                                        let nc = nc as usize;
+                                        let ni = nr * sw + nc;
+                                        if !obstacles[ni] && nav_dist[ni] == 200 {
+                                            nav_dist[ni] = d + 1;
+                                            queue.push_back((nr, nc));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        *r_map.lock().unwrap() = Some(Arc::new(MapData {
+                            width: sw, height: sh, scale, obstacles, nav_dist,
+                        }));
+                        phase = 3;
+                        map_lines.clear();
+                    }
+                }
+                _ => {
+                    let p: Vec<f64> = trimmed.split_whitespace()
+                        .filter_map(|s| s.parse().ok()).collect();
+                    if p.len() >= 7 {
+                        let params = r_params.lock().unwrap();
+                        let (gravity, max_thrust, target_x, target_y) = *params;
+                        drop(params);
+                        let map = r_map.lock().unwrap().clone();
+                        *r_state.lock().unwrap() = Some(Snapshot {
+                            x: p[0], y: p[1], vx: p[2], vy: p[3],
+                            angle: p[4], angular_vel: p[5], fuel: p[6],
+                            gravity, max_thrust, target_x, target_y, map,
+                        });
+                    }
+                }
+            }
+        }
+    });
+
+    // Control loop
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(12));
+
+        let snap = {
+            match state_arc.lock().unwrap().take() {
+                Some(s) => s,
+                None => continue,
+            }
+        };
+
+        let (thrust, turn) = compute_control(&snap);
+        let _ = writeln!(out, "{:.6} {:.6}", thrust, turn);
+        let _ = out.flush();
+    }
+}
+
+fn normalize_angle(a: f64) -> f64 {
+    let mut a = a;
+    while a > PI { a -= 2.0 * PI; }
+    while a < -PI { a += 2.0 * PI; }
+    a
+}
+
+fn compute_control(s: &Snapshot) -> (f64, f64) {
+    let g = s.gravity;
+    let max_t = s.max_thrust;
+    let fuel = s.fuel;
+    let (x, y, vx, vy) = (s.x, s.y, s.vx, s.vy);
+    let angle = s.angle;
+    let angular_vel = s.angular_vel;
+    let (tx, ty) = (s.target_x, s.target_y);
+
+    let dx = tx - x;
+    let dy = ty - y;
+    let dist = (dx * dx + dy * dy).sqrt();
+    let speed = (vx * vx + vy * vy).sqrt();
+
+    // --- Obstacle avoidance and navigation ---
+    let (mut nav_ax, mut nav_ay, ground_clear) = compute_navigation(s);
+
+    // --- Determine desired velocities ---
+    let desired_vx;
+    let desired_vy;
+
+    if dist < 5.0 && speed < 3.0 {
+        // Final landing
+        desired_vx = dx * 0.3;
+        desired_vy = dy * 0.3;
+    } else {
+        // Navigate toward target
+        let max_h_speed = 8.0;
+        let max_v_speed = 10.0;
+
+        desired_vx = (dx * 0.5).clamp(-max_h_speed, max_h_speed);
+
+        // Vertical: descend toward target, but control rate
+        if dy > 20.0 {
+            desired_vy = (dy * 0.2).clamp(-max_v_speed, -2.0);
+        } else if dy > 5.0 {
+            desired_vy = (dy * 0.3).clamp(-8.0, -1.0);
+        } else if dy > 0.0 {
+            desired_vy = dy * 0.4;
+        } else {
+            // Above target (dy < 0)
+            desired_vy = (dy * 0.3).clamp(-3.0, 3.0);
+        }
+
+        // Slow down as we approach horizontally
+        let h_dist = dx.abs();
+        if h_dist < 20.0 {
+            desired_vx *= h_dist / 20.0;
+        }
+    }
+
+    // --- Compute desired accelerations ---
+    let kp = 0.8;
+    let kd = 2.0;
+    let mut desired_ax = kp * (desired_vx - vx) + nav_ax;
+    let mut desired_ay = g + kp * (desired_vy - vy) + nav_ay;
+
+    // Ground proximity braking
+    if ground_clear < 15.0 && vy > 2.0 {
+        let brake_ay = g + (vy * vy) / (2.0 * ground_clear.max(0.5)) * 1.5;
+        desired_ay = desired_ay.max(brake_ay);
+    }
+    if ground_clear < 5.0 && vy > 1.5 {
+        desired_ay = desired_ay.max(g + max_t * 0.9);
+        desired_ax *= 0.2; // Focus on braking
+    }
+
+    // Fuel budgeting
+    let h_to_land = dy.max(5.0);
+    let fuel_needed = h_to_land / 3.0 + 3.0;
+    let fuel_margin = fuel - fuel_needed;
+    if fuel_margin < 3.0 {
+        let scale = if fuel_margin < 0.0 { 0.05 } else { 0.15 + 0.85 * (fuel_margin / 3.0) };
+        desired_ax *= scale;
+        desired_ay = g + (desired_ay - g) * scale;
+    }
+
+    // --- Convert to angle + thrust ---
+    let rel_ax = desired_ax;
+    let rel_ay = desired_ay - g; // Thrust vertical component
+    let target_angle = rel_ax.atan2(-rel_ay);
+    let thrust_mag = (rel_ax * rel_ax + rel_ay * rel_ay).sqrt();
+    let thrust_frac = (thrust_mag / max_t).clamp(0.0, 1.0);
+
+    // --- Angle PD control ---
+    let angle_err = normalize_angle(target_angle - angle);
+    let desired_av = 6.0 * angle_err - 4.5 * angular_vel;
+    let turn = desired_av.clamp(-1.0, 1.0);
+
+    (thrust_frac, turn)
+}
+
+fn compute_navigation(s: &Snapshot) -> (f64, f64, f64) {
+    let mut nav_ax = 0.0;
+    let mut nav_ay = 0.0;
+    let mut ground_clear = 100.0;
+
+    let map = match &s.map {
+        Some(m) => m,
+        None => return (0.0, 0.0, 100.0),
+    };
+
+    let sw = map.width;
+    let sh = map.height;
+    let scale = map.scale;
+
+    let ci = (s.y as usize / scale).min(sh.saturating_sub(1));
+    let cj = (s.x as usize / scale).min(sw.saturating_sub(1));
+
+    // Obstacle repulsion
+    let radius = 15i32;
+    for dr in -radius..=radius {
+        for dc in -radius..=radius {
+            let nr = ci as i32 + dr;
+            let nc = cj as i32 + dc;
+            if nr < 0 || nr >= sh as i32 || nc < 0 || nc >= sw as i32 {
+                let d = ((dr * dr + dc * dc) as f64).sqrt().max(1.0);
+                if d < radius as f64 {
+                    let str = (1.0 - d / radius as f64).powi(2) * 4.0;
+                    nav_ax -= (dc as f64 / d) * str;
+                    nav_ay -= (dr as f64 / d) * str;
+                }
+                continue;
+            }
+            let nr = nr as usize;
+            let nc = nc as usize;
+            if map.obstacles[nr * sw + nc] {
+                let d = ((dr * dr + dc * dc) as f64).sqrt().max(1.0);
+                if d < radius as f64 {
+                    let str = (1.0 - d / radius as f64).powi(2) * 15.0;
+                    nav_ax -= (dc as f64 / d) * str;
+                    nav_ay -= (dr as f64 / d) * str;
+                }
+            }
+        }
+    }
+
+    // Navigation gradient (follow decreasing target_dist)
+    let my_idx = ci * sw + cj;
+    if my_idx < map.nav_dist.len() && map.nav_dist[my_idx] > 3 {
+        let mut gx = 0.0f64;
+        let mut gy = 0.0f64;
+        for &dc in &[-2i32, -1, 1, 2] {
+            let nc = cj as i32 + dc;
+            if nc >= 0 && nc < sw as i32 {
+                let ni = ci * sw + nc as usize;
+                let dd = map.nav_dist[my_idx] as i32 - map.nav_dist[ni] as i32;
+                gx += dd as f64 * dc.signum() as f64;
+            }
+        }
+        for &dr in &[-2i32, -1, 1, 2] {
+            let nr = ci as i32 + dr;
+            if nr >= 0 && nr < sh as i32 {
+                let ni = nr as usize * sw + cj;
+                let dd = map.nav_dist[my_idx] as i32 - map.nav_dist[ni] as i32;
+                gy += dd as f64 * dr.signum() as f64;
+            }
+        }
+        let gm = (gx * gx + gy * gy).sqrt().max(0.001);
+        let nav_str = (map.nav_dist[my_idx] as f64 * 0.2).min(5.0);
+        nav_ax += gx / gm * nav_str;
+        nav_ay += gy / gm * nav_str;
+    }
+
+    // Ground clearance
+    for dy in 0..80.min(sh - ci) {
+        let idx = (ci + dy) * sw + cj;
+        if idx < map.obstacles.len() && map.obstacles[idx] {
+            ground_clear = dy as f64 * scale as f64;
+            break;
+        }
+    }
+
+    (nav_ax, nav_ay, ground_clear)
+}
+```
+
+Wait, I just realized that my `Snapshot` struct includes `Option<Arc<MapData>>` which means I'm trying to clone an Arc every time the state updates. That's actually fine - cloning an Arc is just incrementing a reference count.
+
+But there's an issue: I'm using `take()` on the state mutex, which means I remove the state. If the control loop doesn't run fast enough, the reader thread will put in a new state, and then the control thread takes it. That should be fine - we always get the latest state.
+
+Let me also make sure the map processing handles the case where the map is very large. For maps > 2M cells, I downsample. The scale computation needs to be correct.
+
+Also, I should handle the case where the initial map might not have any obstacles - in that case, the BFS from target will just fill everything with small distances, and the navigation won't add any force.
+
+Let me also think about edge cases:
+1. Lander starts very close to target - should just land gently
+2. Lander starts far from target with obstacles - needs to navigate
+3. Very low fuel - need to be extremely conservative
+4. Lander starts below target (dy < 0) - need to ascend
+
+Let me trace through the control law for a simple case:
+- Start at (50, 10), target at (50, 90), no obstacles, gravity = 2.0, max_thrust = 4.0
+- dx = 0, dy = 80 (target is below)
+- desired_vx = 0
+- desired_vy = 80 * 0.2 = 16 → clamped to -10 → wait, that's wrong
+- dy > 20: desired_vy = (80 * 0.2).clamp(-10, -2) = -10
+
+Wait, dy = 80 (target is 80m below), so desired_vy should be positive (moving downward). But I wrote `.clamp(-max_v_speed, -2.0)` which would make it negative (moving upward). That's wrong!
+
+The issue is that dy = ty - y. If target is below, ty > y, so dy > 0. We want to move downward, so desired_vy > 0. My code has the clamp wrong.
+
+Let me fix:
+- dy > 20: desired_vy = (dy * 0.2).clamp(2.0, max_v_speed) → positive, moving down
+
+And for the vertical control, I want:
+- desired_ay = g + kp * (desired_vy - vy)
+- If desired_vy > vy (want to go down faster), desired_ay > g (need more downward accel)
+- If desired_vy < vy (going down too fast), desired_ay < g (need to slow descent)
+
+Wait, that's also wrong. Let me think again.
+
+vy > 0 means moving downward. gravity = +g means accelerating downward.
+
+If I want to descend at desired_vy = 5 m/s and currently vy = 0:
+- I need to accelerate downward to reach vy = 5
+- desired_ay = g + kp * (5 - 0) = g + kp * 5
+- Since g is already pulling down, this means I need more downward acceleration? No, that would make me go faster than desired.
+
+Wait no. Let me think about this more carefully.
+
+The equation of motion: dvy/dt = g - T*cos(angle)
+
+If the lander is pointing straight up (angle=0), then:
+- dvy/dt = g - T
+- If T = 0: dvy/dt = g (free fall, accelerating downward)
+- If T = g: dvy/dt = 0 (hovering)
+- If T > g: dvy/dt < 0 (decelerating / moving upward)
+
+So if I want to descend at a constant rate (desired_vy > 0, say 5 m/s):
+- I need dvy/dt = 0 when vy = desired_vy
+- T = g (hovering thrust)
+
+If I want to descend faster (desired_vy > vy):
+- I need dvy/dt > 0
+- T < g
+
+If I want to descend slower (desired_vy < vy):
+- I need dvy/dt < 0
+- T > g
+
+So the desired acceleration in the y direction is:
+- desired_ay = dvy/dt_desired = kp * (desired_vy - vy)
+- From the physics: dvy/dt = g + thrust_y
+  where thrust_y = -T*cos(angle) (thrust pushes upward when angle=0)
+- So: g + thrust_y = desired_ay
+- thrust_y = desired_ay - g = kp * (desired_vy - vy) - g... no wait
+
+Let me be very precise. The physics says:
+- ay (acceleration in y, positive downward) = gravity + thrust contribution in y
+- thrust contribution in y = -max_thrust * fraction * cos(angle)
+  (negative because thrust pushes opposite to facing direction, and facing up means thrust is upward = negative y)
+
+So: ay = g - T * cos(angle)
+
+I want: ay = desired_ay
+
+If I want to maintain a desired velocity, I need:
+desired_ay = kp * (desired_vy - vy)
+
+So: T * cos(angle) = g - desired_ay = g - kp * (desired_vy - vy)
+
+For hovering (desired_vy = vy): T * cos(angle) = g → T = g / cos(angle) ≈ g (when angle ≈ 0)
+
+For descending faster (desired_vy > vy): T * cos(angle) = g - kp * (desired_vy - vy) < g → less thrust
+
+For descending slower (desired_vy < vy): T * cos(angle) > g → more thrust
+
+OK so the desired thrust in y direction is: T_y = g - kp * (desired_vy - vy)
+
+And the desired thrust in x direction: T_x = -kp_h * (desired_vx - vx)
+Wait, let me think about x too.
+
+ax = T * sin(angle) (when angle > 0, thrust pushes right = positive x)
+For desired ax: T * sin(angle) = desired_ax = kp * (desired_vx - vx)
+
+So:
+- T * sin(angle) = kp * (desired_vx - vx)
+- T * cos(angle) = g - kp * (desired_vy - vy)
+
+T = sqrt(T_sin^2 + T_cos^2)
+angle = atan2(T_sin, T_cos)
+
+Wait but T here is max_thrust * fraction, and we need to ensure fraction ≤ 1.
+
+Let me reformulate:
+- desired_thrust_x = kp * (desired_vx - vx)  // This is the desired horizontal force per unit mass
+- desired_thrust_y = g - kp * (desired_vy - vy)  // This is the desired upward thrust per unit mass
+
+Wait, that's not right either. Let me be super careful.
+
+The equations of motion:
+- ax = T_frac * max_thrust * sin(angle)
+- ay = g - T_frac * max_thrust * cos(angle)
+
+where T_frac is the thrust fraction [0, 1] and angle is measured from vertical (up), positive clockwise.
+
+If I want desired_ax and desired_ay:
+- T_frac * max_thrust * sin(angle) = desired_ax
+- g - T_frac * max_thrust * cos(angle) = desired_ay
+  → T_frac * max_thrust * cos(angle) = g - desired_ay
+
+So:
+- horizontal_thrust = desired_ax
+- vertical_thrust = g - desired_ay (upward thrust needed)
+
+target_angle = atan2(desired_ax, g - desired_ay)
+thrust_magnitude = sqrt(desired_ax^2 + (g - desired_ay)^2)
+T_frac = thrust_magnitude / max_thrust
+
+Now, what should desired_ay be?
+
+If I want the lander to approach desired_vy:
+desired_ay = kp_v * (desired_vy - vy) + g  ... no wait
+
+Actually let me define it differently. I want:
+ay = desired_ay_total
+
+where desired_ay_total includes gravity. So from the PD:
+desired_ay_total = g + kp * (desired_vy - vy)
+
+Wait, no. If I'm at the desired velocity (vy = desired_vy), I want ay = g (hovering thrust). So:
+- When vy = desired_vy: ay = g → T_frac * max_thrust = g/cos(angle) ≈ g
+- When vy < desired_vy (going down too slowly): want ay > g → less thrust... no
+
+Hmm, let me think about this with concrete numbers.
+
+Say desired_vy = 5 (want to go down at 5 m/s), current vy = 0 (stationary):
+- I need to accelerate downward: ay > g
+- desired_ay = g + kp * (5 - 0) = g + 5*kp
+- Since desired_ay > g, I need T_frac * max_thrust * cos(angle) = g - desired_ay < 0
+  This means cos(angle) < 0, which means angle > π/2. That means pointing downward.
+  
+But that doesn't make sense for normal descent. If I want to descend at 5 m/s, I should briefly reduce thrust to start falling, then increase thrust back to g to maintain the descent rate.
+
+Oh I see the issue. I was confusing desired_ay (total acceleration including gravity) with the thrust component.
+
+Let me redo this properly. The desired total vertical acceleration should be:
+desired_ay = kp * (desired_vy - vy)
+
+This is the total acceleration I want (including gravity). If desired_vy = 5, vy = 0:
+desired_ay = kp * 5 > 0 → I want to accelerate downward
+
+The physics gives: ay = g - T_frac * max_thrust * cos(angle)
+So: g - T_frac * max_thrust * cos(angle) = kp * (desired_vy - vy)
+T_frac * max_thrust * cos(angle) = g - kp * (desired_vy - vy)
+
+For hovering (vy = desired_vy = 0):
+T_frac * max_thrust * cos(angle) = g → correct
+
+For wanting to descend faster:
+T_frac * max_thrust * cos(angle) = g - kp * (desired_vy - vy) < g → less upward thrust → correct
+
+For wanting to slow descent (vy > desired_vy):
+T_frac * max_thrust * cos(angle) = g + kp * (vy - desired_vy) > g → more upward thrust → correct
+
+OK so now I have:
+- thrust_x_component = desired_ax = kp_h * (desired_vx - vx)
+- thrust_y_component = g - kp_v * (desired_vy - vy)  // This is the upward thrust
+
+Wait, let me re-derive:
+desired_ax_total = kp_h * (desired_vx - vx)  // Total desired horizontal acceleration
+desired_ay_total = kp_v * (desired_vy - vy)  // Total desired vertical acceleration
+
+From physics:
+ax = T_frac * max_thrust * sin(angle)
+ay = g - T_frac * max_thrust * cos(angle)
+
+So:
+T_frac * max_thrust * sin(angle) = desired_ax_total
+T_frac * max_thrust * cos(angle) = g - desired_ay_total
+
+target_angle = atan2(desired_ax_total, g - desired_ay_total)
+thrust_magnitude = sqrt(desired_ax_total^2 + (g - desired_ay_total)^2)
+T_frac = thrust_magnitude / max_thrust
+
+This looks right! Let me verify with the hovering case:
+desired_vx = 0, vx = 0 → desired_ax_total = 0
+desired_vy = 0, vy = 0 → desired_ay_total = 0
+
+target_angle = atan2(0, g) = 0 (pointing up) ✓
+thrust = sqrt(0 + g^2) = g
+T_frac = g / max_thrust ✓
+
+And for wanting to go right (desired_vx > 0, vx = 0):
+desired_ax_total = kp * desired_vx > 0
+target_angle = atan2(positive, g) > 0 (tilting right) ✓
+
+And for wanting to slow descent (vy = 10, desired_vy = 3):
+desired_ay_total = kp * (3 - 10) = -7*kp < 0
+g - desired_ay_total = g + 7*kp > g → more upward thrust ✓
+
+Great, this formulation is correct. Let me now write the final code with this proper control law.
+
+Also, I should add damping to the acceleration control (derivative term on velocity is already there via the PD on velocity, but I should also consider the angular velocity damping).
+
+Let me also think about what happens when thrust_magnitude > max_thrust. In this case, I should prioritize:
+1. Vertical deceleration (avoid crashing)
+2. Horizontal correction
+
+Actually, the simple approach of clamping T_frac to [0, 1] and accepting the resulting angle works OK in practice. The lander will just not achieve the desired acceleration in some directions, but it will try its best.
+
+OK let me write the final version. I'll be careful about the sign conventions and make sure everything is correct.
+
+One more thing: the `step` issue in the for loop. In Rust, `for i in -r..=r step s` is not valid syntax. I need to use `for i in (-r..=r).step_by(s)` but that only works for signed ranges in some cases. Actually, `(0..=2*r).map(|i| i as i32 - r).step_by(s)` would work. But for simplicity, I'll just use the full range without stepping - 31*31 = 961 iterations is fast enough.
+
+Let me write the final version:
+
+```rust
+use std::io::{self, BufRead, BufReader, Write, BufWriter};
+use std::sync::{Arc, Mutex};
+use std::collections::VecDeque;
+
+const PI: f64 = std::f64::consts::PI;
+
+struct MapData {
+    sw: usize,
+    sh: usize,
+    scale

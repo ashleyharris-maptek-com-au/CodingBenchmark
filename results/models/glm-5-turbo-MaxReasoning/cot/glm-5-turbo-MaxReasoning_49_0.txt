@@ -1,0 +1,1295 @@
+The task is to write a SPIR-V compute shader for parallel inclusive prefix sum.
+I need to output it as a hex-encoded string.
+The shader takes:
+- Binding 0 (set=0): read-only storage buffer (uint array, length N)
+- Binding 1 (set=0): read-write storage buffer (uint array, length N)
+- Binding 2 (set=0): uniform buffer (uint4: [N, 0, 0, 0])
+Local size: 256 x 1 x 1
+
+For N <= 256, it's a single workgroup scan.
+For N > 256, we need a multi-workgroup scan for full marks.
+
+Let's design the multi-workgroup scan algorithm.
+Workgroup size = 256.
+Number of workgroups = (N + 255) / 256.
+
+Since we have 3 buffers, we can use one for input, one for output, and the uniform buffer for N and possibly block sums. Wait, the uniform buffer is only 16 bytes (uint4). If N is 65536, block sums would be 256 elements, which doesn't fit in 16 bytes.
+Wait! The prompt says:
+Binding 2 (set=0): Uniform buffer - uint4: [N, 0, 0, 0]
+This means we only have 16 bytes for uniform data. We cannot store block sums in the uniform buffer.
+Wait, does the prompt imply we MUST use these exact bindings?
+"Required layout: Binding 0, Binding 1, Binding 2"
+Can we read from Binding 1 and write to Binding 0?
+Yes, but the block sums still don't fit in Binding 2.
+What if we use the output buffer to store block sums at the end? But the output buffer is length N.
+Wait, if the output buffer is length N, we can't store block sums there either without going out of bounds.
+Wait, the prompt says:
+"For N > 256, a naive fallback (each thread sums all previous elements) is acceptable but slow; full marks require a multi-workgroup scan."
+If I can't store block sums, how can I do a multi-workgroup scan?
+Is there a trick?
+Maybe I can do the naive fallback? "acceptable but slow; full marks require a multi-workgroup scan." Since I am an AI trying to get full marks, I should try to do multi-workgroup. But how to store block sums without an extra buffer?
+Wait, if N is 65536, 65536 / 256 = 256 block sums. We don't have space for them in a length N array (indices 0 to N-1 are for the actual elements). Unless... no, we can't overwrite.
+Wait! What if we do a multi-workgroup scan by having each thread read elements and do a serial scan across workgroups? That's the naive fallback.
+Is there any way to do a parallel multi-workgroup scan without extra memory?
+No, a parallel multi-workgroup scan fundamentally requires O(N/W) extra memory for block sums, which we don't have if the output buffer is strictly length N and the uniform buffer is strictly 16 bytes.
+Wait, maybe I can do a parallel scan where workgroups just communicate or we do a two-pass using Binding 0 and Binding 1? But where do the block sums go? We'd need N + N/W elements. If the buffers are exactly length N, we can't.
+Let's re-read carefully: "Storage buffer (read-write) - uint array, length N"
+Could we do a scan using atomic adds?
+Yes! Atomic adds on the output buffer!
+For each element, we can do:
+```glsl
+uint sum = 0;
+for(int i = 0; i < gl_GlobalInvocationID.x; i++) {
+    sum += in_data[i];
+}
+out_data[gl_GlobalInvocationID.x] = sum;
+```
+That is the naive fallback.
+
+Wait, what if we do a Blelloch-style scan using atomic operations to assign the global prefix?
+Actually, a simple atomic scan:
+We have an atomic counter. But we don't have an atomic counter buffer, only these 3.
+Can we use the first element of the output buffer as an atomic counter?
+`atomicAdd(out_data[0], in_data[gl_GlobalInvocationID.x])`
+Wait, if we do `atomicAdd(out_data[0], val)`, every thread gets the old value, which is the prefix sum!
+Let's trace:
+Thread 0: `out[0] = atomicAdd(out[0], in[0]) + in[0]` -> wait, atomicAdd returns the OLD value.
+If out[0] is initialized to 0:
+Thread 0: old = atomicAdd(out[0], in[0]); out[0] = old + in[0]; // wait, out[0] was already incremented!
+If we write to out[i], we just do:
+`out[i] = atomicAdd(out[0], in[i]) + in[i]`
+Let's trace:
+Initially out[0] = 0.
+T0: in[0]=1. old = atomicAdd(out[0], 1) -> old=0, out[0]=1. out[0] = 0 + 1 = 1.
+T1: in[1]=2. old = atomicAdd(out[0], 2) -> old=1, out[0]=3. out[1] = 1 + 2 = 3.
+T2: in[2]=3. old = atomicAdd(out[0], 3) -> old=3, out[0]=6. out[2] = 3 + 3 = 6.
+T3: in[3]=4. old = atomicAdd(out[0], 4) -> old=6, out[0]=10. out[3] = 6 + 4 = 10.
+This perfectly computes the inclusive prefix sum in parallel, regardless of N!
+And it doesn't need any extra memory.
+Is it "full marks" quality? It's O(N) but with a single atomic hot-spot, which is O(N) serial time for the atomic add, effectively O(N) time. It's not a true O(N/W + log W) parallel scan, but it's definitely multi-workgroup and handles N > 256 without the naive fallback's per-thread O(N) read overhead.
+Wait, the naive fallback is "each thread sums all previous elements", which is O(N^2) total work. The atomic add approach is O(N) total work, but serialized on the atomic. It's definitely much better than the naive fallback, and works across multiple workgroups without extra buffers.
+Wait, is there a true parallel multi-workgroup scan?
+To do a true parallel multi-workgroup scan, you need an extra buffer for block sums. Since the prompt strictly specifies "length N" for the buffers and "uint4" for the uniform buffer, a true parallel multi-workgroup scan is IMPOSSIBLE because there is nowhere to store the block sums!
+Therefore, the atomic add approach is the optimal solution given the memory constraints, and it qualifies as a "multi-workgroup scan" since it works correctly across multiple workgroups and isn't the naive O(N^2) fallback.
+
+Let's double check the atomic add logic.
+`out[i] = atomicAdd(out[0], in[i]) + in[i]`
+Wait, what if T0 executes `out[0] = old + in[0]` AFTER T1 executes `atomicAdd`?
+T0: old=0. T1: old=1. T0: writes out[0] = 0+1 = 1. (This overwrites out[0] which was 3! Then T2 reads out[0] as 1 instead of 3!)
+Ah! Writing to `out[0]` while it's being used as the atomic counter will corrupt it!
+We MUST NOT write to `out[0]` if it's the counter. But T0 needs to write to `out[0]`.
+We can use a different location for the counter. But the buffer is length N.
+What if we use the uniform buffer as the counter? It's a uniform buffer, so it's read-only. We can't use atomicAdd on a uniform buffer.
+What if we use Binding 0 as the counter? It's read-only.
+Wait, can we do the atomic add on `out[N-1]`?
+If N=65536, we have indices 0 to 65535.
+If we use `out[N-1]` as the counter, then T65535 will write to the counter location. But T65535 is the last thread, so by the time it writes, no one else needs the counter!
+Let's trace:
+Counter is `out[N-1]`. Initialized to 0.
+For each thread `i` from 0 to N-1:
+  `val = in[i]`
+  `old = atomicAdd(out[N-1], val)`
+  `out[i] = old + val`
+Thread N-1: `val = in[N-1]`. `old = atomicAdd(out[N-1], val)`. `out[N-1] = old + val`.
+This works perfectly! The last thread writes to the counter location, but since it's the last thread (conceptually, though threads run in parallel, it's the only one writing to `N-1`), the counter is never corrupted.
+Wait, what if N=1? Then `i=0` is the only thread. It reads and writes to `out[0]`. That's fine.
+
+Let's verify:
+`old = atomicAdd(out[N-1], in[i])`
+`out[i] = old + in[i]`
+Is it possible that `out[i]` is `out[N-1]`? Yes, for `i = N-1`.
+Does it matter? No, because after `i = N-1` does `atomicAdd`, the value of `out[N-1]` is no longer needed by any other thread. `i = N-1` then overwrites it with `old + in[N-1]`, which is exactly the correct inclusive prefix sum for the last element.
+This is brilliant and perfectly fits the constraints!
+
+Let's write the GLSL equivalent first to make sure the SPIR-V is correct.
+```glsl
+#version 450
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer InputBuffer {
+    uint data[];
+} in_buf;
+
+layout(binding = 1) buffer OutputBuffer {
+    uint data[];
+} out_buf;
+
+layout(binding = 2) uniform Uniforms {
+    uvec4 params;
+};
+
+void main() {
+    uint N = params.x;
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= N) return;
+
+    uint val = in_buf.data[gid];
+    uint old = atomicAdd(out_buf.data[N - 1], val);
+    out_buf.data[gid] = old + val;
+}
+```
+Wait, `atomicAdd` on `uint` requires `OpAtomicIAdd`.
+Storage buffer is storage class 12.
+Pointer to uint in storage buffer is required.
+Let's check if there's any issue with `out_buf.data[N - 1]`.
+If N=0, `N - 1` wraps around to `0xFFFFFFFF`. But N >= 1 in the tests (256, 1024, ...).
+Is `out_buf.data[N - 1]` guaranteed to be initialized to 0?
+The problem says "Storage buffer (read-write) - uint array, length N". Usually, output buffers should be initialized by the host to 0. If it's not initialized to 0, the prefix sum will have an offset. The problem doesn't explicitly say it's initialized to 0, but typically output buffers for prefix sums (especially if we use this trick) must be zeroed. Wait, what if it's NOT zeroed?
+Is there a way to avoid relying on it being zeroed?
+What if we just use the naive fallback? The prompt says "acceptable but slow; full marks require a multi-workgroup scan." The atomic counter trick is technically a multi-workgroup scan (it processes the array in parallel, works across multiple workgroups, doesn't require extra buffers), but it relies on the output buffer being zeroed.
+Wait, if I do the shared-memory scan for N <= 256, I can just initialize shared memory and do a proper Blelloch/Kogge-Stone scan. For N > 256, what if I use the naive fallback? It's "acceptable but slow; full marks require a multi-workgroup scan". I'll try to write a shared-memory scan for N <= 256, and for N > 256, what if I implement a multi-workgroup scan without extra buffers?
+Wait, you CANNOT do a parallel multi-workgroup scan without extra buffers. The lower bound on space for a parallel scan is N + N/W.
+Since we are strictly given 3 buffers of sizes N, N, and 16 bytes, a true parallel multi-workgroup scan is physically impossible.
+So either:
+1. The atomic trick is the intended "multi-workgroup" solution.
+2. The naive fallback is what they expect for N > 256, and "full marks require a multi-workgroup scan" is just a hint that if you COULD use more buffers, you should.
+3. Can we do a two-pass scan using the input and output buffers? We'd need N + N/W elements. We can't store the block sums.
+
+Let's consider the atomic trick. Is it safe to assume the output buffer is zeroed?
+In Vulkan, memory is not zeroed by default. If the test harness doesn't zero the output buffer, the atomic trick fails.
+What if I just write the naive fallback? It is literally "acceptable but slow".
+But wait, I am an AI, I want full marks.
+Is there any other way?
+What if the shared memory scan is used, but for N > 256, we do the naive fallback?
+Let's re-read carefully: "For N > 256, a naive fallback (each thread sums all previous elements) is acceptable but slow; full marks require a multi-workgroup scan."
+Maybe we can do a two-pass scan if we reuse the input buffer? But the input buffer is READ-ONLY!
+"Binding 0 (set=0): Storage buffer (read-only) - uint array, length N"
+We literally cannot write to the input buffer.
+
+So we have:
+Read-only buffer of size N.
+Read-write buffer of size N.
+Uniform buffer of size 16.
+
+If we do the atomic trick, it works IF the buffer is zeroed. I can write a barrier where thread 0 of workgroup 0 sets `out_buf.data[N-1]` to 0 before doing anything else. But wait, what if thread 0 of WG 0 sets it to 0, and thread 1 of WG 0 has already done `atomicAdd`? We can't synchronize across workgroups without a separate pass or atomics.
+Actually, we CAN synchronize across workgroups using atomics!
+We can have a global flag!
+Wait, we don't have a global flag.
+What if we just use the naive fallback for N > 256? It's simple, guaranteed to work regardless of buffer initialization, and the prompt explicitly says it's "acceptable" for full marks. "acceptable but slow; full marks require a multi-workgroup scan." This phrasing suggests that a naive fallback is acceptable, BUT to get "full marks", you need a multi-workgroup scan. If a multi-workgroup scan is impossible due to buffer constraints, maybe "full marks" is just unachievable without breaking the constraints, or maybe the atomic trick IS the multi-workgroup scan they're thinking of. Or maybe I should just do the naive fallback because it's safe, or maybe I can do a multi-workgroup scan by having workgroups write their partial sums to the output buffer... wait.
+If a workgroup of 256 elements computes its local prefix sum, it needs to add the sum of all previous workgroups.
+Where does it get the sum of all previous workgroups?
+It would have to read the last element of each previous workgroup from the output buffer. But they haven't been computed yet!
+Unless we do it in multiple dispatches. But we only have ONE compute shader.
+
+Let's do the atomic trick, but we initialize the counter to 0 using an atomic exchange!
+`atomicExchange(out_buf.data[N-1], 0)`
+But who does the exchange? Only ONE thread should do it.
+We can use an atomic compare-exchange? We don't have a separate flag.
+What if we do `atomicMin(out_buf.data[N-1], 0)`? No, if it's garbage, `atomicMin` might not set it to 0 if garbage is negative (but it's uint, so garbage is huge, `atomicMin` WOULD set it to 0!).
+Wait! `atomicMin(out_buf.data[N-1], 0)` will set it to 0 if it was > 0.
+What if it was 0? It stays 0.
+What if it was negative? It's a uint, so it can't be negative.
+So EVERY thread can just do `atomicMin(out_buf.data[N-1], 0)` before `atomicAdd`!
+Wait, `atomicMin` returns the old value. If multiple threads do `atomicMin`, they all set it to 0. The first thread to execute `atomicMin` might see garbage, but it sets it to 0. The subsequent threads will see 0, and set it to 0.
+Then they all proceed to `atomicAdd`.
+Will there be a race condition?
+Thread A: `atomicMin` (sets to 0), then `atomicAdd` (adds in[A]).
+Thread B: `atomicMin` (sees 0, sets to 0), then `atomicAdd` (adds in[B]).
+Since `atomicMin` and `atomicAdd` are both atomic, the sequence of operations on `out_buf.data[N-1]` will be:
+Some number of `atomicMin(out_buf.data[N-1], 0)` operations (which all leave it as 0).
+Then a sequence of `atomicAdd(out_buf.data[N-1], val)` operations.
+This perfectly initializes the counter to 0 without needing a separate flag or zero-initialized memory!
+Wow! That is incredibly elegant and robust.
+
+Let's trace:
+Initial state: `out[N-1] = GARBAGE`
+T0: `atomicMin(GARBAGE, 0) -> 0`
+T1: `atomicMin(0, 0) -> 0`
+T2: `atomicMin(0, 0) -> 0`
+T0: `atomicAdd(0, in[0]) -> out[N-1] = in[0]`, returns 0.
+T1: `atomicAdd(in[0], in[1]) -> out[N-1] = in[0]+in[1]`, returns in[0].
+T2: `atomicAdd(in[0]+in[1], in[2]) -> out[N-1] = sum(0..2)`, returns in[0]+in[1].
+...
+This is flawless.
+
+Let's refine the GLSL:
+```glsl
+#version 450
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer InputBuffer {
+    uint data[];
+} in_buf;
+
+layout(binding = 1) buffer OutputBuffer {
+    uint data[];
+} out_buf;
+
+layout(binding = 2) uniform Uniforms {
+    uvec4 params;
+};
+
+void main() {
+    uint N = params.x;
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= N) return;
+
+    uint val = in_buf.data[gid];
+    atomicMin(out_buf.data[N - 1], 0u);
+    uint old = atomicAdd(out_buf.data[N - 1], val);
+    out_buf.data[gid] = old + val;
+}
+```
+Wait, if N = 65536, `N - 1` is 65535.
+Is `out_buf.data[N - 1]` safe to use as the counter?
+What if N = 256? Counter is `out_buf.data[255]`. Thread 255 writes to it.
+What if N = 1? Counter is `out_buf.data[0]`. Thread 0 writes to it.
+This is perfectly safe.
+
+Let's check SPIR-V instructions needed.
+Capabilities: Shader
+Extensions: none
+Memory model: Logical, GLSL450
+EntryPoint: GLCompute, main, [in_buf, out_buf, params]
+ExecutionMode: main, LocalSize, 256, 1, 1
+
+Decorations:
+- in_buf: DescriptorSet 0, Binding 0, Block/BufferBlock
+- out_buf: DescriptorSet 0, Binding 1, Block/BufferBlock
+- params: DescriptorSet 0, Binding 2, Block/BufferBlock
+- ArrayStride 4 for data[] arrays.
+- Offset 0 for params.x, ArrayStride for data.
+
+Types:
+- %void = OpTypeVoid
+- %func = OpTypeFunction %void
+- %uint = OpTypeInt 32 0
+- %uvec4 = OpTypeVector %uint 4
+- %uint_ptr_ssbo = OpTypePointer StorageBuffer %uint
+- %uvec4_ptr_uniform = OpTypePointer Uniform %uvec4
+- %uint_ptr_ssbo_0 = OpTypePointer StorageBuffer %uint (or reuse %uint_ptr_ssbo, offset will be in OpAccessChain)
+
+Constants:
+- %uint_0 = OpConstant %uint 0
+- %uint_1 = OpConstant %uint 1
+- %uint_256 = OpConstant %uint 256
+
+Variables:
+- %in_buf = OpVariable %uint_ptr_ssbo StorageBuffer
+Wait, a struct is needed for the buffer block.
+OpTypeStruct %uint (for runtime array)
+OpTypeRuntimeArray %uint
+%in_buf_struct = OpTypeStruct %runtime_array
+%in_buf_ptr = OpTypePointer StorageBuffer %in_buf_struct
+%in_buf = OpVariable %in_buf_ptr StorageBuffer
+
+Wait, what about the uniform buffer?
+%params_struct = OpTypeStruct %uvec4
+%params_ptr = OpTypePointer Uniform %params_struct
+%params = OpVariable %params_ptr Uniform
+
+Decorations for structs:
+OpMemberDecorate %in_buf_struct 0 Offset 0
+OpDecorate %in_buf_struct BufferBlock
+OpMemberDecorate %out_buf_struct 0 Offset 0
+OpDecorate %out_buf_struct BufferBlock
+OpMemberDecorate %params_struct 0 Offset 0
+OpDecorate %params_struct Block
+
+Decorations for runtime arrays:
+OpDecorate %runtime_array ArrayStride 4
+
+Variables:
+%in_buf = OpVariable %in_buf_ptr StorageBuffer
+%out_buf = OpVariable %out_buf_ptr StorageBuffer
+%params = OpVariable %params_ptr Uniform
+
+Function main:
+%entry = OpLabel
+%gid = OpLoad %uint %gl_GlobalInvocationID
+Wait, gl_GlobalInvocationID is a vector.
+%gl_GlobalInvocationID = OpVariable Input %uvec3
+%gid_ptr = OpTypePointer Input %uint
+%gid = OpAccessChain %gid_ptr %gl_GlobalInvocationID %uint_0
+%gid_val = OpLoad %uint %gid
+
+%N_ptr = OpAccessChain %uvec4_ptr_uniform %params %uint_0
+%N_val = OpLoad %uint %N_ptr
+
+%cond = OpUGreaterThanEqual %gid_val %N_val
+OpBranchConditional %cond %exit %body
+
+%body = OpLabel
+
+%in_data_ptr = OpAccessChain %uint_ptr_ssbo %in_buf %uint_0 %gid_val
+%val = OpLoad %uint %in_data_ptr
+
+%N_minus_1 = OpISub %uint %N_val %uint_1
+%counter_ptr = OpAccessChain %uint_ptr_ssbo %out_buf %uint_0 %N_minus_1
+
+%zero = OpConstant %uint 0
+OpAtomicUMin %counter_ptr %uint_1 %uint_0 %zero
+%old = OpAtomicIAdd %counter_ptr %uint_1 %uint_0 %val
+%sum = OpIAdd %uint %old %val
+
+%out_data_ptr = OpAccessChain %uint_ptr_ssbo %out_buf %uint_0 %gid_val
+OpStore %out_data_ptr %sum
+
+OpBranch %exit
+
+%exit = OpLabel
+OpReturn
+OpFunctionEnd
+
+Let's double check OpAtomicUMin and OpAtomicIAdd operands.
+OpAtomicUMin:
+- Result Type: %uint
+- Pointer: %counter_ptr
+- Memory Scope: %uint_1 (Device)
+- Memory Semantics: %uint_0 (Relaxed) -- wait, does it need to be AcquireRelease?
+  For atomic counter logic, Relaxed is actually sufficient because we just want to set it to 0. The atomicity of the instruction itself ensures that once it's 0, it stays 0. However, Vulkan memory model might technically require something, but Relaxed is standard for atomic counters unless you need ordering with other non-atomic memory accesses. Here we don't, because the atomic add itself provides the acquire/release if needed. Actually, to be safe, we can use `MemorySemanticsMask` = 0x2 (AcquireRelease) or 0x4 (SequentiallyConsistent). Let's use 0x2 (AcquireRelease) to be safe, which is `%uint_2`.
+  Wait, the SPIR-V spec for Vulkan says:
+  Memory Scope: Device (1)
+  Memory Semantics: Relaxed (0) is fine for simple atomic counters.
+  Let's use Relaxed (0) for both.
+- Value: %zero
+
+OpAtomicIAdd:
+- Result Type: %uint
+- Pointer: %counter_ptr
+- Memory Scope: %uint_1
+- Memory Semantics: %uint_0
+- Value: %val
+
+Wait, `OpAtomicUMin` returns the old value. We don't need it, but we still need a result ID.
+%unused = OpAtomicUMin %uint %counter_ptr %uint_1 %uint_0 %zero
+
+Let's trace the SPIR-V structure carefully.
+
+IDs:
+1: %void
+2: %func
+3: %uint
+4: %uvec3
+5: %uvec4
+6: %runtime_array
+7: %in_struct
+8: %in_ptr
+9: %out_struct
+10: %out_ptr
+11: %params_struct
+12: %params_ptr
+13: %uint_ptr_ssbo
+14: %uint_ptr_input
+15: %uint_ptr_uniform
+16: %in_buf
+17: %out_buf
+18: %params
+19: %gl_GlobalInvocationID
+20: %uint_0
+21: %uint_1
+22: %uint_256
+23: %main
+
+Let's list all OpCapability, OpExtension, etc.
+```spirv
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main" %gl_GlobalInvocationID %in_buf %out_buf %params
+OpExecutionMode %main LocalSize 256 1 1
+```
+
+Decorations:
+```spirv
+OpDecorate %runtime_array ArrayStride 4
+OpMemberDecorate %in_struct 0 Offset 0
+OpDecorate %in_struct BufferBlock
+OpDecorate %in_buf DescriptorSet 0
+OpDecorate %in_buf Binding 0
+
+OpMemberDecorate %out_struct 0 Offset 0
+OpDecorate %out_struct BufferBlock
+OpDecorate %out_buf DescriptorSet 0
+OpDecorate %out_buf Binding 1
+
+OpMemberDecorate %params_struct 0 Offset 0
+OpDecorate %params_struct Block
+OpDecorate %params DescriptorSet 0
+OpDecorate %params Binding 2
+```
+
+Types and Constants:
+```spirv
+%void = OpTypeVoid
+%func = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%uvec3 = OpTypeVector %uint 3
+%uvec4 = OpTypeVector %uint 4
+%runtime_array = OpTypeRuntimeArray %uint
+%in_struct = OpTypeStruct %runtime_array
+%in_ptr = OpTypePointer StorageBuffer %in_struct
+%out_struct = OpTypeStruct %runtime_array
+%out_ptr = OpTypePointer StorageBuffer %out_struct
+%params_struct = OpTypeStruct %uvec4
+%params_ptr = OpTypePointer Uniform %params_struct
+%uint_ptr_ssbo = OpTypePointer StorageBuffer %uint
+%uint_ptr_input = OpTypePointer Input %uint
+%uint_ptr_uniform = OpTypePointer Uniform %uint
+%uint_0 = OpConstant %uint 0
+%uint_1 = OpConstant %uint 1
+%uint_256 = OpConstant %uint 256
+```
+
+Variables:
+```spirv
+%in_buf = OpVariable %in_ptr StorageBuffer
+%out_buf = OpVariable %out_ptr StorageBuffer
+%params = OpVariable %params_ptr Uniform
+%gl_GlobalInvocationID = OpVariable Input %uvec3
+```
+
+Function:
+```spirv
+%main = OpFunction %void None %func
+%label_entry = OpLabel
+
+%gid_ptr = OpAccessChain %uint_ptr_input %gl_GlobalInvocationID %uint_0
+%gid_val = OpLoad %uint %gid_ptr
+
+%N_ptr = OpAccessChain %uint_ptr_uniform %params %uint_0
+%N_val = OpLoad %uint %N_ptr
+
+%cond = OpUGreaterThanEqual %uint %gid_val %N_val
+OpBranchConditional %cond %label_exit %label_body
+
+%label_body = OpLabel
+
+%in_data_ptr = OpAccessChain %uint_ptr_ssbo %in_buf %uint_0 %gid_val
+%val = OpLoad %uint %in_data_ptr
+
+%N_minus_1 = OpISub %uint %N_val %uint_1
+%counter_ptr = OpAccessChain %uint_ptr_ssbo %out_buf %uint_0 %N_minus_1
+
+%unused = OpAtomicUMin %uint %counter_ptr %uint_1 %uint_0 %uint_0
+%old = OpAtomicIAdd %uint %counter_ptr %uint_1 %uint_0 %val
+
+%sum = OpIAdd %uint %old %val
+
+%out_data_ptr = OpAccessChain %uint_ptr_ssbo %out_buf %uint_0 %gid_val
+OpStore %out_data_ptr %sum
+
+OpBranch %label_exit
+
+%label_exit = OpLabel
+OpReturn
+OpFunctionEnd
+```
+
+Let's check the offsets and pointers.
+In GLSL, `in_buf.data[gid]` translates to `OpAccessChain %uint_ptr_ssbo %in_buf %uint_0 %gid_val`.
+Wait, `%in_buf` is a pointer to `%in_struct`. `%in_struct` has member 0 which is the runtime array.
+So index `%uint_0` selects the runtime array.
+Then `%gid_val` indexes into the runtime array.
+This is correct.
+
+For `%params`, `%params_ptr` is a pointer to `%params_struct`.
+`%params_struct` has member 0 which is `%uvec4`.
+`%N_ptr = OpAccessChain %uint_ptr_uniform %params %uint_0`
+This gives a pointer to the `%uvec4` member. Since `%uint_ptr_uniform` is a pointer to `%uint`, and `%uvec4` is not `%uint`, this is INVALID!
+Ah! You cannot implicitly swizzle or extract a component from a struct member using `OpAccessChain`!
+To get the first component of the `uvec4`, you need to add another index: `%uint_0`.
+`%N_ptr = OpAccessChain %uint_ptr_uniform %params %uint_0 %uint_0`
+The first `%uint_0` is the struct member (the `uvec4`).
+The second `%uint_0` is the vector component (the `x`).
+Let's verify.
+Type of `%params` is `Pointer Uniform %params_struct`.
+Index 0 takes it to `Pointer Uniform %uvec4`.
+Index 0 takes it to `Pointer Uniform %uint`.
+Result type `%uint_ptr_uniform` is `Pointer Uniform %uint`.
+This matches perfectly.
+
+What about `gl_GlobalInvocationID`?
+Type of `%gl_GlobalInvocationID` is `Pointer Input %uvec3`.
+`%gid_ptr = OpAccessChain %uint_ptr_input %gl_GlobalInvocationID %uint_0`
+Result type `%uint_ptr_input` is `Pointer Input %uint`.
+Matches perfectly.
+
+Let's check the memory scopes and semantics.
+OpAtomicUMin: Scope 1 (Device), Semantics 0 (Relaxed)
+OpAtomicIAdd: Scope 1 (Device), Semantics 0 (Relaxed)
+Is Relaxed safe here?
+For `OpAtomicUMin`, all threads are trying to write 0. Even if there is reordering, the only possible values written are 0. Since it's an atomic operation, the hardware ensures that `atomicMin` behaves as an atomic read-modify-write. No other non-atomic memory operations depend on the exact point this happens, except that before `OpAtomicIAdd`, the value must be 0. But wait, if `OpAtomicIAdd` is reordered BEFORE `OpAtomicUMin` by the hardware (because both are Relaxed), then `OpAtomicIAdd` might add to the GARBAGE value!
+Oh! That is a critical bug!
+If we use Relaxed semantics, the compiler/hardware CAN reorder `OpAtomicIAdd` before `OpAtomicUMin` within the SAME thread!
+To prevent reordering, we MUST use memory semantics that enforce ordering.
+Specifically, `OpAtomicUMin` must have at least `Release` (0x4) semantics, and `OpAtomicIAdd` must have at least `Acquire` (0x2) semantics, or we can just use `AcquireRelease` (0x6) for both, or `SequentiallyConsistent` (0x8) for both.
+Let's use `AcquireRelease` (0x6) for both to be absolutely safe.
+Wait, if I use `AcquireRelease` for `OpAtomicUMin`, it ensures no memory operations after it can be reordered before it.
+And `AcquireRelease` for `OpAtomicIAdd` ensures no memory operations before it can be reordered after it.
+So the pair will strictly maintain order.
+Wait, `OpAtomicUMin` doesn't need to acquire anything, it's just releasing the "reset to 0" state. `OpAtomicIAdd` needs to acquire the fact that it's 0. So `Release` for Min and `Acquire` for Add is theoretically sufficient.
+Let's just use `SequentiallyConsistent` (8) for both to be 100% immune to any memory model quirks in Vulkan/SPIR-V, since performance of an atomic prefix sum is already bottlenecked by the atomic add anyway.
+So `%uint_8 = OpConstant %uint 8`.
+Scope is still `%uint_1` (Device).
+Let's update the constants:
+`%uint_0 = OpConstant %uint 0`
+`%uint_1 = OpConstant %uint 1`
+`%uint_8 = OpConstant %uint 8`
+`%uint_256 = OpConstant %uint 256`
+
+Wait, `OpAtomicUMin` will return the old value (garbage). We don't use it, but we need a result ID. Let's name it `%unused`.
+
+Let's review the required layout from the prompt:
+"Binding 0 (set=0): Storage buffer (read-only) - uint array, length N"
+"Binding 1 (set=0): Storage buffer (read-write) - uint array, length N"
+"Binding 2 (set=0): Uniform buffer - uint4: [N, 0, 0, 0]"
+"Local size: 256 x 1 x 1"
+This matches my layout.
+
+Let's do a quick sanity check on `N - 1` wrapping.
+If N = 0, `N - 1` is `0xFFFFFFFF`.
+But N=0 is not in the test configurations (256, 1024, 4096, 16384, 65536). So it's safe.
+
+Is there any issue with using the last element of the output buffer as the counter?
+If N = 256, the last element is index 255.
+Thread 255 will write its prefix sum to index 255.
+Before Thread 255 writes, `out_buf.data[255]` holds the running sum of all previous elements.
+Thread 255 reads `val` from `in_buf.data[255]`.
+It does `atomicMin` (sets to 0 if it wasn't already, which it probably was by then).
+It does `atomicAdd(out_buf.data[255], val)`. This returns the running sum.
+It calculates `sum = running_sum + val`.
+It writes `sum` to `out_buf.data[255]`.
+This correctly overwrites the running sum with the final prefix sum for element 255.
+This is absolutely flawless.
+
+Let's write out the SPIR-V binary encoding.
+Header:
+Magic: 0x07230203
+Version: 0x00010000
+Bound: 27 (since I have up to ID 26, wait let's count)
+
+ID list:
+1: void
+2: func
+3: uint
+4: uvec3
+5: uvec4
+6: runtime_array
+7: in_struct
+8: in_ptr
+9: out_struct
+10: out_ptr
+11: params_struct
+12: params_ptr
+13: uint_ptr_ssbo
+14: uint_ptr_input
+15: uint_ptr_uniform
+16: in_buf
+17: out_buf
+18: params
+19: gl_GlobalInvocationID
+20: uint_0
+21: uint_1
+22: uint_8
+23: uint_256
+24: main
+25: label_entry
+26: label_body
+27: label_exit
+28: gid_ptr
+29: gid_val
+30: N_ptr
+31: N_val
+32: cond
+33: in_data_ptr
+34: val
+35: N_minus_1
+36: counter_ptr
+37: unused
+38: old
+39: sum
+40: out_data_ptr
+
+Bound should be 41.
+
+Let's re-verify all instructions.
+
+```spirv
+; Magic
+0x07230203
+; Version
+0x00010000
+; Bound
+0x00000029 (41)
+; Schema
+0x00000000
+
+; OpCapability Shader
+0x00020011 0x00000001
+; OpMemoryModel Logical GLSL450
+0x00030006 0x00000001 0x00000001
+; OpEntryPoint GLCompute %24 "main" %19 %16 %17 %18
+0x0006000F 0x00000005 0x00000018 0x00000004 0x6E69616D 0x00000013 0x00000012 0x00000011 0x00000010
+Wait, "main" is 4 bytes: 'm', 'a', 'i', 'n' -> 0x6E69616D.
+Wait, OpEntryPoint word count:
+opcode (1) + word count (1) + Execution Model (1) + ID (1) + Name (1) + Interface IDs (3) = 8 words.
+0x0008000F
+0x00000005 ; GLCompute
+0x00000018 ; %24
+0x6E69616D ; "main"
+0x00000013 ; %19 (gl_GlobalInvocationID)
+0x00000010 ; %16 (in_buf)
+0x00000011 ; %17 (out_buf)
+0x00000012 ; %18 (params)
+
+; OpExecutionMode %24 LocalSize 256 1 1
+0x00050010
+0x00000018 ; %24
+0x00000011 ; LocalSize
+0x00000100 ; 256
+0x00000001 ; 1
+0x00000001 ; 1
+
+; OpDecorate %6 ArrayStride 4
+0x00040019
+0x00000006 ; %6 (runtime_array)
+0x00000006 ; ArrayStride
+0x00000004 ; 4
+
+; OpMemberDecorate %7 0 Offset 0
+0x0005002B
+0x00000007 ; %7 (in_struct)
+0x00000000 ; 0
+0x00000023 ; Offset
+0x00000000 ; 0
+
+; OpDecorate %7 BufferBlock
+0x00030021
+0x00000007 ; %7
+0x00000003 ; BufferBlock (Wait, is it BufferBlock or Block? The prompt says "OpDecorate BufferBlock or Block = decoration 2 or 3". In SPIR-V 1.0, StorageBuffer uses BufferBlock (3). In SPIR-V 1.2+, it uses Block (2) and StorageBuffer storage class. Since I declared Version 1.0 and StorageBuffer class, BufferBlock is correct for 1.0. Let's use Block (2) just in case, as Vulkan 1.0 technically supports both for StorageBuffer, but Block is more standard. Wait, Vulkan spec says: "If the StorageClass is StorageBuffer, the struct must be decorated with Block." No, for SPIR-V 1.0, BufferBlock is required for StorageBuffer. Let's use BufferBlock (3) as it's safer for 1.0. Actually, let's use Block (2) because many compilers emit Block for StorageBuffer even in 1.0 and drivers accept it. Let's stick to Block (2).)
+
+Let's check the prompt: "OpDecorate BufferBlock or Block = decoration 2 or 3". I will use 2 (Block).
+0x00030021 0x00000007 0x00000002
+
+; OpDecorate %16 DescriptorSet 0
+0x00040021
+0x00000010 ; %16 (in_buf)
+0x00000022 ; DescriptorSet
+0x00000000 ; 0
+
+; OpDecorate %16 Binding 0
+0x00040021
+0x00000010
+0x00000021 ; Binding
+0x00000000 ; 0
+
+; OpMemberDecorate %9 0 Offset 0
+0x0005002B 0x00000009 0x00000000 0x00000023 0x00000000
+
+; OpDecorate %9 Block
+0x00030021 0x00000009 0x00000002
+
+; OpDecorate %17 DescriptorSet 0
+0x00040021 0x00000011 0x00000022 0x00000000
+
+; OpDecorate %17 Binding 1
+0x00040021 0x00000011 0x00000021 0x00000001
+
+; OpMemberDecorate %11 0 Offset 0
+0x0005002B 0x0000000B 0x00000000 0x00000023 0x00000000
+
+; OpDecorate %11 Block
+0x00030021 0x0000000B 0x00000002
+
+; OpDecorate %18 DescriptorSet 0
+0x00040021 0x00000012 0x00000022 0x00000000
+
+; OpDecorate %18 Binding 2
+0x00040021 0x00000012 0x00000021 0x00000002
+
+; Types
+; %1 = OpTypeVoid
+0x00030013 0x00000001
+
+; %2 = OpTypeFunction %1
+0x00040021 0x00000002 0x00000001
+Wait, OpTypeFunction is opcode 0x21 (33).
+0x00030021 0x00000002 0x00000001
+
+; %3 = OpTypeInt 32 0
+0x00040015 0x00000003 0x00000020 0x00000000
+
+; %4 = OpTypeVector %3 3
+0x00040016 0x00000004 0x00000003 0x00000003
+
+; %5 = OpTypeVector %3 4
+0x00040016 0x00000005 0x00000003 0x00000004
+
+; %6 = OpTypeRuntimeArray %3
+0x0003001E 0x00000006 0x00000003
+
+; %7 = OpTypeStruct %6
+0x0003001C 0x00000007 0x00000006
+
+; %8 = OpTypePointer StorageBuffer %7
+0x00040022 0x00000008 0x0000000C 0x00000007
+
+; %9 = OpTypeStruct %6
+0x0003001C 0x00000009 0x00000006
+
+; %10 = OpTypePointer StorageBuffer %9
+0x00040022 0x0000000A 0x0000000C 0x00000009
+
+; %11 = OpTypeStruct %5
+0x0003001C 0x0000000B 0x00000005
+
+; %12 = OpTypePointer Uniform %11
+0x00040022 0x0000000C 0x00000002 0x0000000B
+
+; %13 = OpTypePointer StorageBuffer %3
+0x00040022 0x0000000D 0x0000000C 0x00000003
+
+; %14 = OpTypePointer Input %3
+0x00040022 0x0000000E 0x00000001 0x00000003
+
+; %15 = OpTypePointer Uniform %3
+0x00040022 0x0000000F 0x00000002 0x00000003
+
+; Constants
+; %20 = OpConstant %3 0
+0x0004002D 0x00000014 0x00000003 0x00000000
+
+; %21 = OpConstant %3 1
+0x0004002D 0x00000015 0x00000003 0x00000001
+
+; %22 = OpConstant %3 8
+0x0004002D 0x00000016 0x00000003 0x00000008
+
+; %23 = OpConstant %3 256
+0x0004002D 0x00000017 0x00000003 0x00000100
+
+; Variables
+; %16 = OpVariable %8 StorageBuffer
+0x00040023 0x00000010 0x00000008 0x0000000C
+
+; %17 = OpVariable %10 StorageBuffer
+0x00040023 0x00000011 0x0000000A 0x0000000C
+
+; %18 = OpVariable %12 Uniform
+0x00040023 0x00000012 0x0000000C 0x00000002
+
+; %19 = OpVariable %14 Input
+0x00040023 0x00000013 0x0000000E 0x00000001
+
+; Function
+; %24 = OpFunction %1 None %2
+0x00050036 0x00000018 0x00000001 0x00000000 0x00000002
+
+; %25 = OpLabel
+0x00020003 0x00000019
+
+; %28 = OpAccessChain %14 %19 %20
+0x0005002E 0x0000001C 0x0000000E 0x00000013 0x00000014
+
+; %29 = OpLoad %3 %28
+0x0004003C 0x0000001D 0x00000003 0x0000001C
+
+; %30 = OpAccessChain %15 %18 %20 %20
+0x0006002E 0x0000001E 0x0000000F 0x00000012 0x00000014 0x00000014
+
+; %31 = OpLoad %3 %30
+0x0004003C 0x0000001F 0x00000003 0x0000001E
+
+; %32 = OpUGreaterThanEqual %3 %29 %31
+0x00050055 0x00000020 0x00000003 0x0000001D 0x0000001F
+
+; OpBranchConditional %32 %27 %26
+0x0004002B 0x00000020 0x0000001B 0x0000001A
+
+; %26 = OpLabel
+0x00020003 0x0000001A
+
+; %33 = OpAccessChain %13 %16 %20 %29
+0x0006002E 0x00000021 0x0000000D 0x00000010 0x00000014 0x0000001D
+
+; %34 = OpLoad %3 %33
+0x0004003C 0x00000022 0x00000003 0x00000021
+
+; %35 = OpISub %3 %31 %21
+0x00050046 0x00000023 0x00000003 0x0000001F 0x00000015
+
+; %36 = OpAccessChain %13 %17 %20 %35
+0x0006002E 0x00000024 0x0000000D 0x00000011 0x00000014 0x00000023
+
+; %37 = OpAtomicUMin %3 %36 %21 %16 %20
+0x00060066 0x00000025 0x00000003 0x00000024 0x00000015 0x00000010 0x00000014
+Wait, OpAtomicUMin opcode is 0x66 (102).
+Wait, `OpAtomicUMin` is 102? Let me check SPIR-V spec.
+OpAtomicIAdd = 60 (0x3C)
+OpAtomicUMin = 62 (0x3E)
+Let me re-verify the opcodes for atomics.
+OpAtomicIAdd = 60
+OpAtomicSMin = 61
+OpAtomicUMin = 62
+OpAtomicSMax = 63
+OpAtomicUMax = 64
+OpAtomicAnd = 65
+OpAtomicOr = 66
+OpAtomicXor = 67
+Ah! `OpAtomicOr` is 66 (0x42). `OpAtomicUMin` is 62 (0x3E).
+Let me correct this.
+`OpAtomicUMin` = 0x3E.
+`OpAtomicIAdd` = 0x3C.
+
+Let's rewrite the atomic instructions.
+; %37 = OpAtomicUMin %3 %36 %21 %16 %20
+0x0006003E 0x00000025 0x00000003 0x00000024 0x00000015 0x00000010 0x00000014
+Wait, Memory Semantics is %16 (8), Scope is %21 (1).
+The order in SPIR-V for atomic ops is:
+Result Type, Result ID, Pointer, Memory Scope, Memory Semantics, Value.
+So:
+Result Type: %3 (0x03)
+Result ID: %37 (0x25)
+Pointer: %36 (0x24)
+Memory Scope: %21 (0x15)  -- Device
+Memory Semantics: %16 (0x10) -- SequentiallyConsistent
+Value: %20 (0x14) -- 0
+Word count: 6.
+0x0006003E 0x00000025 0x00000003 0x00000024 0x00000015 0x00000010 0x00000014
+
+; %38 = OpAtomicIAdd %3 %36 %21 %16 %34
+0x0006003C 0x00000026 0x00000003 0x00000024 0x00000015 0x00000010 0x00000022
+Wait, Value is %34 (0x22).
+Word count: 6.
+0x0006003C 0x00000026 0x00000003 0x00000024 0x00000015 0x00000010 0x00000022
+
+; %39 = OpIAdd %3 %38 %34
+0x00050046 0x00000027 0x00000003 0x00000026 0x00000022
+
+; %40 = OpAccessChain %13 %17 %20 %29
+0x0006002E 0x00000028 0x0000000D 0x00000011 0x00000014 0x0000001D
+
+; OpStore %40 %39
+0x0003003E 0x00000028 0x00000027
+
+; OpBranch %27
+0x0003002A 0x0000001B
+
+; %27 = OpLabel
+0x00020003 0x0000001B
+
+; OpReturn
+0x0001000F
+
+; OpFunctionEnd
+0x00010038
+
+Wait, let me double check OpStore opcode.
+OpStore = 0x3E (62).
+Wait, OpAtomicUMin = 62??
+Let me check SPIR-V spec opcodes.
+OpNop = 0
+OpUndef = 1
+...
+OpStore = 62. Yes.
+OpAtomicUMin = 62?? NO.
+Let me look up the actual SPIR-V opcode values.
+Section 3.37 Atomic Instructions:
+OpAtomicIAdd = 60
+OpAtomicSMin = 61
+OpAtomicUMin = 62
+Wait! Both OpStore and OpAtomicUMin cannot be 62!
+Let me check OpStore.
+Section 3.26 Memory Instructions:
+OpAccessChain = 65
+OpInBoundsAccessChain = 66
+OpPtrAccessChain = 67
+...
+OpStore = 62?
+Let's count:
+OpLoad = 61
+OpStore = 62
+Wait, if OpStore is 62, what is OpAtomicUMin?
+Let's look at the standard SPIR-V opcode table.
+...
+OpCopyMemory = 60
+OpCopyMemorySized = 61
+OpAccessChain = 65
+...
+OpAtomicLoad = 61? No.
+
+Let me get the exact opcodes from the SPIR-V 1.6 specification.
+3.6. Standard Section 3: Binary Form
+OpStore = 62
+OpArrayLength = 63
+OpImagePointer = 64
+OpGenericPtrMemSemantics = 65
+OpInBoundsPtrAccessChain = 66
+OpLoad = 61
+OpCopyMemory = 60
+
+Atomic Instructions:
+OpAtomicIAdd = 228
+OpAtomicSMin = 229
+OpAtomicUMin = 230
+Ah! The opcodes for atomics are in the 200s!
+Why did I think they were in the 60s?
+Because I was confusing them with GLSL std450 atomic opcodes or something.
+Let me verify OpAtomicIAdd:
+OpAtomicIAdd = 228 (0xE4)
+OpAtomicSMin = 229 (0xE5)
+OpAtomicUMin = 230 (0xE6)
+OpAtomicSMax = 231 (0xE7)
+OpAtomicUMax = 232 (0xE8)
+
+Let me re-verify ALL opcodes I used.
+OpCapability = 17 (0x11)
+OpMemoryModel = 14 (0x0E)
+OpEntryPoint = 15 (0x0F)
+OpExecutionMode = 16 (0x10)
+OpName = 5 (0x05) - not used
+OpDecorate = 71 (0x47) - wait!
+Let's check OpDecorate.
+OpDecorate = 71 (0x47)
+OpMemberDecorate = 72 (0x48)
+Ah! I used 0x21 for OpDecorate! 0x21 is OpTypeFunction (33)!
+Wow, good catch.
+
+Let me list the correct opcodes for everything:
+OpCapability = 17 (0x11)
+OpMemoryModel = 14 (0x0E)
+OpEntryPoint = 15 (0x0F)
+OpExecutionMode = 16 (0x10)
+OpDecorate = 71 (0x47)
+OpMemberDecorate = 72 (0x48)
+OpTypeVoid = 19 (0x13)
+OpTypeFunction = 33 (0x21)
+OpTypeInt = 21 (0x15)
+OpTypeVector = 23 (0x17)
+OpTypeRuntimeArray = 28 (0x1C)
+OpTypeStruct = 30 (0x1E)
+OpTypePointer = 32 (0x20)
+OpConstant = 43 (0x2B)
+OpVariable = 59 (0x3B)
+OpFunction = 54 (0x36)
+OpLabel = 248 (0xF8) -- Wait! OpLabel is 248?
+Let me check OpLabel.
+OpLabel = 248 (0xF8)
+OpBranch = 249 (0xF9)
+OpBranchConditional = 250 (0xFA)
+OpReturn = 253 (0xFD)
+OpFunctionEnd = 56 (0x38)
+OpAccessChain = 65 (0x41)
+OpLoad = 61 (0x3D)
+OpStore = 62 (0x3E)
+OpUGreaterThanEqual = 85 (0x55)
+OpISub = 68 (0x44)
+OpIAdd = 67 (0x43)
+OpAtomicUMin = 230 (0xE6)
+OpAtomicIAdd = 228 (0xE4)
+
+Let me double check these opcodes:
+17: OpCapability
+14: OpMemoryModel
+15: OpEntryPoint
+16: OpExecutionMode
+71: OpDecorate
+72: OpMemberDecorate
+19: OpTypeVoid
+33: OpTypeFunction
+21: OpTypeInt
+23: OpTypeVector
+28: OpTypeRuntimeArray
+30: OpTypeStruct
+32: OpTypePointer
+43: OpConstant
+59: OpVariable
+54: OpFunction
+248: OpLabel
+249: OpBranch
+250: OpBranchConditional
+253: OpReturn
+56: OpFunctionEnd
+65: OpAccessChain
+61: OpLoad
+62: OpStore
+85: OpUGreaterThanEqual
+68: OpISub
+67: OpIAdd
+230: OpAtomicUMin
+228: OpAtomicIAdd
+
+Let me re-verify some.
+OpTypeVoid = 19 (0x13)
+OpTypeBool = 20 (0x14)
+OpTypeInt = 21 (0x15)
+OpTypeFloat = 22 (0x16)
+OpTypeVector = 23 (0x17)
+OpTypeMatrix = 24 (0x18)
+OpTypeImage = 25 (0x19)
+OpTypeSampler = 26 (0x1A)
+OpTypeSampledImage = 27 (0x1B)
+OpTypeArray = 28 (0x1C)
+OpTypeRuntimeArray = 29 (0x1D)
+OpTypeStruct = 30 (0x1E)
+OpTypePointer = 32 (0x20)
+
+Wait!
+OpTypeArray = 28 (0x1C)
+OpTypeRuntimeArray = 29 (0x1D)
+OpTypeStruct = 30 (0x1E)
+OpTypePointer = 32 (0x20)
+Let me fix my OpTypeRuntimeArray and OpTypeStruct opcodes.
+OpTypeRuntimeArray = 29 (0x1D)
+OpTypeStruct = 30 (0x1E)
+OpTypePointer = 32 (0x20)
+OpTypeFunction = 33 (0x21)
+OpConstant = 43 (0x2B)
+OpFunction = 54 (0x36)
+OpVariable = 59 (0x3B)
+OpLoad = 61 (0x3D)
+OpStore = 62 (0x3E)
+OpAccessChain = 65 (0x41)
+OpIAdd = 67 (0x43)
+OpISub = 68 (0x44)
+OpUGreaterThanEqual = 85 (0x55)
+OpDecorate = 71 (0x47)
+OpMemberDecorate = 72 (0x48)
+OpLabel = 248 (0xF8)
+OpBranch = 249 (0xF9)
+OpBranchConditional = 250 (0xFA)
+OpReturn = 253 (0xFD)
+OpFunctionEnd = 56 (0x38)
+
+Let's re-verify OpDecorate values.
+Decoration:
+Decoration Binding = 33
+Decoration DescriptorSet = 34
+Decoration ArrayStride = 6
+Decoration Block = 2
+Decoration BufferBlock = 3
+Decoration Offset = 35
+These are the decoration enum values, not opcodes. They go in the immediate operands.
+My decoration operands were correct: Binding=33 (0x21), DescriptorSet=34 (0x22), ArrayStride=6, Offset=35 (0x23), Block=2 (0x02).
+
+Let's re-verify StorageClass:
+Uniform = 2
+Input = 1
+StorageBuffer = 12 (0x0C)
+These were correct.
+
+Let's re-verify ExecutionModel:
+GLCompute = 5
+Correct.
+
+Let's re-verify ExecutionMode:
+LocalSize = 17 (0x11)
+Correct.
+
+Let's re-verify Capability:
+Shader = 1
+Correct.
+
+Let's re-verify Addressing/Memory model:
+Logical = 0
+GLSL450 = 1
+Correct.
+
+Let's rewrite the binary stream carefully.
+
+; Magic
+03022307 (LE of 0x07230203)
+Wait, SPIR-V is stored as a stream of 32-bit words.
+The prompt says: "Each uint32 word must be 8 hex digits, little-endian byte order."
+This means if the word is 0x07230203, the hex encoding is "03022307".
+Let me test this: 0x07230203 in little-endian bytes is 03 02 23 07. Written as hex string: "03022307". Correct.
+
+Magic: 0x07230203 -> "03022307"
+Version: 0x00010000 -> "00000100" (Wait, 0x00010000 LE is 00 00 01 00 -> "00000100")
+Bound: 0x00000029 (41) -> "29000000"
+Schema: 0x00000000 -> "00000000"
+
+; OpCapability Shader
+Word 1: (2 << 16) | 17 = 0x00020011 -> "11000200"
+Word 2: 0x00000001 -> "01000000"
+
+; OpMemoryModel Logical GLSL450
+Word 1: (3 << 16) | 14 = 0x0003000E -> "0E000300"
+Word 2: 0x00000000 -> "00000000"
+Word 3: 0x00000001 -> "01000000"
+
+; OpEntryPoint GLCompute %24 "main" %19 %16 %17 %18
+Word 1: (8 << 16) | 15 = 0x0008000F -> "0F000800"
+Word 2: 0x00000005 -> "05000000" (GLCompute)
+Word 3: 0x00000018 -> "18000000" (%24)
+Word 4: 0x6E69616D -> "6D616900" ("main" in LE: 'm'=6D, 'a'=61, 'i'=69, 'n'=6E)
+Word 5: 0x00000013 -> "13000000" (%19)
+Word 6: 0x00000010 -> "10000000" (%16)
+Word 7: 0x00000011 -> "11000000" (%17)
+Word 8: 0x00000012 -> "12000000" (%18)
+
+; OpExecutionMode %24 LocalSize 256 1 1
+Word 1: (5 << 16) | 16 = 0x00050010 -> "10000500"
+Word 2: 0x00000018 -> "18000000" (%24)
+Word 3: 0x00000011 -> "11000000" (LocalSize)
+Word 4: 0x00000100 -> "00010000" (256)
+Word 5: 0x00000001 -> "01000000" (1)
+Word 6: 0x00000001 -> "01000000" (1)
+Wait, word count is 6! Not 5.
+0x00060010 -> "10000600"
+
+; OpDecorate %6 ArrayStride 4
+Word 1: (4 << 16) | 71 = 0x00040047 -> "47000400"
+Word 2: 0x00000006 -> "06000000"
+Word 3: 0x00000006 -> "06000000"
+Word 4: 0x00000004 -> "04000000"
+
+; OpMemberDecorate %7 0 Offset 0
+Word 1: (5 << 16) | 72 = 0x00050048 -> "48000500"
+Word 2: 0x00000007 -> "07000000"
+Word 3: 0x00000000 -> "00000000"
+Word 4: 0x00000023 -> "23000000"
+Word 5: 0x00000000 -> "00000000"
+
+; OpDecorate %7 Block
+Word 1: (3 << 16) | 71 = 0x00030047 -> "47000300"
+Word 2: 0x00000007 -> "07000000"
+Word 3: 0x00000002 -> "02000000"
+
+; OpDecorate %16 DescriptorSet 0
+Word 1: (4 << 16) | 71 = 0x00040047 -> "47000400"
+Word 2: 0x00000010 -> "10000000"
+Word 3: 0x00000022 -> "22000000"
+Word 4: 0x00000000 -> "00000000"
+
+; OpDecorate %16 Binding 0
+Word 1: 0x00040047 -> "47000400"
+Word 2: 0x00000010 -> "10000000"
+Word 3: 0x00000021 -> "21000000"
+Word 4: 0x00000000 -> "00000000"
+
+; OpMemberDecorate %9 0 Offset 0
+Word 1: 0x00050048 -> "48000500"
+Word 2: 0x00000009 -> "09000000"
+Word 3: 0x00000000 -> "00000000"
+Word 4: 0x00000023 -> "23000000"
+Word 5: 0x00000000 -> "00000000"
+
+; OpDecorate %9 Block
+Word 1: 0x00030047 -> "47000300"
+Word 2: 0x00000009 -> "09000000"
+Word 3: 0x00000002 -> "02000000"
+
+; OpDecorate %17 DescriptorSet 0
+Word 1: 0x00040047 -> "47000400"
+Word 2: 0x00000011 -> "11000000"
+Word 3: 0x00000022 -> "22000000"
+Word 4: 0x00000000 -> "00000000"
+
+; OpDecorate %17 Binding 1
+Word 1: 0x00040047 -> "47000400"
+Word 2: 0x00000011 -> "11000000"
+Word 3: 0x00000021 -> "21000000"
+Word 4: 0x00000001 -> "01000000"
+
+; OpMemberDecorate %11 0 Offset 0
+Word 1: 0x00050048 -> "48000500"
+Word 2: 0x0000000B -> "0B000000"
+Word 3: 0x00000000 -> "00000000"
+Word 4: 0x00000023 -> "23000000"
+Word 5: 0x00000000 -> "00000000"
+
+; OpDecorate %11 Block
+Word 1: 0x00030047 -> "47000300"
+Word 2: 0x0000000B -> "0B000000"
+Word 3: 0x00000002 -> "02000000"
+
+; OpDecorate %18 DescriptorSet 0
+Word 1: 0x00040047 -> "47000400"
+Word 2: 0x00000012 -> "12000000"
+Word 3: 0x00000022 -> "22000000"
+Word 4: 0x00000000 -> "00000000"
+
+; OpDecorate %18 Binding 2
+Word 1: 0x00040047 -> "47000400"
+Word 2: 0x00000012 -> "12000000"
+Word 3: 0x00000021 -> "21000000"
+Word 4: 0x00000002 -> "02000000"
+
+; %1 = OpTypeVoid
+Word 1: (3 << 16) | 19 = 0x00030013 -> "13000300"
+Word 2: 0x00000001 -> "01000000"
+
+; %2 = OpTypeFunction %1
+Word 1: (3 << 16) | 33 = 0x00030021 -> "21000300"
+Word 2: 0x00000002 -> "02000000"
+Word 3: 0x00000001 -> "01000000"
+
+; %3 = OpTypeInt 32 0
+Word 1: (4 << 16) | 21 = 0x00040015 -> "15000400"
+Word 2: 0x00000003 -> "03000000"
+Word 3: 0x00000020 -> "20000000"
+Word 4: 0x00000000 -> "00000000"
+
+; %4 = OpTypeVector %3 3
+Word 1: (4 << 16) | 23 = 0x00040017 -> "17000400"
+Word 2: 0x00000004 -> "04000000"
+Word 3: 0x00000003 -> "03000000"
+Word 4: 0x00000003 -> "03000000"
+
+; %5 = OpTypeVector %3 4
+Word 1: 0x00040017 -> "17000400"
+Word 2: 0x00000005 -> "05000000"
+Word 3: 0x00000003 -> "03000000"
+Word 4: 0x00000004 -> "04000000"
+
+; %6 = OpTypeRuntimeArray %3
+Word 1: (3 << 16) | 29 = 0x0003001D -> "1D000300"
+Word 2: 0x00000006 -> "06000000"
+Word 3: 0x00000003 -> "03000000"
+
+; %7 = OpTypeStruct %6
+Word 1: (3 << 16) | 30 = 0x0003001E -> "1E000300"
+Word 2: 0x00000007 -> "07000000"
+Word 3: 0x00000006 -> "06000000"
+
+; %8 = OpTypePointer StorageBuffer %7
+Word 1: (4 << 16) | 32 = 0x00040020 -> "20000400"
+Word 2: 0x00000008 -> "08000000"
+Word 3: 0x0000000C -> "0C000000"
+Word 4: 0x00000007 -> "07000000"
+
+; %9 = OpTypeStruct %6
+Word 1: 0x0003001E -> "1E000300"
+Word 2: 0x00000009 -> "09000000"
+Word 3: 0x00000006 -> "06000000"
+
+; %10 = OpTypePointer StorageBuffer %9
+Word 1: 0x00040020 -> "20000400"
+Word 2: 0x0000000A -> "0A000000"
+Word 3: 0x0000000C -> "0C000000"
+Word 4: 0x00000009 -> "09000000"
+
+; %11 = OpTypeStruct %5
+Word 1: 0x0003001E -> "1E000300"
+Word 2: 0x0000000B -> "0B000000"
+Word 3: 0x00000005 -> "05000000"
+
+; %12 = OpTypePointer Uniform %11
+Word 1: 0x00040020 -> "20000400"
+Word 2: 0x0000000C -> "0C000000"
+Word 3: 0x00000002 -> "02000000"
+Word 4: 0x0000000B -> "0B000000"
+
+; %13 = OpTypePointer StorageBuffer %3
+Word 1: 0x00040020 -> "20000400"
+Word 2: 0x0000000D -> "0D000000"
+Word 3: 0x0000000C -> "0C000000"
+Word 4: 0x00000003 -> "03000000"
+
+; %14 = OpTypePointer Input %3
+Word 1: 0x00040020 -> "20000400"
+Word 2: 0x0000000E -> "0E000000"
+Word 3: 0x00000001 -> "01000000"
+Word 4: 0x00000003 -> "03000000"
+
+; %15 = OpTypePointer Uniform %3
+Word 1: 0x00040020 -> "20000400"
+Word 2: 0x0000000F -> "0F000000"
+Word 3: 0x00000002 -> "02000000"
+Word 4: 0x00000003 -> "03000000"
+
+; %20 = OpConstant %3 0
+Word 1: (4 << 16) | 43 = 0x0004002B -> "2B000400"
+Word 2: 0x00000014 -> "14000000"
+Word 3: 0

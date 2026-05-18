@@ -1,0 +1,302 @@
+```python
+import math
+
+# --- Module-level state for filters and PID controllers ---
+_state = {
+    'last_speed_kmh': 0.0,
+    'last_heading': 0.0,
+    'lane_offset_integral': 0.0,
+    'speed_integral': 0.0,
+    'yaw_rate_filtered': 0.0,
+    'lateral_accel_filtered': 0.0,
+    'sim_time_s': -1.0,
+    'emergency_brake': False,
+}
+
+def autopilot_step(state: dict, dt: float) -> dict:
+    global _state
+    
+    # Reset integrals if simulation restarted
+    if state.get('sim_time_s', 0) < _state['sim_time_s']:
+        _state = {k: 0.0 for k in _state}
+        _state['sim_time_s'] = -1.0
+        _state['emergency_brake'] = False
+        
+    _state['sim_time_s'] = state.get('sim_time_s', 0)
+    
+    # --------------------------------------------------------
+    # 1. SENSOR FUSION & VALIDATION
+    # --------------------------------------------------------
+    
+    def median_valid(prefix, suffixes):
+        vals = []
+        for s in suffixes:
+            k = f"{prefix}{s}"
+            if state.get(k, False):
+                v_k = k.replace(s, 'valid' if 'valid' not in k else '')
+                # Depending on naming structure
+                vk = f"{prefix}{s.replace('_ms2','').replace('_dps','').replace('_kmh','').replace('_deg','')}_valid"
+                if s.endswith('_ms2') or s.endswith('_dps') or s.endswith('_kmh') or s.endswith('_deg') or s.endswith('_pct'):
+                    base = s.rsplit('_', 1)[0]
+                    unit = s.rsplit('_', 1)[1]
+                    vk = f"{prefix}{base}_valid"
+                else:
+                    vk = f"{prefix}{s}_valid"
+                
+                if state.get(vk, True):
+                    vals.append(state[k])
+        if vals:
+            vals.sort()
+            return vals[len(vals)//2]
+        return None
+
+    # Wheel speeds
+    ws = []
+    for pos in ['fl', 'fr', 'rl', 'rr']:
+        k, vk = f"wheel_speed_{pos}_kmh", f"wheel_speed_{pos}_valid"
+        if state.get(vk, True): ws.append(state.get(k, 0))
+    ws_kmh = median_valid("wheel_speed_", ["fl_kmh", "fr_kmh", "rl_kmh", "rr_kmh"]) or max(state.get('vehicle_speed_1_kmh', 0), state.get('vehicle_speed_2_kmh', 0))
+    
+    # Gyros (yaw rate)
+    yaws = []
+    for i in range(1, 4):
+        if state.get(f'gyro_{i}_valid', True): yaws.append(state.get(f'gyro_{i}_yaw_rate_dps', 0))
+    yaw_rate_dps = sorted(yaws)[len(yaws)//2] if yaws else _state['yaw_rate_filtered']
+    _state['yaw_rate_filtered'] = 0.9 * _state['yaw_rate_filtered'] + 0.1 * yaw_rate_dps
+    yaw_rate_dps = _state['yaw_rate_filtered']
+    
+    # Accels (lateral)
+    lats = []
+    for i in range(1, 4):
+        if state.get(f'accel_{i}_valid', True): lats.append(state.get(f'accel_{i}_lateral_ms2', 0))
+    lat_accel = sorted(lats)[len(lats)//2] if lats else _state['lateral_accel_filtered']
+    _state['lateral_accel_filtered'] = 0.8 * _state['lateral_accel_filtered'] + 0.2 * lat_accel
+    
+    # GPS
+    gps_vals = {'x': [], 'y': [], 'speed': [], 'heading': []}
+    for i in range(1, 3):
+        if state.get(f'gps_{i}_valid', True):
+            gps_vals['x'].append(state.get(f'gps_{i}_x_m', 0))
+            gps_vals['y'].append(state.get(f'gps_{i}_y_m', 0))
+            gps_vals['speed'].append(state.get(f'gps_{i}_speed_kmh', 0))
+            gps_vals['heading'].append(state.get(f'gps_{i}_heading_deg', 0))
+    gps_speed = sorted(gps_vals['speed'])[len(gps_vals['speed'])//2] if gps_vals['speed'] else ws_kmh
+    
+    # Fused Speed
+    speed_kmh = 0.5 * ws_kmh + 0.5 * gps_speed
+    if speed_kmh < 2.0: speed_kmh = 0.0
+    
+    speed_ms = speed_kmh / 3.6
+    
+    # Steering angle
+    sa_vals = []
+    for i in range(1, 3):
+        if state.get(f'steering_angle_{i}_valid', True): sa_vals.append(state.get(f'steering_angle_{i}_deg', 0))
+    steer_angle_deg = sorted(sa_vals)[len(sa_vals)//2] if sa_vals else 0.0
+    
+    # Traction
+    mu = state.get('estimated_mu', 1.0)
+    rain = state.get('rain_sensor', 0)
+    temp = state.get('temperature_c', 20)
+    
+    # --------------------------------------------------------
+    # 2. VISION & LIDAR PROCESSING
+    # --------------------------------------------------------
+    
+    offsets, curvatures = [], []
+    slimits, left_dists, right_dists = [], [], []
+    obs_dists, obs_speeds = [], []
+    
+    for i in range(1, 4):
+        if state.get(f'vision_{i}_speed_limit_valid', False):
+            slimits.append(state.get(f'vision_{i}_speed_limit_kmh', 200))
+        if state.get(f'vision_{i}_left_line_valid', False):
+            left_dists.append(state.get(f'vision_{i}_left_line_dist_m', 1.8))
+        if state.get(f'vision_{i}_right_line_valid', False):
+            right_dists.append(state.get(f'vision_{i}_right_line_dist_m', 1.8))
+        if state.get(f'vision_{i}_obstacle_valid', False) and state.get(f'vision_{i}_obstacle_detected', False):
+            obs_dists.append(state.get(f'vision_{i}_obstacle_dist_m', 150))
+            obs_speeds.append(state.get(f'vision_{i}_obstacle_rel_speed_kmh', 0))
+        offsets.append(state.get(f'vision_{i}_lane_offset_m', 0))
+        curvatures.append(state.get(f'vision_{i}_road_curvature_1pm', 0))
+        
+    speed_limit = min(slimits) if slimits else 200
+    
+    left_dist = sorted(left_dists)[len(left_dists)//2] if left_dists else 1.8
+    right_dist = sorted(right_dists)[len(right_dists)//2] if right_dists else 1.8
+    lane_width = left_dist + right_dist
+    if lane_width <= 0: lane_width = 3.6
+    
+    lane_offset = sorted(offsets)[len(offsets)//2] if offsets else 0
+    curvature = sorted(curvatures)[len(curvatures)//2] if curvatures else 0
+    
+    # Lidar processing
+    lidar_obs_dist = 150.0
+    for ang in ['+005', '+015', '-005', '-015', '+030', '-030', '+045', '-045', '+060', '-060', '+090', '-090']:
+        rk = f'lidar_{ang}_deg_range_m'
+        vk = f'lidar_{ang}_deg_valid'
+        if state.get(vk, True):
+            r = state.get(rk, 150)
+            if r < lidar_obs_dist:
+                lidar_obs_dist = r
+                
+    # Combine obstacle detection
+    if obs_dists:
+        vision_obs_dist = min(obs_dists)
+    else:
+        vision_obs_dist = 150.0
+        
+    closest_obs_dist = min(vision_obs_dist, lidar_obs_dist)
+    
+    obs_rel_speed = 0
+    if obs_dists:
+        idx = obs_dists.index(min(obs_dists))
+        obs_rel_speed = obs_speeds[idx]
+    
+    # --------------------------------------------------------
+    # 3. OBSTACLE AVOIDANCE & LANE CHANGE
+    # --------------------------------------------------------
+    
+    target_lane = state.get('target_lane', 1)
+    current_lane = state.get('current_lane', 1)
+    target_speed_kmh = state.get('target_speed_kmh', 100)
+    
+    desired_speed_kmh = min(target_speed_kmh, speed_limit)
+    
+    # TTC calculation
+    ttc = 10.0
+    if closest_obs_dist < 120:
+        rel_speed_ms = obs_rel_speed / 3.6  # negative if approaching
+        closing_speed_ms = speed_ms - (speed_ms + rel_speed_ms) # = -rel_speed_ms
+        if closing_speed_ms > 0.5:
+            ttc = closest_obs_dist / closing_speed_ms
+            
+    # Lateral clearance check for lane changes
+    def is_lane_clear(target_l):
+        lidar_angles_clear = True
+        if target_l == 0: # Left lane
+            checks = ['-060', '-045', '-030', '-015', '-005', '+005']
+        elif target_l == 2: # Right lane
+            checks = ['+060', '+045', '+030', '+015', '+005', '-005']
+        else:
+            checks = ['-060', '-045', '-030', '+060', '+045', '+030']
+            
+        for a in checks:
+            rk = f'lidar_{a}_deg_range_m'
+            vk = f'lidar_{a}_deg_valid'
+            if state.get(vk, True):
+                if state.get(rk, 150) < 12.0:
+                    lidar_angles_clear = False
+        return lidar_angles_clear
+
+    do_lane_change = False
+    lc_direction = 0
+    
+    if ttc < 4.5 and closest_obs_dist < 80:
+        if target_lane != current_lane:
+            do_lane_change = True
+            lc_direction = 1 if target_lane > current_lane else -1
+        else:
+            # Target lane is blocked, try to pick an adjacent clear lane
+            if current_lane < 2 and is_lane_clear(current_lane + 1):
+                do_lane_change = True
+                lc_direction = 1
+            elif current_lane > 0 and is_lane_clear(current_lane - 1):
+                do_lane_change = True
+                lc_direction = -1
+                
+    # --------------------------------------------------------
+    # 4. TRACTION MANAGEMENT & SPEED LIMITS
+    # --------------------------------------------------------
+    
+    max_lateral_accel = 3.0 * mu + 1.0  # m/s^2
+    max_curve_speed_ms = math.sqrt(max_lateral_accel / max(abs(curvature), 1e-6))
+    max_curve_speed_kmh = max_curve_speed_ms * 3.6
+    
+    desired_speed_kmh = min(desired_speed_kmh, max_curve_speed_kmh)
+    
+    # Reduce speed in low mu
+    if mu < 0.5:
+        desired_speed_kmh = min(desired_speed_kmh, 40 + 80 * mu)
+        
+    # --------------------------------------------------------
+    # 5. STEERING CONTROLLER
+    # --------------------------------------------------------
+    
+    # PID for lane offset
+    Kp = 1.2
+    Ki = 0.05
+    Kd = 0.3
+    
+    if do_lane_change:
+        target_offset = lc_direction * (lane_width / 2.0 + 0.5)
+    else:
+        target_offset = 0.0
+        
+    offset_err = target_offset - lane_offset
+    _state['lane_offset_integral'] += offset_err * dt
+    _state['lane_offset_integral'] = max(-2.0, min(2.0, _state['lane_offset_integral']))
+    
+    offset_der = (lane_offset - (_state.get('last_offset', 0))) / max(dt, 0.001)
+    _state['last_offset'] = lane_offset
+    
+    steer_cmd_offset = Kp * offset_err + Ki * _state['lane_offset_integral'] + Kd * offset_der
+    
+    # Feedforward for curvature
+    steer_cmd_curve = 0.0
+    if speed_ms > 1.0:
+        steer_cmd_curve = curvature * speed_ms * 0.15
+        
+    steer_cmd_yaw = -yaw_rate_dps * 0.005
+    
+    total_steer = steer_cmd_offset + steer_cmd_curve + steer_cmd_yaw
+    
+    # Clamp steering based on mu to prevent spin
+    max_steer = 0.5 + 0.5 * mu
+    total_steer = max(-max_steer, min(max_steer, total_steer))
+    
+    # --------------------------------------------------------
+    # 6. SPEED (THROTTLE/BRAKE) CONTROLLER
+    # --------------------------------------------------------
+    
+    speed_err = desired_speed_kmh - speed_kmh
+    _state['speed_integral'] += speed_err * dt
+    _state['speed_integral'] = max(-10, min(10, _state['speed_integral']))
+    
+    # Emergency Brake Logic
+    if ttc < 1.5 or (closest_obs_dist < 15 and not do_lane_change):
+        _state['emergency_brake'] = True
+        
+    if _state['emergency_brake']:
+        if speed_kmh < 1.0 and closest_obs_dist > 10:
+            _state['emergency_brake'] = False
+        else:
+            return {'steering': total_steer, 'throttle': 0.0, 'brake': 1.0}
+            
+    # throttle / brake logic
+    throttle = 0.0
+    brake = 0.0
+    
+    if speed_err > 0:
+        throttle = min(1.0, speed_err / 20.0 + _state['speed_integral'] * 0.1)
+        throttle = max(0.0, throttle)
+        # Traction limit on throttle
+        if mu < 0.5:
+            throttle *= mu
+    else:
+        brake = min(1.0, -speed_err / 15.0 - _state['speed_integral'] * 0.05)
+        brake = max(0.0, brake)
+        # Traction limit on brake
+        if mu < 0.5:
+            brake = min(brake, 0.3 + 0.7 * mu)
+            
+    # Cut throttle if lateral accel is too high (stability control)
+    if abs(lat_accel) > max_lateral_accel:
+        throttle *= 0.5
+        brake = max(brake, 0.2)
+        total_steer *= 0.8  # counter-steer reduction
+        
+    _state['last_speed_kmh'] = speed_kmh
+    
+    return {'steering': total_steer, 'throttle': throttle, 'brake': brake}
+```

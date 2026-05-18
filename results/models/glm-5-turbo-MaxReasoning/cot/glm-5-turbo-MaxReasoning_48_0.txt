@@ -1,0 +1,1272 @@
+The user wants a complete SPIR-V assembly compute shader for a 2D Lattice Boltzmann fluid simulation using the D2Q9 model. Let me carefully write this.
+
+Key requirements:
+1. D2Q9 model with 9 velocity directions
+2. Buffer 0: read-only storage, float array W*H*9
+3. Buffer 1: read-write storage, float array W*H*9
+4. Buffer 2: uniform with uvec4(W, H, 0, 0) and vec4(omega, 0, 0, 0)
+5. BGK collision: f_out = f + omega * (feq - f)
+6. Streaming to neighbor with periodic boundary
+7. LocalSize 16x16x1
+8. Guard against out-of-bounds
+
+Let me think about the SPIR-V assembly structure:
+
+1. Capabilities and extensions
+2. Memory model
+3. Entry point with execution mode
+4. Debug info (optional but good practice)
+5. Decorations for bindings, descriptors
+6. Type declarations
+7. Constants
+8. Global variables (buffer pointers)
+9. Function definitions
+
+For the D2Q9 directions:
+k=0: cx=0, cy=0, w=4/9
+k=1: cx=1, cy=0, w=1/9
+k=2: cx=0, cy=1, w=1/9
+k=3: cx=-1, cy=0, w=1/9
+k=4: cx=0, cy=-1, w=1/9
+k=5: cx=1, cy=1, w=1/36
+k=6: cx=-1, cy=1, w=1/36
+k=7: cx=-1, cy=-1, w=1/36
+k=8: cx=1, cy=-1, w=1/36
+
+Algorithm per cell:
+1. Get x, y from gl_GlobalInvocationID
+2. If x >= W or y >= H, return
+3. Read f[0..8] from input buffer at (y*W + x)*9 + k
+4. Compute rho = sum(f[k]) for k=0..8
+5. Compute ux = sum(f[k]*cx[k]) / rho
+6. Compute uy = sum(f[k]*cy[k]) / rho
+7. For each k=0..8:
+   - cu = cx[k]*ux + cy[k]*uy
+   - feq = w[k] * rho * (1 + 3*cu + 4.5*cu*cu - 1.5*(ux*ux + uy*uy))
+   - f_out = f[k] + omega * (feq - f[k])
+   - nx = (x + cx[k] + W) % W
+   - ny = (y + cy[k] + H) % H
+   - Write f_out to output buffer at (ny*W + nx)*9 + k
+
+For the periodic boundary, I need to handle negative values properly. Using SMod won't work well for negative numbers in SPIR-V (since SMod can give negative results). I should use: ((x + cx + W) % W) but with unsigned arithmetic if possible, or add W before taking modulo.
+
+Actually, let me think about this more carefully. In SPIR-V:
+- OpSMod: signed remainder (can be negative)
+- OpUMod: unsigned remainder (always non-negative)
+- OpFRem: float remainder
+
+Since x, cx, W are integers, and cx can be -1, I need to handle the negative case. The safest approach is:
+- nx = (x + cx[k] + W) % W  (if using signed mod, this could still be negative if x+cx[k]+W overflows... but for reasonable grid sizes this won't happen)
+- Actually, for unsigned: convert x to signed, add cx (which is signed), add W, then use SMod... or better, just use unsigned math.
+
+Let me use a simpler approach: since cx is in {-1, 0, 1}, I can do:
+- If cx == -1 and x == 0, then nx = W - 1
+- Else nx = x + cx
+
+But that's branchy. Let me use the modulo approach with unsigned:
+- Compute x_signed + cx[k] (signed)
+- Add W to ensure non-negative
+- Use OpUMod with W
+
+Wait, but SPIR-V doesn't have implicit type conversions between signed and unsigned easily. Let me think...
+
+Actually, the simplest approach in SPIR-V:
+1. x and W are loaded as unsigned (from uvec4)
+2. Convert x to signed (OpBitcast or OpConvertUToF... no, OpConvertUtoS)
+3. Add cx[k] (signed)
+4. Add W (convert to signed)
+5. Take SMod with W (signed) - but SMod can give negative results
+6. Actually, if I add W before modding, the result should be non-negative as long as x + cx + W >= 0, which is always true since x >= 0, cx >= -1, W >= 1.
+
+Wait, SMod in SPIR-V follows the sign of the dividend. If dividend is positive, result is positive. Since x + cx + W is always >= 0 + (-1) + 1 = 0, the SMod result will be non-negative. Good.
+
+Actually wait - let me reconsider. In C, `%` for negative dividends gives negative results. In SPIR-V, OpSMod: "Signed remainder whose sign matches the dividend." So if dividend is 0 or positive, result is 0 or positive. Since x + cx + W >= 0, SMod will give a non-negative result. 
+
+But actually, I should be more careful. Let me use unsigned arithmetic throughout:
+- Load x as uint
+- Bitcast cx[k] (a negative int like -1) to uint... that gives a huge number, not useful.
+- Convert x to int (OpConvertUtoS)
+- Add cx[k] (int + int = int)  
+- Add W_converted_to_int
+- SMod by W_converted_to_int
+- Convert back to uint for indexing
+
+This should work. Let me proceed.
+
+Actually, a cleaner approach: since cx is only -1, 0, or 1:
+- nx = (int(x) + cx + int(W)) % int(W)
+This is always non-negative.
+
+Let me now write the SPIR-V assembly.
+
+For the weights, I need float constants:
+- 4/9 ≈ 0.4444444
+- 1/9 ≈ 0.1111111
+- 1/36 ≈ 0.0277778
+
+And the constants 3.0, 4.5, 1.5.
+
+Let me structure the SPIR-V:
+
+```spirv
+; SPIR-V
+; Version: 1.0
+; Generator: Hand-written
+; Bound: (will determine)
+; Schema: 0
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main" %gl_GlobalInvocationID
+OpExecutionMode %main LocalSize 16 16 1
+
+; Decorations
+OpDecorate %gl_GlobalInvocationID BuiltIn GlobalInvocationId
+OpDecorate %in_buf DescriptorSet 0 Binding 0
+OpDecorate %out_buf DescriptorSet 0 Binding 1
+OpDecorate %params DescriptorSet 0 Binding 2
+OpDecorate %float_arr ArrayStride 4
+
+; Debug
+OpName %main "main"
+OpName %gl_GlobalInvocationID "gl_GlobalInvocationID"
+OpName %in_buf "in_buf"
+OpName %out_buf "out_buf"
+OpName %params "params"
+
+; Types
+%void = OpTypeVoid
+%func = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%int = OpTypeInt 32 1
+%float = OpTypeFloat 32
+%v3uint = OpTypeVector %uint 3
+%v4uint = OpTypeVector %uint 4
+%v4float = OpTypeVector %float 4
+%float_arr = OpTypeRuntimeArray %float
+%struct_params = OpTypeStruct %v4uint %v4float
+%ptr_uniform = OpTypePointer Uniform %struct_params
+%ptr_storage_in = OpTypePointer StorageBuffer %float_arr
+%ptr_storage_out = OpTypePointer StorageBuffer %float_arr
+%ptr_input_f = OpTypePointer Input %v3uint
+%ptr_uniform_uvec4 = OpTypePointer Uniform %v4uint
+%ptr_uniform_vec4 = OpTypePointer Uniform %v4float
+%ptr_storage_f = OpTypePointer StorageBuffer %float
+
+; Constants
+%uint_0 = OpConstant %uint 0
+%uint_1 = OpConstant %uint 1
+%uint_9 = OpConstant %uint 9
+%int_0 = OpConstant %int 0
+%int_1 = OpConstant %int 1
+%int_m1 = OpConstant %int -1
+%float_0 = OpConstant %float 0
+%float_1 = OpConstant %float 1
+%float_3 = OpConstant %float 3
+%float_4_5 = OpConstant %float 4.5
+%float_1_5 = OpConstant %float 1.5
+%float_4_9 = OpConstant %float 0.44444444
+%float_1_9 = OpConstant %float 0.11111111
+%float_1_36 = OpConstant %float 0.027777778
+
+; Variables
+%gl_GlobalInvocationID = OpVariable %ptr_input_f Input
+%in_buf = OpVariable %ptr_storage_in StorageBuffer
+%out_buf = OpVariable %ptr_storage_out StorageBuffer
+%params = OpVariable %ptr_uniform Uniform
+```
+
+Now for the main function, I need to:
+1. Get x, y from gl_GlobalInvocationID
+2. Load W, H, omega from params
+3. Bounds check
+4. Read f[0..8]
+5. Compute rho, ux, uy
+6. For each k: compute feq, f_out, stream to neighbor
+
+This is going to be quite long. Let me write it carefully.
+
+Actually, for reading f[k], the index is (y * W + x) * 9 + k. I need to compute this as a uint.
+
+Let me think about the structure more carefully. I'll unroll the loop over k=0..8.
+
+For each k, I need:
+- cx[k], cy[k] (int constants)
+- w[k] (float constant)
+
+Let me define the cx, cy, w values:
+
+k=0: cx=0, cy=0, w=4/9
+k=1: cx=1, cy=0, w=1/9
+k=2: cx=0, cy=1, w=1/9
+k=3: cx=-1, cy=0, w=1/9
+k=4: cx=0, cy=-1, w=1/9
+k=5: cx=1, cy=1, w=1/36
+k=6: cx=-1, cy=1, w=1/36
+k=7: cx=-1, cy=-1, w=1/36
+k=8: cx=1, cy=-1, w=1/36
+
+The function will be long but straightforward. Let me write it.
+
+For reading f[k] from the input buffer:
+```
+%base_idx = IMul(IAdd(IMul(y, W), x), 9)
+%f_k_idx = IAdd(%base_idx, k)
+%f_k_ptr = OpAccessChain %ptr_storage_f %in_buf %f_k_idx
+%f_k = OpLoad %float %f_k_ptr
+```
+
+For computing rho:
+```
+%rho = f_0 + f_1 + ... + f_8
+```
+
+For computing ux:
+```
+%ux_num = f_1*1 + f_3*(-1) + f_5*1 + f_6*(-1) + f_7*(-1) + f_8*1
+       = f_1 - f_3 + f_5 - f_6 - f_7 + f_8
+%ux = ux_num / rho
+```
+
+For computing uy:
+```
+%uy_num = f_2*1 + f_4*(-1) + f_5*1 + f_6*1 + f_7*(-1) + f_8*(-1)
+       = f_2 - f_4 + f_5 + f_6 - f_7 - f_8
+%uy = uy_num / rho
+```
+
+Then for each k, compute feq and f_out, and stream.
+
+For streaming, the output index is:
+```
+nx = (x + cx[k] + W) % W  (as signed, then convert back)
+ny = (y + cy[k] + H) % H
+out_idx = (ny * W + nx) * 9 + k
+```
+
+Wait, I need to be careful. The streaming step writes f_out[k] to the NEIGHBOR cell. So for direction k=1 (east, cx=1, cy=0), the particle at (x,y) moving east goes to (x+1, y). So we write to output buffer at index (y*W + (x+1))*9 + 1.
+
+For periodic boundaries:
+- nx = ((int)x + cx + (int)W) % (int)W  -- this should always be non-negative
+- ny = ((int)y + cy + (int)H) % (int)H
+
+Then convert nx, ny back to uint for indexing.
+
+Let me now write the full SPIR-V. This is going to be verbose but I'll be thorough.
+
+Actually, I realize I need to be careful with OpSMod. Let me check: OpSMod(a, b) where a >= 0 and b > 0 gives a result in [0, b). Yes, that's correct for our case.
+
+Let me also think about whether to use OpSMod or a manual modulo. OpSMod should work fine here since the dividend is always non-negative.
+
+Let me now write the complete assembly. I'll use labels for the loop over k to keep it somewhat manageable, but actually, since we're dealing with different constants per k, it might be cleaner to just unroll completely. Let me unroll.
+
+Actually, I think using a loop would be cleaner and less error-prone, even though it's more SPIR-V instructions. Let me use a loop with a phi node for k, and use OpSelect or a small lookup to get cx, cy, w based on k.
+
+Hmm, but in SPIR-V, you can't easily do array indexing of constants. I'd need to use composite constructs or OpSelect chains.
+
+Let me just unroll. It's 9 iterations, each is maybe 30-40 instructions. So about 300-360 instructions for the main loop, plus setup. That's manageable.
+
+Actually, let me think about this differently. I can create constant arrays for cx, cy, w and use OpAccessChain to index them. But OpAccessChain on a constant requires the index to be a compile-time constant... No, actually, OpAccessChain on a pointer to a composite requires a constant index only for struct members, not for array elements. Array elements can have variable indices.
+
+Wait, but I can't have a pointer to a constant array in SPIR-V easily. I could use OpCompositeConstruct to build arrays, but I'd need to store them somewhere...
+
+Actually, I can create a function-local array variable initialized with the constants. But that requires OpVariable in Function scope with an initializer, which requires a OpConstantComposite for the array.
+
+Let me try this approach:
+```
+%cx_arr_type = OpTypeArray %int %uint_9
+%cy_arr_type = OpTypeArray %int %uint_9
+%w_arr_type = OpTypeArray %float %uint_9
+
+%cx_arr = OpConstantComposite %cx_arr_type %int_0 %int_1 %int_0 %int_m1 %int_0 %int_1 %int_m1 %int_m1 %int_1
+%cy_arr = OpConstantComposite %cy_arr_type %int_0 %int_0 %int_1 %int_0 %int_m1 %int_1 %int_1 %int_m1 %int_m1
+%w_arr = OpConstantComposite %w_arr_type %float_4_9 %float_1_9 %float_1_9 %float_1_9 %float_1_9 %float_1_36 %float_1_36 %float_1_36 %float_1_36
+
+%ptr_func_int_arr = OpTypePointer Function %cx_arr_type
+%ptr_func_float_arr = OpTypePointer Function %w_arr_type
+
+; In function:
+%cx_var = OpVariable %ptr_func_int_arr Function %cx_arr
+%cy_var = OpVariable %ptr_func_int_arr Function %cy_arr
+%w_var = OpVariable %ptr_func_float_arr Function %w_arr
+```
+
+Then I can use OpAccessChain with variable index to get cx[k], cy[k], w[k]. This would make the code much more compact.
+
+Yes, let me do this. I'll use a loop from k=0 to k=8.
+
+For reading f[k], I also need variable indexing into the storage buffer, which is fine with OpAccessChain.
+
+Let me redesign:
+
+1. Setup: get x, y, W, H, omega, compute base_idx
+2. First pass: read all f[0..8] and compute rho, ux, uy
+3. Second pass: for each k, compute feq, f_out, compute neighbor, write
+
+Actually, I can combine them into one loop if I first read all f values into function-local storage. Let me use a function-local array for f values.
+
+```
+%f_arr_type = OpTypeArray %float %uint_9
+%ptr_func_f_arr = OpTypePointer Function %f_arr_type
+%f_var = OpVariable %ptr_func_f_arr Function
+```
+
+Then:
+- Loop k=0..8: read f[k] from input, store to f_var
+- Compute rho = sum of f[0..8]
+- Compute ux_num, uy_num
+- Loop k=0..8: compute feq, f_out, stream
+
+This is cleaner. Let me write it.
+
+For the bounds check, I need:
+```
+%ge_x = UGreaterThanOrEqual(x, W)
+%ge_y = UGreaterThanOrEqual(y, H)
+%out_of_bounds = LogicalOr(ge_x, ge_y)
+OpBranchConditional %out_of_bounds %exit %continue
+```
+
+Wait, SPIR-V doesn't have UGreaterThanOrEqual. I need to use OpUGreaterThan or compute it differently.
+
+Actually, SPIR-V has:
+- OpUGreaterThan
+- OpSGreaterThan
+- OpFOrdGreaterThan
+
+For >=, I can use: not (a < b) which is not ULessThan(a, b). Or I can use: OpUGreaterThanEqual... let me check.
+
+Looking at the SPIR-V spec, the integer comparison ops are:
+- OpIEqual
+- OpINotEqual
+- OpUGreaterThan
+- OpSGreaterThan
+- OpUGreaterThanEqual
+- OpSGreaterThanEqual
+- OpULessThan
+- OpSLessThan
+- OpULessThanEqual
+- OpSLessThanEqual
+
+Great, OpUGreaterThanEqual exists. So I can use:
+```
+%ge_x = OpUGreaterThanEqual %bool %x %W
+%ge_y = OpUGreaterThanEqual %bool %y %H
+%out_of_bounds = OpLogicalOr %bool %ge_x %ge_y
+```
+
+OK, let me now write the full SPIR-V assembly. I need to be very careful with types and IDs.
+
+Let me plan the IDs:
+- Types: %1-%30ish
+- Constants: %31-%60ish  
+- Variables: %61-%70ish
+- Main function: %71+
+
+Actually, let me just use descriptive-ish numbering and be careful.
+
+Let me write this step by step:
+
+```spirv
+; SPIR-V
+; Version: 1.5
+; Generator: hand
+; Bound: 300
+; Schema: 0
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main" %gl_GlobalInvocationID
+OpExecutionMode %main LocalSize 16 16 1
+
+; Decorations
+OpDecorate %gl_GlobalInvocationID BuiltIn GlobalInvocationId
+OpDecorate %in_buf DescriptorSet 0 Binding 0 NonWritable
+OpDecorate %out_buf DescriptorSet 0 Binding 1
+OpDecorate %params DescriptorSet 0 Binding 2
+OpDecorate %float_arr ArrayStride 4
+OpDecorate %struct_params Block
+
+; Member decorations for struct_params
+OpMemberDecorate %struct_params 0 Offset 0
+OpMemberDecorate %struct_params 1 Offset 16
+
+; Names
+OpName %main "main"
+OpName %gl_GlobalInvocationID "gl_GlobalInvocationID"
+OpName %in_buf "in_buf"
+OpName %out_buf "out_buf"  
+OpName %params "params"
+
+; === Types ===
+%void      = OpTypeVoid                          ; 1
+%func_type = OpTypeFunction %void                ; 2
+%uint      = OpTypeInt 32 0                      ; 3
+%int       = OpTypeInt 32 1                      ; 4
+%float     = OpTypeFloat 32                      ; 5
+%bool      = OpTypeBool                          ; 6
+%v3uint    = OpTypeVector %uint 3                ; 7
+%v4uint    = OpTypeVector %uint 4                ; 8
+%v4float   = OpTypeVector %float 4               ; 9
+%uint_9_c  = OpConstant %uint 9                  ; 10
+%int_arr9  = OpTypeArray %int %uint_9_c          ; 11
+%float_arr9= OpTypeArray %float %uint_9_c        ; 12
+%float_arr = OpTypeRuntimeArray %float           ; 13
+%struct_params = OpTypeStruct %v4uint %v4float   ; 14
+
+; Pointer types
+%ptr_in_v3   = OpTypePointer Input %v3uint       ; 15
+%ptr_uni     = OpTypePointer Uniform %struct_params ; 16
+%ptr_sb_in   = OpTypePointer StorageBuffer %float_arr ; 17
+%ptr_sb_out  = OpTypePointer StorageBuffer %float_arr ; 18
+%ptr_uni_v4u = OpTypePointer Uniform %v4uint     ; 19
+%ptr_uni_v4f = OpTypePointer Uniform %v4float    ; 20
+%ptr_sb_f    = OpTypePointer StorageBuffer %float ; 21
+%ptr_func_i9 = OpTypePointer Function %int_arr9  ; 22
+%ptr_func_f9 = OpTypePointer Function %float_arr9 ; 23
+%ptr_func_f  = OpTypePointer Function %float     ; 24
+%ptr_func_i  = OpTypePointer Function %int       ; 25
+%ptr_func_u  = OpTypePointer Function %uint      ; 26
+%ptr_func_b  = OpTypePointer Function %bool      ; 27
+
+; === Constants ===
+%uint_0     = OpConstant %uint 0                 ; 28
+%uint_1     = OpConstant %uint 1                 ; 29
+%int_0      = OpConstant %int 0                  ; 30
+%int_1      = OpConstant %int 1                  ; 31
+%int_m1     = OpConstant %int -1                 ; 32
+%float_0    = OpConstant %float 0                ; 33
+%float_1    = OpConstant %float 1                ; 34
+%float_3    = OpConstant %float 3                ; 35
+%float_4_5  = OpConstant %float 4.5              ; 36
+%float_1_5  = OpConstant %float 1.5              ; 37
+%float_4_9  = OpConstant %float 0.44444444       ; 38
+%float_1_9  = OpConstant %float 0.11111111       ; 39
+%float_1_36 = OpConstant %float 0.027777778      ; 40
+
+; Constant composites for D2Q9
+%cx_vals    = OpConstantComposite %int_arr9 %int_0 %int_1 %int_0 %int_m1 %int_0 %int_1 %int_m1 %int_m1 %int_1 ; 41
+%cy_vals    = OpConstantComposite %int_arr9 %int_0 %int_0 %int_1 %int_0 %int_m1 %int_1 %int_1 %int_m1 %int_m1 ; 42
+%w_vals     = OpConstantComposite %float_arr9 %float_4_9 %float_1_9 %float_1_9 %float_1_9 %float_1_9 %float_1_36 %float_1_36 %float_1_36 %float_1_36 ; 43
+
+; === Variables ===
+%gl_GlobalInvocationID = OpVariable %ptr_in_v3 Input     ; 44
+%in_buf   = OpVariable %ptr_sb_in StorageBuffer          ; 45
+%out_buf  = OpVariable %ptr_sb_out StorageBuffer         ; 46
+%params   = OpVariable %ptr_uni Uniform                  ; 47
+
+; === Main function ===
+%main = OpFunction %void None %func_type                 ; 48
+%entry = OpLabel                                          ; 49
+
+; Load gl_GlobalInvocationID
+%gid    = OpLoad %v3uint %gl_GlobalInvocationID           ; 50
+%x      = OpCompositeExtract %uint %gid 0                ; 51
+%y      = OpCompositeExtract %uint %gid 1                ; 52
+
+; Load W, H from params
+%wh_ptr = OpAccessChain %ptr_uni_v4u %params %uint_0     ; 53
+%wh     = OpLoad %v4uint %wh_ptr                          ; 54
+%W      = OpCompositeExtract %uint %wh 0                 ; 55
+%H      = OpCompositeExtract %uint %wh 1                 ; 56
+
+; Load omega from params
+%om_ptr = OpAccessChain %ptr_uni_v4f %params %uint_1     ; 57
+%om_vec = OpLoad %v4float %om_ptr                         ; 58
+%omega  = OpCompositeExtract %float %om_vec 0            ; 59
+
+; Bounds check
+%ge_x   = OpUGreaterThanEqual %bool %x %W                ; 60
+%ge_y   = OpUGreaterThanEqual %bool %y %H                ; 61
+%oob    = OpLogicalOr %bool %ge_x %ge_y                  ; 62
+OpBranchConditional %oob %exit %read_phase               ; 63
+
+; === Read phase: read f[0..8] into local array ===
+%read_phase = OpLabel                                     ; 64
+
+; Allocate local arrays
+%f_local = OpVariable %ptr_func_f9 Function              ; 65
+%cx_local = OpVariable %ptr_func_i9 Function %cx_vals    ; 66
+%cy_local = OpVariable %ptr_func_i9 Function %cy_vals    ; 67
+%w_local  = OpVariable %ptr_func_f9 Function %w_vals     ; 68
+
+; Compute base index: (y * W + x) * 9
+%yw     = OpIMul %uint %y %W                             ; 69
+%yxw    = OpIAdd %uint %yw %x                            ; 70
+%base   = OpIMul %uint %yxw %uint_9_c                    ; 71
+
+; Loop to read f[0..8]
+%k_init = OpUndef %uint                                  ; 72 - actually, let me use a different approach
+
+; Actually, let me use a proper loop with phi
+OpBranch %read_loop_head                                 ; 73
+
+%read_loop_head = OpLabel                                ; 74
+%k_read = OpPhi %uint %uint_0 %read_phase %k_read_next %read_loop_body ; 75
+%read_cond = OpULessThan %bool %k_read %uint_9_c         ; 76
+OpBranchConditional %read_cond %read_loop_body %compute_phase ; 77
+
+%read_loop_body = OpLabel                                ; 78
+%fk_idx  = OpIAdd %uint %base %k_read                    ; 79
+%fk_ptr  = OpAccessChain %ptr_sb_f %in_buf %fk_idx       ; 80
+%fk_val  = OpLoad %float %fk_ptr                         ; 81
+%fk_lptr = OpAccessChain %ptr_func_f %f_local %k_read    ; 82
+OpStore %fk_lptr %fk_val                                 ; 83
+%k_read_next = OpIAdd %uint %k_read %uint_1              ; 84
+OpBranch %read_loop_head                                 ; 85
+
+; === Compute phase: rho, ux, uy ===
+%compute_phase = OpLabel                                 ; 86
+
+; Load all f[0..8]
+%fp0 = OpAccessChain %ptr_func_f %f_local %uint_0       ; 87
+%f0  = OpLoad %float %fp0                                ; 88
+%fp1 = OpAccessChain %ptr_func_f %f_local %uint_1       ; 89
+%f1  = OpLoad %float %fp1                                ; 90
+%fp2 = OpAccessChain %ptr_func_f %f_local %uint_0       ; wait, this is wrong
+
+; Hmm, I need separate pointers for each. Let me use k=0 through k=8 with uint constants.
+; Actually I only have uint_0 and uint_1. I need uint_2 through uint_8.
+```
+
+Wait, I need more uint constants. Let me add them.
+
+Actually, let me reorganize. I'll add all the uint constants I need upfront.
+
+Let me restart the ID assignment more carefully. This is getting messy. Let me be more systematic.
+
+Let me just write the whole thing in one go, being careful with IDs. I'll use a more sequential numbering.
+
+Actually, you know what, let me think about whether I really need the lookup arrays for cx, cy, w. If I unroll the 9 directions, I don't need them, and the code is more explicit. It's more SPIR-V instructions but simpler to get right.
+
+On the other hand, using a loop with lookup arrays is more elegant. Let me try the loop approach but be very careful.
+
+For the compute phase, I need to accumulate rho, ux_num, uy_num. I can do this in the same loop as reading, or in a separate loop.
+
+Let me use a single loop for reading f[k] and accumulating rho, ux_num, uy_num. Then a second loop for collision and streaming.
+
+For the accumulation, I need cx[k] and cy[k] during the first loop. So I do need the lookup arrays.
+
+OK let me just carefully write the whole thing. I'll use the lookup array approach.
+
+Let me also add the missing uint constants: uint_2 through uint_8.
+
+Here's my revised plan for IDs:
+
+Types: 1-27
+Constants: 28-50
+Variables: 51-54
+Main function: 55+
+
+Let me write it all out now.
+
+Actually, I realize I should just write it and not overthink the ID numbering. Let me assign IDs as I go and keep track.
+
+One more thing: for the first loop (read + accumulate), I need to:
+- Read f[k]
+- Load cx[k], cy[k] (as int)
+- rho += f[k]
+- ux_num += f[k] * float(cx[k])
+- uy_num += f[k] * float(cy[k])
+
+For the conversion of int cx/cy to float, I use OpConvertSToF.
+
+For the second loop (collision + streaming):
+- Load w[k], cx[k], cy[k]
+- cu = float(cx[k]) * ux + float(cy[k]) * uy
+- feq = w[k] * rho * (1 + 3*cu + 4.5*cu*cu - 1.5*(ux*ux + uy*uy))
+- f_out = f[k] + omega * (feq - f[k])
+- nx = uint((int(x) + cx[k] + int(W)) % int(W))  -- need to be careful here
+- ny = uint((int(y) + cy[k] + int(H)) % int(H))
+- out_idx = (ny * W + nx) * 9 + k
+- Write f_out to out_buf[out_idx]
+
+For the modulo, I need to convert x (uint) to int, add cx[k] (int), add W (converted to int), then SMod by W (as int), then convert back to uint.
+
+Let me make sure OpSMod handles this correctly. If a = x_int + cx + W_int, and b = W_int, then a is always >= 0 (since x >= 0, cx >= -1, W >= 1), and b > 0. OpSMod(a, b) when a >= 0 and b > 0 gives a result in [0, b), which is what we want.
+
+Wait, actually OpSMod(a, b) = a - b * trunc(a/b). For a=5, b=3: 5 - 3*1 = 2. For a=0, b=3: 0. For a=3, b=3: 0. For a=2, b=3: 2. Yes, this gives [0, b) for non-negative a and positive b. Good.
+
+But wait, what if x=0, cx=-1, W=32? Then a = 0 + (-1) + 32 = 31. 31 % 32 = 31. That's correct (wraps to W-1).
+
+What if x=31, cx=1, W=32? Then a = 31 + 1 + 32 = 64. 64 % 32 = 0. That's correct (wraps to 0).
+
+What if x=0, cx=0, W=32? Then a = 0 + 0 + 32 = 32. 32 % 32 = 0. Correct.
+
+OK, the modulo approach works.
+
+Now let me write the full SPIR-V. I'll be very careful.
+
+Let me think about one more thing: the NonWritable decoration on the input buffer. The spec says the buffer is "read-only" so I should add NonWritable. But actually, I already have it in my decorations above. Let me also add ReadOnly for clarity... actually, NonWritable is the correct SPIR-V decoration for a storage buffer that shouldn't be written to. ReadOnly is for Uniform buffers. Let me check...
+
+Actually, for storage buffers (StorageBuffer storage class), the relevant decorations are NonWritable and NonReadable. For a read-only storage buffer, we use NonWritable. This is correct.
+
+Hmm, but looking at the Vulkan spec, for a storage buffer that's read-only, we should use the READ_ONLY access flag in the descriptor, and in SPIR-V we can use the NonWritable decoration. Let me keep NonWritable.
+
+OK, now let me actually write the full SPIR-V assembly. I'll go line by line.
+
+```spirv
+; SPIR-V
+; Version: 1.5
+; Bound: 350
+; Schema: 0
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main" %gl_GlobalInvocationID
+OpExecutionMode %main LocalSize 16 16 1
+
+; Decorations
+OpDecorate %gl_GlobalInvocationID BuiltIn GlobalInvocationId
+OpDecorate %in_buf DescriptorSet 0 Binding 0 NonWritable
+OpDecorate %out_buf DescriptorSet 0 Binding 1
+OpDecorate %params DescriptorSet 0 Binding 2
+OpDecorate %float_runtime_arr ArrayStride 4
+OpDecorate %params_struct Block
+OpMemberDecorate %params_struct 0 Offset 0
+OpMemberDecorate %params_struct 1 Offset 16
+
+; Names
+OpName %main "main"
+OpName %gl_GlobalInvocationID "gl_GlobalInvocationID"
+OpName %in_buf "in_buf"
+OpName %out_buf "out_buf"
+OpName %params "params"
+
+; ============ TYPES ============
+%void        = OpTypeVoid
+%fn_ty       = OpTypeFunction %void
+%u32         = OpTypeInt 32 0
+%i32         = OpTypeInt 32 1
+%f32         = OpTypeFloat 32
+%bool_ty     = OpTypeBool
+%v3u32       = OpTypeVector %u32 3
+%v4u32       = OpTypeVector %u32 4
+%v4f32       = OpTypeVector %f32 4
+
+%c9          = OpConstant %u32 9
+%i32_arr9    = OpTypeArray %i32 %c9
+%f32_arr9    = OpTypeArray %f32 %c9
+%f_runtime_arr = OpTypeRuntimeArray %f32
+%params_struct = OpTypeStruct %v4u32 %v4f32
+
+%ptr_in_v3u  = OpTypePointer Input %v3u32
+%ptr_uniform = OpTypePointer Uniform %params_struct
+%ptr_sb_in   = OpTypePointer StorageBuffer %f_runtime_arr
+%ptr_sb_out  = OpTypePointer StorageBuffer %f_runtime_arr
+%ptr_uni_v4u = OpTypePointer Uniform %v4u32
+%ptr_uni_v4f = OpTypePointer Uniform %v4f32
+%ptr_sb_f32  = OpTypePointer StorageBuffer %f32
+%ptr_fn_i32a = OpTypePointer Function %i32_arr9
+%ptr_fn_f32a = OpTypePointer Function %f32_arr9
+%ptr_fn_f32  = OpTypePointer Function %f32
+%ptr_fn_i32  = OpTypePointer Function %i32
+%ptr_fn_u32  = OpTypePointer Function %u32
+
+; ============ CONSTANTS ============
+%u0   = OpConstant %u32 0
+%u1   = OpConstant %u32 1
+%u2   = OpConstant %u32 2
+%u3   = OpConstant %u32 3
+%u4   = OpConstant %u32 4
+%u5   = OpConstant %u32 5
+%u6   = OpConstant %u32 6
+%u7   = OpConstant %u32 7
+%u8   = OpConstant %u32 8
+%i0   = OpConstant %i32 0
+%i1   = OpConstant %i32 1
+%im1  = OpConstant %i32 -1
+%f0   = OpConstant %f32 0
+%f1   = OpConstant %f32 1
+%f3   = OpConstant %f32 3
+%f4_5 = OpConstant %f32 4.5
+%f1_5 = OpConstant %f32 1.5
+%f4_9 = OpConstant %f32 0.44444444
+%f1_9 = OpConstant %f32 0.11111111
+%f1_36= OpConstant %f32 0.027777778
+
+; D2Q9 constant arrays
+%cx_arr = OpConstantComposite %i32_arr9 %i0 %i1 %i0 %im1 %i0 %i1 %im1 %im1 %i1
+%cy_arr = OpConstantComposite %i32_arr9 %i0 %i0 %i1 %i0 %im1 %i1 %i1 %im1 %im1
+%w_arr  = OpConstantComposite %f32_arr9 %f4_9 %f1_9 %f1_9 %f1_9 %f1_9 %f1_36 %f1_36 %f1_36 %f1_36
+
+; ============ GLOBAL VARIABLES ============
+%gl_GlobalInvocationID = OpVariable %ptr_in_v3u Input
+%in_buf  = OpVariable %ptr_sb_in StorageBuffer
+%out_buf = OpVariable %ptr_sb_out StorageBuffer
+%params  = OpVariable %ptr_uniform Uniform
+
+; ============ MAIN FUNCTION ============
+%main = OpFunction %void None %fn_ty
+%entry = OpLabel
+
+; Get invocation ID
+%gid = OpLoad %v3u32 %gl_GlobalInvocationID
+%x   = OpCompositeExtract %u32 %gid 0
+%y   = OpCompositeExtract %u32 %gid 1
+
+; Load W, H
+%wh_ptr = OpAccessChain %ptr_uni_v4u %params %u0
+%wh     = OpLoad %v4u32 %wh_ptr
+%W      = OpCompositeExtract %u32 %wh 0
+%H      = OpCompositeExtract %u32 %wh 1
+
+; Load omega
+%om_ptr = OpAccessChain %ptr_uni_v4f %params %u1
+%om_v4  = OpLoad %v4f32 %om_ptr
+%omega  = OpCompositeExtract %f32 %om_v4 0
+
+; Bounds check
+%oob_x = OpUGreaterThanEqual %bool_ty %x %W
+%oob_y = OpUGreaterThanEqual %bool_ty %y %H
+%oob   = OpLogicalOr %bool_ty %oob_x %oob_y
+OpBranchConditional %oob %exit %setup
+
+; Setup local variables
+%setup = OpLabel
+%f_loc  = OpVariable %ptr_fn_f32a Function
+%cx_loc = OpVariable %ptr_fn_i32a Function %cx_arr
+%cy_loc = OpVariable %ptr_fn_i32a Function %cy_arr
+%w_loc  = OpVariable %ptr_fn_f32a Function %w_arr
+
+; Convert W, H to int for later use
+%W_i = OpConvertUtoS %i32 %W
+%H_i = OpConvertUtoS %i32 %H
+%W_i_copy = OpCopyObject %i32 %W_i  ; need copies for phi merges? Actually no, these are loop-invariant
+%H_i_copy = OpCopyObject %i32 %H_i
+
+; Compute base index: (y * W + x) * 9
+%yw    = OpIMul %u32 %y %W
+%yxw   = OpIAdd %u32 %yw %x
+%base  = OpIMul %u32 %yxw %c9
+
+; Initialize accumulators
+%rho_acc  = OpVariable %ptr_fn_f32 Function %f0
+%uxn_acc  = OpVariable %ptr_fn_f32 Function %f0
+%uyn_acc  = OpVariable %ptr_fn_f32 Function %f0
+
+; Branch to read loop
+OpBranch %rl_head
+
+; === Read loop: read f[k], accumulate rho, ux_num, uy_num ===
+%rl_head = OpLabel
+%k_rl = OpPhi %u32 %u0 %setup %k_rl_next %rl_body
+%rl_cond = OpULessThan %bool_ty %k_rl %c9
+OpBranchConditional %rl_cond %rl_body %compute_macro
+
+%rl_body = OpLabel
+; Read f[k] from input buffer
+%fk_idx = OpIAdd %u32 %base %k_rl
+%fk_ptr = OpAccessChain %ptr_sb_f32 %in_buf %fk_idx
+%fk_val = OpLoad %f32 %fk_ptr
+
+; Store to local array
+%fk_lptr = OpAccessChain %ptr_fn_f32 %f_loc %k_rl
+OpStore %fk_lptr %fk_val
+
+; Load cx[k], cy[k]
+%cxk_ptr = OpAccessChain %ptr_fn_i32 %cx_loc %k_rl
+%cyk_ptr = OpAccessChain %ptr_fn_i32 %cy_loc %k_rl
+%cxk = OpLoad %i32 %cxk_ptr
+%cyk = OpLoad %i32 %cyk_ptr
+
+; Convert to float
+%cxk_f = OpConvertSToF %f32 %cxk
+%cyk_f = OpConvertSToF %f32 %cyk
+
+; Accumulate rho
+%rho_old = OpLoad %f32 %rho_acc
+%rho_new = OpFAdd %f32 %rho_old %fk_val
+OpStore %rho_acc %rho_new
+
+; Accumulate ux_num
+%uxn_old = OpLoad %f32 %uxn_acc
+%fk_cx   = OpFMul %f32 %fk_val %cxk_f
+%uxn_new = OpFAdd %f32 %uxn_old %fk_cx
+OpStore %uxn_acc %uxn_new
+
+; Accumulate uy_num
+%uyn_old = OpLoad %f32 %uyn_acc
+%fk_cy   = OpFMul %f32 %fk_val %cyk_f
+%uyn_new = OpFAdd %f32 %uyn_old %fk_cy
+OpStore %uyn_acc %uyn_new
+
+%k_rl_next = OpIAdd %u32 %k_rl %u1
+OpBranch %rl_head
+
+; === Compute macroscopic quantities ===
+%compute_macro = OpLabel
+%rho = OpLoad %f32 %rho_acc
+%uxn = OpLoad %f32 %uxn_acc
+%uyn = OpLoad %f32 %uyn_acc
+%ux  = OpFDiv %f32 %uxn %rho
+%uy  = OpFDiv %f32 %uyn %rho
+
+; Precompute common terms
+%ux2 = OpFMul %f32 %ux %ux
+%uy2 = OpFMul %f32 %uy %uy
+%usq = OpFAdd %f32 %ux2 %uy2
+%usq_1_5 = OpFMul %f32 %usq %f1_5
+%neg_usq_1_5 = OpFNegate %f32 %usq_1_5
+%one_minus = OpFAdd %f32 %f1 %neg_usq_1_5  ; 1 - 1.5*usq
+
+; Convert x, y to int for streaming
+%x_i = OpConvertUtoS %i32 %x
+%y_i = OpConvertUtoS %i32 %y
+
+OpBranch %sl_head
+
+; === Stream loop: collision + streaming ===
+%sl_head = OpLabel
+%k_sl = OpPhi %u32 %u0 %compute_macro %k_sl_next %sl_body
+%sl_cond = OpULessThan %bool_ty %k_sl %c9
+OpBranchConditional %sl_cond %sl_body %exit
+
+%sl_body = OpLabel
+
+; Load f[k], w[k], cx[k], cy[k]
+%fk_sptr = OpAccessChain %ptr_fn_f32 %f_loc %k_sl
+%fk_s    = OpLoad %f32 %fk_sptr
+%wk_ptr  = OpAccessChain %ptr_fn_f32 %w_loc %k_sl
+%wk      = OpLoad %f32 %wk_ptr
+%cxk_sptr= OpAccessChain %ptr_fn_i32 %cx_loc %k_sl
+%cxk_s   = OpLoad %i32 %cxk_sptr
+%cyk_sptr= OpAccessChain %ptr_fn_i32 %cy_loc %k_sl
+%cyk_s   = OpLoad %i32 %cyk_sptr
+
+; Compute cu = cx*ux + cy*uy
+%cxk_sf  = OpConvertSToF %f32 %cxk_s
+%cyk_sf  = OpConvertSToF %f32 %cyk_s
+%cu1     = OpFMul %f32 %cxk_sf %ux
+%cu2     = OpFMul %f32 %cyk_sf %uy
+%cu      = OpFAdd %f32 %cu1 %cu2
+
+; Compute feq = w * rho * (1 + 3*cu + 4.5*cu*cu - 1.5*usq)
+%cu3     = OpFMul %f32 %cu %f3
+%cu2_4_5 = OpFMul %f32 %cu %cu
+%cu2_4_5m= OpFMul %f32 %cu2_4_5 %f4_5
+%paren   = OpFAdd %f32 %cu3 %cu2_4_5m
+%paren2  = OpFAdd %f32 %one_minus %paren
+%wrho    = OpFMul %f32 %wk %rho
+%feq     = OpFMul %f32 %wrho %paren2
+
+; BGK collision: f_out = f + omega * (feq - f)
+%feq_diff= OpFSub %f32 %feq %fk_s
+%omega_diff = OpFMul %f32 %omega %feq_diff
+%f_out   = OpFAdd %f32 %fk_s %omega_diff
+
+; Compute neighbor coordinates with periodic wrap
+%x_plus_cx = OpIAdd %i32 %x_i %cxk_s
+%x_wrap    = OpIAdd %i32 %x_plus_cx %W_i
+%nx_i      = OpSMod %i32 %x_wrap %W_i
+%y_plus_cy = OpIAdd %i32 %y_i %cyk_s
+%y_wrap    = OpIAdd %i32 %y_plus_cy %H_i
+%ny_i      = OpSMod %i32 %y_wrap %H_i
+
+; Convert to uint for indexing
+%nx = OpConvertStoU %u32 %nx_i
+%ny = OpConvertStoU %u32 %ny_i
+
+; Compute output index: (ny * W + nx) * 9 + k
+%nyw   = OpIMul %u32 %ny %W
+%nywx  = OpIAdd %u32 %nyw %nx
+%nbase = OpIMul %u32 %nywx %c9
+%nidx  = OpIAdd %u32 %nbase %k_sl
+
+; Write to output buffer
+%out_ptr = OpAccessChain %ptr_sb_f32 %out_buf %nidx
+OpStore %out_ptr %f_out
+
+%k_sl_next = OpIAdd %u32 %k_sl %u1
+OpBranch %sl_head
+
+%exit = OpLabel
+OpReturn
+OpFunctionEnd
+```
+
+Wait, I have an issue with the `one_minus` computation. I compute it before the stream loop, but then inside the loop I add cu3 and cu2_4_5m to it. But `one_minus = 1 - 1.5*usq`, and the full parenthesis is `1 + 3*cu + 4.5*cu*cu - 1.5*usq = (1 - 1.5*usq) + 3*cu + 4.5*cu*cu`. So:
+```
+%paren = 3*cu + 4.5*cu*cu
+%paren2 = one_minus + paren = (1 - 1.5*usq) + 3*cu + 4.5*cu*cu
+```
+That's correct.
+
+Let me also double-check the OpSMod behavior. From the SPIR-V spec:
+"Result is the remainder of Operand 1 divided by Operand 2. The sign of the result is the same as the sign of Operand 1."
+
+So for SMod(32, 32) = 32 - 32 * trunc(32/32) = 32 - 32*1 = 0. Correct.
+SMod(31, 32) = 31 - 32 * trunc(31/32) = 31 - 32*0 = 31. Correct.
+SMod(64, 32) = 64 - 32 * trunc(64/32) = 64 - 32*2 = 0. Correct.
+
+Great, the modulo is correct.
+
+Now, there's one issue I'm worried about: the `%W_i` and `%H_i` values. I use them inside the loop body, but they're defined in the `%setup` block. In SPIR-V, a value defined in a block can only be used in that block or in blocks dominated by it. The loop body is dominated by `%setup` (via `%rl_head -> %rl_body -> ... -> %compute_macro -> %sl_head -> %sl_body`), so this should be fine.
+
+Wait, actually, let me think about dominance more carefully. In SPIR-V structured control flow:
+- `%setup` branches to `%rl_head`
+- `%rl_head` branches to either `%rl_body` or `%compute_macro`
+- `%rl_body` branches back to `%rl_head`
+- `%compute_macro` branches to `%sl_head`
+- `%sl_head` branches to either `%sl_body` or `%exit`
+- `%sl_body` branches back to `%sl_head`
+
+The `%setup` block dominates all blocks reachable from it (except through back edges), which includes `%rl_head`, `%rl_body`, `%compute_macro`, `%sl_head`, `%sl_body`, and `%exit`. So using `%W_i`, `%H_i`, etc. in `%sl_body` is fine.
+
+However, there might be an issue with the phi node at `%sl_head`. The phi takes values from `%compute_macro` (with value %u0) and from `%sl_body` (with value %k_sl_next). Both predecessors are valid.
+
+Similarly, the phi at `%rl_head` takes from `%setup` and `%rl_body`, both valid.
+
+Let me also check: are there any issues with using OpLoad of local variables across merge points? I don't think so, since the variables are function-scoped and not block-scoped.
+
+One thing I want to double-check: the `%base` computation uses `%y`, `%W`, `%x` which are all defined in `%entry`. These dominate `%setup` and everything after, so they're fine.
+
+Let me also verify that I'm not missing any required decorations. For the storage buffer runtime arrays, I need ArrayStride 4, which I have. For the uniform struct, I need Block decoration and member offsets, which I have.
+
+Actually, wait. Let me re-examine the struct layout. The uniform buffer has:
+- uvec4(W, H, 0, 0) at offset 0 (16 bytes)
+- vec4(omega, 0, 0, 0) at offset 16 (16 bytes)
+
+That's 32 bytes total. The offsets look correct.
+
+I think the SPIR-V is correct. Let me clean it up and make sure the formatting is right.
+
+Oh wait, one issue: I used `%W_i_copy` and `%H_i_copy` but never actually used them. Let me remove those dead instructions.
+
+Also, I should double-check: does OpAccessChain on a Function-scope pointer to an array work with a variable (non-constant) index? Yes, it does. The restriction on constant indices only applies to struct members.
+
+Let me also make sure the `OpCopyObject` for W_i and H_i isn't needed. Actually, I don't think I need them. The phi nodes don't reference them, they only reference the loop counter. So I can remove those.
+
+Let me also reconsider: do I need to worry about the `one_minus` variable being used inside the loop? It's computed in `%compute_macro` and used in `%sl_body`. Since `%compute_macro` dominates `%sl_body` (via `%sl_head`), this is fine.
+
+Actually, hold on. Let me re-examine dominance. In SPIR-V structured control flow, a block B1 dominates block B2 if every path from the entry to B2 goes through B1.
+
+- Entry is `%entry`
+- `%entry` -> (conditional) -> `%exit` or `%setup`
+- `%setup` -> `%rl_head`
+- `%rl_head` -> (conditional) -> `%rl_body` or `%compute_macro`
+- `%rl_body` -> `%rl_head`
+- `%compute_macro` -> `%sl_head`
+- `%sl_head` -> (conditional) -> `%sl_body` or `%exit`
+- `%sl_body` -> `%sl_head`
+
+Does `%compute_macro` dominate `%sl_body`? Every path from entry to `%sl_body`:
+1. entry -> setup -> rl_head -> rl_body -> rl_head -> ... -> compute_macro -> sl_head -> sl_body
+
+Yes, every path goes through compute_macro. Good.
+
+Does `%setup` dominate `%sl_body`? Yes, since setup dominates compute_macro which dominates sl_body.
+
+Great, everything checks out.
+
+Let me finalize the SPIR-V. I'll remove the unused CopyObject instructions and make sure everything is clean.
+
+One more thing: I should verify the float constants are precise enough. 
+- 4/9 = 0.44444444... -> 0.44444444 (7 decimal places, should be fine for float32)
+- 1/9 = 0.11111111... -> 0.11111111 (fine)
+- 1/36 = 0.02777777... -> 0.027777778 (fine, this rounds correctly)
+
+Actually, let me use more decimal places to be safe:
+- 4/9 ≈ 0.444444417953491 (float32) -> 0.4444444 is not enough precision
+- Actually for float32, we have ~7 significant digits. 0.4444444 has 7 significant digits. Let me use 0.44444444 to be safe (8 digits, the extra won't hurt).
+- 1/9 ≈ 0.111111111938953 -> 0.11111111 is fine
+- 1/36 ≈ 0.027777778148651 -> 0.027777778 is fine
+
+Actually, the SPIR-V assembler should handle the conversion to float32 correctly regardless of how many decimal places I provide. So my values are fine.
+
+Let me also think about potential numerical issues. The BGK collision with omega > 1 (e.g., 1.7857) could lead to negative distribution functions if the simulation becomes unstable. But that's a physics issue, not a shader issue. The shader just implements the math correctly.
+
+OK, I think the SPIR-V is correct. Let me write the final version.
+
+Actually, wait - I just realized there might be an issue with how I handle the `one_minus` computation. Let me trace through:
+
+```
+%usq = ux*ux + uy*uy
+%usq_1_5 = usq * 1.5
+%neg_usq_1_5 = -usq_1_5
+%one_minus = 1 + neg_usq_1_5 = 1 - 1.5*usq
+```
+
+Then in the loop:
+```
+%cu3 = cu * 3
+%cu2_4_5 = cu*cu * 4.5
+%paren = cu3 + cu2_4_5 = 3*cu + 4.5*cu^2
+%paren2 = one_minus + paren = 1 - 1.5*usq + 3*cu + 4.5*cu^2
+%wrho = w * rho
+%feq = wrho * paren2 = w * rho * (1 + 3*cu + 4.5*cu^2 - 1.5*usq)
+```
+
+Yes, this matches the formula. 
+
+Now, let me also think about whether there's a more efficient way. We could precompute `rho * (1 - 1.5*usq)` outside the loop and then for each k just do `feq = w * (precomputed + rho * (3*cu + 4.5*cu^2))`. But this would change the numerical order of operations slightly. The current approach is fine and matches the formula directly.
+
+One more thought: should I use `OpFastFMath` or relaxed precision? The problem doesn't mention it, and for a physics simulation, we probably want precise results. I'll keep the default (no fast math flags).
+
+Let me finalize. Actually, I realize I should double-check one more thing: the OpAccessChain for the uniform struct. I have:
+
+```
+%wh_ptr = OpAccessChain %ptr_uni_v4u %params %u0
+```
+
+This accesses member 0 (v4uint) of the struct. Then I load it and extract components. This is correct.
+
+```
+%om_ptr = OpAccessChain %ptr_uni_v4f %params %u1
+```
+
+This accesses member 1 (v4float) of the struct. Correct.
+
+OK, I'm confident the SPIR-V is correct. Let me write the final clean version.
+
+Hmm, actually one more thing: I need to verify that the `W_i` used in `%sl_body` is correctly in scope. `W_i` is defined in `%setup` block. `%sl_body` is dominated by `%setup`. But there's a subtlety: in SPIR-V, for a value to be used in a block, it must be defined in the same block or in a block that dominates it. Since `%setup` dominates `%sl_body`, using `%W_i` in `%sl_body` is valid. Same for `%H_i`, `%x_i`, `%y_i`, `%one_minus`, `%ux`, `%uy`, etc.
+
+Wait, actually, I realize there might be an issue. Let me look at the control flow more carefully:
+
+```
+%setup -> %rl_head
+%rl_head -> %rl_body (loop back edge from %rl_body)
+%rl_head -> %compute_macro
+%compute_macro -> %sl_head
+%sl_head -> %sl_body (loop back edge from %sl_body)
+%sl_head -> %exit
+```
+
+In SPIR-V, the "continue block" of a loop is where the back edge goes. For the read loop:
+- Header: %rl_head
+- Body: %rl_body
+- Continue: %rl_body (the back edge goes from rl_body to rl_head)
+- Merge: %compute_macro
+
+For the stream loop:
+- Header: %sl_head
+- Body: %sl_body
+- Continue: %sl_body
+- Merge: %exit
+
+Hmm, in standard SPIR-V loops, you typically have:
+- A header block with the phi and branch
+- A body block
+- A continue block (for the loop increment and branch back)
+- A merge block
+
+But in my case, I'm combining body and continue into one block. This should be fine as long as the structured control flow is correct. The OpBranch from %rl_body to %rl_head is the loop back edge.
+
+Actually, looking at the SPIR-V spec more carefully, for OpBranchConditional in a loop header:
+- The "true" branch goes to the loop body
+- The "false" branch goes to the merge block
+
+And the loop body must eventually branch back to the loop header (the continue block). In my case, %rl_body serves as both body and continue, which is allowed.
+
+But wait, I should use OpLoopMerge to declare the merge and continue blocks explicitly. Let me add those.
+
+```
+%rl_head = OpLabel
+OpLoopMerge %compute_macro %rl_body None  ; merge=%compute_macro, continue=%rl_body
+%k_rl = OpPhi %u32 %u0 %setup %k_rl_next %rl_body
+...
+```
+
+Actually, for the continue block, it should be the block that has the back edge. In my case, %rl_body branches back to %rl_head, so %rl_body is the continue block. But I also have the loop body logic in %rl_body. This is fine - the continue block can also contain other instructions.
+
+Similarly for the stream loop:
+```
+%sl_head = OpLabel
+OpLoopMerge %exit %sl_body None
+%k_sl = OpPhi %u32 %u0 %compute_macro %k_sl_next %sl_body
+...
+```
+
+Wait, but if %sl_body is both the continue block AND the body, and the merge is %exit, then:
+- OpBranchConditional in %sl_head: true -> %sl_body, false -> %exit
+- %sl_body ends with OpBranch to %sl_head
+
+The phi in %sl_head takes values from %compute_macro (for the first iteration, since %compute_macro branches to %sl_head) and from %sl_body (for subsequent iterations). Since %sl_body is the continue block, this is correct.
+
+Let me add OpLoopMerge to both loops.
+
+Actually, I realize that without OpLoopMerge, the SPIR-V might still be valid but the structured control flow won't be properly declared. Many validators and tools expect OpLoopMerge. Let me add them.
+
+For the read loop:
+```
+%rl_head = OpLabel
+OpLoopMerge %compute_macro %rl_body None
+%k_rl = OpPhi ...
+```
+
+For the stream loop:
+```
+%sl_head = OpLabel
+OpLoopMerge %exit %sl_body None
+%k_sl = OpPhi ...
+```
+
+This should be correct. The None is for the loop control (no unrolling hints).
+
+Let me finalize the SPIR-V now. Here's the complete version:
+
+Actually, one more concern: the `OpBranchConditional %oob %exit %setup` in the entry block. The %exit block is the merge block of the stream loop. Can a non-loop branch target a loop merge block? 
+
+In SPIR-V, a merge block can be entered from multiple places. The entry block branching to %exit is fine because %exit is just a regular block that happens to also be a merge block. It's allowed.
+
+But wait, there's a potential issue with structured control flow. If the entry block does `OpBranchConditional %oob %exit %setup`, then:
+- The "true" branch goes to %exit
+- The "false" branch goes to %setup
+
+For this to be valid structured control flow, %exit must be the merge block of this conditional, which means I need `OpSelectionMerge %exit None` before the `OpBranchConditional`. Let me add that.
+
+```
+%entry = OpLabel
+...
+OpSelectionMerge %exit None
+OpBranchConditional %oob %exit %setup
+```
+
+This declares %exit as the merge block of the selection construct. Then later, %exit is also the merge block of the stream loop. Is it OK for a block to be the merge of multiple constructs? Yes, in SPIR-V, a block can be the merge block of both a selection and a loop. It's called "shared merge block."
+
+OK, with OpSelectionMerge and OpLoopMerge added, the structured control flow should be valid.
+
+Let me write the final version now. I'll be very careful with the structure.
+
+Actually, I want to reconsider one thing. The `OpSelectionMerge %exit None` + `OpBranchConditional %oob %exit %setup` means:
+- If oob, go to %exit
+- If !oob, go to %setup
+
+And the selection merge is %exit. This means that after the selection construct, control flows to %exit. The "false" branch goes to %setup, which then eventually reaches %exit (through the loops). This is valid because %exit post-dominates both %exit (trivially) and %setup (since the only path from %setup eventually reaches %exit via the loop merges).
+
+Wait, actually, in SPIR-V structured control flow, the merge block must post-dominate all blocks in the construct. The selection construct includes %entry and %setup (and everything reachable from %setup until the merge). Since %exit post-dominates %setup (the only way out of the loop structure from %setup is through the merge), this is valid.
+
+OK, I'm confident now. Let me write the final version.
+
+Oh, one more thing: I should make sure the Bound is set high enough. Let me count the IDs I'll use. I have types, constants, variables, and then all the instructions in the function. Let me estimate:
+- Types: ~27
+- Constants: ~25
+- Variables: ~7
+- Function instructions: ~100-120
+
+So Bound should be at least ~180. I'll set it to 300 to be safe.
+
+Let me now write the complete, final SPIR-V assembly.
+
+Wait, I realize there could be another issue. When I do:
+
+```
+%rl_head = OpLabel
+OpLoopMerge %compute_macro %rl_body None
+%k_rl = OpPhi %u32 %u0 %setup %k_rl_next %rl_body
+```
+
+The phi node references %setup (the predecessor for the first iteration) and %rl_body (the predecessor for subsequent iterations). But %rl_body is the continue block. Is it valid for the phi to reference the continue block as a predecessor? 
+
+Yes, it is. The continue block branches back to the loop header, so it is a predecessor of the loop header. The phi node lists all predecessors with their corresponding values.
+
+And the value from %setup is %u0 (the initial value of k), and the value from %rl_body is %k_rl_next (the incremented k). This is correct.
+
+OK, I'm really confident now. Let me write it.
+
+Actually, I want to also double-check one more thing about the OpLoopMerge placement. The spec says:
+"OpLoopMerge must appear immediately before the branch or conditional branch that terminates the loop header block."
+
+So the order in %rl_head should be:
+1. OpLoopMerge
+2. OpPhi (phi nodes can come after OpLoopMerge in the header)
+3. OpBranchConditional
+
+Wait, actually, let me check the spec more carefully. The spec says OpLoopMerge must appear before the terminating branch. But can phi nodes appear between OpLoopMerge and the branch?
+
+Looking at the SPIR-V spec: "The OpLoopMerge must immediately precede the branch or conditional branch instruction that terminates the loop header block."
+
+"Immediately precede" means there should be no other instructions between OpLoopMerge and the branch, except... actually, I think phi nodes are allowed because they're not "instructions" in the same sense - they're part of the block's header. But I'm not 100% sure.
+
+To be safe, let me put OpLoopMerge after the phi nodes, right before the branch:
+
+```
+%rl_head = OpLabel
+%k_rl = OpPhi %u32 %u0 %setup %k_rl_next %rl_body
+OpLoopMerge %compute_macro %rl_body None
+%rl_cond = OpULessThan %bool_ty %k_rl %c9
+OpBranchConditional %rl_cond %rl_body %compute_macro
+```
+
+Hmm, but the spec says "OpLoopMerge must appear immediately before the branch or conditional branch." If I put the comparison between OpLoopMerge and OpBranchConditional, is that OK?
+
+Actually, looking at examples in the SPIR-V spec and various references, it seems like OpLoopMerge must be the LAST instruction before the terminating branch. So any comparison or other instructions should come BEFORE OpLoopMerge.
+
+So the correct order is:
+```
+%rl_head = OpLabel
+%k_rl = OpPhi %u32 %u0 %setup %k_rl_next %rl_body
+%rl_cond = OpULessThan %bool_ty %k_rl %c9
+OpLoopMerge %compute_macro %rl_body None
+OpBranchConditional %rl_cond %rl_body %compute_macro
+```
+
+Yes, this is the correct ordering. Phi nodes can come before OpLoopMerge (they're not regular instructions), and the comparison comes before OpLoopMerge, and then OpLoopMerge immediately precedes the branch.
+
+OK let me finalize this now. I've been overthinking it.
+
+Actually, I just want to double check one more thing: the "immediately precede" language. From the SPIR-V 1.5 spec, section 3.11:
+
+"Terminate the header block with either an OpBranch or OpBranchConditional instruction. The OpLoopMerge must immediately precede this branch instruction."
+
+I think "immediately precede" means there are no other Op* instructions between them. Phi nodes are special and don't count. So:
+
+```
+%rl_head = OpLabel
+%k_rl = OpPhi ...       ; phi is OK here
+%rl_cond = OpULessThan ...  ; this is NOT OK between LoopMerge and Branch
+OpLoopMerge ...
+OpBranchConditional ...
+```
+
+vs.
+
+```
+%rl_head = OpLabel
+%k_rl = OpPhi ...       ; phi is OK here
+%rl_cond = OpULessThan ...  ; OK, before LoopMerge
+OpLoopMerge ...
+OpBranchConditional ...
+```
+
+The second version is correct. The ULessThan is before OpLoopMerge, not between it and the branch.
+
+OK, now I'm really going to write the final version. Let me also make sure I handle the `OpSelectionMerge` correctly:
+
+```
+%entry = OpLabel
+...
+OpSelectionMerge %exit None
+OpBranchConditional %oob %exit %setup
+```
+
+OpSelectionMerge must also immediately precede the branch instruction. And there should be no other instructions between them. So I need to put the oob computation before OpSelectionMerge.
+
+Here's the correct order for entry:
+```
+%entry = OpLabel
+%gid = OpLoad ...
+%x = OpCompositeExtract ...
+%y = OpCompositeExtract ...
+%wh_ptr = OpAccessChain ...
+%wh = OpLoad ...
+%W = OpCompositeExtract ...
+%H = OpCompositeExtract ...
+%om_ptr = OpAccessChain ...
+%om_v4 = OpLoad ...
+%omega = OpCompositeExtract ...
+%oob_x = OpUGreaterThanEqual ...
+%oob_y = OpUGreaterThanEqual ...
+%oob = OpLogicalOr ...
+OpSelectionMerge %exit None
+OpBranchConditional %oob %exit %setup
+```
+
+This is correct. All computations are done before OpSelectionMerge, which immediately precedes OpBranchConditional.
+
+OK, final version coming up:
+
+One last thing: I want to make sure the float constants are in the right format. SPIR-V float literals use decimal notation. So `4.5` is fine, `0.44444444` is fine, etc.
+
+Let me write it now. For real this time.
+
+Hmm, actually there's a potential issue I want to address. The `one_minus` value is computed in `%compute_macro`, which is the merge block of the read loop. Then it's used in `%sl_body`. Is there any issue with using a value from a merge block in a subsequent loop body?
+
+In SPIR-V, the merge block is just a regular block. Values defined in it can be used in blocks it dominates. `%compute_macro` branches to `%sl_head`, and `%sl_head` branches to `%sl_body

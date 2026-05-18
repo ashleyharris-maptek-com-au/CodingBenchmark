@@ -1,0 +1,1266 @@
+The user wants a SPIR-V binary compute shader for parallel inclusive prefix sum, encoded as a hex string.
+The shader needs to handle various sizes of N (256, 1024, 4096, 16384, 65536).
+The constraints are strict:
+- Input: Binding 0 (readonly uint array).
+- Output: Binding 1 (readwrite uint array).
+- Uniforms: Binding 2 (uint4: N, 0, 0, 0).
+- Local size: 256 x 1 x 1.
+- Magic: 0x07230203.
+- Version 1.0.
+- Little-endian uint32 words.
+
+**Algorithm Strategy:**
+
+Since the problem asks for parallel inclusive prefix sum and mentions "full marks require a multi-workgroup scan", and the test cases go up to 65,536 elements, I should implement a work-efficient parallel scan.
+
+However, implementing a full multi-workgroup scan in raw SPIR-V binary by hand is extremely complex and error-prone due to the need for:
+1. Workgroup synchronization (`OpControlBarrier`).
+2. Shared memory (`OpVariable` with `Workgroup` storage class).
+3. Multi-pass algorithms (e.g., Hillis-Steele or Blelloch) usually require global synchronization or multiple dispatches, which are hard to do in a single shader invocation without atomics or multiple dispatches from the host. But typically, for a single compute shader task, we can implement a workgroup-level scan and then a "scan of block sums" approach or simply just a single workgroup handling the whole array if N fits, or a naive approach if it doesn't.
+
+Wait, the prompt says: "For N > 256, a naive fallback (each thread sums all previous elements) is acceptable but slow; full marks require a multi-workgroup scan."
+Actually, looking at the test configurations:
+- N=256: 1 workgroup.
+- N=1024: 4 workgroups.
+- N=4096: 16 workgroups.
+- N=16384: 64 workgroups.
+- N=65536: 256 workgroups.
+
+Writing a correct multi-workgroup prefix sum in a *single* shader dispatch is technically impossible without using atomic operations or multiple dispatches (which implies multiple shader invocations or complex logic usually done via atomics to aggregate block sums).
+Standard parallel scan algorithms (like Blelloch) operate in phases:
+1. Scan within workgroups.
+2. Scan the partial sums (could be recursive).
+3. Add partial sums back to the workgroups.
+
+Since I only control the shader code and not the host-side dispatch logic (how many times the shader is launched), and the prompt implies "a compute shader" (singular), I have to make a choice.
+Choice A: Naive O(N^2) approach. Thread $i$ sums elements $0$ to $i$. This works for any N in one dispatch but is slow.
+Choice B: Workgroup scan (Hillis-Steele or Blelloch) inside the shader. Since local size is 256, each workgroup handles 256 elements. If `N > 256`, multiple workgroups are launched.
+However, workgroups cannot synchronize globally. If workgroup 0 finishes and writes result 0..255, workgroup 1 (handling 256..511) needs to know the sum of 0..255 to perform the prefix sum correctly for its elements.
+Since we cannot communicate between workgroups in a single dispatch easily (unless we use atomic adds to a global counter, but that doesn't give us the prefix sum easily without multiple passes), the only way to get "full marks" (multi-workgroup scan) in a single dispatch is usually:
+1. Use atomics to determine the prefix sum of previous workgroups? Not straightforward because workgroups execute out of order.
+2. The "Naive fallback" mentioned in the prompt is actually the correct safe bet for a single shader file if we don't assume multiple dispatches.
+
+Let's re-read carefully: "For N > 256, a naive fallback (each thread sums all previous elements) is acceptable but slow; full marks require a multi-workgroup scan."
+This implies the test might check correctness on N=1024, 4096 etc.
+If I implement the naive O(N^2) scan, it will be correct but slow.
+If I implement the workgroup scan (local size 256), it will only be correct for N=256 (one workgroup). If multiple workgroups run, they act independently. Workgroup 1 would compute the prefix sum of its chunk relative to zero, not relative to the total sum of previous chunks.
+
+Is it possible to do a multi-workgroup scan in *one* shader?
+Yes, using a specific trick: `OpControlBarrier` only works within a workgroup.
+To do a global scan, standard practice is:
+- Pass 1: Local scan. Write result + block sums.
+- Pass 2: Scan block sums.
+- Pass 3: Add block sums to elements.
+This requires 3 dispatches.
+Since the prompt asks for "A SPIR-V binary compute shader" (singular), and "Test Configurations" list N values up to 65536, implying the test harness likely launches the shader once with `N/256` workgroups.
+
+If the test harness launches `ceil(N/256)` workgroups:
+- N=256 -> 1 WG.
+- N=1024 -> 4 WGs.
+
+If I write a simple local scan, for N=1024, WG 0 computes scan(0..255). WG 1 computes scan(256..511). The result for index 300 would be `sum(256..300)`, missing `sum(0..255)`. This is incorrect for a global prefix sum.
+The prompt accepts naive fallback.
+The prompt *also* hints at "full marks" for multi-workgroup.
+But standard SPIR-V compute shaders cannot synchronize across workgroups in a single dispatch.
+
+Wait, is there a way?
+If I use `OpAtomicIAdd`?
+Algorithm:
+Each workgroup has an ID.
+WG 0 processes elements 0..255.
+WG 1 processes elements 256..511.
+WG 0 computes its total sum. It adds it to a global counter using `OpAtomicIAdd`. The return value of `OpAtomicIAdd` is the *old* value.
+If WGs execute sequentially (not guaranteed), this might work. But WGs execute in parallel/out-of-order.
+If WG 1 executes first, it adds its sum. Then WG 0 executes. The ordering is broken.
+
+So, a true multi-workgroup scan in a single dispatch is generally impossible without specific hardware features (like subgroups/shuffle) or the assumption of serialized execution (which violates the compute model).
+Therefore, the only reliable "correct" implementation for N > LocalSize in a single dispatch file is the naive O(N) per thread approach (Total O(N^2)). Each thread $i$ simply loops from 0 to $i-1$ and sums.
+Or, slightly optimized: Thread 0 sums 0..N. Thread 1 sums 1..N?
+No, standard naive scan: Thread $i$ sums Input[0]...Input[i].
+Since N <= 65536, and threads are 256 * (N/256) = N threads total.
+Each thread does up to 65536 reads. 65536 * 65536 operations.
+65536 threads * 65536 reads = 4 billion ops. That might time out.
+Optimization: Workgroup shared memory?
+The prompt asks for N up to 65536.
+If I use the naive approach, it's $O(N^2)$.
+Is there a better way?
+Maybe the "Test Configurations" implies the shader is dispatched multiple times?
+Usually, when asked for "a shader", it's one file.
+If I provide a shader that handles N=256 perfectly (local scan) and falls back to naive for others, it covers the requirements.
+However, 65536^2 is too much for a GPU shader timeout usually?
+Actually, `gl_NumWorkGroups` might not be known to the shader easily without a capability or uniform?
+Wait, Uniform buffer has `N`.
+The shader knows `N`.
+Algorithm Naive:
+`uint sum = 0;`
+`for (uint i=0; i < global_id && i < N; i++) sum += Input[i];`
+`Output[global_id] = sum;`
+This is O(N) per thread. Total O(N^2).
+For N=65536, this is 4 billion ops. 4GB/s bandwidth roughly? Maybe slow but might finish.
+
+Let's consider the "Multi-workgroup scan" requirement again.
+Maybe I can implement a distributed scan?
+No, synchronization is the blocker.
+What if I ignore the "full marks" part for the complex case and stick to "acceptable"? The prompt explicitly allows the naive fallback. Writing a complex multi-pass logic in raw hex that assumes the user will dispatch it multiple times is risky because the interface is just "Input, Output, Uniform".
+If the user dispatches it once, the multi-pass logic fails.
+If I write the naive logic, it always works (correctness).
+However, is there a middle ground?
+A "Workgroup Scan" is required for N=256 (Subpass 0).
+So I *must* implement a workgroup scan using shared memory.
+If I implement that, I can just let the other workgroups run that same logic. They will produce block-local prefix sums.
+To make it global, I need the prefix sum of previous blocks.
+Can I calculate it?
+WG 0 sums 0..255.
+WG 1 sums 256..511.
+If I could access the sum of WG 0 inside WG 1...
+There is no standard way.
+So for N > 256, the naive fallback is the only robust single-dispatch solution provided the O(N^2) complexity is acceptable (which the prompt states it is).
+
+However, there's a specific SPIR-V capability `DeviceGroup` or `Subgroup`? No, keep it simple.
+
+Let's design the shader for the N=256 case (Local Scan) first.
+Since the prompt says "For N <= 256, use a shared-memory scan".
+This implies the shader should check N?
+Or is the shader specialized?
+"For N <= 256... For N > 256..."
+It sounds like the shader code logic should branch.
+`if (N <= 256) { do_local_scan(); } else { do_naive(); }`
+
+Let's refine the "Naive" strategy.
+We have `gl_WorkGroupID`, `gl_LocalInvocationID`.
+Global ID = `WorkGroupID * 256 + LocalInvocationID`.
+If N > 256:
+Dispatch has `ceil(N/256)` workgroups.
+Each thread does the naive sum.
+Wait, if N=1024.
+WG 0, LocalID 0: GlobalID 0. Sums 0..0.
+WG 0, LocalID 255: GlobalID 255. Sums 0..255.
+WG 1, LocalID 0: GlobalID 256. Sums 0..256.
+This works. All threads read the Input buffer.
+The constraint: "Input: Storage buffer (read-only)".
+This is fine.
+
+Implementation Plan:
+1. **Header**: Magic, Version, Generator, Bound, Schema.
+2. **Capabilities**: `Shader`.
+3. **Memory Model**: Logical GLSL450.
+4. **Entry Point**: `GLCompute`, "main".
+5. **Execution Modes**: `LocalSize` 256, 1, 1.
+6. **Debug**: Source extension (optional but good practice, or skip to save space/simplicity).
+7. **Decorations**:
+   - Binding 0, 1, 2.
+   - DescriptorSet 0.
+   - ArrayStride 4.
+   - Block decoration for uniform buffer struct and storage buffer struct?
+     - SPIR-V 1.0 used `BufferBlock` for SSBOs and `Block` for UBOs. In newer versions, it's `Block` for both with StorageBuffer storage class.
+     - The prompt notes mention: "OpDecorate BufferBlock or Block = decoration 2 or 3".
+     - It also says: "OpTypePointer StorageBuffer = storage class 12".
+     - Note: Storage Class 12 is `StorageBuffer` (added in SPIR-V 1.3?).
+     - Wait. SPIR-V 1.3 introduced `StorageBuffer` storage class and `Block` decoration for it.
+     - SPIR-V 1.0 used `Uniform` storage class and `BufferBlock` decoration for SSBOs.
+     - The prompt specifies Version 1.0 (`0x00010000`).
+     - The prompt notes say "OpTypePointer StorageBuffer = storage class 12". Storage Class 12 is indeed `StorageBuffer`.
+     - If I use `StorageBuffer` class, I usually need SPIR-V 1.3+?
+     - Let's check the magic/version. `0x07230203` is magic. `0x00010000` is 1.0.
+     - In 1.0, SSBOs used `Uniform` storage class (2) and `BufferBlock` decoration (3).
+     - If the prompt mandates "storage class 12" in the notes, but Version 1.0, there's a contradiction.
+     - However, usually "StorageBuffer" is class 12. If I stick to SPIR-V 1.0 strictly, I should use `Uniform` (2) + `BufferBlock` (3).
+     - But the prompt explicitly lists: "OpTypePointer StorageBuffer = storage class 12".
+     - If I ignore the Version 1.0 constraint and use the class 12, it's cleaner.
+     - BUT, the prompt explicitly set Version to 1.0.
+     - Let's look at the prompt's note "OpDecorate BufferBlock or Block".
+     - I will use the older style (SPIR-V 1.0 compliant) for safety:
+       - SSBOs: Storage Class `Uniform` (2). Decoration `BufferBlock` (3).
+       - UBOs: Storage Class `Uniform` (2). Decoration `Block` (2).
+     - Wait, the prompt's "SPIR-V binary encoding notes" seem to be hints. "OpTypePointer StorageBuffer = storage class 12".
+     - If I write the binary, I define the storage class values.
+     - Let's stick to SPIR-V 1.0 standard approach:
+       - Inputs/Outputs (SSBOs): `Uniform` class (2), `BufferBlock` decoration.
+       - Uniforms (UBO): `Uniform` class (2), `Block` decoration.
+     - Why did the prompt mention class 12? Maybe it refers to the name of the storage class in the spec.
+     - Let's check if class 12 is supported in 1.0.
+     - SPIR-V 1.0 spec, Section 3.2 Storage Class: 12 is "StorageBuffer"?
+     - Actually, `StorageBuffer` was added later. In 1.0, the valid storage classes are 0..11.
+     - So using Class 12 with Version 1.0 is invalid SPIR-V.
+     - I will use `Uniform` (2) for all bindings.
+     - Bindings 0 & 1 (SSBOs): Decoration `BufferBlock` (3).
+     - Binding 2 (UBO): Decoration `Block` (2).
+
+8. **Types & Constants**:
+   - `void`
+   - `bool`
+   - `uint` (32-bit unsigned).
+   - `uint4` (vec4).
+   - Pointers: `Output` (Function), `Uniform` (Uniform constant ptr? No, Uniform pointer).
+   - Arrays: Runtime array of uint.
+   - Structs to wrap the arrays/buffers.
+
+   Structure for SSBO:
+   ```
+   struct SSBO {
+     uint values[];
+   };
+   ```
+   Decoration: `BufferBlock` on struct. `ArrayStride` 4 on the array member.
+
+   Structure for UBO:
+   ```
+   struct UBO {
+     uint4 val;
+   };
+   ```
+   Decoration: `Block` on struct. `Offset` 0 for member.
+
+9. **Variables**:
+   - `InputBuffer` (Binding 0, Set 0). Readonly? In 1.0 SSBOs are read-write. I can use `NonWritable` decoration if I want to be strict, or just not write to it.
+   - `OutputBuffer` (Binding 1, Set 0).
+   - `Uniforms` (Binding 2, Set 0).
+
+10. **Function "main"**:
+    - Load `N` from Uniforms.
+    - Load `GlobalInvocationID`. `BuiltIn GlobalInvocationId`.
+    - Load `LocalInvocationIndex` (0..255). `BuiltIn LocalInvocationIndex`.
+    
+    **Branch**:
+    `if (N <= 256)`
+       - Perform workgroup scan.
+       - OnlyWG 0 should do work? Or is it guaranteed only 1 WG is launched?
+       - "For N <= 256, use a shared-memory scan".
+       - This implies if N is small, we use the WG scan.
+       - Logic:
+         1. Load input values to Shared Memory.
+         2. Sync.
+         3. Up-sweep (Reduce) or Hillis-Steele?
+            Hillis-Steele is O(log n) steps.
+            Step d=1..8 (log2(256)):
+              temp = shared[id - 2^(d-1)]
+              barrier
+              shared[id] += temp
+              barrier
+         4. Store shared[id] to output[id].
+    
+    `else` (N > 256)
+       - Naive scan.
+       - Loop `i` from 0 to `GlobalID`. Sum `Input[i]`.
+       - Store sum to `Output[GlobalID]`.
+       
+       Wait, if N > 256, usually multiple WGs are launched.
+       If naive scan is used, every thread does the full accumulation up to its ID.
+       For `GlobalID` = 0, sum = Input[0].
+       For `GlobalID` = 1000, sum = Input[0] + ... + Input[1000].
+       Correct.
+       
+       Optimization: Check if `GlobalID < N`. If out of bounds, do nothing?
+       Usually compute shaders should check bounds.
+    
+    **Shared Memory**:
+    - Variable in `Workgroup` storage class.
+    - Type: Array of 256 uints.
+    
+    **Builtin Inputs**:
+    - Need to define `gl_GlobalInvocationID`.
+    - Variable: `BuiltIn GlobalInvocationId` (Index 28).
+    - Type: `vec3` (or `uvec3`).
+    - Input storage class (1).
+
+**Detailed SPIR-V Construction:**
+
+**Words generation (Hex)**
+Order:
+1. Header
+2. Capabilities
+3. Extensions (none needed)
+4. Memory Model
+5. Entry Points
+6. Execution Modes
+7. Debug (none)
+8. Decorations
+9. Types, Constants, Variables
+10. Functions
+
+**IDs allocation**:
+1. `void`
+2. `bool`
+3. `uint`
+4. `float` (maybe not needed)
+5. `uvec3`
+6. `uvec4`
+7. `ptr_Function_uint`
+8. `ptr_Function_uvec3`
+9. `ptr_Function_uvec4`
+10. `struct_SSBO`
+11. `array_uint_runtime`
+12. `ptr_Uniform_struct_SSBO` (SSBO ptr)
+13. `struct_UBO`
+14. `ptr_Uniform_struct_UBO` (UBO ptr)
+15. `ptr_Uniform_uint` (pointer to uint inside SSBO)
+16. `ptr_Uniform_uvec4` (pointer to val inside UBO)
+17. `ptr_Workgroup_uint` (shared mem pointer)
+18. `array_uint_256` (shared mem type)
+19. `ptr_Workgroup_array` (pointer to shared array) -> Wait, variable is the array.
+20. `func_main_type`
+21. `func_main`
+22. `label_main`
+23. `var_shared` (Workgroup storage)
+24. `var_input_ssbo` (Uniform storage)
+25. `var_output_ssbo` (Uniform storage)
+26. `var_ubo` (Uniform storage)
+27. `var_global_id` (Input storage)
+28. `var_N` (Function local, uint)
+29. `var_gid` (Function local, uint)
+30. `var_sum` (Function local, uint)
+... and constants.
+
+**Constants**:
+Need specific constants for offsets, strides, etc.
+`Constant 0` (uint)
+`Constant 1` (uint)
+`Constant 2` ...
+`Constant 256` (uint)
+
+Let's write the opcodes.
+
+**Header**:
+Magic: `07230203`
+Version: `00010000`
+Generator: `00000000` (manual)
+Bound: `50` (estimate)
+Schema: `00000000`
+
+**Capabilities**:
+`OpCapability Shader` = `00020011 00000001`.
+
+**Memory Model**:
+`OpMemoryModel Logical GLSL450` = `00030006 00000001 00000001`.
+
+**Entry Point**:
+`OpEntryPoint GLCompute %main "main"` (Need ID for main).
+Opcode `15`.
+Word count = 4 + string length.
+"main" is 4 chars + null = 5 bytes -> 2 words.
+Total 4 + 2 = 6 words?
+Format: `OpCode | WordCount`, `ExecutionModel`, `EntryFunction`, `Name...`
+`0006000F` (OpEntryPoint, 6 words), `00000005` (GLCompute), `%main`, `6E69616D` ("main\0"? little endian "main" -> "niam".
+Wait. String literal packing.
+"main" -> 'm', 'a', 'i', 'n'. Null terminator.
+Bytes: 6D 61 69 6E 00.
+Words:
+Word 1: 6E69616D ("niam") -> `6D` is LSB. `61` `69` `6E`. Correct.
+Word 2: `00000000` (null term + padding).
+Hex: `6E69616D`, `00000000`.
+
+**Execution Mode**:
+`OpExecutionMode %main LocalSize 256 1 1`.
+Opcode `16`.
+Words: `Op`, `Mode`, `x`, `y`, `z`.
+`00060010` (OpExecutionMode, 6 words?? No).
+Opcode 16 is `OpExecutionMode`.
+Format: `OpCode|WordCount`, `EntryFunction`, `Mode`, `Operands...`
+Mode 17 (`LocalSize`).
+Operands: 256, 1, 1.
+Total words: 1 (Op) + 1 (Func) + 1 (Mode) + 3 (Operands) = 6 words.
+Hex: `00060010`, `%main`, `00000011` (17), `00000100` (256), `00000001`, `00000001`.
+
+**Decorations**:
+1. Binding 0: `OpDecorate %var_input_ssbo Binding 0`.
+   Op `71` (0x47). Words: 1+1+1+1 = 4.
+   `00040047`, `%var_in`, `00000021` (33=Binding), `00000000`.
+2. Binding 1: `OpDecorate %var_output_ssbo Binding 1`.
+   `00040047`, `%var_out`, `00000021`, `00000001`.
+3. Binding 2: `OpDecorate %var_ubo Binding 2`.
+   `00040047`, `%var_ubo`, `00000021`, `00000002`.
+4. DescriptorSet 0: `OpDecorate %var_in DescriptorSet 0`. (Same for out, ubo).
+   Decoration `34` (`DescriptorSet`).
+   `00040047`, `%var_in`, `00000022`, `00000000`.
+   `00040047`, `%var_out`, `00000022`, `00000000`.
+   `00040047`, `%var_ubo`, `00000022`, `00000000`.
+5. Block for UBO struct. `OpDecorate %struct_UBO Block`.
+   Decoration `2` (`Block`).
+   `00020047` (Wrong word count? 1+1+1=3).
+   `00030047`, `%struct_UBO`, `00000002`.
+6. BufferBlock for SSBO struct. `OpDecorate %struct_SSBO BufferBlock`.
+   Decoration `3` (`BufferBlock`).
+   `00030047`, `%struct_SSBO`, `00000003`.
+7. ArrayStride for runtime array. `OpDecorate %arr_runtime ArrayStride 4`.
+   Decoration `6` (`ArrayStride`).
+   `00030047` -> No, OpDecorate is `47`? Yes.
+   `00040047` -> 1+1+1+1=4 words.
+   `00040047`, `%arr_runtime`, `00000006`, `00000004`.
+8. Member Offset for UBO. `OpMemberDecorate %struct_UBO 0 Offset 0`.
+   Op `49` (0x31).
+   Words: 1+1+1+1+1 = 5.
+   `00050031`, `%struct_UBO`, `00000000`, `00000015` (21=Offset? No, spec says Offset is 35).
+   Let's check Decoration enum. Offset is 35 (0x23).
+   `00050031`, `%struct_UBO`, `00000000`, `00000023`, `00000000`.
+
+**Types**:
+`%void` = `OpTypeVoid`. Op `19`. `00020013`, `%void`.
+`%bool` = `OpTypeBool`. Op `20`. `00020014`, `%bool`.
+`%uint` = `OpTypeInt 32 0`. Op `21`. `00030015`, `%uint`, `00000020`, `00000000`.
+`%uvec3` = `OpTypeVector %uint 3`. Op `22`. `00030016`, `%uvec3`, `%uint`, `00000003`.
+`%uvec4` = `OpTypeVector %uint 4`. Op `22`. `00030016`, `%uvec4`, `%uint`, `00000004`.
+`%arr_runtime` = `OpTypeRuntimeArray %uint`. Op `29`. `0002001D`, `%arr_runtime`, `%uint`.
+`%struct_SSBO` = `OpTypeStruct %arr_runtime`. Op `30`. `0002001E`, `%struct_SSBO`, `%arr_runtime`.
+`%struct_UBO` = `OpTypeStruct %uvec4`. Op `30`. `0002001E`, `%struct_UBO`, `%uvec4`.
+`%ptr_Uniform_SSBO` = `OpTypePointer Uniform %struct_SSBO`. Op `32`. Storage Class `Uniform` (2).
+   `00030020`, `%ptr_Uniform_SSBO`, `00000002`, `%struct_SSBO`.
+`%ptr_Uniform_UBO` = `OpTypePointer Uniform %struct_UBO`.
+   `00030020`, `%ptr_Uniform_UBO`, `00000002`, `%struct_UBO`.
+`%ptr_Input_uvec3` = `OpTypePointer Input %uvec3`. Storage Class `Input` (1).
+   `00030020`, `%ptr_Input_uvec3`, `00000001`, `%uvec3`.
+`%ptr_Uniform_uint` = `OpTypePointer Uniform %uint`.
+   `00030020`, `%ptr_Uniform_uint`, `00000002`, `%uint`.
+`%ptr_Function_uint` = `OpTypePointer Function %uint`. Storage Class `Function` (7).
+   `00030020`, `%ptr_Function_uint`, `00000007`, `%uint`.
+
+Constants:
+`%c_0` = `OpConstant %uint 0`. Op `43`.
+   `0003002B`, `%c_0`, `%uint`, `00000000`.
+`%c_1` = `OpConstant %uint 1`.
+   `0003002B`, `%c_1`, `%uint`, `00000001`.
+`%c_256` = `OpConstant %uint 256`.
+   `0003002B`, `%c_256`, `%uint`, `00000100`.
+
+Variables:
+`%var_in_ssbo` = `OpVariable %ptr_Uniform_SSBO Uniform`.
+   Op `59`. Words: 1+1+1.
+   `0003003B`, `%var_in_ssbo`, `%ptr_Uniform_SSBO`, `00000002`.
+`%var_out_ssbo` = `OpVariable %ptr_Uniform_SSBO Uniform`.
+   `0003003B`, `%var_out_ssbo`, `%ptr_Uniform_SSBO`, `00000002`.
+`%var_ubo` = `OpVariable %ptr_Uniform_UBO Uniform`.
+   `0003003B`, `%var_ubo`, `%ptr_Uniform_UBO`, `00000002`.
+`%var_gid` = `OpVariable %ptr_Input_uvec3 Input`.
+   `0003003B`, `%var_gid`, `%ptr_Input_uvec3`, `00000001`.
+   Built-in decoration needed for `%var_gid`!
+   `OpDecorate %var_gid BuiltIn GlobalInvocationId`.
+   Decoration `11` (`BuiltIn`). Value `28` (`GlobalInvocationId`).
+   `00040047`, `%var_gid`, `0000000B`, `0000001C`.
+
+Function:
+`%functype` = `OpTypeFunction %void`. Op `33`.
+   `00020021`, `%functype`, `%void`.
+`%main` = `OpFunction %void None %functype`. Op `54`.
+   `00050036`, `%main`, `%void`, `00000000`, `%functype`.
+   Wait, OpFunction format: `OpCode|WC`, `Result`, `FunctionControl`, `FunctionType`.
+   `00040036`, `%main`, `%void`, `00000000`, `%functype`.
+`%label_main` = `OpLabel`. Op `248`.
+   `000200F8`, `%label_main`.
+
+Function Body:
+The shader logic is complex.
+Need shared memory for the "if N<=256" case?
+If I implement the naive scan, I don't need shared memory.
+But the prompt says "For N <= 256, use a shared-memory scan".
+This implies I *must* handle the N<=256 case specifically.
+However, N=256 is just a configuration.
+If I ignore the optimization and just use naive scan for all N?
+"For N <= 256, use a shared-memory scan... For N > 256, a naive fallback... is acceptable".
+Does this mean "If you use naive for N<=256, you fail"?
+Or "If N<=256, you *must* use shared memory"?
+The phrasing "For N <= 256, use a shared-memory scan... For N > 256, ... naive ... is acceptable" suggests a conditional behavior.
+Usually, shared memory scan is faster. Naive is slower.
+Maybe the test harness checks performance on N=256?
+If so, I must implement the shared memory scan.
+Okay, I will implement:
+`if (N <= 256) { shared_scan(); } else { naive_scan(); }`
+
+To implement `shared_scan()`:
+Need Shared Memory variable.
+`%shared_arr` = `OpVariable ... Workgroup`.
+Type must be `OpTypeArray %uint 256`.
+`%arr_256` = `OpTypeArray %uint %c_256`. Op `28` (0x1C).
+   `0003001C`, `%arr_256`, `%uint`, `%c_256`.
+Need pointer to it: `%ptr_Workgroup_arr` = `OpTypePointer Workgroup %arr_256`. Storage Class `Workgroup` (3).
+   `00030020`, `%ptr_Workgroup_arr`, `00000003`, `%arr_256`.
+Var: `%var_shared` = `OpVariable %ptr_Workgroup_arr Workgroup`.
+   `0003003B`, `%var_shared`, `%ptr_Workgroup_arr`, `00000003`.
+Pointer to uint in shared: `%ptr_Workgroup_uint`. (Already defined?)
+Yes, `%ptr_Function_uint` is storage class 7.
+Need `%ptr_Workgroup_uint`: `OpTypePointer Workgroup %uint`.
+   `00030020`, `%ptr_WG_uint`, `00000003`, `%uint`.
+
+**Scan Logic (Workgroup)**:
+Assume LocalInvocationIndex is `lid`. GlobalID is `gid`.
+If `N <= 256`:
+  WG ID is guaranteed to be 0?
+  Not necessarily. But if `N <= 256`, the host *should* launch 1 WG.
+  Even if it launches more, only `gid < N` are valid.
+  
+  Algorithm (Hillis-Steele):
+  1. Load `Input[gid]` into `Shared[lid]`. If `gid >= N`, store 0.
+  2. Barrier.
+  3. Loop `d` from 1 to 8:
+     If `lid >= d`: `Shared[lid] += Shared[lid - d]`.
+     Barrier.
+  4. Store `Shared[lid]` to `Output[gid]`.
+
+**Naive Logic**:
+  `sum = 0`
+  `for (i=0; i<gid; i++) sum += Input[i]`
+  `Output[gid] = sum + Input[gid]`? (Inclusive)
+  Correct inclusive sum: `sum(0..gid)`.
+  `for (i=0; i<=gid; i++) sum += Input[i]`.
+  Loop `i` from 0 to `gid`.
+  Check bounds `i < N`.
+
+**Register Allocation**:
+Need SSA values.
+`%N_val` = Load from UBO.
+  UBO is struct { uvec4 val }.
+  Access: `OpAccessChain %ptr_Uniform_uvec4 %var_ubo %c_0`.
+  Load uvec4.
+  CompositeExtract component 0 -> `%N`.
+`%gid_val` = Load from `%var_gid`.
+  Load uvec3.
+  CompositeExtract component 0 (X) -> `%gid`.
+
+Comparison: `SLessThanEqual` or `ULessThanEqual`.
+`%cond` = `OpULessThanEqual %bool %N %c_256`.
+`OpSelectionMerge %else_label None`.
+`OpBranchConditional %cond %if_label %else_label`.
+
+**If Block (Shared Scan)**:
+Label `%if_label`.
+Barrier? `OpControlBarrier`.
+  Execution: `Device` (1)? `Workgroup` (2)?
+  Memory: `WorkgroupMemory` (0x100)? `AcquireRelease`?
+  For LocalSize 256, single WG:
+  Wait, if multiple WGs are launched for N<=256 (e.g. user error), this logic is unsafe without global sync. But we can't have global sync. We assume 1 WG.
+
+  1. Load Input[gid]:
+     `ptr_in = OpAccessChain %ptr_Uniform_uint %var_in_ssbo %c_0 %gid`.
+     `val_in = OpLoad %uint %ptr_in`.
+     Check bounds: `if (gid < N)`.
+     Shared mem `ptr_sh = OpAccessChain %ptr_WG_uint %var_shared %lid`.
+     `OpStore %ptr_sh %val_in` (if inside) or `OpStore 0` (if outside).
+     Need `lid`: `CompositeExtract` index 2? No, `LocalInvocationIndex` is built-in 25. `LocalInvocationId` is 27.
+     Better use `LocalInvocationId` built-in.
+     `%var_lid` -> Input `uvec3`.
+     `lid` = `.x`.
+     
+     `OpControlBarrier`. Mode: `Workgroup` (2). Semantics: `AcquireRelease` (0x8 | 0x4? No).
+     Memory Semantics: `None` (0)? No, need `WorkgroupMemory` (0x100).
+     Wait, `OpControlBarrier` arguments:
+       `Scope` (Execution), `Scope` (Memory), `MemorySemantics`.
+       Execution: `Workgroup` (2).
+       Memory: `Workgroup` (2).
+       Semantics: `AcquireRelease` (8|4=12) + `WorkgroupMemory` (256) = 268?
+       For simple barrier, `Device` (1) and `SequentiallyConsistent` (0x10)?
+       Usually `OpControlBarrier Workgroup Workgroup AcquireRelease|WorkgroupMemory`.
+       
+  2. Hillis-Steele loop (unrolled or loop?).
+     Unrolled is easier for binary construction.
+     Steps 1, 2, 4, 8, 16, 32, 64, 128.
+     
+     Step 1 (offset 1):
+       `if (lid >= 1)`:
+         `val = OpLoad %ptr_sh`.
+         `prev = OpLoad %ptr_sh_minus_1`.
+         `OpStore %ptr_sh (val+prev)`.
+       `Barrier`.
+       
+     Step 2 (offset 2):
+       ...
+       
+     This generates a lot of code.
+     Maybe a loop?
+     `OpLoopMerge`. `OpBranchConditional`.
+     Counter `d` (init 1).
+     Label `loop_start`.
+     `OpLoad %ptr_sh`.
+     Calculate offset pointer. `OpAccessChain %ptr_WG_uint %var_shared (lid - d)`.
+     Add. Store.
+     Barrier.
+     `d *= 2`.
+     Check `d <= 128`.
+     
+     The loop approach is much smaller.
+
+**Else Block (Naive)**:
+Label `%else_label`.
+Loop `i` from 0 to `gid`.
+  Load `Input[i]`.
+  Accumulate.
+Store `Output[gid]`.
+Branch `%end_label`.
+
+**Data Structures & Constants**:
+I need to generate a large sequence of hex.
+I will organize the instructions step-by-step and convert.
+
+Bound ID estimation: ~100.
+
+**Writing the Hex Stream**:
+I will use Python or manual mapping.
+Format: `WordCount << 16 | OpCode`.
+Little-endian: `0x12345678` -> "78563412".
+
+Let's refine the "Else" block (Naive).
+For N=65536, this is slow.
+Is there any constraint on the provided hex string length? No.
+So I can implement the loop.
+
+**Implementation Details**:
+
+IDs:
+1: void
+2: bool
+3: uint
+4: uvec3
+5: uvec4
+6: arr_runtime
+7: struct_ssbo
+8: struct_ubo
+9: ptr_ssbo
+10: ptr_ubo
+11: ptr_in_uvec3
+12: ptr_in_uvec4 (for UBO member)
+13: ptr_in_uint
+14: ptr_func_uint
+15: ptr_wg_uint
+16: arr_256
+17: ptr_wg_arr
+18: var_in
+19: var_out
+20: var_ubo
+21: var_gid (BuiltIn GlobalInvocationId)
+22: var_lid (BuiltIn LocalInvocationId)
+23: var_shared
+24: functype
+25: main
+26: label_start
+27: label_if
+28: label_else
+29: label_end
+30: c_0
+31: c_1
+...
+40: c_256
+
+Let's start writing the words.
+
+**1. Header**
+`07230203` (Magic)
+`00010000` (Version 1.0)
+`00000000` (Generator)
+`00000080` (Bound: 128)
+`00000000` (Schema)
+
+**2. Instructions**
+
+**OpCapability Shader**
+Op: 17. WC: 2.
+`00020011 00000001`
+
+**OpMemoryModel**
+Op: 14. WC: 3. Logical=1, GLSL450=1.
+`0003000E 00000001 00000001`
+
+**OpEntryPoint**
+Op: 15. WC: 6. GLCompute=5. Main ID=25. "main\0".
+`0006000F 00000005 00000019 6E69616D 00000000`
+(Main ID 25 is 0x19).
+
+**OpExecutionMode**
+Op: 16. WC: 6. LocalSize=17. 256, 1, 1.
+`00060010 00000019 00000011 00000100 00000001 00000001`
+
+**OpSource**
+Optional. Skip.
+
+**OpDecorate**
+`var_in` (18) Binding 0.
+`00040047 00000012 00000021 00000000`
+`var_out` (19) Binding 1.
+`00040047 00000013 00000021 00000001`
+`var_ubo` (20) Binding 2.
+`00040047 00000014 00000021 00000002`
+
+`var_in` DescSet 0.
+`00040047 00000012 00000022 00000000`
+`var_out` DescSet 0.
+`00040047 00000013 00000022 00000000`
+`var_ubo` DescSet 0.
+`00040047 00000014 00000022 00000000`
+
+`struct_ssbo` (7) BufferBlock (3).
+`00030047 00000007 00000003`
+`struct_ubo` (8) Block (2).
+`00030047 00000008 00000002`
+
+`arr_runtime` (6) ArrayStride 4.
+`00040047 00000006 00000006 00000004`
+
+`var_gid` (21) BuiltIn GlobalInvocationId (28).
+`00040047 00000015 0000000B 0000001C`
+`var_lid` (22) BuiltIn LocalInvocationId (27).
+`00040047 00000016 0000000B 0000001B`
+
+OpMemberDecorate `struct_ubo` (8) 0 Offset 0.
+`00050031 00000008 00000000 00000023 00000000`
+
+**Types**
+`%void` (1)
+`00020013 00000001`
+`%bool` (2)
+`00020014 00000002`
+`%uint` (3)
+`00030015 00000003 00200000`
+`%uvec3` (4)
+`00030016 00000004 00000003`
+`%uvec4` (5)
+`00030016 00000005 00000003` -> Wait, component count is 3rd word. `00000003` is uint ID.
+   `%uvec4` ID 5. `uint` ID 3. Count 4.
+   `00030016 00000005 00000003 00000004` -> WC=4.
+   Correct: `00040016 00000005 00000003 00000004`
+`%arr_runtime` (6)
+`0002001D 00000006 00000003`
+`%struct_ssbo` (7)
+`0002001E 00000007 00000006`
+`%struct_ubo` (8)
+`0002001E 00000008 00000005`
+`%ptr_ssbo` (9) (Uniform ptr to struct_ssbo)
+`00030020 00000009 00000002 00000007`
+`%ptr_ubo` (10) (Uniform ptr to struct_ubo)
+`00030020 0000000A 00000002 00000008`
+`%ptr_in_uvec3` (11) (Input ptr to uvec3)
+`00030020 0000000B 00000001 00000004`
+`%ptr_in_uvec4` (12) (Uniform ptr to uvec4)
+`00030020 0000000C 00000002 00000005`
+`%ptr_in_uint` (13) (Uniform ptr to uint)
+`00030020 0000000D 00000002 00000003`
+`%ptr_func_uint` (14) (Function ptr to uint)
+`00030020 0000000E 00000007 00000003`
+
+Constants:
+`%c_0` (30)
+`0003002B 0000001E 00000003 00000000`
+`%c_1` (31)
+`0003002B 0000001F 00000003 00000001`
+`%c_256` (32)
+`0003002B 00000020 00000003 00000100`
+
+Shared memory type:
+`%arr_256` (33) = TypeArray %uint %c_256
+`0004001C 00000021 00000003 00000020`
+`%ptr_wg_arr` (34) = TypePointer Workgroup %arr_256
+`00030020 00000022 00000003 00000021`
+`%ptr_wg_uint` (35) = TypePointer Workgroup %uint
+`00030020 00000023 00000003 00000003`
+
+Variables:
+`%var_in` (18) = Variable %ptr_ssbo Uniform
+`0003003B 00000012 00000009 00000002`
+`%var_out` (19) = Variable %ptr_ssbo Uniform
+`0003003B 00000013 00000009 00000002`
+`%var_ubo` (20) = Variable %ptr_ubo Uniform
+`0003003B 00000014 0000000A 00000002`
+`%var_gid` (21) = Variable %ptr_in_uvec3 Input
+`0003003B 00000015 0000000B 00000001`
+`%var_lid` (22) = Variable %ptr_in_uvec3 Input (Reuse type uvec3)
+`0003003B 00000016 0000000B 00000001`
+`%var_shared` (23) = Variable %ptr_wg_arr Workgroup
+`0003003B 00000017 00000022 00000003`
+
+Function Type:
+`%functype` (24) = TypeFunction %void
+`00020021 00000018 00000001`
+
+Function:
+`%main` (25) = Function
+`00040036 00000019 00000001 00000018` (Result 25, Void 1, None 0, Type 24).
+   Wait, Function Control is `None` (0).
+   Format: `OpFunction` `ResultID` `ResultType` `FuncControl` `FuncType`.
+   Op `54` (0x36). WC=5? No, WC=5 is for explicit result type and id.
+   Let's check spec. `OpFunction` ResultID, ResultTypeID, FuncControl, FuncType.
+   WC: 1+1+1+1+1 = 5?
+   `OpFunction` (54) format:
+   `WordCount|OpCode`, `ResultID`, `ResultType`, `FunctionControl`, `FunctionType`.
+   `00050036 00000019 00000001 00000000 00000018`
+
+`%label_start` (26) = Label
+`000200F8 0000001A`
+
+**Body**:
+Load N:
+Access UBO: `OpAccessChain %ptr_in_uvec4 %var_ubo %c_0`.
+`OpAccessChain` (65).
+Result ID 40.
+`00050041 0000000C 00000028 00000014 0000001E` (Type, Result, Base, Index 0).
+Load uvec4 (ID 41):
+`OpLoad` (61). WC=4 (aligned?).
+`0004003D 00000005 00000029 00000028` (Type, Result, Pointer).
+Extract N (ID 42):
+`OpCompositeExtract` (81). `uvec4` -> `uint`.
+`00040051 00000003 0000002A 00000029 00000000` (Type, Result, Composite, Index 0).
+
+Load GID (ID 43):
+`OpLoad %uvec3 %var_gid`.
+`0004003D 00000004 0000002B 00000015`
+Extract X (ID 44):
+`OpCompositeExtract %uint`.
+`00040051 00000003 0000002C 0000002B 00000000`
+
+Load LID (ID 45):
+`OpLoad %uvec3 %var_lid`.
+`0004003D 00000004 0000002D 00000016`
+Extract X (ID 46):
+`OpCompositeExtract %uint`.
+`00040051 00000003 0000002E 0000002D 00000000`
+
+Check N <= 256:
+`OpULessThanEqual` (53). `%bool` (2).
+`00050035 00000002 0000002F 0000002A 00000020` (Type, Result, Operand1 N, Operand2 256).
+
+Branch:
+`OpSelectionMerge` (247) `%label_else` None.
+`000300F7 0000001D 00000000`
+`OpBranchConditional` (251) `%cond` `%label_if` `%label_else`.
+`000400FB 0000002F 0000001C 0000001D`
+
+**IF BLOCK (Label 28)**:
+`%label_if` (28):
+`000200F8 0000001C`
+
+Inside IF:
+Barrier to ensure shared mem is clean? Not needed.
+Check bounds `gid < N`.
+`OpULessThan` (52).
+`00050034 00000002 00000030 0000002C 0000002A`
+`OpSelectionMerge %skip_load` ...
+If true, load input.
+Else store 0.
+
+Pointer to Input[gid]:
+`OpAccessChain %ptr_in_uint %var_in %c_0 %gid`.
+`00060041 0000000D 00000031 00000012 0000001E 0000002C`
+Load val:
+`OpLoad %uint %ptr`.
+`0004003D 00000003 00000032 00000031`
+Pointer to Shared[lid]:
+`OpAccessChain %ptr_wg_uint %var_shared %lid`.
+`00050041 00000023 00000033 00000017 0000002E`
+Store:
+`OpStore %ptr_sh %val`.
+`0002003E 00000033 00000032`
+
+Branch for bounds check...
+Actually, unrolling the bounds check logic for every step is tedious.
+Given N<=256 is the condition for this block, and we launch 256 threads...
+The test "N <= 256" means we are in a small array.
+If we launch 256 threads, and N=100, threads 100..255 should do nothing?
+Or should they write 0?
+Prefix sum output is length N.
+If `gid >= N`, thread should not write to Output.
+So inside IF:
+  `if (gid < N) { load; store to shared; } else { store 0 to shared; }` -> For Hillis-Steele, 0s don't affect sum.
+  
+  Barrier `Workgroup`.
+  `OpControlBarrier` (224).
+  `000400E0 00000002 00000002 00000108` (Wait, semantics 0x108?)
+  Semantics: `AcquireRelease|WorkgroupMemory`.
+  Acquire=2, Release=4 -> 6? No. Release=4, Acquire=2.
+  MemorySemantics mask:
+  `AcquireRelease` (8) | `UniformMemory` (16) | `WorkgroupMemory` (256).
+  For shared memory only: `WorkgroupMemory` (256) | `AcquireRelease` (8).
+  Value `264` (0x108).
+  `OpControlBarrier` Scope Scope Semantics.
+  Scope Workgroup (2).
+  `000400E0 00000002 00000002 00000108`
+
+  Loop for Scan (Hillis-Steele):
+  Need loop variable `d`. Function local uint.
+  `OpVariable %ptr_func_uint Function`. (ID 50).
+  `OpStore %var_d %c_1`.
+  `OpBranch %loop_check`.
+
+  Loop Check:
+  `OpLoopMerge %loop_end %loop_cont None`.
+  `OpBranch %loop_body`.
+  
+  Loop Body:
+  Load `d`. Load `lid`.
+  `if (lid >= d)`: `shared[lid] += shared[lid-d]`.
+  
+  This is getting very long for hex.
+  Is there a simpler way for N<=256?
+  Just simple add?
+  Since N<=256, we can just use the naive approach here too!
+  Wait. "For N <= 256, use a shared-memory scan". This sounds like a requirement to use the algorithm.
+  However, naive scan for N=256 is `256*256 = 65536` ops. Trivial.
+  But the prompt says "For N <= 256, use a shared-memory scan...".
+  If I implement naive scan for N<=256, does it violate the instruction?
+  "Use a shared-memory scan within a single workgroup".
+  If I don't use shared memory, I violate it.
+  But if I implement the naive scan in the `else` branch (N>256) and duplicate logic?
+  
+  Alternative: Workgroup reduction is complex in hex.
+  Is there a simpler Workgroup scan?
+  Hillis-Steele is unrolled easily for 256 (8 steps).
+  
+  Unrolled Hillis-Steele for 256 (Steps 1, 2, 4, 8, 16, 32, 64, 128).
+  
+  Step 1:
+    `if (lid >= 1)`.
+    Load `sh[lid]`. Load `sh[lid-1]`. Add. Store.
+    Barrier.
+  Step 2:
+    `if (lid >= 2)`.
+    ...
+  
+  This is many instructions.
+  Given the constraints of manually writing hex, maybe I should:
+  1. Implement the naive scan for ALL N?
+     "For N <= 256, use a shared-memory scan".
+     If I use naive scan for N<=256, is it acceptable?
+     The prompt says "For N <= 256, use a shared-memory scan... For N > 256, a naive fallback... is acceptable".
+     This phrasing implies:
+     - N <= 256: Required shared memory.
+     - N > 256: Naive is acceptable (because multi-wg is hard).
+     
+     So I MUST implement shared memory for N <= 256.
+     
+     Okay, I will implement the unrolled loop.
+     It adds instructions but ensures correctness/performance for the required case.
+     
+     Shared Mem Logic:
+     1. Load `input[gid]` -> `shared[lid]`.
+     2. Barrier.
+     3. Step 1:
+        `tmp = shared[lid]`.
+        `if (lid >= 1) tmp += shared[lid-1]`.
+        `shared[lid] = tmp`.
+        Barrier.
+     4. Step 2 ...
+     
+     Total 8 steps.
+     Finally `shared[lid]` -> `output[gid]`.
+     
+     This is manageable.
+     
+     Constants needed: 1, 2, 4, 8, 16, 32, 64, 128.
+     I have `c_1`. Need `c_2`, `c_4`, etc.
+     Or I can compute them with shifts? Constants are easier.
+     
+     I'll just write the naive scan for the `else` branch.
+     
+**Back to Hex Construction**:
+
+I'll define IDs for constants 2, 4, ... 128.
+33..40.
+
+Skip the "If" block shared memory implementation details in this thought trace and proceed to generate the binary structure. I will output the complete hex.
+
+**Structure of the Binary**:
+1. Header
+2. Capabilities
+3. MemoryModel
+4. EntryPoint
+5. ExecMode
+6. Decorations
+7. Types/Constants
+8. Variables
+9. Function Main
+   - Load N, GID, LID
+   - `if (N <= 256)`
+     - Load Input -> Shared
+     - Barrier
+     - Scan steps (unrolled)
+     - Barrier
+     - Shared -> Output
+   - `else`
+     - Naive loop sum -> Output
+
+**Constants**:
+0, 1, 2, 4, 8, 16, 32, 64, 128, 256.
+IDs:
+30: 0
+31: 1
+32: 2
+33: 4
+34: 8
+35: 16
+36: 32
+37: 64
+38: 128
+39: 256
+
+**Scan Steps**:
+Step 1 (offset 1):
+`if (lid >= 1)`.
+`val = Load shared[lid]`.
+`prev = Load shared[lid-1]`.
+`sum = Add val prev`.
+`Store shared[lid] sum`.
+`Barrier`.
+
+**Naive Scan**:
+`sum = 0`.
+`i = 0`.
+Loop:
+`if (i <= gid)`.
+  `val = Load input[i]`.
+  `sum += val`.
+  `i++`.
+`Store output[gid] sum`.
+Note: Inclusive sum. `i` goes 0 to `gid`.
+Wait. Input is `uint`.
+Load pointer: `input[0] + i`.
+AccessChain: `base, 0, i`.
+Correct.
+
+**Final Check on SPIR-V Version**:
+If I use `StorageBuffer` class (12), it requires SPIR-V 1.3.
+Prompt asks for SPIR-V 1.0 (`00010000`).
+So I will use `Uniform` (2) and `BufferBlock` (3) for SSBOs.
+I will use `Uniform` (2) and `Block` (2) for UBO.
+This is standard SPIR-V 1.0.
+Decorations:
+SSBO Var -> `BufferBlock` (3).
+UBO Var -> `Block` (2).
+Arrays in SSBO -> `ArrayStride` (6).
+
+Let's build the hex string.
+
+Instruction List:
+1. `OpCapability Shader` (17).
+2. `OpMemoryModel Logical GLSL450` (14).
+3. `OpEntryPoint GLCompute` (15).
+4. `OpExecutionMode` (16).
+5. `OpDecorate`s.
+6. `OpType`s.
+7. `OpConstant`s.
+8. `OpVariable`s.
+9. `OpFunction` Main.
+
+Detailed IDs for Main:
+`%label_if` (28)
+`%label_else` (29)
+`%label_end` (30) -> Wait, I used 30 for c_0.
+Let's re-ID.
+Constants: 20-29.
+Labels: 40+.
+Variables: 10-19.
+Types: 1-9.
+Result IDs in function: 50+.
+
+Bound: 128 is plenty.
+
+**Shared Memory Barrier**:
+`OpControlBarrier`.
+Execution: `Workgroup` (2).
+Memory: `Workgroup` (2).
+Semantics: `AcquireRelease` (8) | `WorkgroupMemory` (256).
+Hex for `Workgroup`: `00000002`.
+Hex for `Semantics`: `00000108`.
+Instruction `OpControlBarrier`: `000400E0` (Op 224). `E0` is 224. `04` words.
+`000400E0 00000002 00000002 00000108`.
+
+**Naive Loop**:
+Loop header.
+Phi node for `i` and `sum`.
+`i` (init 0).
+`sum` (init 0).
+Check `i <= gid`.
+Body: Load `Input[i]`. Add `sum`.
+Next: `i++`.
+Branch back.
+After loop: Store `sum`.
+
+This requires Phi nodes. `OpPhi` (250).
+`%i_next` = Phi (`i+1` from body, `0` from start).
+`%sum_next` = Phi (`sum+val` from body, `0` from start).
+
+**Shared Mem Bounds**:
+For N<=256:
+If `gid >= N`, don't write to Output.
+But we still participate in barrier?
+Yes.
+Load Input: if `gid < N` load, else load 0.
+Actually, `OpLoad` from out-of-bounds is undefined.
+So `if (gid < N)` logic is needed.
+This bloats the IF block.
+Optimization: `Input` is valid for `0..N-1`.
+Threads `0..N-1` load. Threads `N..255` load 0 (or skip).
+Since it's inclusive scan, if `gid >= N`, we don't care about the result, but `Output` write is checked.
+To keep it simple:
+Inside IF (N<=256):
+  `val = 0`.
+  `if (gid < N) val = Load(Input[gid])`.
+  `Shared[lid] = val`.
+  Barrier.
+  Scan...
+  Barrier.
+  `if (gid < N) Output[gid] = Shared[lid]`.
+
+This logic handles N=256 perfectly (all active) and N<256 (partial active).
+
+Okay, I'm ready to generate the hex.
+I will produce the string directly.
+
+Word counts are tricky.
+`OpAccessChain` -> WC = 4 + num indices.
+`OpLoad` -> WC = 4.
+`OpStore` -> WC = 3 (Op+Ptr+Val)? No.
+`OpStore` (61): WC 3. Words: `Op`, `Pointer`, `Object`. (Opcode 61 is 0x3D. Wait. `OpStore` is 61. 0x3D.
+  Wait. `OpLoad` is 61 (0x3D)? No.
+  Let's check standard opcode numbers.
+  `OpLoad` = 61.
+  `OpStore` = 62.
+  `OpLoad` format: `Result Type`, `Result ID`, `Pointer`. WC=4.
+  `OpStore` format: `Pointer`, `Object`. WC=3.
+  
+Correct.
+
+**Final Hex String Construction**:
+I will write the code in a mental stream, verifying word counts.
+
+Start of binary: `07230203 00010000 00000000 00000080 00000000` (Header).
+
+`OpCapability Shader`: `00020011 00000001`.
+
+`OpMemoryModel`: `0003000E 00000001 00000001`.
+
+`OpEntryPoint`: `GLCompute` (5). ID `%main` (19). "main\0".
+`0006000F 00000005 00000013 6E69616D 00000000`. (Main ID 19).
+
+`OpExecutionMode`: `LocalSize` (17). `%main` (19). 256, 1, 1.
+`00060010 00000013 00000011 00000100 00000001 00000001`.
+
+Decorations:
+`%var_in` (10) Binding 0. `00040047 0000000A 00000021 00000000`.
+`%var_out` (11) Binding 1. `00040047 0000000B 00000021 00000001`.
+`%var_ubo` (12) Binding 2. `00040047 0000000C 00000021 00000002`.
+`%var_in` DescSet 0. `00040047 0000000A 00000022 00000000`.
+`%var_out` DescSet 0. `00040047 0000000B 00000022 00000000`.
+`%var_ubo` DescSet 0. `00040047 0000000C 00000022 00000000`.
+`%struct_ssbo` (6) BufferBlock (3). `00030047 00000006 00000003`.
+`%struct_ubo` (7) Block (2). `00030047 00000007 00000002`.
+`%arr_runtime` (8) ArrayStride 4. `00040047 00000008 00000006 00000004`.
+`%var_gid` (14) BuiltIn GlobalInvocationId (28). `00040047 0000000E 0000000B 0000001C`.
+`%var_lid` (15) BuiltIn LocalInvocationId (27). `00040047 0000000F 0000000B 0000001B`.
+MemberDeco: `%struct_ubo` (7) 0 Offset 0. `00050031 00000007 00000000 00000023 00000000`.
+
+Types:
+`%void` (1). `00020013 00000001`.
+`%bool` (2). `00020014 00000002`.
+`%uint` (3). `00030015 00000003 00200000`. -> `00030015 00000003 00000020 00000000`.
+`%uvec3` (4). `00040016 00000004 00000003 00000003`.
+`%uvec4` (5). `00040016 00000005 00000003 00000004`.
+`%arr_runtime` (8). `0002001D 00000008 00000003`.
+`%struct_ssbo` (6). `0002001E 00000006 00000008`.
+`%struct_ubo` (7). `0002001E 00000007 00000005`.
+`%ptr_ssbo` (9). `00030020 00000009 00000002 00000006`.
+`%ptr_ubo` (13). `00030020 0000000D 00000002 00000007`.
+`%ptr_in_uvec3` (16). `00030020 00000010 00000001 00000004`.
+`%ptr_in_uvec4` (17). `00030020 00000011 00000002 00000005`.
+`%ptr_in_uint` (18). `00030020 00000012 00000002 00000003`.
+`%ptr_func_uint` (21). `00030020 00000015 00000007 00000003`.
+`%ptr_wg_uint` (20). `00030020 00000014 00000003 00000003`.
+`%arr_256` (23). `0004001C 00000017 00000003 00000019`.
+`%ptr_wg_arr` (22). `00030020 00000016 00000003 00000017`.
+`%functype` (24). `00020021 00000018 00000001`.
+
+Constants:
+`%c_0` (25). `0003002B 00000019 00000003 00000000`.
+`%c_1` (26). `0003002B 0000001A 00000003 00000001`.
+`%c_256` (27). `0003002B 0000001B 00000003 00000100`.
+`%c_2` (28). `0003002B 0000001C 00000003 00000002`.
+`%c_4` (29). `0003002B 0000001D 00000003 00000004`.
+`%c_8` (30). `0003002B 0000001E 00000003 00000008`.
+`%c_16` (31). `0003002B 0000001F 00000003 00000010`.
+`%c_32` (32). `0003002B 00000020 00000003 00000020`.
+`%c_64` (33). `0003002B 00000021 00000003 00000040`.
+`%c_128` (34). `0003002B 00000022 00000003 00000080`.
+
+Variables:
+`%var_in` (10). `0003003B 0000000A 00000009 00000002`.
+`%var_out` (11). `0003003B 0000000B 00000009 00000002`.
+`%var_ubo` (12). `0003003B 0000000C 0000000D 00000002`.
+`%var_gid` (14). `0003003B 0000000E 00000010 00000001`.
+`%var_lid` (15). `0003003B 0000000F 00000010 00000001`.
+`%var_shared` (35). `0003003B 00000023 00000016 00000003`.
+
+Function Main (19):
+`00040036 00000013 00000001 00000000 00000018`. -> OpFunction WC 5. `00050036 00000013 00000001 00000000 00000018`.
+Label Start (36): `000200F8 00000024`.
+
+Load N:
+Access UBO (40). `OpAccessChain`. `00050041 00000011 00000028 0000000C 00000019`.
+Load UBO Member (41). `OpLoad`. `0004003D 00000005 00000029 00000028`.
+Extract N (42). `OpCompositeExtract`. `00040051 00000003 0000002A 00000029 00000000`.
+
+Load GID:
+Load GID vec (43). `OpLoad`. `0004003D 00000004 0000002B 0000000E`.
+Extract GID (44). `OpCompositeExtract`. `00040051 00000003 0000002C 0000002B 00000000`.
+
+Load LID:
+Load LID vec (45). `OpLoad`. `0004003D 00000004 0000002D 0000000F`.
+Extract LID (46). `OpCompositeExtract`. `00040051 00000003 0000002E 0000002D 00000000`.
+
+Check N <= 256 (47). `OpULessThanEqual`. `00050035 00000002 0000002F 0000002A 0000001B`.
+
+Selection Merge (48). `000300F7 00000031 00000000`.
+Branch Cond (49). `000400FB 0000002F 00000030 00000031`.
+
+**IF Block (Label 48)**:
+Label (48). `000200F8 00000030`.
+Check GID < N (50). `OpULessThan`. `00050034 00000002 00000032 0000002C 0000002A`.
+SelectionMerge (51). `000300F7 00000034 00000000`.
+BranchCond (52). `000400FB 00000032 00000033 00000034`.
+
+  Load True (53):
+  Label (53). `000200F8 00000035`.
+  Access Input (54). `00060041 00000012 00000036 0000000A 00000019 0000002C`.
+  Load Input (55). `0004003D 00000003 00000037 00000036`.
+  Branch (56). `00020010 00000038`.
+
+  Load False (57):
+  Label (57). `000200F8 00000039`.
+  Branch (58). `00020010 00000038`.
+
+  Merge Load (59):
+  Label (59). `000200F8 0000003A`.
+  Phi Val (60). `OpPhi`. Type uint(3). ID 60.
+    From True (53, 37). From False (57, 19=0? No need const 25).
+    `0005003A 00000003 0000003B 00000037 00000035 00000019 00000039`.
+    Wait, Phi format: Result, Type, Var1, Parent1, Var2, Parent2...
+    `0006003A 00000003 0000003B 00000037 00000035 00000019 00000039`.
+    (ID 25 is c_0).
+
+  Store Shared (61). AccessChain Shared[lid].
+  `00050041 00000014 0000003C 00000023 0000002E`.
+  `OpStore`. `0002003E 0000003C 0000003B`.
+
+Barrier (62). `000400E0 00000002 00000002 00000108`.
+
+Scan Steps (Unrolled):
+Step 1 (offset 1):
+  Check LID >= 1 (63). `OpUGreaterThanEqual`.
+  `00050036 00000002 0000003D 0000002E 0000001A`. (Using Op 54? No. Op 54 is Function. Op 54=0x36? Wait. `OpUGreaterThanEqual` is 53? `OpULessThan` 52. `OpSLessThan` 54.
+  Check Spec:
+    `OpUGreaterThanEqual` (55).
+    Wait, my previous manual opcodes might be wrong.
+    Let's use the codes:
+    `OpULessThan` 52 (0x34).
+    `OpULessThanEqual` 53 (0x35).
+    `OpUGreaterThan` 54 (0x36).
+    `OpUGreaterThanEqual` 55 (0x37).
+  Correct Op for >=: 55.
+  `00050037 00000002 0000003D 0000002E 0000001A`. (LID, 1).
+  SelectionMerge/Branch.
+  If True:
+    Load Shared[lid] (64).
+    `00050041 00000014 0000003E 00000023 0000002E`.
+    `OpLoad`. `0004003D 00000003 0000003F 0000003E`.
+    Calc offset (LID - 1). `OpISub`. `0004007F 00000003 00000040 0000002E 0000001A`.
+    AccessChain offset ptr. `00050041 00000014 00000041 00000023 00000040`.
+    Load prev. `0004003D 00000003 00000042 00000041`.
+    Add. `OpIAdd`. `00050080 00000003 00000043 0000003F 00000042`.
+    Store. `0002003E 0000003E 00000043`.
+  Barrier (65). `000400E0 00000002 00000002 00000108`.
+
+... Repeat for 2, 4, 8, 16, 32, 64, 128 ...
+This is huge.
+Given the constraints and the fact I need to type this out...
+The prompt accepts naive fallback for N
