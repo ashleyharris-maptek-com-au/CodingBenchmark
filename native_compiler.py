@@ -610,7 +610,7 @@ class CppCompiler(NativeCompiler):
     exe_path = self._get_cached_exe_path(source_hash)
 
     # Create temp source file
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.cpp', delete=False,encoding='utf-8') as f:
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.cpp', delete=False, encoding='utf-8') as f:
       f.write(source_code)
       src_path = f.name
 
@@ -1069,7 +1069,7 @@ class CSharpCompiler(NativeCompiler):
 
   def _compile_with_csc(self, source_code: str, exe_path: Path, extra_flags: List[str]) -> Path:
     """Compile using csc.exe."""
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.cs', delete=False,encoding='utf-8') as f:
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.cs', delete=False, encoding='utf-8') as f:
       f.write(source_code)
       src_path = f.name
 
@@ -1101,7 +1101,7 @@ class CSharpCompiler(NativeCompiler):
 
   def _compile_with_mono(self, source_code: str, exe_path: Path, extra_flags: List[str]) -> Path:
     """Compile using Mono mcs."""
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.cs', delete=False,encoding='utf-8') as f:
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.cs', delete=False, encoding='utf-8') as f:
       f.write(source_code)
       src_path = f.name
 
@@ -1429,6 +1429,7 @@ def compile_and_run(code: str,
   try:
     compiler = get_compiler(language, engine_name)
   except ValueError as e:
+    print(f"!!!COMPILER MISSING FOR {language}!!!")
     return RunResult(False, error=str(e), error_stage='compiler_missing')
 
   if not compiler.find_compiler():
@@ -1437,6 +1438,8 @@ def compile_and_run(code: str,
   try:
     exe_path = compiler.compile(code)
   except CompilationError as e:
+    print("Compilation Error:")
+    print(str(e))
     return RunResult(False, error=str(e), error_stage='compilation')
 
   try:
@@ -1451,6 +1454,15 @@ def compile_and_run(code: str,
 
     success = return_code == 0
     error = stderr if not success else ""
+    if success:
+      if len(stdout) < 100:
+        print("OUTPUT:" + stdout.replace("\n", "\\n"))
+      else:
+        print("OUTPUT:" + stdout[:100].replace("\n", "\\n") + "..." + str(len(stdout) - 100) +
+              " more bytes.")
+    else:
+      print("RuntimeError " + str(return_code))
+      print(stderr)
     return RunResult(success,
                      stdout,
                      stderr,
@@ -1460,6 +1472,7 @@ def compile_and_run(code: str,
                      error_stage='execution' if not success else '')
 
   except ExecutionError as e:
+    print("Execution error: " + str(e))
     return RunResult(False,
                      error=str(e),
                      error_stage='timeout' if 'timed out' in str(e) else 'execution')

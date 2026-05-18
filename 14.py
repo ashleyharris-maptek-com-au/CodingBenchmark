@@ -20,7 +20,7 @@ import time
 from typing import List, Tuple, Set
 
 from native_compiler import CSharpCompiler, compile_and_run, describe_this_pc
-from solver_utils import BaselineCache, StreamingInputFile, normalize_code_result
+from solver_utils import BaselineCache, StreamingInputFile, get_ram_in_gb, normalize_code_result
 
 title = "Minesweeper Solver (C#)"
 
@@ -561,14 +561,8 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
   if not is_valid:
     return 0.0, f"[{description}] {validation_error}"
 
-  if os.name == 'nt':
-    total_ram = os.popen('wmic computersystem get totalphysicalmemory').read().split()[1]
-  else:
-    total_ram = os.popen('free -b | grep Mem | awk \'{print $2}\'').read().strip()
-
-  total_ram_gb = int(total_ram) / (1024**3)
-
-  if total_ram_gb < 32 and subPass > 7:
+  ramInGb = get_ram_in_gb()
+  if ramInGb < 32 and subPass > 7:
     return 1.0, "Not enough RAM to safely grade answer - it was validated, assuming pass."
 
   # Get baseline

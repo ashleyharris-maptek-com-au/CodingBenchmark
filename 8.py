@@ -6,7 +6,7 @@ import os
 from typing import List, Tuple, Set
 
 from native_compiler import RustCompiler, compile_and_run, describe_this_pc
-from solver_utils import GradeCache, StreamingInputFile, normalize_code_result
+from solver_utils import GradeCache, StreamingInputFile, get_ram_in_gb, normalize_code_result
 
 title = "Maze Solver (Rust)"
 
@@ -590,14 +590,8 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
   if "rust_code" not in result:
     return 0.0, "No Rust code provided"
 
-  if os.name == 'nt':
-    total_ram = os.popen('wmic computersystem get totalphysicalmemory').read().split()[1]
-  else:
-    total_ram = os.popen('free -b | grep Mem | awk \'{print $2}\'').read().strip()
-
-  total_ram_gb = int(total_ram) / (1024**3)
-
-  if total_ram_gb < 64 and subPass > 8:
+  ramInGb = get_ram_in_gb()
+  if ramInGb < 64 and subPass > 8:
     return 1.0, "Not enough RAM to grade answer - assuming pass."
 
   maze = get_maze(subPass)
