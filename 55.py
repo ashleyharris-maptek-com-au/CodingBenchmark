@@ -889,7 +889,7 @@ def _grade_stockfish_game(exe_path: str, subPass: int, aiEngineName: str):
         json.dump({}, open("results/chessElo.json", "w"))
       elo = json.load(open("results/chessElo.json"))
       elo[aiEngineName] = target_elo - 50
-      json.dump(elo, open("results/chessElo.json", "w"))
+      json.dump(elo, open("results/chessElo.json", "w"), indent=2)
     except Exception:
       pass
   else:
