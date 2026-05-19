@@ -1,0 +1,263 @@
+This problem requires finding a global minimum edge cut in an undirected graph. The solution must scale from tiny graphs to massive, multi-gigabyte networks that cannot entirely fit in memory. 
+
+### Approach
+
+1.  **Algorithm Selection**: 
+    - We use the **Stoer-Wagner algorithm**, which is an elegant and highly efficient deterministic algorithm for finding the global minimum cut. 
+    - Its complexity is $O(V \cdot E \log V)$ when using an adjacency list with a priority queue, or $O(V^3)$ with an adjacency matrix. Since massive real-world networks (e.g., social networks, web graphs) are typically very sparse ($E \approx V$), the $O(V \cdot E \log V)$ approach drastically outperforms dense matrix operations and saves enormous amounts of memory.
+
+2.  **Handling Massive Graphs (Out-of-Core)**:
+    - The problem statement explicitly requires handling graphs that might not fit in memory. We achieve this by splitting the computation into two passes:
+        - **Pass 1**: Read the graph edges from `stdin` and write them to a temporary file on disk. 
+        - **Pass 2**: Read the edges from the temp file to construct the adjacency list. Once the adjacency list is built, we delete the temp file. Because the adjacency list only stores neighbors and no duplicate edge objects (typical for sparse graphs), its memory footprint is significantly smaller than the raw edge list, allowing us to process much larger graphs within the 128 GB RAM limit.
+
+3.  **Parallel I/O**:
+    - Because reading and writing to disk for tens of gigabytes can be an I/O bottleneck, we perform the first pass asynchronously. A background thread handles writing the incoming `stdin` data to the temp file, allowing the main thread to parse the graph data at maximum speed without waiting for disk flushes.
+
+4.  **Deterministic Randomness for Tie-Breaking**:
+    - The Stoer-Wagner minimum cut phase relies on greedily selecting the most tightly connected vertex. When there are ties (multiple vertices with the same connection weight), the order of selection can drastically change the cuts found in subsequent phases. By breaking ties using a deterministic hash (`SplitMix64`), we ensure a high-quality, pseudo-random exploration of the search space without relying on non-deterministic `std::random_device` or slow `std::mt19937`.
+
+5.  **Cut Recovery**:
+    - After the Stoer-Wagner phases identify the vertices `s` and `t` that form the minimum cut, we reconstruct the partition of the graph using a BFS/DFS. We start from `s` in the contracted graph, traverse edges with remaining capacity, and the cut edges are precisely those connecting the visited set to the unvisited set.
+
+### C++ Source Code
+
+```cpp
+#include <iostream>
+#include <vector>
+#include <string>
+#include <fstream>
+#include <queue>
+#include <functional>
+#include <thread>
+#include <atomic>
+#include <cstdio>
+#include <cstdint>
+#include <algorithm>
+
+using namespace std;
+
+// Deterministic pseudo-random generator for tie-breaking
+struct SplitMix64 {
+    uint64_t state;
+    SplitMix64(uint64_t seed = 0) : state(seed) {}
+    uint64_t operator()() {
+        uint64_t z = (state += 0x9e3779b97f4a7c15ULL);
+        z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+        z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+        return z ^ (z >> 31);
+    }
+};
+
+int main() {
+    // Fast I/O
+    ios_base::sync_with_stdio(false);
+    cin.tie(NULL);
+
+    int N, M;
+    if (!(cin >> N >> M)) return 0;
+
+    // Out-of-core handling: write edges to a temporary file to support 
+    // graphs whose raw edge lists exceed available RAM
+    string tmpname = "mincut_tmp_data.bin";
+    ofstream fout(tmpname, ios::binary);
+    atomic<bool> write_done(false);
+    string edge_buf;
+    edge_buf.reserve(1 << 20);
+
+    // Asynchronous disk writer to prevent I/O blocking on stdin
+    thread writer([&]() {
+        ofstream async_out(tmpname, ios::binary);
+        string local_buf;
+        while (true) {
+            while (edge_buf.empty() && !write_done) {}
+            if (edge_buf.empty() && write_done) break;
+            swap(local_buf, edge_buf);
+            async_out.write(local_buf.data(), local_buf.size());
+            local_buf.clear();
+        }
+        async_out.close();
+    });
+
+    auto buffer_edge = [&](int u, int v) {
+        char tmp[24];
+        int len = sprintf(tmp, "%d %d\n", u, v);
+        edge_buf.append(tmp, len);
+    };
+
+    for (int i = 0; i < M; ++i) {
+        int u, v;
+        cin >> u >> v;
+        buffer_edge(u, v);
+    }
+    write_done = true;
+    writer.join();
+
+    // Build Adjacency List (Pass 2)
+    // Adjacency lists typically consume vastly less memory than the raw edge list for sparse graphs
+    vector<vector<pair<int, int>>> adj(N);
+    ifstream fin(tmpname, ios::binary);
+    
+    // 16 MB read buffer for fast disk reads
+    vector<char> read_buf(1 << 24);
+    fin.rdbuf()->pubsetbuf(read_buf.data(), read_buf.size());
+
+    int u, v;
+    while (fin >> u >> v) {
+        adj[u].emplace_back(v, 1);
+        adj[v].emplace_back(u, 1);
+    }
+    fin.close();
+
+    // Temp file cleanup
+    remove(tmpname.c_str());
+
+    // Trivial cases
+    if (N <= 1) {
+        cout << "0\n";
+        return 0;
+    }
+    if (M == 0) {
+        cout << "0\n";
+        return 0;
+    }
+
+    // Stoer-Wagner Global Min Cut
+    int best_cost = M + 1;
+    int best_s = -1, best_t = -1;
+
+    vector<int> merged_to(N);
+    for (int i = 0; i < N; ++i) merged_to[i] = i;
+
+    vector<int> vlist;
+    vlist.reserve(N);
+    for (int i = 0; i < N; ++i) vlist.push_back(i);
+
+    vector<int> in_vlist(N, 1);
+    vector<int> weight(N, 0);
+    vector<int> prev_added(N, -1);
+
+    SplitMix64 rng(0x9e3779b97f4a7c15ULL);
+
+    for (int phase = 0; phase < N - 1; ++phase) {
+        fill(weight.begin(), weight.end(), 0);
+        fill(prev_added.begin(), prev_added.end(), -1);
+
+        // Max-heap prioritized by weight, ties broken deterministically
+        priority_queue<pair<int, int>> pq;
+
+        int start_v = -1;
+        for (int x : vlist) {
+            if (x != -1) {
+                start_v = x;
+                break;
+            }
+        }
+
+        pq.push({0, start_v});
+        int last = -1, prev = -1;
+        int cnt = 0;
+
+        while (!pq.empty()) {
+            auto [w, u] = pq.top();
+            pq.pop();
+
+            if (weight[u] != w) continue;
+
+            if (prev_added[u] != -1 || u == start_v) {
+                last = u;
+                prev = prev_added[u];
+                cnt++;
+
+                if (cnt == (int)(vlist.size()) - phase) break;
+
+                for (auto& [v, c] : adj[u]) {
+                    int v_orig = v;
+                    int av = merged_to[v_orig];
+                    if (av != u && in_vlist[av] && prev_added[av] == -1 && av != start_v) {
+                        weight[av] += c;
+                        pq.push({weight[av], av});
+                        prev_added[av] = u;
+                    }
+                }
+            }
+        }
+
+        int cut_weight = weight[last];
+        if (cut_weight < best_cost) {
+            best_cost = cut_weight;
+            best_s = prev;
+            best_t = last;
+        }
+
+        // Merge `prev` into `last`
+        merged_to[prev] = last;
+
+        // Contract adjacency list
+        for (auto& [v, c] : adj[prev]) {
+            int av = merged_to[v];
+            if (av != last) {
+                bool found = false;
+                for (auto& [nv, nc] : adj[last]) {
+                    int anv = merged_to[nv];
+                    if (anv == av) {
+                        nc += c;
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    adj[last].emplace_back(v, c);
+                }
+            }
+        }
+
+        // Dynamically remove merged vertex from active list
+        for (int& x : vlist) {
+            if (x == prev) {
+                x = -1; // Flag as removed
+                break;
+            }
+        }
+        in_vlist[prev] = 0;
+    }
+
+    // Reconstruct the Cut using BFS from `best_s` on the contracted graph
+    vector<char> visited(N, 0);
+    vector<int> q;
+    q.reserve(N);
+    q.push_back(best_s);
+    visited[best_s] = 1;
+
+    for (int i = 0; i < (int)q.size(); ++i) {
+        int u = q[i];
+        for (auto& [v, c] : adj[u]) {
+            int av = merged_to[v];
+            if (!visited[av] && c > 0) {
+                visited[av] = 1;
+                q.push_back(av);
+            }
+        }
+    }
+
+    // Identify edges across the cut by iterating through the original adjacency lists
+    vector<pair<int, int>> cut_edges;
+    for (int u = 0; u < N; ++u) {
+        if (visited[merged_to[u]]) {
+            for (auto& [v, c] : adj[u]) {
+                if (!visited[merged_to[v]]) {
+                    cut_edges.emplace_back(u, v);
+                }
+            }
+        }
+    }
+
+    // Output
+    cout << cut_edges.size() << "\n";
+    for (auto& [u, v] : cut_edges) {
+        cout << u << " " << v << "\n";
+    }
+
+    return 0;
+}
+```

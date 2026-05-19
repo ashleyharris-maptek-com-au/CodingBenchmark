@@ -37,6 +37,62 @@ GRADE_CACHE_DIR = Path(tempfile.gettempdir()) / "codingbenchmark_grade_cache"
 BASELINE_CACHE_DIR = Path(tempfile.gettempdir()) / "codingbenchmark_baseline_cache"
 
 
+def get_total_ram_bytes() -> Optional[int]:
+  """Return total system RAM in bytes without spawning subprocesses."""
+  if platform.system() == 'Windows':
+    try:
+      import ctypes
+
+      class MEMORYSTATUSEX(ctypes.Structure):
+        _fields_ = [
+          ('dwLength', ctypes.c_ulong),
+          ('dwMemoryLoad', ctypes.c_ulong),
+          ('ullTotalPhys', ctypes.c_ulonglong),
+          ('ullAvailPhys', ctypes.c_ulonglong),
+          ('ullTotalPageFile', ctypes.c_ulonglong),
+          ('ullAvailPageFile', ctypes.c_ulonglong),
+          ('ullTotalVirtual', ctypes.c_ulonglong),
+          ('ullAvailVirtual', ctypes.c_ulonglong),
+          ('ullAvailExtendedVirtual', ctypes.c_ulonglong),
+        ]
+
+      memory_status = MEMORYSTATUSEX()
+      memory_status.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+      if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(memory_status)):
+        return int(memory_status.ullTotalPhys)
+    except Exception:
+      pass
+
+  try:
+    page_size = os.sysconf('SC_PAGE_SIZE')
+    phys_pages = os.sysconf('SC_PHYS_PAGES')
+    if page_size > 0 and phys_pages > 0:
+      return int(page_size * phys_pages)
+  except (AttributeError, OSError, ValueError):
+    pass
+
+  meminfo_path = Path('/proc/meminfo')
+  if meminfo_path.exists():
+    try:
+      for line in meminfo_path.read_text(encoding='utf-8', errors='replace').splitlines():
+        if line.startswith('MemTotal:'):
+          parts = line.split()
+          if len(parts) >= 2:
+            return int(parts[1]) * 1024
+    except Exception:
+      pass
+
+  return None
+
+
+def get_ram_in_gb() -> float:
+  """Return total system RAM in GiB, or infinity if detection fails."""
+  total_ram_bytes = get_total_ram_bytes()
+  if total_ram_bytes is None:
+    return float('inf')
+  return total_ram_bytes / (1024**3)
+
+
 def _strip_comment_prefix(line: str) -> str:
   stripped = line.lstrip()
   if stripped.startswith("///"):

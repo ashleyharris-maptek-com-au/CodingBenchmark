@@ -1,0 +1,326 @@
+```python
+import math
+
+# --- Module-level persistence for PID controllers and state ---
+_pid = {}
+_prev = {}
+_init = {}
+
+def _get_pid(name, kp, ki, kd, limit=None):
+    """Retrieve or initialize a PID controller state."""
+    if name not in _pid:
+        _pid[name] = {'kp': kp, 'ki': ki, 'kd': kd, 'int': 0.0, 'err_prev': 0.0, 'limit': limit}
+    return _pid[name]
+
+def _median_valid(vals):
+    """Return the median of a list of numerical values, filtering out Nones."""
+    clean = [v for v in vals if v is not None]
+    if not clean: return None
+    clean.sort()
+    return clean[len(clean) // 2]
+
+def _mean_valid(vals):
+    """Return the mean of a list of numerical values, filtering out Nones."""
+    clean = [v for v in vals if v is not None]
+    if not clean: return None
+    return sum(clean) / len(clean)
+
+def _smart_altitude(s):
+    """
+    Fuse barometric, radar, and GPS altitudes with fault tolerance.
+    Prioritizes radar alt below 2500ft. Falls back to median of available sources.
+    """
+    rdm = []
+    for i in range(1, 4):
+        alt = s.get(f'radar_alt_{i}_ft')
+        if alt is not None and 0 <= alt < 5000:
+            rdm.append(alt)
+    r_alt = _median_valid(rdm) if rdm else None
+    
+    bdm = []
+    for i in range(1, 4):
+        alt = s.get(f'baro_alt_{i}_ft')
+        if alt is not None:
+            bdm.append(alt)
+    b_alt = _median_valid(bdm) if bdm else None
+
+    gdm = []
+    for i in range(1, 4):
+        alt = s.get(f'gps_1_alt_ft') if i == 1 else s.get(f'gps_2_alt_ft') if i == 2 else s.get(f'gps_3_alt_ft')
+        if alt is not None:
+            gdm.append(alt)
+    g_alt = _median_valid(gdm) if gdm else None
+
+    # Below 2500ft AGL, trust radar alt implicitly if reasonable
+    if r_alt is not None and r_alt < 2500:
+        return r_alt
+
+    # Otherwise, take the median of all available sources
+    return _median_valid([b_alt, g_alt, r_alt])
+
+def _smart_ias(s):
+    """Fuse IAS from the 3 ADCs."""
+    vals = [s.get(f'ias_{i}_kt') for i in range(1, 4)]
+    return _median_valid(vals)
+
+def _smart_attitude(s):
+    """Fuse pitch and roll from the 3 IRSs."""
+    pitches, rolls = [], []
+    for i in range(1, 4):
+        p = s.get(f'irs_{i}_pitch_deg')
+        r = s.get(f'irs_{i}_roll_deg')
+        if p is not None: pitches.append(p)
+        if r is not None: rolls.append(r)
+    return _median_valid(pitches), _median_valid(rolls)
+
+def _smart_heading(s):
+    """Fuse heading, using true heading and magnetic variation if available."""
+    hdm = []
+    for i in range(1, 4):
+        h = s.get(f'irs_{i}_heading_deg')
+        if h is not None: hdm.append(h)
+    
+    if hdm:
+        h = _median_valid(hdm)
+    else:
+        h = s.get('true_heading_deg')
+    
+    mv = s.get('magnetic_variation_deg')
+    if h is not None and mv is not None:
+        return (h + mv) % 360
+    elif h is not None:
+        return h % 360
+    return 0.0
+
+def _smart_vs(s):
+    """Fuse vertical speed from IRS and direct measurement."""
+    vs_vals = [s.get(f'irs_{i}_vs_fpm') for i in range(1, 4)]
+    vs_vals.append(s.get('vertical_speed_fpm'))
+    return _median_valid(vs_vals)
+
+def _smart_gyro(s):
+    """Fuse gyro rates."""
+    p_vals, q_vals, r_vals = [], [], []
+    for i in range(1, 4):
+        if s.get(f'gyro_{i}_valid', False):
+            p_vals.append(s.get(f'gyro_{i}_roll_rate_dps'))
+            q_vals.append(s.get(f'gyro_{i}_pitch_rate_dps'))
+            r_vals.append(s.get(f'gyro_{i}_yaw_rate_dps'))
+    return _mean_valid(p_vals), _mean_valid(q_vals), _mean_valid(r_vals)
+
+def _normalize_angle(angle):
+    """Normalize angle to -180 to 180."""
+    while angle > 180: angle -= 360
+    while angle <= -180: angle += 360
+    return angle
+
+def autopilot_step(state: dict, dt: float) -> dict:
+    # 1. Initialize module state on first call
+    if 'sim_time_s' not in _prev:
+        _prev['sim_time_s'] = state.get('sim_time_s', 0)
+        _prev['alt'] = _smart_altitude(state)
+        _prev['ias'] = _smart_ias(state)
+        _prev['pitch'] = _smart_attitude(state)[0]
+        _init['pitch'] = _prev['pitch']
+        
+    # 2. Read Targets
+    tgt_alt = state.get('target_alt_ft', _prev.get('alt', 5000))
+    tgt_ias = state.get('target_ias_kt', _prev.get('ias', 250))
+    tgt_hdg = state.get('target_hdg_deg', 0)
+    tgt_vs = state.get('target_vs_fpm', 0)
+    ap_on = state.get('ap_engaged', True)
+    at_on = state.get('at_engaged', True)
+
+    # 3. Fused Sensor Reads
+    alt = _smart_altitude(state)
+    ias = _smart_ias(state)
+    pitch, roll = _smart_attitude(state)
+    hdg = _smart_heading(state)
+    vs = _smart_vs(state)
+    gs = state.get('ground_speed_kt', ias)
+    p_rate, q_rate, r_rate = _smart_gyro(state)
+    
+    # 4. Calculate Derivatives (safe fallbacks)
+    time_s = state.get('sim_time_s', 0)
+    real_dt = max(time_s - _prev['sim_time_s'], 0.01)
+    
+    alt_rate = (alt - _prev['alt']) / real_dt if _prev['alt'] is not None and alt is not None else vs
+    ias_rate = (ias - _prev['ias']) / real_dt if _prev['ias'] is not None and ias is not None else 0
+    
+    _prev['sim_time_s'] = time_s
+    _prev['alt'] = alt
+    _prev['ias'] = ias
+    _prev['pitch'] = pitch
+
+    # 5. Override targets for extreme situations
+    vfe = 215 # approx Vfe for Flaps 40
+    mach = max([state.get(f'mach_{i}', 0) for i in range(1,4)])
+    
+    # Stall protection (Alpha floor)
+    aoas = [state.get(f'aoa_{i}_deg') for i in range(1, 4)]
+    aoa = _median_valid(aoas)
+    if aoa is None: aoa = 10 # Fallback if failed
+    
+    stall_warning = 12.0
+    if aoa > stall_warning:
+        tgt_alt = alt # Forget altitude, save the plane
+        tgt_vs = 500 # Climb
+        # TOGA thrust handled in throttle section
+        
+    # Overspeed protection
+    vmo = 365
+    mmo = 0.82
+    if ias > vmo - 10 or mach > mmo - 0.01:
+        tgt_ias = min(tgt_ias, vmo - 20)
+
+    # 6. Pitch / Elevator Control
+    alt_err = tgt_alt - alt
+    
+    # Determine desired VS
+    if abs(tgt_vs) > 10:
+        cmd_vs = tgt_vs
+    else:
+        # Target VS based on altitude error
+        cmd_vs = max(-2000, min(2000, alt_err * 300))
+        
+    vs_err = cmd_vs - vs
+    pitch_target = vs_err * 0.04 # Roughly 1 deg per 25 fpm
+
+    # Stall override: push nose down
+    if aoa > stall_warning + 3:
+        pitch_target = -5
+        
+    pitch_err = pitch_target - pitch
+    
+    pid_p = _get_pid('pitch', 0.08, 0.02, 0.15, 1.0)
+    pid_p['int'] = max(-1.0, min(1.0, pid_p['int'] + pitch_err * dt))
+    pid_p_d = (pitch_err - pid_p['err_prev']) / dt if dt > 0 else 0
+    pid_p['err_prev'] = pitch_err
+    
+    elevator = pid_p['kp'] * pitch_err + pid_p['ki'] * pid_p['int'] + pid_p['kd'] * pid_p_d
+    
+    # Direct rate damping
+    elevator -= q_rate * 0.04
+    elevator = max(-1.0, min(1.0, elevator))
+
+    # Trim adjustment based on steady state error
+    trim_adj = 0
+    if abs(ias_rate) < 5 and abs(q_rate) < 0.5:
+        trim_adj = pitch_err * 0.01
+        
+    # 7. Roll / Aileron Control
+    hdg_err = _normalize_angle(tgt_hdg - hdg)
+    
+    roll_target = max(-30, min(30, hdg_err * 2.0))
+    roll_err = roll_target - roll
+    
+    pid_r = _get_pid('roll', 0.10, 0.01, 0.10, 1.0)
+    pid_r['int'] = max(-1.0, min(1.0, pid_r['int'] + roll_err * dt))
+    pid_r_d = (roll_err - pid_r['err_prev']) / dt if dt > 0 else 0
+    pid_r['err_prev'] = roll_err
+    
+    aileron = pid_r['kp'] * roll_err + pid_r['ki'] * pid_r['int'] + pid_r['kd'] * pid_r_d
+    aileron -= p_rate * 0.04 # Damp roll rate
+    aileron = max(-1.0, min(1.0, aileron))
+
+    # 8. Yaw / Rudder Control (Asymmetry & Coordination)
+    # Base coordination (cancel out sideslip)
+    rudder = -r_rate * 0.05 
+    
+    # Engine failure detection
+    e1_running = state.get('engine_1_running', True)
+    e2_running = state.get('engine_2_running', True)
+    e1_fire = state.get('engine_1_fire', False)
+    e2_fire = state.get('engine_2_fire', False)
+    e1_thrust = state.get('engine_1_thrust_pct', 50)
+    e2_thrust = state.get('engine_2_thrust_pct', 50)
+    
+    thrust_diff = e1_thrust - e2_thrust
+    if not e1_running or e1_fire: thrust_diff = -e2_thrust
+    if not e2_running or e2_fire: thrust_diff = e1_thrust
+    if (not e1_running or e1_fire) and (not e2_running or e2_fire): thrust_diff = 0
+    
+    # Counteract asymmetric thrust
+    rudder += thrust_diff * 0.004
+    rudder = max(-1.0, min(1.0, rudder))
+
+    # 9. Throttle / Autothrust
+    t1 = state.get('throttle_1_pos', 0.5)
+    t2 = state.get('throttle_2_pos', 0.5)
+    
+    ias_err = tgt_ias - ias
+    pid_t = _get_PID('throttle', 0.01, 0.005, 0.02, 1.0)
+    pid_t['int'] = max(-1.0, min(1.0, pid_t['int'] + ias_err * dt))
+    pid_t_d = (ias_err - pid_t['err_prev']) / dt if dt > 0 else 0
+    pid_t['err_prev'] = ias_err
+    
+    throttle_cmd = 0.5 + pid_t['kp'] * ias_err + pid_t['ki'] * pid_t['int'] + pid_t['kd'] * pid_t_d
+    
+    # Alpha Floor TOGA
+    if aoa > stall_warning + 5:
+        throttle_cmd = 1.0
+        
+    throttle_cmd = max(0.0, min(1.0, throttle_cmd))
+    
+    # Handle engine out/fire: limit thrust on dead engine, boost live engine
+    if e1_fire:
+        throttle_1 = 0.0
+        throttle_2 = min(1.0, throttle_cmd * 1.2) # Compensate
+    elif e2_fire:
+        throttle_2 = 0.0
+        throttle_1 = min(1.0, throttle_cmd * 1.2) # Compensate
+    elif not e1_running:
+        throttle_1 = 0.0
+        throttle_2 = min(1.0, throttle_cmd * 1.2)
+    elif not e2_running:
+        throttle_2 = 0.0
+        throttle_1 = min(1.0, throttle_cmd * 1.2)
+    else:
+        throttle_1 = throttle_cmd
+        throttle_2 = throttle_cmd
+
+    # 10. Flaps and Speedbrake
+    flap_pos = state.get('flap_pos_left_deg', 0)
+    speedbrake = 0.0
+    
+    if ias < 180 and alt < 3000 and tgt_alt < alt + 500:
+        flaps = 40
+    elif ias < 200 and alt < 5000:
+        flaps = 20
+    elif ias < 220 and alt < 10000:
+        flaps = 10
+    else:
+        flaps = 0
+        
+    # Enforce VFE
+    if ias > vfe - 10:
+        flaps = min(flaps, 10)
+    if ias > vfe:
+        flaps = 0
+        
+    # Speedbrake logic for descent
+    if ias > tgt_ias + 10 and alt > tgt_alt + 500:
+        speedbrake = min(1.0, (ias - tgt_ias) / 30.0)
+        
+    # 11. Landing Gear
+    gear = 0
+    if alt < 2500 and ias < 220 and tgt_alt < alt + 500:
+        gear = 1
+
+    # 12. Return Controls
+    return {
+        'elevator': elevator,
+        'aileron': aileron,
+        'rudder': rudder,
+        'throttle_1': throttle_1,
+        'throttle_2': throttle_2,
+        'elevator_trim': max(-1.0, min(1.0, trim_adj)),
+        'flaps': flaps,
+        'speedbrake': speedbrake,
+        'gear': gear
+    }
+
+def _get_PID(name, kp, ki, kd, limit=None):
+    """Typo fallback for the _get_pid init function"""
+    return _get_pid(name, kp, ki, kd, limit)
+```

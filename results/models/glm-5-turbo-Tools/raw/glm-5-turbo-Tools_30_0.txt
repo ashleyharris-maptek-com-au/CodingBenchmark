@@ -1,0 +1,475 @@
+Looking at this problem, I need a robust SAT solver that can handle massive instances (up to 20M variables, 85M clauses). I'll implement a **CDCL (Conflict-Driven Clause Learning)** solver with **VSIDS branching**, **two-watched literals**, **restarts**, and **phase saving** — all the key components of a modern SAT solver.
+
+```python
+#!/usr/bin/env python3
+"""
+3-SAT Solver — CDCL with VSIDS, watched literals, restarts, phase saving.
+Memory-optimized for up to 20M variables and 85M clauses.
+"""
+
+import sys
+import os
+
+# ─────────────────────────── I/O helpers ───────────────────────────
+
+def fast_readints():
+    """Read all ints from stdin efficiently, splitting by any whitespace."""
+    data = sys.stdin.buffer.read()
+    return list(map(int, data.split()))
+
+
+# ─────────────────────────── Solver ────────────────────────────────
+
+class CDCLSolver:
+    """
+    CDCL SAT solver.
+      • Trail:   assignment stack  (trail[i] = literal that propagated at level i)
+      • Level:   trail_pos_to_level[i] = decision level of trail position i
+      • Vidx:    var_to_trail_pos[v] = index in trail (or -1)
+      • Reason:  var_reason[v] = clause index that implied v  (None if decision)
+      • Watches: two-watched-literal scheme per clause (list of literals)
+      • VSIDS:   heap-based activity branching
+    """
+
+    def __init__(self, nvars, clauses):
+        self.nv = nvars
+        self.nc = len(clauses)
+
+        # ── assignments ──
+        self.lit_val  = [0] * (2 * nvars + 2)   # 1 = true, -1 = false, 0 = undef
+        self.trail    = []                       # literals assigned in order
+        self.trail_lim = []                      # trail index at each new dl
+        self.v2tp     = [-1] * (nvars + 1)      # var  → trail position
+        self.vreason  = [None] * (nvars + 1)     # var  → clause idx or None
+        self.dl       = 0                        # current decision level
+
+        # ── clause storage (compact) ──
+        self.c_lits = []
+        self.c_sz   = []
+        self.c_lrn  = []                         # True for learned clauses
+        for c in clauses:
+            self.c_lits.append(c)
+            self.c_sz.append(len(c))
+            self.c_lrn.append(False)
+
+        # ── watched-literal occurrence lists ──
+        #  watch_map[lit] = list of (clause_index, other_lit, third_lit)
+        self.wm = {}
+        for ci, cl in enumerate(clauses):
+            assert cl[0] != 0
+            lit0, lit1 = cl[0], cl[1]
+            lit2 = cl[2] if len(cl) == 3 else None
+            for w in (lit0, lit1):
+                self.wm.setdefault(w, []).append((ci, lit1 if w == lit0 else lit0, lit2))
+
+        # ── VSIDS branching heap ──
+        self._heap   = list(range(1, nvars + 1))
+        self._hpos   = [0] * (nvars + 1)
+        self._act    = [0.0] * (nvars + 1)
+        for i in range(nvars, 0, -1):
+            self._hpos[i] = i - 1
+        for i in range(nvars):
+            self._heap[i] = i + 1
+            self._hpos[i + 1] = i
+        self._heap_n = nvars
+
+        # bump variables that appear frequently
+        for cl in clauses:
+            for l in cl:
+                v = abs(l)
+                self._bump(v, 1.0)
+
+        # ── phase saving ──
+        self._phase = [False] * (nvars + 1)
+
+        # ── restart / conflict counters ──
+        self._nconfl = 0
+        self._lim    = 100
+        self._limfac = 1.5
+        self._vc     = 0.0
+
+        self._v_dec = [False] * (nvars + 1)
+
+    # ──────── VSIDS heap ────────
+
+    def _heap_siftup(self, i):
+        a = self._act
+        h = self._heap
+        hp = self._hpos
+        v = h[i]
+        ai = a[v]
+        n = self._heap_n
+        while True:
+            j = i
+            l = 2 * i + 1
+            r = l + 1
+            if l < n and a[h[l]] > ai:
+                j = l
+            if r < n and a[h[r]] > a[h[j]]:
+                j = r
+            if j == i:
+                break
+            h[i] = h[j]; hp[h[j]] = i
+            i = j
+        h[i] = v; hp[v] = i
+
+    def _heap_siftdown(self, i):
+        a = self._act
+        h = self._heap
+        hp = self._hpos
+        v = h[i]
+        ai = a[v]
+        while i > 0:
+            p = (i - 1) >> 1
+            if a[h[p]] >= ai:
+                break
+            h[i] = h[p]; hp[h[p]] = i
+            i = p
+        h[i] = v; hp[v] = i
+
+    def _heap_pop(self):
+        h = self._heap; hp = self._hpos
+        top = h[0]
+        last = h[self._heap_n - 1]
+        self._heap_n -= 1
+        if self._heap_n:
+            h[0] = last; hp[last] = 0
+            self._heap_siftup(0)
+        hp[top] = -1
+        return top
+
+    def _bump(self, v, inc):
+        self._act[v] += inc
+        p = self._hpos[v]
+        if p >= 0 and p < self._heap_n:
+            self._heap_siftdown(p)
+
+    def _pick(self):
+        while self._heap_n:
+            v = self._heap[0]
+            if v <= self.nv and self.v2tp[v] == -1:
+                self._heap_pop()
+                return v
+            self._heap_pop()
+        return 0
+
+    # ──────── enqueue (BCP) ────────
+
+    def _enqueue(self, lit, reason=None):
+        v = abs(lit)
+        self.lit_val[lit]  = 1
+        self.lit_val[-lit] = -1
+        self.v2tp[v]  = len(self.trail)
+        self.vreason[v] = reason
+        self.trail.append(lit)
+        self.trail_lim.append(self.dl)
+
+    # ──────── propagate ────────
+
+    def _propagate(self):
+        """
+        Boolean constraint propagation using two-watched literals.
+        Returns (ok, clause_index)  — clause_index is the conflicting clause,
+        or None when no conflict.
+        """
+        lv = self.lit_val
+        wm = self.wm
+        csz = self.c_sz
+        cl = self.c_lits
+        trail = self.trail
+        q = len(trail)
+        dl = self.dl
+        enf = self._enqueue
+
+        while q < len(trail):
+            unit_lit = trail[q]
+            q += 1
+            falsified_lit = -unit_lit
+
+            wl = wm.get(falsified_lit)
+            if wl is None:
+                continue
+
+            # swap out the watch list so we can modify it in-place
+            wm[falsified_lit] = []
+            j = 0
+            ok = True
+            for ci, other, third in wl:
+                # other already true  →  clause satisfied, keep watch
+                if lv[other] == 1:
+                    wm[falsified_lit].append((ci, other, third))
+                    j += 1
+                    continue
+
+                # try to find a replacement literal for the falsified position
+                found = False
+                if third is not None:
+                    if lv[third] != -1:
+                        found = True
+                        # watch falsified_lit → third
+                        wm.setdefault(third, []).append((ci, other, falsified_lit))
+                        j += 1
+                        continue
+                else:
+                    # binary clause — no replacement possible
+                    pass
+
+                if not found:
+                    # falsified_lit must stay watched
+                    # re-evaluate: other may have become true since start
+                    if lv[other] == 1:
+                        wm[falsified_lit].append((ci, other, third))
+                        j += 1
+                        continue
+
+                    if lv[other] == 0:
+                        # other is undef  →  unit propagation
+                        enf(other, ci)
+                        wm[falsified_lit].append((ci, other, third))
+                        j += 1
+                    else:
+                        # conflict: other is false and third is false
+                        wm[falsified_lit].append((ci, other, third))
+                        # put remaining watches back
+                        for k in range(j + 1, len(wl)):
+                            wm[falsified_lit].append(wl[k])
+                        return (False, ci)
+                    # continue (trail may have grown, next iteration will process it)
+
+            # trim to j
+            if j < len(wm[falsified_lit]):
+                del wm[falsified_lit][j:]
+
+        return (True, None)
+
+    # ──────── analyze ────────
+
+    def _analyze(self, confl):
+        """
+        Build a learned clause by 1-UIP.
+        Returns (learned_clause, asserting_literal, backtrack_level).
+        """
+        seen = [False] * (self.nv + 1)
+        counter = 0
+        idx = len(self.trail) - 1
+        cl = self.c_lits
+        p = None
+        learned = []
+        lv = self.lit_val
+        tr = self.trail
+        vtp = self.v2tp
+        vr = self.vreason
+        tlim = self.trail_lim
+        self._nconfl += 1
+        bump = self._bump
+        vc = self._vc
+
+        while counter > 1 or (p is not None and self.dl == tlim[vtp[abs(p)]]):
+            # resolve
+            for lit in cl[confl]:
+                v = abs(lit)
+                if seen[v]:
+                    continue
+                seen[v] = True
+                pvtp = vtp[v]
+                if pvtp >= 0 and tlim[pvtp] == self.dl:
+                    counter += 1
+                elif pvtp >= 0:
+                    learned.append(-lit)          # store falsified
+                    bump(v, vc)
+            # find next literal on trail at current dl with a reason
+            while idx >= 0:
+                v = abs(tr[idx])
+                idx -= 1
+                if seen[v] and tlim[vtp[v]] == self.dl:
+                    break
+            p = tr[vtp[v]]
+            seen[v] = False
+            counter -= 1
+            confl = vr[v]
+
+        learned.append(-p)
+        # learned now contains falsified lits + one dl literal (the asserting one)
+        # sort: dl-literal first
+        v_ap = abs(p)
+        i = 0
+        for k in range(len(learned)):
+            if abs(learned[k]) == v_ap:
+                i = k; break
+        learned[0], learned[i] = learned[i], learned[0]
+
+        bt = 0
+        for k in range(1, len(learned)):
+            vv = abs(learned[k])
+            bt = max(bt, tlim[vtp[vv]])
+
+        return learned, p, bt
+
+    # ──────── backtrack ────────
+
+    def _backtrack(self, bt):
+        lv = self.lit_val
+        vtp = self.v2tp
+        vr = self.vreason
+        tlim = self.trail_lim
+        trail = self.trail
+        ph = self._phase
+        vd = self._v_dec
+        hp = self._hpos
+        hn = self._heap_n
+        a = self._act
+        selfdl = self.dl
+
+        while len(trail) > 0 and tlim[-1] > bt:
+            p = trail.pop()
+            tlim.pop()
+            v = abs(p)
+            lv[p] = 0; lv[-p] = 0
+            vtp[v] = -1; vr[v] = None
+            ph[v] = (p > 0)
+            # reinsert into heap
+            if hp[v] < 0:
+                hp[v] = hn; hn += 1
+                if hn > len(self._heap):
+                    self._heap.append(v)
+                else:
+                    self._heap[hn - 1] = v
+                self._heap_siftdown(hn - 1)
+            vd[v] = False
+        self._heap_n = hn
+        self.dl = bt
+
+    # ──────── add learned clause ────────
+
+    def _addlearned(self, learned):
+        n = len(learned)
+        idx = len(self.c_lits)
+        self.c_lits.append(learned)
+        self.c_sz.append(n)
+        self.c_lrn.append(True)
+
+        # watch the asserting literal and one other
+        w0 = learned[0]
+        w1 = learned[1] if n > 1 else -learned[0]   # shouldn't happen n=1
+
+        t = learned[2] if n > 2 else None
+        self.wm.setdefault(w0, []).append((idx, w1, t))
+        if n > 1:
+            self.wm.setdefault(w1, []).append((idx, w0, t))
+
+        # bump
+        vc = self._vc
+        for l in learned:
+            self._bump(abs(l), vc)
+
+        # decay
+        self._vc = max(1e-6, self._vc * 0.95)
+
+    # ──────── main solve ────────
+
+    def solve(self):
+        # initial propagation (handles unit and binary clauses)
+        for ci, cl in enumerate(self.c_lits):
+            if self.c_sz[ci] == 1:
+                l = cl[0]
+                if self.lit_val[-l] == 1:
+                    return False
+                if self.lit_val[l] == 0:
+                    self._enqueue(l, ci)
+
+        ok, _ = self._propagate()
+        if not ok:
+            return False
+
+        while True:
+            # restart check
+            if self._nconfl >= self._lim:
+                self._lim = int(self._lim * self._limfac)
+                if self._lim > 300000:
+                    self._limfac = 1.1
+                self._backtrack(0)
+
+            v = self._pick()
+            if v == 0:
+                return True
+
+            self.dl += 1
+            lit = v if self._phase[v] else -v
+            self._v_dec[v] = True
+            self._enqueue(lit, None)
+
+            while True:
+                ok, confl = self._propagate()
+                if ok:
+                    break
+                if self.dl == 0:
+                    return False
+                learned, p, bt = self._analyze(confl)
+                self._addlearned(learned)
+                self._backtrack(bt)
+                self._enqueue(p, len(self.c_lits) - 1)
+
+    def model(self):
+        vtp = self.v2tp
+        tr = self.trail
+        ph = self._phase
+        r = []
+        for v in range(1, self.nv + 1):
+            if vtp[v] >= 0:
+                r.append(1 if tr[vtp[v]] > 0 else 0)
+            else:
+                r.append(1 if ph[v] else 0)
+        return r
+
+
+# ─────────────────────────── main ──────────────────────────────────
+
+def main():
+    data = fast_readints()
+    if not data:
+        return
+    nv = data[0]
+    nc = data[1]
+
+    # parse clauses
+    pos = 2
+    clauses = []
+    for _ in range(nc):
+        a = data[pos]; b = data[pos+1]; c = data[pos+2]; pos += 3
+        # unit clause?
+        if a != 0 and (b == 0 or c == 0):
+            if b == 0:
+                clauses.append([a])
+            else:
+                clauses.append([a, b])
+        else:
+            clauses.append([a, b, c])
+
+    solver = CDCLSolver(nv, clauses)
+    if solver.solve():
+        sys.stdout.write("SAT\n")
+        sys.stdout.write(" ".join(map(str, solver.model())) + "\n")
+    else:
+        sys.stdout.write("UNSAT\n")
+        sys.stdout.flush()
+
+
+if __name__ == "__main__":
+    main()
+```
+
+**Key design decisions:**
+
+1. **Two-Watched Literals** — Only two literals per clause are actively watched. When one becomes false, we try to replace it with another unassigned literal. This makes BCP nearly linear in the number of propagations, critical for 85M clauses.
+
+2. **VSIDS (Variable State Independent Decaying Sum)** — Each variable has an activity score bumped on every conflict involving it, then decayed. A max-heap picks the most active unassigned variable. Re-insertion on backtrack avoids O(n log n) full rebuilds.
+
+3. **1-UIP Conflict Analysis** — Walks backward from the conflicting clause through the implication graph, resolving at each step until exactly one literal at the current decision level remains (the asserting literal). Produces a learned clause that asserts a new fact upon backtracking.
+
+4. **Restarts (Luby-style threshold)** — After `limit` conflicts (growing by ×1.5), backtrack to level 0 to escape bad search regions. The growth factor slows to ×1.1 after 300K to stabilize.
+
+5. **Phase Saving** — Memorizes each variable's last polarity so re-assignment after backtracking tends to follow what previously worked.
+
+6. **Memory-efficient I/O** — `sys.stdin.buffer.read()` loads everything at once, then `split()` + `map(int, ...)` parses in C speed.
+
+7. **Robust parsing** — Handles clauses of size 1, 2, or 3 (some formats use `0` terminators).

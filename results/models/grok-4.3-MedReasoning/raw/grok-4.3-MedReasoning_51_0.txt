@@ -1,0 +1,257 @@
+```python
+import math
+from collections import deque
+
+# Persistence across calls (module-level state)
+_prev_values = {
+    'alt': 0.0, 'ias': 250.0, 'vs': 0.0, 'pitch': 0.0, 'roll': 0.0,
+    'heading': 0.0, 'mach': 0.0, 'radar_alt': 0.0
+}
+_integrals = {'alt': 0.0, 'ias': 0.0, 'hdg': 0.0, 'vs': 0.0}
+_prev_errors = {'alt': 0.0, 'ias': 0.0, 'hdg': 0.0, 'vs': 0.0}
+_last_valid = {'alt': 5000.0, 'ias': 250.0, 'hdg': 0.0, 'pitch': 0.0, 'roll': 0.0}
+_mode = {'phase': 'cruise', 'last_alt': 0.0, 'time_in_phase': 0.0}
+_fuel_trim = 0.0
+_trim_rate_limiter = 0.0
+
+def _median(values):
+    if not values:
+        return None
+    s = sorted(values)
+    n = len(s)
+    return s[n // 2] if n % 2 == 1 else (s[n // 2 - 1] + s[n // 2]) / 2
+
+def _vote_triple(state, base_name, fallback=None):
+    """Triple sensor voting with validity cross-check and sanity filtering."""
+    vals = []
+    for i in (1, 2, 3):
+        v = state.get(f'{base_name}_{i}')
+        valid = state.get(f'{base_name}_{i}_valid', True)
+        if v is not None and valid:
+            vals.append(v)
+    if len(vals) >= 2:
+        med = _median(vals)
+        # Reject outliers > 15% from median (catches silent failures)
+        filtered = [v for v in vals if abs(v - med) / max(abs(med), 1e-3) < 0.15]
+        if filtered:
+            return _median(filtered)
+    if vals:
+        return _median(vals)
+    return fallback
+
+def _crosscheck_altitude(state):
+    """Robust altitude fusion with baro/GPS/radar cross-check."""
+    baro = _vote_triple(state, 'baro_alt', _last_valid['alt'])
+    gps_vals = [state.get(f'gps_{i}_alt_ft', None) for i in (1, 2, 3)]
+    gps = _median([v for v in gps_vals if v is not None])
+    radar = _vote_triple(state, 'radar_alt', None)
+    
+    # Detect gross inconsistencies (two failures scenario)
+    if baro is not None and gps is not None:
+        if abs(baro - gps) > 800:
+            # Prefer baro in cruise, radar near ground
+            if radar is not None and radar < 2500:
+                return radar
+            return baro  # baro usually more reliable for absolute alt
+    if baro is not None:
+        return baro
+    if gps is not None:
+        return gps
+    return _last_valid['alt']
+
+def _get_fused_state(state):
+    """Produce best-estimate flight state."""
+    s = {}
+    s['alt'] = _crosscheck_altitude(state)
+    s['ias'] = _vote_triple(state, 'ias', _last_valid['ias'])
+    s['mach'] = _vote_triple(state, 'mach', _last_valid['mach'])
+    s['vs'] = _vote_triple(state, 'irs_vs', state.get('vertical_speed_fpm', 0))
+    s['pitch'] = _vote_triple(state, 'irs_pitch', _last_valid['pitch'])
+    s['roll'] = _vote_triple(state, 'irs_roll', _last_valid['roll'])
+    s['heading'] = _vote_triple(state, 'irs_heading', _last_valid['hdg'])
+    s['track'] = _vote_triple(state, 'irs_track', s['heading'])
+    s['aoa'] = _vote_triple(state, 'aoa', 3.0)
+    s['radar_alt'] = _vote_triple(state, 'radar_alt', 0)
+    s['n1_1'] = state.get('engine_1_n1_pct', 0)
+    s['n1_2'] = state.get('engine_2_n1_pct', 0)
+    s['epr_1'] = state.get('engine_1_epr', 1.0)
+    s['epr_2'] = state.get('engine_2_epr', 1.0)
+    s['fire_1'] = state.get('engine_1_fire', False)
+    s['fire_2'] = state.get('engine_2_fire', False)
+    s['wow'] = (state.get('weight_on_wheels_nose', False) or
+                state.get('weight_on_wheels_left', False) or
+                state.get('weight_on_wheels_right', False))
+    s['gear_down'] = state.get('gear_handle_down', True)
+    s['flap'] = state.get('flap_pos_left_deg', 0)
+    s['on_ground'] = s['wow'] and s['radar_alt'] < 5
+    
+    # Update last valid
+    for k in ['alt', 'ias', 'hdg', 'pitch', 'roll']:
+        if s[k] is not None:
+            _last_valid[k] = s[k]
+    return s
+
+def _pid(name, error, kp, ki, kd, dt, i_limit=100, d_limit=50):
+    """Standard PID with anti-windup."""
+    global _integrals, _prev_errors
+    _integrals[name] += error * dt
+    _integrals[name] = max(min(_integrals[name], i_limit), -i_limit)
+    
+    derivative = (error - _prev_errors[name]) / max(dt, 0.001)
+    derivative = max(min(derivative, d_limit), -d_limit)
+    
+    output = kp * error + ki * _integrals[name] + kd * derivative
+    _prev_errors[name] = error
+    return output
+
+def autopilot_step(state: dict, dt: float) -> dict:
+    global _prev_values, _mode, _fuel_trim, _trim_rate_limiter
+    
+    fused = _get_fused_state(state)
+    target_alt = state.get('target_alt_ft', fused['alt'])
+    target_hdg = state.get('target_hdg_deg', fused['heading'])
+    target_ias = state.get('target_ias_kt', 280)
+    target_vs = state.get('target_vs_fpm', 0)
+    
+    alt = fused['alt']
+    ias = fused['ias']
+    mach = fused['mach']
+    vs = fused['vs']
+    pitch = fused['pitch']
+    roll = fused['roll']
+    hdg = fused['heading']
+    aoa = fused['aoa']
+    radar = fused['radar_alt']
+    on_ground = fused['on_ground']
+    fire1 = fused['fire_1']
+    fire2 = fused['fire_2']
+    
+    # === Phase detection ===
+    if on_ground:
+        phase = 'ground'
+    elif radar < 50 and vs < -300:
+        phase = 'flare'
+    elif alt < 3000 and (target_alt < alt or vs < -400):
+        phase = 'approach'
+    elif abs(alt - target_alt) < 200:
+        phase = 'altitude_hold'
+    elif alt < target_alt:
+        phase = 'climb'
+    else:
+        phase = 'descent'
+    
+    if phase != _mode['phase']:
+        _mode['phase'] = phase
+        _mode['time_in_phase'] = 0.0
+        _integrals['alt'] = 0.0
+        _integrals['vs'] = 0.0
+    _mode['time_in_phase'] += dt
+    
+    # === Speed / Mach protection (Vne ~365 KIAS / M0.82) ===
+    overspeed = False
+    if ias > 360 or mach > 0.80:
+        overspeed = True
+        target_ias = min(target_ias, 340)
+    
+    # === Attitude limits (stall / upset prevention) ===
+    max_aoa = 12.0 if ias > 180 else 8.0
+    if aoa > max_aoa:
+        # Nose down priority
+        elevator_cmd = -0.6
+        _integrals['alt'] *= 0.3
+    else:
+        # === Vertical control ===
+        alt_error = target_alt - alt
+        vs_target = max(min(alt_error * 0.8, 1800), -2200) if phase != 'flare' else -600
+        
+        vs_error = vs_target - vs
+        vs_cmd = _pid('vs', vs_error, kp=0.0008, ki=0.00003, kd=0.0004, dt=dt)
+        
+        # Pitch target derived from VS command + attitude
+        pitch_target = vs_cmd + (alt_error * 0.001)
+        pitch_target = max(min(pitch_target, 12.0), -8.0)
+        
+        pitch_error = pitch_target - pitch
+        elevator_cmd = _pid('alt', pitch_error, kp=0.12, ki=0.005, kd=0.08, dt=dt)
+        elevator_cmd = max(min(elevator_cmd, 0.7), -0.6)
+    
+    # === Lateral control ===
+    hdg_error = (target_hdg - hdg + 180) % 360 - 180
+    roll_target = hdg_error * 1.8
+    roll_target = max(min(roll_target, 25.0), -25.0)
+    
+    roll_error = roll_target - roll
+    aileron_cmd = _pid('hdg', roll_error, kp=0.09, ki=0.002, kd=0.05, dt=dt)
+    aileron_cmd = max(min(aileron_cmd, 0.6), -0.6)
+    
+    # Yaw damping + turn coordination
+    yaw_rate = state.get('gyro_1_yaw_rate_dps', 0)
+    rudder_cmd = -yaw_rate * 0.04
+    if abs(hdg_error) > 5:
+        rudder_cmd += hdg_error * 0.015
+    rudder_cmd = max(min(rudder_cmd, 0.4), -0.4)
+    
+    # === Thrust ===
+    ias_error = target_ias - ias
+    thrust_cmd = _pid('ias', ias_error, kp=0.008, ki=0.0004, kd=0.003, dt=dt)
+    thrust_cmd = max(min(thrust_cmd, 1.0), 0.0)
+    
+    # Engine failure / fire handling
+    if fire1 or fire2:
+        if fire1 and not fire2:
+            thrust1 = min(thrust_cmd * 0.3, 0.25)
+            thrust2 = thrust_cmd
+        elif fire2 and not fire1:
+            thrust1 = thrust_cmd
+            thrust2 = min(thrust_cmd * 0.3, 0.25)
+        else:
+            thrust1 = thrust2 = min(thrust_cmd, 0.6)
+    else:
+        thrust1 = thrust2 = thrust_cmd
+    
+    # Asymmetric thrust compensation
+    n1_diff = fused['n1_1'] - fused['n1_2']
+    if abs(n1_diff) > 15:
+        rudder_cmd += n1_diff * 0.008
+    
+    # === Configuration ===
+    if on_ground:
+        flaps_cmd = 20 if ias < 140 else 10
+        gear_cmd = 1
+        speedbrake_cmd = 0.0 if ias < 80 else 0.6
+    elif phase in ('approach', 'flare'):
+        flaps_cmd = 25 if radar < 800 else 15
+        gear_cmd = 1 if radar < 1200 else 0
+        speedbrake_cmd = 0.0
+    elif overspeed:
+        flaps_cmd = min(fused['flap'], 5)
+        gear_cmd = 0
+        speedbrake_cmd = 0.7
+    else:
+        flaps_cmd = 0
+        gear_cmd = 0 if alt > 800 else 1
+        speedbrake_cmd = 0.0
+    
+    # === Trim management ===
+    trim_adjust = 0.0
+    if abs(pitch) > 4 and abs(elevator_cmd) > 0.15:
+        trim_adjust = -elevator_cmd * 0.03 * dt
+    _trim_rate_limiter = _trim_rate_limiter * 0.95 + trim_adjust * 0.05
+    elevator_trim = max(min(_trim_rate_limiter, 0.8), -0.8)
+    
+    # Update history
+    _prev_values.update({'alt': alt, 'ias': ias, 'vs': vs, 'pitch': pitch,
+                         'roll': roll, 'heading': hdg, 'mach': mach})
+    
+    return {
+        'elevator': float(elevator_cmd),
+        'aileron': float(aileron_cmd),
+        'rudder': float(rudder_cmd),
+        'throttle_1': float(thrust1),
+        'throttle_2': float(thrust2),
+        'elevator_trim': float(elevator_trim),
+        'flaps': float(flaps_cmd),
+        'speedbrake': float(speedbrake_cmd),
+        'gear': int(gear_cmd)
+    }
+```

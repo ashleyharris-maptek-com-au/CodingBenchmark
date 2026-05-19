@@ -1,0 +1,1486 @@
+This is a complex 3D Lunar Lander game controller problem. Let me break down what I need to implement:
+
+1. **Input Parsing**:
+   - Initial header with world parameters
+   - Terrain file path (may contain spaces)
+   - Continuous state updates every 0.1s
+
+2. **Terrain Loading**:
+   - Binary file with uint16_t triplets
+   - Row-major order (x outer, y inner)
+   - Each cell has: ground_top, floating_bottom, floating_top
+   - Need to handle potentially huge files (up to GBs)
+
+3. **Real-time Control**:
+   - Read stdin continuously (at least 10Hz)
+   - Output thrust/rotation commands
+   - Avoid blocking
+
+4. **Physics**:
+   - Gravity: 1.62 m/s² in -Z
+   - Thrust along local up axis
+   - Rotation dynamics with angular acceleration and damping
+   - Fuel consumption
+
+5. **Landing**:
+   - Target position given
+   - Must land with speed < 3 m/s
+   - Landing zone radius given
+
+Let me design a multithreaded solution:
+
+**Thread Architecture**:
+1. Main thread: Read stdin, parse state updates
+2. Control thread: Compute control commands
+3. Output thread: Write commands to stdout
+4. Background thread: Parse terrain file if needed
+
+**Control Strategy**:
+1. Simple PD controller for position/velocity
+2. Terrain avoidance
+3. Fuel management
+
+Let me write the code:
+
+```cpp
+#include <iostream>
+#include <fstream>
+#include <sstream>
+#include <string>
+#include <vector>
+#include <thread>
+#include <mutex>
+#include <atomic>
+#include <condition_variable>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <algorithm>
+#include <queue>
+#include <memory>
+
+// Constants
+constexpr double GRAVITY = 1.62;
+constexpr double PI = 3.14159265358979323846;
+constexpr double DT = 0.1; // Time step
+constexpr double ANGULAR_ACCEL = 2.0; // rad/s² per unit
+constexpr double ANGULAR_DAMPING = 0.95;
+
+// State structure
+struct State {
+    double x, y, z;
+    double vx, vy, vz;
+    double pitch, yaw, roll;
+    double pitch_rate, yaw_rate, roll_rate;
+    double fuel;
+    double timestamp;
+};
+
+// Control command
+struct Command {
+    double thrust;
+    double pitch_cmd;
+    double yaw_cmd;
+    double roll_cmd;
+};
+
+// World parameters
+struct WorldParams {
+    int width, depth, height;
+    double gravity;
+    double max_thrust;
+    double fuel;
+    double start_x, start_y, start_z;
+    double target_x, target_y, target_z;
+    std::string terrain_path;
+};
+
+// Terrain data
+struct Terrain {
+    std::vector<uint16_t> ground_top;
+    std::vector<uint16_t> floating_bottom;
+    std::vector<uint16_t> floating_top;
+    int width, depth;
+    std::atomic<bool> loaded{false};
+    
+    bool isSolid(int x, int y, int z) const {
+        if (x < 0 || x >= width || y < 0 || y >= depth) return true;
+        int idx = x * depth + y;
+        uint16_t a = ground_top[idx];
+        uint16_t b = floating_bottom[idx];
+        uint16_t c = floating_top[idx];
+        
+        if (z < a) return true; // Solid ground
+        if (z >= b && z < c) return true; // Floating rock
+        return false;
+    }
+    
+    uint16_t getGroundHeight(int x, int y) const {
+        if (x < 0 || x >= width || y < 0 || y >= depth) return 0;
+        return ground_top[x * depth + y];
+    }
+};
+
+// Thread-safe state buffer
+class StateBuffer {
+    std::mutex mutex;
+    State latest_state;
+    std::atomic<bool> has_state{false};
+    std::atomic<bool> running{true};
+    
+public:
+    void update(const State& state) {
+        std::lock_guard<std::mutex> lock(mutex);
+        latest_state = state;
+        has_state = true;
+    }
+    
+    bool get(State& state) {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (has_state) {
+            state = latest_state;
+            return true;
+        }
+        return false;
+    }
+    
+    void stop() { running = false; }
+    bool isRunning() const { return running; }
+};
+
+// Thread-safe command buffer
+class CommandBuffer {
+    std::mutex mutex;
+    Command latest_command{0, 0, 0, 0};
+    std::atomic<bool> has_command{false};
+    
+public:
+    void set(const Command& cmd) {
+        std::lock_guard<std::mutex> lock(mutex);
+        latest_command = cmd;
+        has_command = true;
+    }
+    
+    Command get() {
+        std::lock_guard<std::mutex> lock(mutex);
+        return latest_command;
+    }
+};
+
+// Global buffers
+StateBuffer state_buffer;
+CommandBuffer command_buffer;
+WorldParams world_params;
+Terrain terrain;
+
+// Utility functions
+double clamp(double val, double min_val, double max_val) {
+    return std::max(min_val, std::min(max_val, val));
+}
+
+double normalizeAngle(double angle) {
+    while (angle > PI) angle -= 2 * PI;
+    while (angle < -PI) angle += 2 * PI;
+    return angle;
+}
+
+// Load terrain from file
+void loadTerrain(const std::string& path, int width, int depth) {
+    terrain.width = width;
+    terrain.depth = depth;
+    terrain.ground_top.resize(width * depth);
+    terrain.floating_bottom.resize(width * depth);
+    terrain.floating_top.resize(width * depth);
+    
+    std::ifstream file(path, std::ios::binary);
+    if (!file) {
+        std::cerr << "Failed to open terrain file: " << path << std::endl;
+        return;
+    }
+    
+    for (int x = 0; x < width; x++) {
+        for (int y = 0; y < depth; y++) {
+            int idx = x * depth + y;
+            char buf[6];
+            file.read(buf, 6);
+            
+            // Little-endian uint16_t
+            terrain.ground_top[idx] = static_cast<uint16_t>(
+                static_cast<uint8_t>(buf[0]) | (static_cast<uint8_t>(buf[1]) << 8));
+            terrain.floating_bottom[idx] = static_cast<uint16_t>(
+                static_cast<uint8_t>(buf[2]) | (static_cast<uint8_t>(buf[3]) << 8));
+            terrain.floating_top[idx] = static_cast<uint16_t>(
+                static_cast<uint8_t>(buf[4]) | (static_cast<uint8_t>(buf[5]) << 8));
+        }
+    }
+    
+    terrain.loaded = true;
+}
+
+// Controller
+class LanderController {
+    // PID gains
+    double kp_pos = 0.5;
+    double kd_pos = 1.0;
+    double kp_vel = 0.3;
+    
+    double kp_angle = 4.0;
+    double kd_angle = 2.0;
+    
+public:
+    Command compute(const State& state, const WorldParams& params, const Terrain& terrain) {
+        Command cmd{0, 0, 0, 0};
+        
+        // Compute desired position (above target)
+        double dx = params.target_x - state.x;
+        double dy = params.target_y - state.y;
+        double dz = params.target_z - state.z;
+        
+        // Horizontal distance
+        double dist_h = std::sqrt(dx * dx + dy * dy);
+        
+        // Compute desired velocity
+        double desired_vx = clamp(dx * kp_pos, -10.0, 10.0);
+        double desired_vy = clamp(dy * kp_pos, -10.0, 10.0);
+        double desired_vz = clamp(dz * kp_pos, -5.0, 5.0);
+        
+        // Slow down near target
+        if (dist_h < 50) {
+            double scale = dist_h / 50.0;
+            desired_vx *= scale;
+            desired_vy *= scale;
+        }
+        
+        // Velocity errors
+        double evx = desired_vx - state.vx;
+        double evy = desired_vy - state.vy;
+        double evz = desired_vz - state.vz;
+        
+        // Compute acceleration needed
+        double ax = evx * kp_vel;
+        double ay = evy * kp_vel;
+        double az = evz * kp_vel + GRAVITY; // Counteract gravity
+        
+        // Compute thrust vector direction and magnitude
+        double thrust_mag = std::sqrt(ax * ax + ay * ay + az * az);
+        thrust_mag = clamp(thrust_mag, 0.0, params.max_thrust);
+        
+        // Compute required tilt
+        double required_pitch = 0, required_yaw = state.yaw;
+        
+        if (thrust_mag > 0.1) {
+            // Normalize thrust direction
+            double tx = ax / thrust_mag;
+            double ty = ay / thrust_mag;
+            double tz = az / thrust_mag;
+            
+            // Compute yaw (heading)
+            required_yaw = std::atan2(-tx, -ty);
+            
+            // Compute pitch (tilt from vertical)
+            double horiz = std::sqrt(tx * tx + ty * ty);
+            required_pitch = std::atan2(horiz, tz);
+            
+            // Clamp pitch
+            required_pitch = clamp(required_pitch, -PI / 2, PI / 2);
+        }
+        
+        // Compute thrust fraction
+        cmd.thrust = clamp(thrust_mag / params.max_thrust, 0.0, 1.0);
+        
+        // Compute rotation commands
+        double pitch_error = normalizeAngle(required_pitch - state.pitch);
+        double yaw_error = normalizeAngle(required_yaw - state.yaw);
+        
+        cmd.pitch_cmd = clamp(pitch_error * kp_angle - state.pitch_rate * kd_angle, -1.0, 1.0);
+        cmd.yaw_cmd = clamp(yaw_error * kp_angle - state.yaw_rate * kd_angle, -1.0, 1.0);
+        cmd.roll_cmd = clamp(-state.roll_rate * kd_angle, -1.0, 1.0);
+        
+        return cmd;
+    }
+};
+
+int main() {
+    // Set up fast I/O
+    std::ios_base::sync_with_stdio(false);
+    std::cin.tie(nullptr);
+    
+    // Parse initial header
+    std::string line;
+    
+    // Read first line: width depth height gravity max_thrust fuel
+    std::getline(std::cin, line);
+    std::istringstream iss1(line);
+    iss1 >> world_params.width >> world_params.depth >> world_params.height
+         >> world_params.gravity >> world_params.max_thrust >> world_params.fuel;
+    
+    // Read second line: start and target positions
+    std::getline(std::cin, line);
+    std::istringstream iss2(line);
+    iss2 >> world_params.start_x >> world_params.start_y >> world_params.start_z
+         >> world_params.target_x >> world_params.target_y >> world_params.target_z;
+    
+    // Read terrain file path
+    std::getline(std::cin, world_params.terrain_path);
+    
+    // Read "STATE" marker
+    std::getline(std::cin, line);
+    
+    // Start terrain loading in background
+    std::thread terrain_thread([&]() {
+        loadTerrain(world_params.terrain_path, world_params.width, world_params.depth);
+    });
+    terrain_thread.detach();
+    
+    // Controller
+    LanderController controller;
+    
+    // Main loop
+    std::string state_line;
+    while (std::getline(std::cin, state_line)) {
+        if (state_line.empty()) continue;
+        
+        // Parse state
+        State state;
+        std::istringstream iss(state_line);
+        if (!(iss >> state.x >> state.y >> state.z
+                >> state.vx >> state.vy >> state.vz
+                >> state.pitch >> state.yaw >> state.roll
+                >> state.pitch_rate >> state.yaw_rate >> state.roll_rate
+                >> state.fuel)) {
+            continue;
+        }
+        
+        // Compute command
+        Command cmd = controller.compute(state, world_params, terrain);
+        
+        // Output command
+        std::cout << cmd.thrust << " " << cmd.pitch_cmd << " " 
+                  << cmd.yaw_cmd << " " << cmd.roll_cmd << "\n";
+        std::cout.flush();
+    }
+    
+    return 0;
+}
+```
+
+Wait, I need to be more careful. Let me reconsider the problem:
+
+1. The terrain file can be very large (GBs), so I need efficient storage
+2. The control needs to handle terrain avoidance
+3. The control needs to land precisely with low velocity
+
+Let me revise the approach:
+
+1. For terrain, I'll use a simpler collision check - only check nearby cells
+2. For control, I'll implement a more sophisticated approach:
+   - Approach phase: move towards target at altitude
+   - Descent phase: descend slowly
+   - Landing phase: final approach with low velocity
+
+Actually, looking at the problem again, the terrain data is uint16_t per value, which means:
+- For a 100000 x 10000 map, that's 1 billion cells
+- Each cell has 3 uint16_t values = 6 bytes
+- Total = 6 GB
+
+So I need to be careful with memory. Let me think about this...
+
+Actually, the terrain file IS the source of truth. I can either:
+1. Load it all into memory (if it fits)
+2. Memory-map it for efficient access
+3. Load only needed regions
+
+Given the constraints and the fact that memory-mapped files work on Windows, let me try that approach.
+
+Actually, let me simplify. The problem says I have a grace period to load the terrain. For smaller maps, I can load entirely. For larger maps, I might need to load in chunks or use memory mapping.
+
+Let me write a more complete solution:
+
+```cpp
+#include <iostream>
+#include <fstream>
+#include <sstream>
+#include <string>
+#include <vector>
+#include <thread>
+#include <mutex>
+#include <atomic>
+#include <cmath>
+#include <cstdint>
+#include <algorithm>
+#include <chrono>
+#include <iomanip>
+
+#ifdef _WIN32
+#include <windows.h>
+#include <memoryapi.h>
+#endif
+
+// Constants
+constexpr double GRAVITY = 1.62;
+constexpr double PI = 3.14159265358979323846;
+constexpr double DT = 0.1;
+
+// Utility functions
+inline double clamp(double val, double min_val, double max_val) {
+    return std::max(min_val, std::min(max_val, val));
+}
+
+inline double normalizeAngle(double angle) {
+    while (angle > PI) angle -= 2 * PI;
+    while (angle < -PI) angle += 2 * PI;
+    return angle;
+}
+
+// World parameters
+struct WorldParams {
+    int width = 0, depth = 0, height = 0;
+    double gravity = GRAVITY;
+    double max_thrust = 0;
+    double initial_fuel = 0;
+    double start_x = 0, start_y = 0, start_z = 0;
+    double target_x = 0, target_y = 0, target_z = 0;
+    std::string terrain_path;
+    double landing_radius = 5.0;
+};
+
+// Terrain - using memory mapping for large files
+class Terrain {
+    int width_ = 0, depth_ = 0;
+    
+#ifdef _WIN32
+    HANDLE file_handle_ = INVALID_HANDLE_VALUE;
+    HANDLE mapping_handle_ = NULL;
+    const uint8_t* data_ = nullptr;
+    size_t file_size_ = 0;
+#else
+    std::vector<uint8_t> data_;
+#endif
+    
+    std::vector<uint16_t> ground_top_;
+    std::vector<uint16_t> floating_bottom_;
+    std::vector<uint16_t> floating_top_;
+    bool use_vector_ = false;
+    
+public:
+    std::atomic<bool> loaded{false};
+    
+    ~Terrain() {
+#ifdef _WIN32
+        if (data_) UnmapViewOfFile(data_);
+        if (mapping_handle_) CloseHandle(mapping_handle_);
+        if (file_handle_ != INVALID_HANDLE_VALUE) CloseHandle(file_handle_);
+#endif
+    }
+    
+    bool load(const std::string& path, int width, int depth) {
+        width_ = width;
+        depth_ = depth;
+        size_t expected_size = static_cast<size_t>(width) * depth * 6;
+        
+#ifdef _WIN32
+        // Try memory mapping first
+        file_handle_ = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ,
+                                   NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (file_handle_ == INVALID_HANDLE_VALUE) {
+            // Fall back to regular loading
+            return loadVector(path, width, depth);
+        }
+        
+        LARGE_INTEGER file_size;
+        GetFileSizeEx(file_handle_, &file_size);
+        file_size_ = file_size.QuadPart;
+        
+        if (file_size_ < expected_size) {
+            CloseHandle(file_handle_);
+            file_handle_ = INVALID_HANDLE_VALUE;
+            return false;
+        }
+        
+        mapping_handle_ = CreateFileMappingA(file_handle_, NULL, PAGE_READONLY, 0, 0, NULL);
+        if (!mapping_handle_) {
+            CloseHandle(file_handle_);
+            file_handle_ = INVALID_HANDLE_VALUE;
+            return loadVector(path, width, depth);
+        }
+        
+        data_ = static_cast<const uint8_t*>(MapViewOfFile(mapping_handle_, FILE_MAP_READ, 0, 0, 0));
+        if (!data_) {
+            CloseHandle(mapping_handle_);
+            CloseHandle(file_handle_);
+            mapping_handle_ = NULL;
+            file_handle_ = INVALID_HANDLE_VALUE;
+            return loadVector(path, width, depth);
+        }
+        
+        use_vector_ = false;
+#else
+        return loadVector(path, width, depth);
+#endif
+        loaded = true;
+        return true;
+    }
+    
+    bool loadVector(const std::string& path, int width, int depth) {
+        std::ifstream file(path, std::ios::binary | std::ios::ate);
+        if (!file) return false;
+        
+        auto file_size = file.tellg();
+        file.seekg(0);
+        
+        size_t expected_size = static_cast<size_t>(width) * depth * 6;
+        if (file_size < static_cast<std::streampos>(expected_size)) return false;
+        
+        ground_top_.resize(width * depth);
+        floating_bottom_.resize(width * depth);
+        floating_top_.resize(width * depth);
+        
+        for (int x = 0; x < width; x++) {
+            for (int y = 0; y < depth; y++) {
+                int idx = x * depth + y;
+                uint8_t buf[6];
+                file.read(reinterpret_cast<char*>(buf), 6);
+                
+                ground_top_[idx] = buf[0] | (buf[1] << 8);
+                floating_bottom_[idx] = buf[2] | (buf[3] << 8);
+                floating_top_[idx] = buf[4] | (buf[5] << 8);
+            }
+        }
+        
+        use_vector_ = true;
+        loaded = true;
+        return true;
+    }
+    
+    // Returns (ground_top, floating_bottom, floating_top)
+    std::tuple<uint16_t, uint16_t, uint16_t> getTerrainAt(int x, int y) const {
+        if (x < 0 || x >= width_ || y < 0 || y >= depth_) {
+            return {0, 0, 0};
+        }
+        
+        size_t idx = static_cast<size_t>(x) * depth_ + y;
+        
+        if (use_vector_) {
+            return {ground_top_[idx], floating_bottom_[idx], floating_top_[idx]};
+        }
+        
+#ifdef _WIN32
+        const uint8_t* ptr = data_ + idx * 6;
+        uint16_t a = ptr[0] | (ptr[1] << 8);
+        uint16_t b = ptr[2] | (ptr[3] << 8);
+        uint16_t c = ptr[4] | (ptr[5] << 8);
+        return {a, b, c};
+#else
+        return {0, 0, 0};
+#endif
+    }
+    
+    bool isSolid(double x, double y, double z) const {
+        int ix = static_cast<int>(std::floor(x));
+        int iy = static_cast<int>(std::floor(y));
+        int iz = static_cast<int>(std::floor(z));
+        
+        if (ix < 0 || ix >= width_ || iy < 0 || iy >= depth_ || iz < 0) {
+            return true; // Out of bounds is solid
+        }
+        
+        auto [a, b, c] = getTerrainAt(ix, iy);
+        
+        if (iz < static_cast<int>(a)) return true;
+        if (iz >= static_cast<int>(b) && iz < static_cast<int>(c)) return true;
+        
+        return false;
+    }
+    
+    double getGroundHeight(double x, double y) const {
+        int ix = static_cast<int>(std::floor(x));
+        int iy = static_cast<int>(std::floor(y));
+        
+        if (ix < 0 || ix >= width_ || iy < 0 || iy >= depth_) {
+            return 0;
+        }
+        
+        auto [a, b, c] = getTerrainAt(ix, iy);
+        return static_cast<double>(a);
+    }
+    
+    double getClearanceAbove(double x, double y, double z) const {
+        int ix = static_cast<int>(std::floor(x));
+        int iy = static_cast<int>(std::floor(y));
+        int iz = static_cast<int>(std::floor(z));
+        
+        if (ix < 0 || ix >= width_ || iy < 0 || iy >= depth_) {
+            return 0;
+        }
+        
+        auto [a, b, c] = getTerrainAt(ix, iy);
+        
+        // Check if we're inside floating rock
+        if (iz >= static_cast<int>(b) && iz < static_cast<int>(c)) {
+            return 0; // Inside solid
+        }
+        
+        // Clearance to floating rock bottom (if above ground)
+        if (iz >= static_cast<int>(a) && iz < static_cast<int>(b)) {
+            return static_cast<double>(b) - z;
+        }
+        
+        return std::numeric_limits<double>::max();
+    }
+};
+
+// Global state
+WorldParams world_params;
+Terrain terrain;
+
+// Controller class
+class LanderController {
+    double kp_xy = 0.3;
+    double kd_xy = 0.8;
+    double kp_z = 0.5;
+    double kd_z = 1.2;
+    double kp_angle = 5.0;
+    double kd_angle = 2.5;
+    
+    double last_time = 0;
+    bool first_update = true;
+    
+public:
+    struct ControlOutput {
+        double thrust;
+        double pitch_cmd;
+        double yaw_cmd;
+        double roll_cmd;
+    };
+    
+    ControlOutput compute(double x, double y, double z,
+                          double vx, double vy, double vz,
+                          double pitch, double yaw, double roll,
+                          double pitch_rate, double yaw_rate, double roll_rate,
+                          double fuel) {
+        ControlOutput out{0, 0, 0, 0};
+        
+        // Target position
+        double tx = world_params.target_x;
+        double ty = world_params.target_y;
+        double tz = world_params.target_z;
+        
+        // Position errors
+        double ex = tx - x;
+        double ey = ty - y;
+        double ez = tz - z;
+        
+        // Horizontal distance
+        double dist_h = std::sqrt(ex * ex + ey * ey);
+        
+        // Determine phase based on distance and altitude
+        double desired_vx, desired_vy, desired_vz;
+        
+        if (dist_h > 20) {
+            // Approach phase: move towards target
+            double approach_speed = std::min(dist_h * 0.5, 15.0);
+            desired_vx = (ex / dist_h) * approach_speed;
+            desired_vy = (ey / dist_h) * approach_speed;
+            
+            // Maintain altitude above terrain
+            double ground_h = terrain.loaded ? terrain.getGroundHeight(x, y) : 0;
+            double safe_alt = std::max(tz, ground_h + 30);
+            desired_vz = clamp((safe_alt - z) * 0.3, -5.0, 5.0);
+        } else {
+            // Landing phase: descend to target
+            double slow_factor = dist_h / 20.0;
+            desired_vx = ex * 0.5 * slow_factor;
+            desired_vy = ey * 0.5 * slow_factor;
+            
+            // Descend
+            if (dist_h < 5 && std::abs(vx) < 2 && std::abs(vy) < 2) {
+                desired_vz = clamp(ez * 0.3, -2.0, 2.0); // Slow descent
+            } else {
+                desired_vz = clamp((tz + 10 - z) * 0.3, -5.0, 5.0); // Hover above
+            }
+        }
+        
+        // Velocity errors
+        double evx = desired_vx - vx;
+        double evy = desired_vy - vy;
+        double evz = desired_vz - vz;
+        
+        // Desired accelerations (in world frame)
+        double ax = evx * kd_xy;
+        double ay = evy * kd_xy;
+        double az = evz * kd_z + world_params.gravity; // Add gravity
+        
+        // Terrain avoidance - check if we need to go up
+        if (terrain.loaded && z < 50) {
+            double ground_h = terrain.getGroundHeight(x, y);
+            if (z < ground_h + 10) {
+                az = std::max(az, world_params.gravity + 3.0); // Push up
+            }
+        }
+        
+        // Compute thrust magnitude
+        double thrust_mag = std::sqrt(ax * ax + ay * ay + az * az);
+        
+        // Compute thrust fraction
+        out.thrust = clamp(thrust_mag / world_params.max_thrust, 0.0, 1.0);
+        
+        // Compute required attitude
+        double required_pitch = 0;
+        double required_yaw = yaw;
+        
+        if (thrust_mag > 0.01) {
+            // Normalize thrust direction
+            double tx_d = ax / thrust_mag;
+            double ty_d = ay / thrust_mag;
+            double tz_d = az / thrust_mag;
+            
+            // Compute yaw (rotation around Z)
+            required_yaw = std::atan2(-tx_d, -ty_d);
+            
+            // Compute pitch (tilt from vertical)
+            double horiz = std::sqrt(tx_d * tx_d + ty_d * ty_d);
+            required_pitch = std::atan2(horiz, tz_d);
+            required_pitch = clamp(required_pitch, -PI / 2 + 0.1, PI / 2 - 0.1);
+        }
+        
+        // Attitude control
+        double pitch_error = normalizeAngle(required_pitch - pitch);
+        double yaw_error = normalizeAngle(required_yaw - yaw);
+        
+        out.pitch_cmd = clamp(pitch_error * kp_angle - pitch_rate * kd_angle, -1.0, 1.0);
+        out.yaw_cmd = clamp(yaw_error * kp_angle - yaw_rate * kd_angle, -1.0, 1.0);
+        out.roll_cmd = clamp(-roll_rate * kd_angle * 0.5, -1.0, 1.0);
+        
+        // Limit thrust when close to landing
+        double total_speed = std::sqrt(vx*vx + vy*vy + vz*vz);
+        if (dist_h < 10 && z < tz + 20 && total_speed < 5) {
+            // Final approach - be gentle
+            out.thrust = clamp(out.thrust, 0.0, 0.7);
+        }
+        
+        return out;
+    }
+};
+
+int main() {
+    // Fast I/O
+    std::ios_base::sync_with_stdio(false);
+    std::cin.tie(nullptr);
+    std::cout << std::fixed << std::setprecision(6);
+    
+    // Parse header
+    std::string line;
+    
+    // First line: dimensions and physics
+    std::getline(std::cin, line);
+    {
+        std::istringstream iss(line);
+        iss >> world_params.width >> world_params.depth >> world_params.height
+            >> world_params.gravity >> world_params.max_thrust >> world_params.initial_fuel;
+    }
+    
+    // Second line: positions
+    std::getline(std::cin, line);
+    {
+        std::istringstream iss(line);
+        iss >> world_params.start_x >> world_params.start_y >> world_params.start_z
+            >> world_params.target_x >> world_params.target_y >> world_params.target_z;
+    }
+    
+    // Third line: terrain path
+    std::getline(std::cin, world_params.terrain_path);
+    
+    // Fourth line: "STATE" marker
+    std::getline(std::cin, line);
+    
+    // Compute landing radius
+    world_params.landing_radius = std::max(5.0, std::min(static_cast<double>(world_params.width),
+                                                          static_cast<double>(world_params.depth)) * 0.02);
+    
+    // Start terrain loading in background thread
+    std::thread terrain_thread([]() {
+        terrain.load(world_params.terrain_path, world_params.width, world_params.depth);
+    });
+    terrain_thread.detach();
+    
+    // Controller
+    LanderController controller;
+    
+    // Main loop - read state, compute control, output
+    while (std::getline(std::cin, line)) {
+        if (line.empty()) continue;
+        
+        std::istringstream iss(line);
+        double x, y, z, vx, vy, vz, pitch, yaw, roll, pitch_rate, yaw_rate, roll_rate, fuel;
+        
+        if (!(iss >> x >> y >> z >> vx >> vy >> vz >> pitch >> yaw >> roll
+                >> pitch_rate >> yaw_rate >> roll_rate >> fuel)) {
+            continue;
+        }
+        
+        auto out = controller.compute(x, y, z, vx, vy, vz, pitch, yaw, roll,
+                                      pitch_rate, yaw_rate, roll_rate, fuel);
+        
+        std::cout << out.thrust << " " << out.pitch_cmd << " "
+                  << out.yaw_cmd << " " << out.roll_cmd << "\n";
+        std::cout.flush();
+    }
+    
+    return 0;
+}
+```
+
+Hmm, wait. Looking at the problem more carefully:
+
+1. Pitch: +pitch tilts forward, redirecting thrust partially into -X
+2. Yaw: rotates heading around Z
+
+So when pitch is positive, the lander tilts "forward" (which I assume means in the direction of its heading), and this redirects thrust. The yaw rotates the heading.
+
+Let me think about the thrust direction:
+- When yaw=0 and pitch=0: thrust is +Z
+- When yaw=0 and pitch>0: thrust has component in -X direction
+- When yaw=π/2 and pitch>0: thrust has component in -Y direction
+
+So the thrust vector in world coordinates would be:
+- thrust_x = -sin(pitch) * sin(yaw) * thrust_magnitude? No wait...
+
+Actually, let me think about this more carefully. The problem says:
+- "+pitch tilts forward, redirecting thrust partially into -X"
+- "Yaw: rotates heading around Z"
+
+So if yaw=0, a positive pitch gives thrust in -X direction.
+If yaw=π/2, a positive pitch would give thrust in -Y direction.
+
+This suggests:
+- thrust_x = -sin(pitch) * cos(yaw) * thrust_mag? Hmm...
+
+Let me think of it as a rotation:
+1. Start with thrust pointing up (+Z)
+2. Rotate around Y axis by pitch angle (this gives thrust in -X direction for positive pitch)
+3. Then rotate around Z axis by yaw angle
+
+The rotation matrix for pitch (rotation around Y axis, positive = tilt forward = -X thrust):
+```
+[cos(pitch), 0, sin(pitch)]
+[0,          1, 0         ]
+[-sin(pitch),0, cos(pitch)]
+```
+Wait, this gives thrust vector = [sin(pitch), 0, cos(pitch)] for initial [0, 0, 1]
+
+Then apply yaw (rotation around Z axis):
+```
+[cos(yaw), -sin(yaw), 0]
+[sin(yaw),  cos(yaw), 0]
+[0,         0,        1]
+```
+
+Final thrust direction:
+```
+[cos(yaw), -sin(yaw), 0]   [sin(pitch)]   [cos(yaw)*sin(pitch)]
+[sin(yaw),  cos(yaw), 0] * [0         ] = [sin(yaw)*sin(pitch)]
+[0,         0,        1]   [cos(pitch)]   [cos(pitch)         ]
+```
+
+So:
+- thrust_x = cos(yaw) * sin(pitch)
+- thrust_y = sin(yaw) * sin(pitch)
+- thrust_z = cos(pitch)
+
+Hmm, but the problem says "+pitch tilts forward, redirecting thrust partially into -X". So positive pitch should give thrust in -X, not +X.
+
+Let me reconsider. If "forward" means the direction the lander is facing, and at yaw=0 the lander faces in +X direction, then tilting forward would give thrust in -X.
+
+So maybe the convention is:
+- thrust_x = -cos(yaw) * sin(pitch)
+- thrust_y = -sin(yaw) * sin(pitch)
+- thrust_z = cos(pitch)
+
+Wait, or maybe it's:
+- thrust_x = -sin(pitch) when yaw=0
+
+Let me just use a different interpretation:
+- At yaw=0, pitch>0: thrust has -X component
+- The yaw rotates this direction
+
+So:
+- thrust_x = -sin(pitch) * cos(yaw)
+- thrust_y = -sin(pitch) * sin(yaw)
+- thrust_z = cos(pitch)
+
+Hmm, let me think again. The problem says pitch is clamped to [-pi/2, pi/2].
+
+At pitch=0, thrust is straight up (+Z).
+At pitch=pi/2, thrust is horizontal.
+
+Let me use a simpler model:
+- When yaw=0: thrust_x = -sin(pitch), thrust_z = cos(pitch)
+- With yaw: rotate the XY components by yaw
+
+So:
+- horizontal_thrust = sin(pitch)
+- thrust_x = -sin(pitch) * cos(yaw)
+- thrust_y = -sin(pitch) * sin(yaw)
+- thrust_z = cos(pitch)
+
+Actually wait, I think I had it backwards. Let me re-read: "+pitch tilts forward, redirecting thrust partially into -X".
+
+If +pitch tilts forward, and this redirects thrust to -X at yaw=0, then:
+- thrust_x = -sin(pitch) at yaw=0
+
+With yaw rotation (yaw rotates around Z):
+- thrust_x = -sin(pitch) * cos(yaw)
+- thrust_y = -sin(pitch) * sin(yaw)
+- thrust_z = cos(pitch)
+
+Hmm, but this doesn't account for the direction properly. Let me think of it as:
+- The "forward" direction is determined by yaw
+- At yaw=0, forward = +X direction
+- At yaw=π/2, forward = +Y direction
+- Positive pitch tilts "forward", which means thrust goes "backward"
+
+So if forward = (cos(yaw), sin(yaw), 0), then backward = (-cos(yaw), -sin(yaw), 0).
+
+With positive pitch:
+- thrust = cos(pitch) * (0, 0, 1) + sin(pitch) * backward
+- thrust = cos(pitch) * (0, 0, 1) + sin(pitch) * (-cos(yaw), -sin(yaw), 0)
+- thrust = (-sin(pitch)*cos(yaw), -sin(pitch)*sin(yaw), cos(pitch))
+
+Yes! So:
+- thrust_x = -sin(pitch) * cos(yaw)
+- thrust_y = -sin(pitch) * sin(yaw)
+- thrust_z = cos(pitch)
+
+Now for the inverse: given a desired thrust direction, compute the required pitch and yaw.
+
+If we want thrust direction (tx, ty, tz) (normalized):
+- tz = cos(pitch) => pitch = acos(tz), or more numerically stable: pitch = atan2(sqrt(tx^2 + ty^2), tz)
+- tx = -sin(pitch) * cos(yaw)
+- ty = -sin(pitch) * sin(yaw)
+- So: cos(yaw) = -tx / sin(pitch), sin(yaw) = -ty / sin(pitch)
+- yaw = atan2(-ty, -tx) or atan2(sin(yaw), cos(yaw)) = atan2(-ty/sin(pitch), -tx/sin(pitch)) = atan2(-ty, -tx)
+
+So:
+- pitch = atan2(sqrt(tx^2 + ty^2), tz)
+- yaw = atan2(-ty, -tx)
+
+Wait, let me double-check. If we want thrust in +Z direction (tx=0, ty=0, tz=1):
+- pitch = atan2(0, 1) = 0 ✓
+- yaw = atan2(0, 0) which is undefined, but we can keep current yaw ✓
+
+If we want thrust in -X direction (tx=-1, ty=0, tz=0) at yaw=0:
+- pitch = atan2(1, 0) = π/2 ✓
+- yaw = atan2(0, 1) = 0 ✓
+
+If we want thrust in -Y direction (tx=0, ty=-1, tz=0):
+- pitch = atan2(1, 0) = π/2 ✓
+- yaw = atan2(1, 0) = π/2 ✓
+
+Great, so the inverse formulas are:
+- pitch = atan2(sqrt(tx^2 + ty^2), tz)
+- yaw = atan2(-ty, -tx)
+
+Now let me refine the controller. Actually, I realize I need to be more careful about the control. The current state includes the orientation, and I need to compute commands that will rotate the lander to the desired orientation.
+
+The rotation dynamics are:
+- Angular acceleration = 2 rad/s² per unit command
+- Angular rates are damped by 0.95 per tick (every 0.1s)
+
+So the angular velocity update is approximately:
+- new_rate = old_rate * 0.95 + command * 2 * 0.1
+
+For a simple PD controller:
+- command = kp * (desired - current) - kd * current_rate
+- With some tuning for the angular dynamics
+
+Let me now write a more complete and robust solution:
+
+```cpp
+#include <iostream>
+#include <fstream>
+#include <sstream>
+#include <string>
+#include <vector>
+#include <thread>
+#include <atomic>
+#include <cmath>
+#include <cstdint>
+#include <algorithm>
+#include <iomanip>
+#include <limits>
+
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
+// Constants
+constexpr double PI = 3.14159265358979323846;
+constexpr double GRAVITY = 1.62;
+constexpr double DT = 0.1;
+constexpr double ANGULAR_ACCEL = 2.0;
+constexpr double ANGULAR_DAMPING = 0.95;
+
+// Utility functions
+inline double clamp(double val, double min_val, double max_val) {
+    if (val < min_val) return min_val;
+    if (val > max_val) return max_val;
+    return val;
+}
+
+inline double normalizeAngle(double angle) {
+    while (angle > PI) angle -= 2.0 * PI;
+    while (angle < -PI) angle += 2.0 * PI;
+    return angle;
+}
+
+inline double sign(double x) {
+    if (x > 0) return 1.0;
+    if (x < 0) return -1.0;
+    return 0.0;
+}
+
+// World parameters
+struct WorldParams {
+    int width = 0, depth = 0, height = 0;
+    double gravity = GRAVITY;
+    double max_thrust = 1.0;
+    double initial_fuel = 100.0;
+    double start_x = 0, start_y = 0, start_z = 0;
+    double target_x = 0, target_y = 0, target_z = 0;
+    std::string terrain_path;
+    double landing_radius = 5.0;
+};
+
+// Terrain class
+class Terrain {
+    int width_ = 0, depth_ = 0;
+    
+#ifdef _WIN32
+    HANDLE file_handle_ = INVALID_HANDLE_VALUE;
+    HANDLE mapping_handle_ = NULL;
+    const uint8_t* mapped_data_ = nullptr;
+#endif
+    
+    // Fallback for small files or when memory mapping fails
+    std::vector<uint16_t> ground_top_;
+    std::vector<uint16_t> floating_bottom_;
+    std::vector<uint16_t> floating_top_;
+    bool use_vector_ = false;
+    
+public:
+    std::atomic<bool> loaded{false};
+    
+    ~Terrain() {
+#ifdef _WIN32
+        if (mapped_data_) {
+            UnmapViewOfFile(mapped_data_);
+        }
+        if (mapping_handle_) {
+            CloseHandle(mapping_handle_);
+        }
+        if (file_handle_ != INVALID_HANDLE_VALUE) {
+            CloseHandle(file_handle_);
+        }
+#endif
+    }
+    
+    bool load(const std::string& path, int width, int depth);
+    
+    inline std::tuple<uint16_t, uint16_t, uint16_t> getTerrainAt(int x, int y) const {
+        if (x < 0 || x >= width_ || y < 0 || y >= depth_) {
+            return {0, 0, 0};
+        }
+        
+        size_t idx = static_cast<size_t>(x) * depth_ + y;
+        
+        if (use_vector_) {
+            return {ground_top_[idx], floating_bottom_[idx], floating_top_[idx]};
+        }
+        
+#ifdef _WIN32
+        if (mapped_data_) {
+            const uint8_t* ptr = mapped_data_ + idx * 6;
+            uint16_t a = static_cast<uint16_t>(ptr[0] | (ptr[1] << 8));
+            uint16_t b = static_cast<uint16_t>(ptr[2] | (ptr[3] << 8));
+            uint16_t c = static_cast<uint16_t>(ptr[4] | (ptr[5] << 8));
+            return {a, b, c};
+        }
+#endif
+        
+        return {0, 0, 0};
+    }
+    
+    bool isSolid(double x, double y, double z) const;
+    double getGroundHeight(double x, double y) const;
+    double getCeilingHeight(double x, double y, double z) const;
+};
+
+bool Terrain::load(const std::string& path, int width, int depth) {
+    width_ = width;
+    depth_ = depth;
+    size_t expected_size = static_cast<size_t>(width) * depth * 6;
+    
+#ifdef _WIN32
+    // Try memory mapping first
+    file_handle_ = CreateFileA(
+        path.c_str(),
+        GENERIC_READ,
+        FILE_SHARE_READ,
+        NULL,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
+        NULL
+    );
+    
+    if (file_handle_ != INVALID_HANDLE_VALUE) {
+        LARGE_INTEGER file_size;
+        GetFileSizeEx(file_handle_, &file_size);
+        
+        if (static_cast<size_t>(file_size.QuadPart) >= expected_size) {
+            mapping_handle_ = CreateFileMappingA(
+                file_handle_,
+                NULL,
+                PAGE_READONLY,
+                0, 0,
+                NULL
+            );
+            
+            if (mapping_handle_) {
+                mapped_data_ = static_cast<const uint8_t*>(
+                    MapViewOfFile(mapping_handle_, FILE_MAP_READ, 0, 0, 0)
+                );
+                
+                if (mapped_data_) {
+                    use_vector_ = false;
+                    loaded = true;
+                    return true;
+                }
+                CloseHandle(mapping_handle_);
+                mapping_handle_ = NULL;
+            }
+        }
+        CloseHandle(file_handle_);
+        file_handle_ = INVALID_HANDLE_VALUE;
+    }
+#endif
+    
+    // Fallback to loading into memory
+    std::ifstream file(path, std::ios::binary);
+    if (!file) {
+        loaded = true; // Mark as "loaded" but empty
+        return false;
+    }
+    
+    ground_top_.resize(static_cast<size_t>(width) * depth);
+    floating_bottom_.resize(static_cast<size_t>(width) * depth);
+    floating_top_.resize(static_cast<size_t>(width) * depth);
+    
+    std::vector<uint8_t> buffer(6);
+    for (int x = 0; x < width; x++) {
+        for (int y = 0; y < depth; y++) {
+            size_t idx = static_cast<size_t>(x) * depth + y;
+            file.read(reinterpret_cast<char*>(buffer.data()), 6);
+            
+            ground_top_[idx] = static_cast<uint16_t>(buffer[0] | (buffer[1] << 8));
+            floating_bottom_[idx] = static_cast<uint16_t>(buffer[2] | (buffer[3] << 8));
+            floating_top_[idx] = static_cast<uint16_t>(buffer[4] | (buffer[5] << 8));
+        }
+    }
+    
+    use_vector_ = true;
+    loaded = true;
+    return true;
+}
+
+bool Terrain::isSolid(double x, double y, double z) const {
+    int ix = static_cast<int>(std::floor(x));
+    int iy = static_cast<int>(std::floor(y));
+    int iz = static_cast<int>(std::floor(z));
+    
+    if (ix < 0 || ix >= width_ || iy < 0 || iy >= depth_ || iz < 0) {
+        return true;
+    }
+    
+    auto [a, b, c] = getTerrainAt(ix, iy);
+    
+    if (iz < static_cast<int>(a)) return true;
+    if (iz >= static_cast<int>(b) && iz < static_cast<int>(c)) return true;
+    
+    return false;
+}
+
+double Terrain::getGroundHeight(double x, double y) const {
+    int ix = static_cast<int>(std::floor(x));
+    int iy = static_cast<int>(std::floor(y));
+    
+    if (ix < 0 || ix >= width_ || iy < 0 || iy >= depth_) {
+        return 0.0;
+    }
+    
+    auto [a, b, c] = getTerrainAt(ix, iy);
+    return static_cast<double>(a);
+}
+
+double Terrain::getCeilingHeight(double x, double y, double z) const {
+    int ix = static_cast<int>(std::floor(x));
+    int iy = static_cast<int>(std::floor(y));
+    int iz = static_cast<int>(std::floor(z));
+    
+    if (ix < 0 || ix >= width_ || iy < 0 || iy >= depth_) {
+        return z;
+    }
+    
+    auto [a, b, c] = getTerrainAt(ix, iy);
+    
+    if (iz >= static_cast<int>(b) && iz < static_cast<int>(c)) {
+        return static_cast<double>(c);
+    }
+    
+    return std::numeric_limits<double>::max();
+}
+
+// Global instances
+WorldParams world_params;
+Terrain terrain;
+
+// Controller
+class LanderController {
+    // Control gains - tuned for various scales
+    double kp_horiz = 0.4;
+    double kd_horiz = 1.0;
+    double kp_vert = 0.6;
+    double kd_vert = 1.5;
+    
+    double kp_attitude = 4.0;
+    double kd_attitude = 2.0;
+    
+public:
+    void computeControl(
+        double x, double y, double z,
+        double vx, double vy, double vz,
+        double pitch, double yaw, double roll,
+        double pitch_rate, double yaw_rate, double roll_rate,
+        double fuel,
+        double& out_thrust, double& out_pitch, double& out_yaw, double& out_roll
+    ) {
+        // Target position
+        double tx = world_params.target_x;
+        double ty = world_params.target_y;
+        double tz = world_params.target_z;
+        
+        // Position errors
+        double ex = tx - x;
+        double ey = ty - y;
+        double ez = tz - z;
+        
+        double dist_h = std::sqrt(ex * ex + ey * ey);
+        double dist_v = std::abs(ez);
+        
+        // Determine control phase
+        double desired_vx, desired_vy, desired_vz;
+        
+        // Approach phase
+        if (dist_h > 30.0) {
+            // Move towards target horizontally
+            double speed = std::min(dist_h * 0.3, 20.0);
+            desired_vx = speed * ex / dist_h;
+            desired_vy = speed * ey / dist_h;
+            
+            // Maintain safe altitude
+            double ground_h = terrain.loaded ? terrain.getGroundHeight(x, y) : 0.0;
+            double safe_alt = std::max(tz + 20.0, ground_h + 30.0);
+            desired_vz = clamp((safe_alt - z) * 0.4, -8.0, 8.0);
+        }
+        // Near target - prepare for landing
+        else if (dist_h > 10.0 || dist_v > 10.0) {
+            double slow_factor = dist_h / 30.0;
+            desired_vx = ex * 0.4 * slow_factor;
+            desired_vy = ey * 0.4 * slow_factor;
+            
+            // Hover above target
+            double hover_alt = tz + 15.0;
+            desired_vz = clamp((hover_alt - z) * 0.4, -5.0, 5.0);
+        }
+        // Landing phase
+        else {
+            desired_vx = ex * 0.3;
+            desired_vy = ey * 0.3;
+            
+            // Descend slowly
+            double speed = std::sqrt(vx*vx + vy*vy + vz*vz);
+            if (speed < 3.0) {
+                desired_vz = clamp(ez * 0.3, -1.5, 1.5);
+            } else {
+                desired_vz = clamp(-vz * 0.5, -1.0, 1.0);
+            }
+        }
+        
+        // Terrain avoidance
+        if (terrain.loaded) {
+            double ground_h = terrain.getGroundHeight(x, y);
+            double clearance = z - ground_h;
+            
+            if (clearance < 15.0) {
+                // Push up
+                desired_vz = std::max(desired_vz, 3.0);
+            }
+            
+            // Check for floating rocks above
+            double ceiling = terrain.getCeilingHeight(x, y, z);
+            if (ceiling - z < 10.0 && ceiling < 1e10) {
+                // Slow down vertical velocity
+                desired_vz = std::min(desired_vz, 1.0);
+            }
+        }
+        
+        // Velocity errors
+        double evx = desired_vx - vx;
+        double evy = desired_vy - vy;
+        double evz = desired_vz - vz;
+        
+        // Compute required acceleration (world frame)
+        double ax = evx * kd_horiz;
+        double ay = evy * kd_horiz;
+        double az = evz * kd_vert + world_params.gravity;
+        
+        // Thrust magnitude
+        double thrust_mag = std::sqrt(ax * ax + ay * ay + az * az);
+        out_thrust = clamp(thrust_mag / world_params.max_thrust, 0.0, 1.0);
+        
+        // Compute required attitude
+        double required_pitch = 0.0;
+        double required_yaw = yaw;
+        
+        if (thrust_mag > 0.01 * world_params.max_thrust) {
+            // Normalized thrust direction
+            double tnx = ax / thrust_mag;
+            double tny = ay / thrust_mag;
+            double tnz = az / thrust_mag;
+            
+            // Compute required pitch
+            double horiz = std::sqrt(tnx * tnx + tny * tny);
+            required_pitch = std::atan2(horiz, tnz);
+            required_pitch = clamp(required_pitch, -PI/2 + 0.05, PI/2 - 0.05);
+            
+            // Compute required yaw
+            // From thrust equations: tx = -sin(pitch)*cos(yaw), ty = -sin(pitch)*sin(yaw)
+            // So: cos(yaw) = -tx/sin(pitch), sin(yaw) = -ty/sin(pitch)
+            if (horiz > 0.01) {
+                required_yaw = std::atan2(-tny, -tnx);
+            }
+        }
+        
+        // Attitude control (PD)
+        double pitch_error = normalizeAngle(required_pitch - pitch);
+        double yaw_error = normalizeAngle(required_yaw - yaw);
+        double roll_error = normalizeAngle(-roll); // Try to keep roll at 0
+        
+        out_pitch = clamp(pitch_error * kp_attitude - pitch_rate * kd_attitude, -1.0, 1.0);
+        out_yaw = clamp(yaw_error * kp_attitude - yaw_rate * kd_attitude, -1.0, 1.0);
+        out_roll = clamp(roll_error * kp_attitude - roll_rate * kd_attitude, -1.0, 1.0);
+        
+        // Fuel conservation - reduce thrust when not needed
+        if (dist_h < 5.0 && dist_v < 5.0) {
+            double speed = std::sqrt(vx*vx + vy*vy + vz*vz);
+            if (speed < 2.0) {
+                // Very close to landing, minimal thrust
+                out_thrust = clamp(out_thrust, 0.0, 0.6);
+            }
+        }
+    }
+};
+
+int main() {
+    // Fast I/O
+    std::ios_base::sync_with_stdio(false);
+    std::cin.tie(nullptr);
+    std::cout << std::fixed << std::setprecision(6);
+    
+    // Parse header
+    std::string line;
+    
+    // Line 1: dimensions and physics
+    if (!std::getline(std::cin, line)) return 1;
+    {
+        std::istringstream iss(line);
+        iss >> world_params.width >> world_params.depth >> world_params.height
+            >> world_params.gravity >> world_params.max_thrust >> world_params.initial_fuel;
+    }
+    
+    // Line 2: start and target positions
+    if (!std::getline(std::cin, line)) return 1;
+    {
+        std::istringstream iss(line);
+        iss >> world_params.start_x >> world_params.start_y >> world_params.start_z
+            >> world_params.target_x >> world_params.target_y >> world_params.target_z;
+    }
+    
+    // Line 3: terrain file path
+    if (!std::getline(std::cin, world_params.terrain_path)) return 1;
+    
+    // Line 4: "STATE" marker
+    if (!std::getline(std::cin, line)) return 1;
+    
+    // Compute landing radius
+    world_params.landing_radius = std::max(5.0, 
+        std::min(static_cast<double>(world_params.width),
+                 static_cast<double>(world_params.depth)) * 0.02);
+    
+    // Start terrain loading in background
+    std::thread terrain_thread([]() {
+        terrain.load(world_params.terrain_path, world_params.width, world_params.depth);
+    });
+    terrain_thread.detach();
+    
+    // Controller
+    LanderController controller;
+    
+    // Main loop
+    while (std::getline(std::cin, line)) {
+        if (line.empty()) continue;
+        
+        // Parse state
+        std::istringstream iss(line);
+        double x, y, z, vx, vy, vz, pitch, yaw, roll, pitch_rate, yaw_rate, roll_rate, fuel;
+        
+        if (!(iss >> x >> y >> z >> vx >> vy >> vz >> pitch >> yaw >> roll
+              >> pitch_rate >> yaw_rate >> roll_rate >> fuel)) {
+            continue;
+        }
+        
+        // Compute control
+        double thrust, pitch_cmd, yaw_cmd, roll_cmd;
+        controller.computeControl(
+            x, y, z, vx, vy, vz, pitch, yaw, roll,
+            pitch_rate, yaw_rate, roll_rate, fuel,
+            thrust, pitch_cmd, yaw_cmd, roll_cmd
+        );
+        
+        // Output command
+        std::cout << thrust << " " << pitch_cmd << " " 
+                  << yaw_cmd << " " << roll_cmd << "\n";
+        std::cout.flush();
+    }
+    
+    return 0;
+}
+```
+
+Actually, I realize I should be more careful about the multithreading aspect. The problem says:
+- "Multithreaded code is HIGHLY recommended"
+- "If your code stalls / freezes for 100ms or more... the engine will cut thrust automatically"
+
+So I need to ensure:
+1. Terrain loading doesn't block the main loop
+2. The control computation is fast
+3. I/O is handled promptly
+
+Let me also improve the control algorithm to handle various scenarios better, including different scales (100m to 100km).
+
+Here's my improved approach:
+
+1. Use a more adaptive controller that scales based on distance
+2. Better terrain avoidance
+3. More robust handling of edge cases
+
+Let me write a more polished version:

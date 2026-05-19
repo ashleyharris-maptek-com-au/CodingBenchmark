@@ -18,7 +18,7 @@ import hashlib
 import os
 from typing import List, Tuple, Set, Dict, Any
 from native_compiler import RustCompiler, CompilationError, ExecutionError, describe_this_pc
-from solver_utils import StreamingInputFile, GradeCache, normalize_code_result
+from solver_utils import StreamingInputFile, GradeCache, get_ram_in_gb, normalize_code_result
 
 _grade_cache = GradeCache('test35')
 
@@ -511,14 +511,8 @@ def _gradeAnswer_uncached(result: dict, subPass: int, aiEngineName: str) -> tupl
       set_size = int(lines[0])
       dom_set = set(map(int, lines[1].split())) if len(lines) > 1 else set()
 
-      if os.name == 'nt':
-        total_ram = os.popen('wmic computersystem get totalphysicalmemory').read().split()[1]
-      else:
-        total_ram = os.popen('free -b | grep Mem | awk \'{print $2}\'').read().strip()
-
-      total_ram_gb = int(total_ram) / (1024**3)
-
-      if total_ram_gb < 64 and subPass > 15:
+      ramInGb = get_ram_in_gb()
+      if ramInGb < 64 and subPass > 15:
         return 1.0, "Not enough RAM to grade answer - assuming pass."
 
       # Use planted structure for verification on streaming graphs

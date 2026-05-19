@@ -1,0 +1,299 @@
+```cpp
+#include <iostream>
+#include <fstream>
+#include <vector>
+#include <thread>
+#include <mutex>
+#include <atomic>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <chrono>
+
+// High precision timer for Windows
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <time.h>
+#endif
+
+// Constants
+const double GRAVITY = 1.62;
+const double DT = 0.1;
+const double KP_POS = 2.5;
+const double KP_VEL = 8.0;
+const double K_LIMIT = 1.0;
+
+struct LanderState {
+    double x, y, z;
+    double vx, vy, vz;
+    double pitch, yaw, roll;
+    double pitch_rate, yaw_rate, roll_rate;
+    double fuel_remaining;
+};
+
+struct Config {
+    int width;
+    int depth;
+    int height;
+    double max_thrust;
+    double fuel; // Initial fuel
+    double start_x, start_y, start_z;
+    double target_x, target_y, target_z;
+    std::string terrain_path;
+};
+
+// Global terrain buffer
+std::vector<uint8_t> g_terrain_buffer;
+std::mutex g_terrain_mutex;
+std::atomic<bool> g_terrain_loaded(false);
+Config g_config;
+LanderState g_state;
+
+// Parse double from string
+double parseDouble(const char* str) {
+    double val = 0.0;
+    sscanf(str, "%lf", &val);
+    return val;
+}
+
+// Load terrain file in background
+void LoadTerrainThread() {
+    std::ifstream file(g_config.terrain_path, std::ios::binary | std::ios::ate);
+    if (!file.is_open()) {
+        // Fallback if file not found or we are running without real file (debugging)
+        // Just return or error out.
+        return;
+    }
+
+    std::streamsize size = file.tellg();
+    file.seekg(0, std::ios::beg);
+
+    g_terrain_buffer.resize(size);
+    file.read(reinterpret_cast<char*>(g_terrain_buffer.data()), size);
+
+    std::lock_guard<std::mutex> lock(g_terrain_mutex);
+    g_terrain_loaded.store(true);
+}
+
+// Get landing zone radius
+double getLandingZoneRadius(int width, int depth) {
+    return std::max(5.0, std::min((double)width, (double)depth) * 0.02);
+}
+
+// Compute Control Commands
+void ControlLoop() {
+    auto start_time = std::chrono::high_resolution_clock::now();
+    
+    // Allow grace period
+    while (true) {
+        auto now = std::chrono::high_resolution_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - start_time).count();
+        
+        // Calculate grace period: 5s + 10s/GB
+        // File size is roughly width * depth * 6 bytes
+        double size_gb = (g_config.width * g_config.depth * 6.0) / (1024.0 * 1024.0 * 1024.0);
+        double grace = 5000.0 + (10.0 * size_gb);
+        
+        if (elapsed > grace) break;
+        
+        // Small sleep to prevent busy loop before data arrives
+        #ifdef _WIN32
+        Sleep(1);
+        #else
+        usleep(1000);
+        #endif
+    }
+
+    // Initialize PID terms
+    // Vector of desired accelerations [ax, ay, az]
+    // az includes gravity compensation
+    double cmd_ax = 0.0;
+    double cmd_ay = 0.0;
+    double cmd_az = GRAVITY; // Gravity compensation base
+
+    // State variables for integration
+    double prev_x = g_state.x, prev_y = g_state.y;
+    double prev_vx = g_state.vx, prev_vy = g_state.vy;
+    double prev_z = g_state.z, prev_vz = g_state.vz;
+
+    double zone_radius = getLandingZoneRadius(g_config.width, g_config.depth);
+
+    while (true) {
+        // 1. Read State
+        // Format: x y z vx vy vz pitch yaw roll pitch_rate yaw_rate roll_rate fuel
+        double x, y, z, vx, vy, vz, p, yw, r, pr, yr, rr, fuel;
+        
+        // Using scanf for speed
+        int read_count = scanf("%lf %lf %lf %lf %lf %lf %lf %lf %lf %lf %lf %lf %lf", 
+                               &x, &y, &z, &vx, &vy, &vz, 
+                               &p, &yw, &r, &pr, &yr, &rr, 
+                               &fuel);
+                               
+        if (read_count != 13) {
+            // Handle end of stream or error
+            break;
+        }
+
+        // Update global state for next iteration (physics runs elsewhere)
+        g_state.x = x; g_state.y = y; g_state.z = z;
+        g_state.vx = vx; g_state.vy = vy; g_state.vz = vz;
+        g_state.fuel_remaining = fuel;
+
+        // 2. Logic
+        
+        // Horizontal distance to target
+        double dx = g_config.target_x - x;
+        double dy = g_config.target_y - y;
+        double dist = sqrt(dx*dx + dy*dy);
+
+        bool in_zone = dist <= zone_radius;
+
+        // Horizontal Control
+        // Proportional + Derivative (PD) to close gap and damp velocity
+        // Desired horizontal velocity is towards target
+        
+        if (in_zone) {
+            // On pad: aggressive damping of horizontal motion
+            cmd_ax = -KP_VEL * vx;
+            cmd_ay = -KP_VEL * vy;
+        } else {
+            // Off pad: Move towards target
+            // If far, we might want to fly higher first? 
+            // But we assume standard PID works for approach.
+            cmd_ax = KP_POS * dx - KP_VEL * vx;
+            cmd_ay = KP_POS * dy - KP_VEL * vy;
+        }
+
+        // Vertical Control
+        // We need to slow down descent. 
+        // Target vertical velocity is 0.
+        // Target position is target_z.
+        
+        double dz = g_config.target_z - z;
+        double dz_cmd = KP_POS * dz - KP_VEL * vz;
+        
+        // If in landing zone, maintain a small descent rate or stop?
+        // If we stop completely at target_z (which is "just above terrain"), we are good.
+        // However, gravity keeps pulling us down.
+        // We add gravity compensation to the total thrust requirement.
+        
+        cmd_az = GRAVITY + dz_cmd;
+
+        // 3. Thrust Allocation
+        // Calculate magnitude of the 3D force vector
+        double thrust_mag = sqrt(cmd_ax*cmd_ax + cmd_ay*cmd_ay + cmd_az*cmd_az);
+
+        // Clamp to Max Thrust
+        if (thrust_mag > 1.0) {
+            double scale = 1.0 / thrust_mag;
+            cmd_ax *= scale;
+            cmd_ay *= scale;
+            cmd_az *= scale;
+        }
+
+        // Check Fuel
+        if (fuel <= 0.0) {
+            cmd_ax = 0.0; cmd_ay = 0.0; cmd_az = 0.0;
+        }
+
+        // 4. Compute Angular Commands
+        // Pitch: maps to rotation around X-axis.
+        // Yaw: maps to rotation around Z-axis.
+        // Thrust vector is (cmd_ax, cmd_ay, cmd_az).
+        
+        // Pitch cmd (-1 to 1) corresponds to angle -pi/2 to pi/2
+        // arctan2(x, z)
+        double pitch_angle = atan2(cmd_ax, cmd_az);
+        // Clamp to range -pi/2 to pi/2
+        if (pitch_angle > M_PI/2) pitch_angle = M_PI/2;
+        if (pitch_angle < -M_PI/2) pitch_angle = -M_PI/2;
+        double pitch_cmd = pitch_angle / (M_PI / 2.0);
+
+        // Yaw cmd (-1 to 1)
+        // arctan2(y, z) or arctan2(y, x) if using Z-up?
+        // Standard convention: Yaw is around Z. 
+        // If we are pointing Up (0,0,1), we want yaw 0.
+        // If we point Right (+x), yaw should be 0 (or -pi/2 depending on definition).
+        // Let's use atan2(y, x) projected onto XY plane for direction, 
+        // but since we have magnitude, we just need direction.
+        // Actually, standard ship yaw 0 is usually North or East.
+        // Let's assume standard math: Yaw is angle from +X (East) towards +Y (North) in XY plane.
+        // Vector is (cmd_ax, cmd_ay).
+        double yaw_angle = atan2(cmd_ay, cmd_ax);
+        double yaw_cmd = yaw_angle / (M_PI / 2.0); // Map to -1..1 roughly
+
+        // Roll cmd: cosmetic, just stabilize or set to 0.
+        double roll_cmd = 0.0;
+
+        // 5. Output
+        printf("%.4f %.4f %.4f %.4f\n", thrust_mag, pitch_cmd, yaw_cmd, roll_cmd);
+        fflush(stdout);
+    }
+}
+
+int main() {
+    // Set high precision timer
+    #ifdef _WIN32
+    timeBeginPeriod(1);
+    #endif
+
+    // 1. Parse Header
+    // Format: width depth height gravity max_thrust fuel
+    // start_x start_y start_z target_x target_y target_z
+    // terrain_file_path
+    // STATE
+    
+    // Read integers and floats
+    int width, depth, height;
+    double gravity, max_thrust, fuel;
+    double sx, sy, sz, tx, ty, tz;
+
+    // We use scanf for header as well, but we need to read the path line carefully.
+    // Since scanf skips whitespace, we can use it.
+    // We need to detect the "STATE" line to switch from parsing header to parsing state.
+    
+    // However, we don't know where the path is until we parse the numbers.
+    // The input format separates numbers from the path.
+    
+    // Let's parse the numbers first.
+    int parsed = scanf("%d %d %d %lf %lf %lf %lf %lf %lf %lf %lf %lf", 
+                       &width, &depth, &height, &gravity, &max_thrust, &fuel,
+                       &sx, &sy, &sz, &tx, &ty, &tz);
+    
+    if (parsed != 12) {
+        // Error parsing header
+        return 1;
+    }
+
+    g_config.width = width;
+    g_config.depth = depth;
+    g_config.height = height;
+    g_config.gravity = gravity;
+    g_config.max_thrust = max_thrust;
+    g_config.fuel = fuel;
+    g_config.start_x = sx; g_config.start_y = sy; g_config.start_z = sz;
+    g_config.target_x = tx; g_config.target_y = ty; g_config.target_z = tz;
+
+    // Read Terrain Path Line
+    char path_buffer[1024];
+    std::getline(std::cin, g_config.terrain_path);
+
+    // Read "STATE"
+    char state_str[10];
+    std::cin >> state_str;
+
+    // 2. Launch Terrain Loader
+    std::thread loader(LoadTerrainThread);
+    loader.detach(); // Detach so we can run main logic immediately (grace period handles wait)
+
+    // 3. Run Control Loop
+    ControlLoop();
+
+    #ifdef _WIN32
+    timeEndPeriod(1);
+    #endif
+
+    return 0;
+}
+```

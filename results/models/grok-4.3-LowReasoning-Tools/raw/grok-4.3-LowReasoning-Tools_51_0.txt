@@ -1,0 +1,206 @@
+```python
+import math
+
+# Module-level persistence (survives across calls within a scenario)
+_prev_alt_err = 0.0
+_prev_hdg_err = 0.0
+_prev_ias_err = 0.0
+_int_alt = 0.0
+_int_hdg = 0.0
+_int_ias = 0.0
+_last_trim = 0.0
+_last_flaps = 0.0
+_last_gear = 1.0
+_last_speedbrake = 0.0
+
+def _safe_median(vals):
+    """Return median of list, ignoring None/NaN"""
+    clean = [v for v in vals if v is not None and not math.isnan(v)]
+    if not clean:
+        return 0.0
+    clean.sort()
+    n = len(clean)
+    mid = n // 2
+    if n % 2:
+        return clean[mid]
+    return (clean[mid-1] + clean[mid]) / 2
+
+def _fused_alt(state):
+    """Robust baro + GPS + radar fusion with validity cross-check"""
+    b1 = state.get('baro_alt_1_ft') if state.get('baro_alt_1_valid', False) else None
+    b2 = state.get('baro_alt_2_ft') if state.get('baro_alt_2_valid', False) else None
+    b3 = state.get('baro_alt_3_ft') if state.get('baro_alt_3_valid', False) else None
+    g1 = state.get('gps_1_alt_ft') if state.get('gps_1_valid', False) else None
+    r1 = state.get('radar_alt_1_ft') if state.get('radar_alt_1_valid', False) else None
+    
+    baro_vals = [v for v in [b1, b2, b3] if v is not None]
+    gps_vals = [v for v in [g1] if v is not None]
+    
+    if len(baro_vals) >= 2:
+        return _safe_median(baro_vals)
+    elif baro_vals:
+        return baro_vals[0]
+    elif gps_vals:
+        return gps_vals[0]
+    elif r1 is not None:
+        return r1
+    return state.get('baro_alt_1_ft', 5000.0)
+
+def _fused_ias(state):
+    i1 = state.get('ias_1_kt') if state.get('ias_1_valid', False) else None
+    i2 = state.get('ias_2_kt') if state.get('ias_2_valid', False) else None
+    i3 = state.get('ias_3_kt') if state.get('ias_3_valid', False) else None
+    return _safe_median([i1, i2, i3]) or 250.0
+
+def _fused_heading(state):
+    h1 = state.get('irs_1_heading_deg')
+    h2 = state.get('irs_2_heading_deg')
+    h3 = state.get('irs_3_heading_deg')
+    gps_h = state.get('gps_1_track_deg')
+    vals = [v for v in [h1, h2, h3, gps_h] if v is not None]
+    if not vals:
+        return 0.0
+    # Circular mean
+    rads = [math.radians(v) for v in vals]
+    avg_sin = sum(math.sin(r) for r in rads) / len(rads)
+    avg_cos = sum(math.cos(r) for r in rads) / len(rads)
+    return math.degrees(math.atan2(avg_sin, avg_cos)) % 360
+
+def _fused_pitch_roll(state):
+    p1, p2, p3 = state.get('irs_1_pitch_deg', 0), state.get('irs_2_pitch_deg', 0), state.get('irs_3_pitch_deg', 0)
+    r1, r2, r3 = state.get('irs_1_roll_deg', 0), state.get('irs_2_roll_deg', 0), state.get('irs_3_roll_deg', 0)
+    return (_safe_median([p1,p2,p3]), _safe_median([r1,r2,r3]))
+
+def autopilot_step(state: dict, dt: float) -> dict:
+    global _prev_alt_err, _prev_hdg_err, _prev_ias_err
+    global _int_alt, _int_hdg, _int_ias
+    global _last_trim, _last_flaps, _last_gear, _last_speedbrake
+    
+    dt = max(dt, 0.01)
+    
+    # === SENSOR FUSION ===
+    alt = _fused_alt(state)
+    ias = _fused_ias(state)
+    hdg = _fused_heading(state)
+    pitch, roll = _fused_pitch_roll(state)
+    vs = state.get('vertical_speed_fpm', 0.0)
+    mach = state.get('mach_1', 0.0)
+    n1_1 = state.get('engine_1_n1_pct', 80.0)
+    n1_2 = state.get('engine_2_n1_pct', 80.0)
+    
+    # Targets
+    tgt_alt = state.get('target_alt_ft', alt)
+    tgt_hdg = state.get('target_hdg_deg', hdg) % 360
+    tgt_ias = state.get('target_ias_kt', ias)
+    
+    ap_on = bool(state.get('ap_engaged', True))
+    at_on = bool(state.get('at_engaged', True))
+    
+    # === SAFETY LIMITS ===
+    if ias > 360 or mach > 0.80:
+        # Overspeed protection
+        speedbrake_cmd = min(1.0, (ias - 355) / 30.0)
+        throttle_cmd = 0.0
+    else:
+        speedbrake_cmd = 0.0
+    
+    # === ALTITUDE / VS CONTROL (Elevator) ===
+    alt_err = tgt_alt - alt
+    vs_target = max(-2000, min(2000, alt_err * 0.8))   # simple VS demand
+    
+    vs_err = vs_target - vs
+    _int_alt = max(-300, min(300, _int_alt + vs_err * dt * 0.0008))
+    
+    pitch_cmd = 0.0
+    if ap_on:
+        pitch_cmd = (vs_err * 0.008 + _int_alt) * 0.6
+        pitch_cmd += (alt_err * 0.0006)           # outer loop
+        pitch_cmd = max(-12.0, min(15.0, pitch_cmd))
+    
+    # Elevator command (relative to trim)
+    elevator = pitch_cmd * 0.12
+    elevator = max(-1.0, min(1.0, elevator))
+    
+    # === HEADING / ROLL CONTROL (Aileron) ===
+    hdg_err = ((tgt_hdg - hdg + 180) % 360) - 180
+    _int_hdg = max(-30, min(30, _int_hdg + hdg_err * dt * 0.02))
+    
+    bank_cmd = 0.0
+    if ap_on:
+        bank_cmd = hdg_err * 1.8 + _int_hdg * 0.4
+        bank_cmd = max(-25.0, min(25.0, bank_cmd))
+    
+    aileron = bank_cmd * 0.035
+    aileron = max(-1.0, min(1.0, aileron))
+    
+    # Rudder: simple yaw damper + coordinated turn
+    yaw_rate = state.get('gyro_1_yaw_rate_dps', 0.0)
+    rudder = -yaw_rate * 0.04
+    if abs(bank_cmd) > 5:
+        rudder += math.sin(math.radians(bank_cmd)) * 0.15   # coordination
+    rudder = max(-0.6, min(0.6, rudder))
+    
+    # === SPEED / THRUST ===
+    ias_err = tgt_ias - ias
+    _int_ias = max(-50, min(50, _int_ias + ias_err * dt * 0.015))
+    
+    throttle_cmd = 0.65
+    if at_on:
+        throttle_cmd = 0.55 + (ias_err * 0.004 + _int_ias * 0.003)
+        throttle_cmd = max(0.15, min(0.95, throttle_cmd))
+    
+    # Asymmetric thrust protection (engine failure)
+    if n1_1 < 40 and n1_2 > 70:
+        throttle_cmd = min(throttle_cmd, 0.75)
+        rudder = max(rudder, 0.25)
+    elif n1_2 < 40 and n1_1 > 70:
+        throttle_cmd = min(throttle_cmd, 0.75)
+        rudder = min(rudder, -0.25)
+    
+    # === CONFIGURATION MANAGEMENT ===
+    # Flaps
+    if alt < 1500:
+        flaps_cmd = 20.0
+    elif alt < 5000:
+        flaps_cmd = 10.0
+    else:
+        flaps_cmd = 0.0
+    
+    # Gear
+    if alt < 800 and ias < 200:
+        gear_cmd = 1.0
+    elif alt > 1200:
+        gear_cmd = 0.0
+    else:
+        gear_cmd = _last_gear
+    
+    # Trim: very slow adjustment toward zero elevator demand
+    trim_rate = 0.008 * dt
+    desired_trim = _last_trim - elevator * 0.15
+    trim_cmd = _last_trim + max(-trim_rate, min(trim_rate, desired_trim - _last_trim))
+    trim_cmd = max(-0.8, min(0.8, trim_cmd))
+    
+    # === FINAL OUTPUT ===
+    controls = {
+        'elevator': round(elevator, 4),
+        'aileron': round(aileron, 4),
+        'rudder': round(rudder, 4),
+        'throttle_1': round(throttle_cmd, 4),
+        'throttle_2': round(throttle_cmd, 4),
+        'elevator_trim': round(trim_cmd, 4),
+        'flaps': round(flaps_cmd, 1),
+        'speedbrake': round(speedbrake_cmd, 3),
+        'gear': int(gear_cmd)
+    }
+    
+    # Update persistence
+    _prev_alt_err = alt_err
+    _prev_hdg_err = hdg_err
+    _prev_ias_err = ias_err
+    _last_trim = trim_cmd
+    _last_flaps = flaps_cmd
+    _last_gear = gear_cmd
+    _last_speedbrake = speedbrake_cmd
+    
+    return controls
+```

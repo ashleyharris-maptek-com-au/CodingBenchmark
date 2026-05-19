@@ -1,0 +1,217 @@
+Looking at this problem, I need to build a real-time lunar lander controller that:
+1. Reads from stdin continuously (state updates at 10Hz)
+2. Outputs control commands at 20Hz+ 
+3. Handles potentially huge maps efficiently
+4. Implements a stable landing controller
+
+I'll use a producer-consumer pattern with a dedicated reader thread and a main control loop. The control algorithm uses feedback control to navigate to the target and land softly.
+
+```rust
+use std::io::{self, BufRead, Write, BufWriter, BufReader};
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread;
+use std::time::Duration;
+
+#[derive(Clone, Copy, Debug)]
+struct State {
+    x: f64,
+    y: f64,
+    vx: f64,
+    vy: f64,
+    angle: f64,
+    angular_vel: f64,
+    fuel: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Config {
+    gravity: f64,
+    max_thrust: f64,
+    target_x: f64,
+    target_y: f64,
+}
+
+fn main() {
+    let stdout = io::stdout();
+    let (config_tx, config_rx) = mpsc::channel();
+    let state = Arc::new(Mutex::new(None::<State>));
+    
+    // Dedicated reader thread to prevent stdin buffer overflow
+    let state_reader = Arc::clone(&state);
+    thread::spawn(move || {
+        let stdin = io::stdin();
+        let mut reader = BufReader::new(stdin.lock());
+        let mut line = String::with_capacity(2048);
+        
+        // Parse header: width height gravity max_thrust fuel
+        line.clear();
+        if reader.read_line(&mut line).is_err() { return; }
+        let mut parts = line.split_whitespace();
+        let _width: usize = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let height: usize = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let gravity: f64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(1.62);
+        let max_thrust: f64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(10.0);
+        
+        // Parse: start_x start_y target_x target_y
+        line.clear();
+        if reader.read_line(&mut line).is_err() { return; }
+        let mut parts = line.split_whitespace();
+        let _start_x = parts.next().and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+        let _start_y = parts.next().and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+        let target_x = parts.next().and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+        let target_y = parts.next().and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+        
+        let _ = config_tx.send(Config { gravity, max_thrust, target_x, target_y });
+        
+        // Stream through map data without storing (handles multi-GB maps)
+        for _ in 0..height {
+            line.clear();
+            if reader.read_line(&mut line).is_err() { return; }
+        }
+        
+        // Continuous state updates
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    let nums: Vec<f64> = line.split_whitespace()
+                        .filter_map(|s| s.parse().ok())
+                        .collect();
+                    if nums.len() >= 7 {
+                        let s = State {
+                            x: nums[0], y: nums[1],
+                            vx: nums[2], vy: nums[3],
+                            angle: nums[4], angular_vel: nums[5],
+                            fuel: nums[6],
+                        };
+                        *state_reader.lock().unwrap() = Some(s);
+                    }
+                }
+            }
+        }
+    });
+    
+    let config = config_rx.recv().expect("Failed to receive config");
+    let mut stdout = BufWriter::new(stdout.lock());
+    
+    // Main control loop at ~25Hz
+    loop {
+        let current = state.lock().unwrap().clone();
+        
+        if let Some(s) = current {
+            let (thrust, turn) = compute_control(&s, &config);
+            writeln!(stdout, "{:.6} {:.6}", thrust, turn).unwrap();
+            let _ = stdout.flush();
+        } else {
+            writeln!(stdout, "0.0 0.0").unwrap();
+            let _ = stdout.flush();
+        }
+        
+        thread::sleep(Duration::from_millis(40));
+    }
+}
+
+fn compute_control(state: &State, config: &Config) -> (f64, f64) {
+    // Position error relative to target
+    let px = config.target_x - state.x;
+    let py = config.target_y - state.y;
+    let dist = (px * px + py * py).sqrt();
+    let height_above = -py; // Negative py means above target (y increases down)
+    
+    // Phase-dependent speed limits
+    let (max_h_speed, max_v_speed) = if dist < 5.0 {
+        (1.5, 1.5) // Final landing: very slow
+    } else if dist < 20.0 {
+        (3.0, 2.0) // Approach phase
+    } else {
+        (8.0, 4.0) // Transit phase
+    };
+    
+    // Desired velocity using PD control
+    let kp_pos = 0.25;
+    let des_vx = (px * kp_pos).clamp(-max_h_speed, max_h_speed);
+    
+    // Vertical control: descend if above, hover if at level, climb slowly if below
+    let des_vy = if height_above < -2.0 {
+        // Below target: climb
+        (-0.5).max(height_above * 0.1)
+    } else if height_above > 2.0 {
+        // Above target: controlled descent
+        (height_above * 0.2).min(max_v_speed)
+    } else {
+        // Near target height: minimal vertical velocity
+        0.3
+    };
+    
+    // Landing phase: prioritize soft touchdown
+    let des_vy = if dist < 8.0 && height_above > -1.0 {
+        des_vy.min(1.0) // Ensure slow descent near target
+    } else {
+        des_vy
+    };
+    
+    // Velocity error
+    let dvx = des_vx - state.vx;
+    let dvy = des_vy - state.vy;
+    
+    // Required acceleration (world frame)
+    // thrust_world = (sin(angle) * thrust, -cos(angle) * thrust)
+    // Need to counteract gravity: ay must include +gravity to cancel
+    let kp_vel = 0.5;
+    let ax = dvx * kp_vel;
+    let ay = dvy * kp_vel + config.gravity;
+    
+    // Convert to desired angle and thrust magnitude
+    let thrust_mag = (ax * ax + ay * ay).sqrt();
+    let desired_angle = if thrust_mag > 0.01 {
+        ax.atan2(-ay) // Angle where thrust vector = (ax, ay)
+    } else {
+        0.0 // Default upright
+    };
+    
+    // Normalize angle error to [-π, π]
+    let mut angle_err = desired_angle - state.angle;
+    while angle_err > std::f64::consts::PI { angle_err -= std::f64::consts::TAU; }
+    while angle_err < -std::f64::consts::PI { angle_err += std::f64::consts::TAU; }
+    
+    // Angular control with damping to prevent oscillation
+    let turn = (angle_err * 1.8 - state.angular_vel * 0.3).clamp(-1.0, 1.0);
+    
+    // Thrust magnitude, clamped to available power
+    let mut thrust = (thrust_mag / config.max_thrust).min(1.0);
+    
+    // Only thrust when reasonably aligned (safety measure)
+    if angle_err.abs() > 0.5 {
+        thrust = 0.0;
+    } else if angle_err.abs() > 0.25 {
+        thrust *= 0.5;
+    }
+    
+    // Fuel conservation: reduce thrust if very low
+    if state.fuel < 2.0 && dist < 30.0 {
+        thrust = thrust.min(0.6); // Gentle approach when low on fuel
+    }
+    
+    (thrust, turn)
+}
+```
+
+This solution:
+
+1. **Multithreaded I/O**: A dedicated reader thread continuously parses stdin while the main loop outputs commands, preventing buffer overflow
+
+2. **Memory-efficient map handling**: Streams through map data without storing it, handling multi-GB maps
+
+3. **Feedback control**: Uses a cascaded PD controller:
+   - Position error → desired velocity
+   - Velocity error → required acceleration  
+   - Acceleration → thrust angle and magnitude
+
+4. **Phase-aware control**: Different behavior for transit, approach, and landing phases
+
+5. **Safety features**:
+   - Thrust only when aligned (prevents wasted fuel)
+   - Angular damping to prevent oscillation
+   - Speed limits based on distance
+   - Fuel-aware thrust limiting

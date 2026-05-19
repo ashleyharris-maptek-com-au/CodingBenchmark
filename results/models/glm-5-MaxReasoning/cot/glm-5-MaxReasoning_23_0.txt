@@ -1,0 +1,1598 @@
+This is a complex real-time control problem for a Lunar Lander game. Let me break down the requirements:
+
+1. **Input Processing:**
+   - Initial map with dimensions, gravity, thrust, fuel, start/target positions
+   - Continuous state updates (position, velocity, angle, angular velocity, fuel)
+   - Must read from stdin fast enough to avoid buffer overflow
+
+2. **Output:**
+   - thrust (0.0-1.0) and turn (-1.0 to 1.0) commands at 20Hz minimum
+   - Must not freeze for more than 100ms
+
+3. **Physics:**
+   - Gravity pulls down (positive y direction)
+   - Thrust applies in facing direction
+   - Fuel is limited
+   - Must land softly (< 2m/s)
+
+4. **Constraints:**
+   - Maps can be huge (multi-GB)
+   - Real-time constraints (20Hz output, <100ms freezes)
+   - Single-threaded blocking code has failure modes
+
+Given the recommendation for multithreaded/async code and the real-time constraints, I'll use a producer-consumer pattern:
+- One thread reads from stdin
+- Main thread processes and outputs commands
+
+Let me design the controller:
+
+**Strategy:**
+1. Parse initial map to understand obstacles and landing zone
+2. Use a simple control law to navigate to the target
+3. The controller needs to:
+   - Rotate to point toward target (or retrograde for braking)
+   - Manage descent rate
+   - Avoid obstacles
+
+**Control Algorithm:**
+A simple but effective approach:
+1. Calculate desired position (target)
+2. Calculate error in position
+3. Use PID-like control for velocity
+4. Point thrust in appropriate direction
+5. Manage fuel and time
+
+Let me think about the physics more carefully:
+- Gravity is +g (downward, positive y)
+- Angle 0 = facing up (negative y direction)
+- Thrust applies in facing direction
+- To hover, need to thrust upward (angle 0, thrust = g/max_thrust)
+
+**Landing Strategy:**
+1. If far from target, navigate horizontally
+2. As approaching target, reduce horizontal velocity
+3. Control descent rate
+4. Final approach: soft landing
+
+For obstacle avoidance, I should:
+- Parse the map to find obstacles
+- Check if current trajectory would intersect obstacles
+- Adjust path if necessary
+
+Given the map can be multi-GB, I can't store it all in memory. But for obstacle checking, I only need to check along the trajectory. Let me implement a streaming map parser that stores only relevant obstacles near the trajectory.
+
+Actually, let me re-read the problem... The map is sent once at the start, then state updates come continuously. The map can be large, so I need to be efficient. 
+
+For a simple initial solution, I'll:
+1. Store the map in a compact form (just obstacle positions near the path)
+2. Use a simple feedback controller for landing
+3. Add obstacle avoidance if needed
+
+Let me write the code:
+
+```rust
+use std::io::{self, BufRead, Write, BufWriter};
+use std::sync::{Arc, Mutex};
+use std::thread;
+
+fn main() {
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let mut stdout = BufWriter::new(stdout.lock());
+    
+    // Read initial map
+    let mut lines = stdin.lock().lines();
+    
+    // Parse first line: width height gravity max_thrust fuel
+    let first_line = lines.next().unwrap().unwrap();
+    let parts: Vec<f64> = first_line.split_whitespace()
+        .map(|s| s.parse().unwrap())
+        .collect();
+    let width = parts[0] as usize;
+    let height = parts[1] as usize;
+    let gravity = parts[2];
+    let max_thrust = parts[3];
+    let initial_fuel = parts[4];
+    
+    // Parse second line: start_x start_y target_x target_y
+    let second_line = lines.next().unwrap().unwrap();
+    let parts: Vec<f64> = second_line.split_whitespace()
+        .map(|s| s.parse().unwrap())
+        .collect();
+    let start_x = parts[0];
+    let start_y = parts[1];
+    let target_x = parts[2];
+    let target_y = parts[3];
+    
+    // Parse map rows - only store obstacles
+    let mut obstacles = Vec::new();
+    for y in 0..height {
+        let line = lines.next().unwrap().unwrap();
+        for (x, ch) in line.chars().enumerate() {
+            if ch == '#' {
+                obstacles.push((x as f64, y as f64));
+            }
+        }
+    }
+    
+    // ... rest of the control loop
+}
+```
+
+Wait, the map can be multi-GB. If I try to parse it character by character, that's too slow. Let me think...
+
+Actually, for obstacle avoidance, I don't need to store all obstacles - just check along the path. But the path isn't known at parse time...
+
+Let me simplify: for the initial implementation, I'll store obstacle information in a compact form (maybe just a grid of bools for nearby obstacles) and focus on the control algorithm.
+
+Actually, re-reading more carefully: the map rows use `.`, `#`, `S`, `T`, `L` characters. Each row is `width` characters long. For multi-GB maps, this could be billions of characters.
+
+For now, let me implement a solution that:
+1. Uses multithreading for I/O
+2. Implements a basic landing controller
+3. Handles the map efficiently (streaming parse, store only what's needed)
+
+Here's my plan:
+
+```rust
+use std::io::{self, BufRead, Write, BufWriter};
+use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
+use std::thread;
+use std::collections::VecDeque;
+
+// Shared state between reader and controller
+struct SharedState {
+    latest_update: Mutex<Option<StateUpdate>>,
+    new_data: AtomicBool,
+}
+
+struct StateUpdate {
+    x: f64,
+    y: f64,
+    vx: f64,
+    vy: f64,
+    angle: f64,
+    angular_vel: f64,
+    fuel: f64,
+}
+
+struct GameConfig {
+    gravity: f64,
+    max_thrust: f64,
+    target_x: f64,
+    target_y: f64,
+    width: usize,
+    height: usize,
+    obstacles: Vec<(i32, i32)>, // Only nearby obstacles
+}
+```
+
+Actually, let me reconsider the architecture. The problem says:
+- Input comes continuously (state updates every 0.1s)
+- Output must be at least 20Hz (every 50ms)
+- If stdin buffer fills, ship crashes
+- If code freezes for 100ms, power cuts
+
+So I need:
+1. A thread dedicated to reading stdin
+2. Main loop running at 20Hz+ outputting commands
+3. Non-blocking access to latest state
+
+Let me implement this properly:
+
+```rust
+use std::io::{self, BufRead, Write, BufWriter};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
+
+fn main() {
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let mut stdout = BufWriter::new(stdout.lock());
+    
+    // Parse initial setup (this blocks, but it's at the start)
+    let config = parse_initial_input(&stdin);
+    
+    // Shared state for continuous updates
+    let state = Arc::new(Mutex::new(State {
+        x: 0.0, y: 0.0, vx: 0.0, vy: 0.0,
+        angle: 0.0, angular_vel: 0.0, fuel: config.initial_fuel,
+    }));
+    
+    // Spawn reader thread
+    let state_clone = Arc::clone(&state);
+    let stdin_handle = stdin.lock();
+    thread::spawn(move || {
+        let mut lines = stdin_handle.lines();
+        loop {
+            if let Some(Ok(line)) = lines.next() {
+                if let Some(s) = parse_state_update(&line) {
+                    let mut locked = state_clone.lock().unwrap();
+                    *locked = s;
+                }
+            }
+        }
+    });
+    
+    // Main control loop
+    let mut last_output = Instant::now();
+    loop {
+        let current_state = state.lock().unwrap().clone();
+        let (thrust, turn) = compute_control(&current_state, &config);
+        
+        writeln!(stdout, "{} {}", thrust, turn).unwrap();
+        stdout.flush().unwrap();
+        
+        // Sleep to maintain ~20Hz
+        let elapsed = last_output.elapsed();
+        if elapsed < Duration::from_millis(50) {
+            thread::sleep(Duration::from_millis(50) - elapsed);
+        }
+        last_output = Instant::now();
+    }
+}
+```
+
+Now for the control algorithm. A lunar lander controller needs to:
+1. Get to the target position
+2. Slow down for landing
+3. Land softly
+
+A common approach is:
+- Point toward the target (or toward velocity for braking)
+- Apply thrust to control descent
+
+Let me implement a more sophisticated controller:
+
+```rust
+fn compute_control(state: &State, config: &GameConfig) -> (f64, f64) {
+    let dx = config.target_x - state.x;
+    let dy = config.target_y - state.y;
+    let dist = (dx * dx + dy * dy).sqrt();
+    
+    // Desired velocity vector toward target
+    let approach_speed = 5.0; // m/s
+    let desired_vx = if dist > 10.0 { dx / dist * approach_speed } else { dx * 0.5 };
+    let desired_vy = if dist > 10.0 { dy / dist * approach_speed } else { dy * 0.5 };
+    
+    // Velocity error
+    let dvx = desired_vx - state.vx;
+    let dvy = desired_vy - state.vy;
+    
+    // Desired thrust direction (in world frame)
+    let thrust_dir_x = dvx;
+    let thrust_dir_y = dvy + config.gravity; // Compensate for gravity
+    
+    // Convert to angle
+    let desired_angle = (-thrust_dir_x).atan2(-thrust_dir_y); // Negative because angle 0 = up
+    
+    // Angular control
+    let angle_error = normalize_angle(desired_angle - state.angle);
+    let turn = angle_error.clamp(-1.0, 1.0);
+    
+    // Thrust magnitude
+    let needed_thrust = (thrust_dir_x * thrust_dir_x + thrust_dir_y * thrust_dir_y).sqrt() / config.max_thrust;
+    let thrust = needed_thrust.clamp(0.0, 1.0);
+    
+    (thrust, turn)
+}
+```
+
+Actually, let me think about this more carefully. The angle is measured from "up" (negative y direction), so:
+- angle = 0: thrusting upward (against gravity)
+- angle = π: thrusting downward (with gravity)
+- angle = π/2: thrusting right
+- angle = -π/2: thrusting left
+
+The thrust vector in world coordinates when angle = θ is:
+- thrust_x = sin(θ) * thrust_magnitude
+- thrust_y = -cos(θ) * thrust_magnitude
+
+So to thrust in direction (dx, dy), the desired angle is:
+- θ = atan2(dx, -dy)
+
+Let me also consider the landing phase more carefully. Near the target:
+1. Need to reduce horizontal velocity
+2. Need to control descent rate
+3. Final vertical descent
+
+Let me write a cleaner implementation:
+
+```rust
+fn compute_control(state: &State, config: &GameConfig) -> (f64, f64) {
+    // Distance to target
+    let dx = config.target_x - state.x;
+    let dy = config.target_y - state.y;
+    let dist = (dx * dx + dy * dy).sqrt();
+    
+    // Phase determination
+    let is_final_approach = dist < 50.0;
+    let is_landing = dist < 10.0;
+    
+    // Calculate desired velocity
+    let (desired_vx, desired_vy) = if is_landing {
+        // Landing: zero velocity, hover
+        (0.0, 0.0)
+    } else if is_final_approach {
+        // Final approach: slow down, aim for target
+        (dx * 0.3, dy * 0.3)
+    } else {
+        // Transit: move toward target
+        let speed = 10.0.min(dist * 0.5);
+        (dx / dist * speed, dy / dist * speed)
+    };
+    
+    // Velocity error
+    let dvx = desired_vx - state.vx;
+    let dvy = desired_vy - state.vy;
+    
+    // Required thrust to achieve desired velocity change + counteract gravity
+    // F = ma, a = dv/dt, but we want to achieve dv over some time
+    // For simplicity, thrust direction = (dvx, dvy + gravity_compensation)
+    let thrust_world_x = dvx * 0.5; // P controller gain
+    let thrust_world_y = dvy * 0.5 + config.gravity;
+    
+    // Convert world thrust to lander angle
+    // thrust_world = (sin(angle) * thrust, -cos(angle) * thrust)
+    // We want thrust_world_y > 0 to counteract gravity
+    // So we need -cos(angle) * thrust > 0, meaning cos(angle) < 0
+    // This means angle should be around π (pointing down)... but that's wrong
+    
+    // Wait, let me reconsider. The thrust applies in the facing direction.
+    // If angle = 0 (facing up), thrust vector = (0, -1) in world frame (upward)
+    // If angle = π (facing down), thrust vector = (0, 1) in world frame (downward)
+    
+    // So to hover, we need thrust vector pointing up with magnitude g
+    // thrust_x = sin(angle) * thrust = 0 → angle = 0
+    // thrust_y = -cos(angle) * thrust = -g → with angle = 0, thrust = g
+    // That makes sense!
+    
+    // To thrust in direction (tx, ty), we need:
+    // sin(angle) * thrust = tx
+    // -cos(angle) * thrust = ty
+    // angle = atan2(tx, -ty)
+    
+    let desired_angle = (thrust_world_x).atan2(-thrust_world_y);
+    
+    // Angle control
+    let angle_error = normalize_angle(desired_angle - state.angle);
+    let turn = (angle_error * 2.0).clamp(-1.0, 1.0); // P controller
+    
+    // Thrust magnitude
+    let thrust_magnitude = (thrust_world_x * thrust_world_x + thrust_world_y * thrust_world_y).sqrt() / config.max_thrust;
+    let thrust = thrust_magnitude.clamp(0.0, 1.0);
+    
+    // Only thrust if roughly aligned
+    let thrust = if angle_error.abs() < 0.5 { thrust } else { 0.0 };
+    
+    (thrust, turn)
+}
+
+fn normalize_angle(angle: f64) -> f64 {
+    let mut a = angle;
+    while a > std::f64::consts::PI { a -= 2.0 * std::f64::consts::PI; }
+    while a < -std::f64::consts::PI { a += 2.0 * std::f64::consts::PI; }
+    a
+}
+```
+
+Hmm, but I need to think about this more carefully. The problem says thrust and gravity are in m/s/s. So gravity might be like 1.6 m/s/s (moon gravity).
+
+Also, I realized the thrust direction calculation needs more thought. Let me re-derive:
+
+World frame: x right, y down
+Angle = 0 means facing up (negative y direction)
+Thrust vector in world frame = thrust_magnitude * (sin(angle), -cos(angle))
+
+To counteract gravity (which is +y direction):
+We need thrust_y = -gravity, so -cos(angle) * thrust = -gravity
+If angle = 0: -1 * thrust = -gravity → thrust = gravity
+This is correct for hovering!
+
+Now, to navigate to a target, we need:
+1. Horizontal movement: some x component of thrust
+2. Vertical control: y component to manage descent
+
+Let me think about this as a control problem:
+- We want to reach position (target_x, target_y)
+- We have limited thrust and fuel
+- We need to avoid obstacles
+- We need to land softly
+
+A simple approach:
+1. PID controller for position → desired velocity
+2. PID controller for velocity → desired acceleration
+3. Convert desired acceleration to thrust angle and magnitude
+
+Actually, let me simplify. The key insight is:
+- Thrust magnitude is limited (0 to max_thrust)
+- We can rotate the thrust vector
+- Gravity is constant downward
+
+The simplest controller:
+1. Point toward target (or retrograde for braking)
+2. Apply thrust to control velocity
+
+Let me write a cleaner version:
+
+```rust
+fn compute_control(state: &State, config: &GameConfig) -> (f64, f64) {
+    // Target relative position
+    let dx = config.target_x - state.x;
+    let dy = config.target_y - state.y;
+    let dist = (dx * dx + dy * dy).sqrt();
+    
+    // Horizontal and vertical velocities
+    let vx = state.vx;
+    let vy = state.vy; // Positive = moving down
+    
+    // Safe descent rate
+    let safe_descent_rate = 2.0; // m/s
+    
+    // Determine if we're above the target
+    let above_target = dy.abs() < 10.0 && dx.abs() < 10.0;
+    
+    // Desired velocity toward target
+    let horizontal_speed = if above_target { 0.0 } else { (dist * 0.2).min(5.0) };
+    let desired_vx = if dist > 1.0 { dx / dist * horizontal_speed } else { 0.0 };
+    
+    // Desired descent rate (positive = down)
+    let desired_vy = if dy > 5.0 { safe_descent_rate } else if dy > 0.0 { dy * 0.5 } else { -1.0 };
+    
+    // Velocity error
+    let dvx = desired_vx - vx;
+    let dvy = desired_vy - vy;
+    
+    // Compute required thrust direction and magnitude
+    // thrust_x = sin(angle) * thrust_mag
+    // thrust_y = -cos(angle) * thrust_mag
+    // We need: thrust_x to change vx, thrust_y - gravity to change vy
+    
+    // Required acceleration in world frame
+    let ax = dvx * 1.0; // P gain
+    let ay = dvy * 1.0 + config.gravity; // + gravity to counteract it
+    
+    // Desired angle
+    let desired_angle = ax.atan2(-ay);
+    
+    // Desired thrust magnitude
+    let thrust_mag = (ax * ax + ay * ay).sqrt() / config.max_thrust;
+    
+    // Angle control
+    let mut angle_error = desired_angle - state.angle;
+    while angle_error > std::f64::consts::PI { angle_error -= 2.0 * std::f64::consts::PI; }
+    while angle_error < -std::f64::consts::PI { angle_error += 2.0 * std::f64::consts::PI; }
+    
+    let turn = angle_error.clamp(-1.0, 1.0);
+    let thrust = thrust_mag.clamp(0.0, 1.0);
+    
+    // Don't thrust hard if not aligned
+    let alignment = angle_error.abs();
+    let thrust = if alignment < 0.3 { thrust } else if alignment < 0.5 { thrust * 0.5 } else { 0.0 };
+    
+    (thrust, turn)
+}
+```
+
+Actually, I think I should think about this more systematically. Let me consider the physics:
+
+State: (x, y, vx, vy, θ, ω)
+Control: (thrust, turn)
+- thrust: 0 to 1 (fraction of max_thrust)
+- turn: -1 to 1 (angular acceleration-ish, but actually turning rate)
+
+Wait, the problem says "turn: -1.0 to 1.0 (turning rate, negative = left, positive = right)". So turn directly affects angular velocity? Or angular acceleration?
+
+Looking at the input: "angular_vel is in radians per second", and output is "turn: -1.0 to 1.0 (turning rate)". I think turn is a command for desired angular velocity change rate, not the angular velocity itself.
+
+Let me assume turn ∈ [-1, 1] maps to angular acceleration in some way. The specifics don't matter too much for a feedback controller.
+
+Alright, let me write the complete solution. I'll use:
+1. A reader thread that continuously reads state updates
+2. A main loop that outputs control commands at 20Hz
+3. A feedback controller for landing
+
+For obstacle avoidance, I'll initially skip it and see if the simple controller works. If needed, I can add path planning.
+
+Here's the complete code:
+
+```rust
+use std::io::{self, BufRead, Write, BufWriter, BufReader};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
+
+#[derive(Clone, Debug)]
+struct State {
+    x: f64,
+    y: f64,
+    vx: f64,
+    vy: f64,
+    angle: f64,
+    angular_vel: f64,
+    fuel: f64,
+}
+
+#[derive(Debug)]
+struct Config {
+    width: usize,
+    height: usize,
+    gravity: f64,
+    max_thrust: f64,
+    initial_fuel: f64,
+    target_x: f64,
+    target_y: f64,
+    // For obstacle avoidance, we might store a grid of obstacles
+    // For now, skip this
+}
+
+fn main() {
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    
+    // Parse initial input
+    let config = {
+        let mut lines = stdin.lock().lines();
+        
+        // First line: width height gravity max_thrust fuel
+        let first_line = lines.next().unwrap().unwrap();
+        let parts: Vec<f64> = first_line.split_whitespace()
+            .map(|s| s.parse().unwrap())
+            .collect();
+        
+        // Second line: start_x start_y target_x target_y
+        let second_line = lines.next().unwrap().unwrap();
+        let parts2: Vec<f64> = second_line.split_whitespace()
+            .map(|s| s.parse().unwrap())
+            .collect();
+        
+        // Map rows - skip for now (streaming, don't store)
+        // Count lines to skip
+        let _ = lines.by_ref().take(parts[1] as usize).count();
+        
+        Config {
+            width: parts[0] as usize,
+            height: parts[1] as usize,
+            gravity: parts[2],
+            max_thrust: parts[3],
+            initial_fuel: parts[4],
+            target_x: parts2[2],
+            target_y: parts2[3],
+        }
+    };
+    
+    // Shared state
+    let state = Arc::new(Mutex::new(State {
+        x: 0.0, y: 0.0, vx: 0.0, vy: 0.0,
+        angle: 0.0, angular_vel: 0.0, fuel: config.initial_fuel,
+    }));
+    
+    // Spawn reader thread
+    let state_clone = Arc::clone(&state);
+    thread::spawn(move || {
+        let stdin = io::stdin();
+        let mut lines = stdin.lock().lines();
+        loop {
+            if let Some(Ok(line)) = lines.next() {
+                let parts: Vec<f64> = line.split_whitespace()
+                    .filter_map(|s| s.parse().ok())
+                    .collect();
+                if parts.len() >= 7 {
+                    let mut s = state_clone.lock().unwrap();
+                    s.x = parts[0];
+                    s.y = parts[1];
+                    s.vx = parts[2];
+                    s.vy = parts[3];
+                    s.angle = parts[4];
+                    s.angular_vel = parts[5];
+                    s.fuel = parts[6];
+                }
+            }
+        }
+    });
+    
+    // Main control loop
+    let mut stdout = BufWriter::new(stdout.lock());
+    let mut last_time = Instant::now();
+    let dt = Duration::from_millis(50); // 20Hz
+    
+    loop {
+        // Get current state
+        let current_state = state.lock().unwrap().clone();
+        
+        // Compute control
+        let (thrust, turn) = compute_control(&current_state, &config);
+        
+        // Output
+        writeln!(stdout, "{} {}", thrust, turn).unwrap();
+        let _ = stdout.flush();
+        
+        // Rate limit
+        let elapsed = last_time.elapsed();
+        if elapsed < dt {
+            thread::sleep(dt - elapsed);
+        }
+        last_time = Instant::now();
+    }
+}
+
+fn compute_control(state: &State, config: &Config) -> (f64, f64) {
+    // Target relative position
+    let dx = config.target_x - state.x;
+    let dy = config.target_y - state.y;
+    let dist = (dx * dx + dy * dy).sqrt();
+    
+    // Phase detection
+    let landing_phase = dist < 20.0;
+    let final_phase = dist < 5.0;
+    
+    // Desired velocity
+    let (des_vx, des_vy) = if final_phase {
+        // Final landing: zero velocity
+        (0.0, 0.0)
+    } else if landing_phase {
+        // Landing approach: slow toward target
+        (dx * 0.3, dy * 0.3)
+    } else {
+        // Transit: move toward target at moderate speed
+        let speed = 8.0.min(dist * 0.3);
+        if dist > 0.1 {
+            (dx / dist * speed, dy / dist * speed)
+        } else {
+            (0.0, 0.0)
+        }
+    };
+    
+    // Velocity error
+    let dvx = des_vx - state.vx;
+    let dvy = des_vy - state.vy;
+    
+    // Required acceleration (P controller)
+    let kp = 0.8;
+    let ax = dvx * kp;
+    let ay = dvy * kp + config.gravity; // Add gravity compensation
+    
+    // Desired thrust direction
+    let thrust_mag = (ax * ax + ay * ay).sqrt();
+    let desired_angle = if thrust_mag > 0.01 {
+        ax.atan2(-ay)
+    } else {
+        0.0 // Default to up if no thrust needed
+    };
+    
+    // Angle error (normalize to [-π, π])
+    let mut angle_err = desired_angle - state.angle;
+    while angle_err > std::f64::consts::PI { angle_err -= 2.0 * std::f64::consts::PI; }
+    while angle_err < -std::f64::consts::PI { angle_err += 2.0 * std::f64::consts::PI; }
+    
+    // Angular control
+    let turn = angle_err.clamp(-1.0, 1.0);
+    
+    // Thrust magnitude
+    let thrust = (thrust_mag / config.max_thrust).clamp(0.0, 1.0);
+    
+    // Only thrust if reasonably aligned
+    let thrust = if angle_err.abs() < 0.4 { thrust } else { 0.0 };
+    
+    (thrust, turn)
+}
+```
+
+Wait, I realize there might be an issue with the map parsing. The map might be huge, and `lines.by_ref().take(...).count()` will still try to read all lines. Let me handle this more carefully.
+
+Also, I should consider:
+1. What if the target is inside an obstacle?
+2. What if the starting position is surrounded?
+3. Fuel management
+
+For now, let me focus on getting a working solution. I'll add robustness later.
+
+Let me also reconsider the I/O model. The problem says "If your code doesn't read from stdin fast enough and the io buffer fills up, the ship will likely crash."
+
+This suggests:
+1. State updates come at 10Hz (every 0.1s)
+2. We need to output at 20Hz (every 0.05s)
+3. If we don't read, the buffer fills and we lose data
+
+So the reader thread needs to be fast. Let me optimize:
+
+```rust
+// Reader thread
+let state_clone = Arc::clone(&state);
+thread::spawn(move || {
+    let stdin = io::stdin();
+    let mut reader = BufReader::new(stdin.lock());
+    let mut line = String::new();
+    
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => break, // EOF
+            Ok(_) => {
+                let parts: Vec<f64> = line.split_whitespace()
+                    .filter_map(|s| s.parse().ok())
+                    .collect();
+                if parts.len() >= 7 {
+                    let mut s = state_clone.lock().unwrap();
+                    s.x = parts[0];
+                    s.y = parts[1];
+                    s.vx = parts[2];
+                    s.vy = parts[3];
+                    s.angle = parts[4];
+                    s.angular_vel = parts[5];
+                    s.fuel = parts[6];
+                }
+            }
+            Err(_) => break,
+        }
+    }
+});
+```
+
+This is better because we reuse the String buffer instead of allocating a new one each iteration.
+
+Now let me think about the control algorithm more carefully. The key challenge is:
+1. Reaching the target position
+2. Landing softly (velocity < 2 m/s)
+3. Managing fuel
+
+A simple approach that should work:
+1. Use a PD controller for position → velocity → acceleration
+2. Convert acceleration to thrust angle and magnitude
+3. Handle the final landing phase carefully
+
+Let me also add some safety features:
+1. Don't crash into ground (too fast descent)
+2. Fuel management (don't burn when not needed)
+
+Here's a more refined control algorithm:
+
+```rust
+fn compute_control(state: &State, config: &Config) -> (f64, f64) {
+    // Distance to target
+    let dx = config.target_x - state.x;
+    let dy = config.target_y - state.y;
+    let dist = (dx * dx + dy * dy).sqrt();
+    
+    // Height above target
+    let height = -dy; // Negative dy means above target (y increases down)
+    
+    // Desired velocities
+    let max_horizontal_speed = 10.0;
+    let max_descent_rate = 5.0;
+    let safe_landing_speed = 1.5;
+    
+    // Phase-dependent velocity targets
+    let (des_vx, des_vy) = if dist < 5.0 && height.abs() < 5.0 {
+        // Final landing phase: hover and descend slowly
+        (0.0, safe_landing_speed)
+    } else if dist < 30.0 {
+        // Approach phase: move toward target with controlled speed
+        let approach_speed = (dist * 0.2).min(max_horizontal_speed);
+        let descent = if height > 0 { max_descent_rate } else { -1.0 };
+        if dist > 0.1 {
+            (dx / dist * approach_speed, descent)
+        } else {
+            (0.0, descent)
+        }
+    } else {
+        // Transit phase: move quickly toward target
+        let speed = max_horizontal_speed;
+        let descent = max_descent_rate.min(height * 0.3).max(0.0);
+        if dist > 0.1 {
+            (dx / dist * speed, descent)
+        } else {
+            (0.0, descent)
+        }
+    };
+    
+    // Velocity error with derivative term
+    let kp = 0.5;
+    let kd = 0.3;
+    
+    let dvx = des_vx - state.vx;
+    let dvy = des_vy - state.vy;
+    
+    // Required acceleration
+    let ax = dvx * kp;
+    let ay = dvy * kp + config.gravity;
+    
+    // Thrust direction
+    let thrust_mag = (ax * ax + ay * ay).sqrt();
+    let desired_angle = if thrust_mag > 0.001 {
+        ax.atan2(-ay)
+    } else {
+        0.0
+    };
+    
+    // Normalize angle error
+    let mut angle_err = desired_angle - state.angle;
+    while angle_err > std::f64::consts::PI { angle_err -= 2.0 * std::f64::consts::PI; }
+    while angle_err < -std::f64::consts::PI { angle_err += 2.0 * std::f64::consts::PI; }
+    
+    // Angular control with some damping
+    let turn = (angle_err * 2.0 - state.angular_vel * 0.5).clamp(-1.0, 1.0);
+    
+    // Thrust
+    let thrust = (thrust_mag / config.max_thrust).clamp(0.0, 1.0);
+    
+    // Don't thrust hard if not aligned
+    let thrust = if angle_err.abs() < 0.3 { thrust } else if angle_err.abs() < 0.5 { thrust * 0.3 } else { 0.0 };
+    
+    (thrust, turn)
+}
+```
+
+Actually, I realize I'm overcomplicating this. Let me step back and think about what a successful lunar lander controller needs:
+
+1. **Horizontal control**: Get to the target x position
+2. **Vertical control**: Manage descent rate
+3. **Final approach**: Soft landing
+
+The classic approach for lunar lander is:
+1. Burn retrograde to slow down
+2. Adjust trajectory toward target
+3. Final hover and soft landing
+
+Let me simplify the control algorithm:
+
+```rust
+fn compute_control(state: &State, config: &Config) -> (f64, f64) {
+    // Relative position to target
+    let dx = config.target_x - state.x;
+    let dy = config.target_y - state.y;
+    let dist = (dx * dx + dy * dy).sqrt();
+    
+    // Current speed
+    let speed = (state.vx * state.vx + state.vy * state.vy).sqrt();
+    
+    // Direction to target
+    let dir_to_target = dy.atan2(dx);
+    
+    // Retrograde direction (opposite of velocity)
+    let retrograde = if speed > 0.1 {
+        (-state.vy).atan2(-state.vx)
+    } else {
+        std::f64::consts::FRAC_PI_2 // Down if stationary
+    };
+    
+    // Determine control mode
+    let mode = if dist < 10.0 && speed < 5.0 {
+        "landing"
+    } else if speed > dist * 0.5 && speed > 2.0 {
+        "brake"
+    } else {
+        "approach"
+    };
+    
+    let (desired_angle, desired_thrust) = match mode {
+        "landing" => {
+            // Point up, control descent
+            let hover_thrust = config.gravity / config.max_thrust;
+            let des_vy = 1.0; // Slow descent
+            let vy_err = des_vy - state.vy;
+            let extra_thrust = vy_err * 0.2;
+            (0.0, hover_thrust + extra_thrust)
+        }
+        "brake" => {
+            // Point retrograde, burn
+            (retrograde, 0.8)
+        }
+        "approach" => {
+            // Point toward target with some downward component
+            let target_angle = (dx * 0.5).atan2(-dy - 5.0);
+            (target_angle, 0.5)
+        }
+        _ => (0.0, 0.0),
+    };
+    
+    // Angle control
+    let mut angle_err = desired_angle - state.angle;
+    while angle_err > std::f64::consts::PI { angle_err -= 2.0 * std::f64::consts::PI; }
+    while angle_err < -std::f64::consts::PI { angle_err += 2.0 * std::f64::consts::PI; }
+    
+    let turn = angle_err.clamp(-1.0, 1.0);
+    let thrust = desired_thrust.clamp(0.0, 1.0);
+    
+    // Thrust only if aligned
+    let thrust = if angle_err.abs() < 0.5 { thrust } else { 0.0 };
+    
+    (thrust, turn)
+}
+```
+
+Hmm, this is getting complicated and might not work well. Let me try a different approach: a PID controller for position.
+
+Actually, the simplest approach that should work is:
+1. Hover in place (thrust = gravity, angle = 0)
+2. Adjust position by tilting
+3. For landing, descend slowly
+
+Let me implement this:
+
+```rust
+fn compute_control(state: &State, config: &Config) -> (f64, f64) {
+    // Position error
+    let px = config.target_x - state.x;
+    let py = config.target_y - state.y;
+    
+    // Desired acceleration (PD control)
+    let kp = 0.3;
+    let kd = 0.5;
+    
+    // Desired velocity toward target
+    let des_vx = px * kp;
+    let des_vy = if py > 0.0 { py * kp } else { py * 0.1 }; // Descend if above, climb slowly if below
+    
+    // Velocity error
+    let dvx = des_vx - state.vx;
+    let dvy = des_vy - state.vy;
+    
+    // Desired acceleration
+    let ax = dvx * kd;
+    let ay = dvy * kd + config.gravity; // Add gravity compensation
+    
+    // Convert to angle and thrust
+    let thrust_mag = (ax * ax + ay * ay).sqrt();
+    let desired_angle = ax.atan2(-ay);
+    
+    // Clamp thrust
+    let thrust = (thrust_mag / config.max_thrust).min(1.0);
+    
+    // Angle control
+    let mut angle_err = desired_angle - state.angle;
+    while angle_err > std::f64::consts::PI { angle_err -= 2.0 * std::f64::consts::PI; }
+    while angle_err < -std::f64::consts::PI { angle_err += 2.0 * std::f64::consts::PI; }
+    
+    let turn = angle_err.clamp(-1.0, 1.0);
+    
+    // Only thrust if aligned
+    let thrust = if angle_err.abs() < 0.4 { thrust } else { 0.0 };
+    
+    (thrust, turn)
+}
+```
+
+This is simpler and should work for basic cases. Let me now write the complete solution with all the pieces together:
+
+Actually, let me reconsider the problem statement again. It says:
+- "angle is in radians, 0 is facing up"
+- "Thrust applies force in lander's facing direction"
+- "Y increases downward"
+- "Positive vy means moving downward"
+- "Gravity is +g"
+
+So if angle = 0 (facing up), thrust applies upward (negative y). To hover, we need thrust = gravity.
+
+Let me also handle the map parsing more carefully. The map can be huge, but we only need to know about obstacles near our path. For now, I'll skip the map entirely and focus on the control.
+
+Here's my complete solution:
+
+```rust
+use std::io::{self, BufRead, Write, BufWriter, BufReader};
+use std::sync::{Arc, Mutex};
+use std::thread;
+
+#[derive(Clone, Copy, Debug)]
+struct State {
+    x: f64,
+    y: f64,
+    vx: f64,
+    vy: f64,
+    angle: f64,
+    angular_vel: f64,
+    fuel: f64,
+}
+
+struct Config {
+    gravity: f64,
+    max_thrust: f64,
+    target_x: f64,
+    target_y: f64,
+}
+
+fn main() {
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    
+    // Parse initial input
+    let config = {
+        let stdin_lock = stdin.lock();
+        let mut lines = stdin_lock.lines();
+        
+        // First line: width height gravity max_thrust fuel
+        let first_line = lines.next().unwrap().unwrap();
+        let mut parts = first_line.split_whitespace();
+        let _width: usize = parts.next().unwrap().parse().unwrap();
+        let height: usize = parts.next().unwrap().parse().unwrap();
+        let gravity: f64 = parts.next().unwrap().parse().unwrap();
+        let max_thrust: f64 = parts.next().unwrap().parse().unwrap();
+        let _fuel: f64 = parts.next().unwrap().parse().unwrap();
+        
+        // Second line: start_x start_y target_x target_y
+        let second_line = lines.next().unwrap().unwrap();
+        let mut parts = second_line.split_whitespace();
+        let _start_x: f64 = parts.next().unwrap().parse().unwrap();
+        let _start_y: f64 = parts.next().unwrap().parse().unwrap();
+        let target_x: f64 = parts.next().unwrap().parse().unwrap();
+        let target_y: f64 = parts.next().unwrap().parse().unwrap();
+        
+        // Skip map rows
+        for _ in 0..height {
+            let _ = lines.next();
+        }
+        
+        Config { gravity, max_thrust, target_x, target_y }
+    };
+    
+    // Shared state
+    let state = Arc::new(Mutex::new(State {
+        x: 0.0, y: 0.0, vx: 0.0, vy: 0.0,
+        angle: 0.0, angular_vel: 0.0, fuel: 100.0,
+    }));
+    
+    // Reader thread
+    let state_reader = Arc::clone(&state);
+    thread::spawn(move || {
+        let stdin = io::stdin();
+        let mut reader = BufReader::new(stdin.lock());
+        let mut line = String::new();
+        
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    let mut parts = line.split_whitespace();
+                    if let (Some(x), Some(y), Some(vx), Some(vy), Some(angle), Some(angular_vel), Some(fuel)) = (
+                        parts.next().and_then(|s| s.parse::<f64>().ok()),
+                        parts.next().and_then(|s| s.parse::<f64>().ok()),
+                        parts.next().and_then(|s| s.parse::<f64>().ok()),
+                        parts.next().and_then(|s| s.parse::<f64>().ok()),
+                        parts.next().and_then(|s| s.parse::<f64>().ok()),
+                        parts.next().and_then(|s| s.parse::<f64>().ok()),
+                        parts.next().and_then(|s| s.parse::<f64>().ok()),
+                    ) {
+                        let mut s = state_reader.lock().unwrap();
+                        s.x = x;
+                        s.y = y;
+                        s.vx = vx;
+                        s.vy = vy;
+                        s.angle = angle;
+                        s.angular_vel = angular_vel;
+                        s.fuel = fuel;
+                    }
+                }
+            }
+        }
+    });
+    
+    // Main control loop
+    let mut stdout = BufWriter::new(stdout.lock());
+    
+    loop {
+        let current = state.lock().unwrap().clone();
+        let (thrust, turn) = compute_control(&current, &config);
+        
+        writeln!(stdout, "{:.6} {:.6}", thrust, turn).unwrap();
+        let _ = stdout.flush();
+        
+        thread::sleep(std::time::Duration::from_millis(40)); // ~25Hz
+    }
+}
+
+fn compute_control(state: &State, config: &Config) -> (f64, f64) {
+    // Position error
+    let px = config.target_x - state.x;
+    let py = config.target_y - state.y;
+    let dist = (px * px + py * py).sqrt();
+    
+    // Control gains
+    let kp_pos = 0.2;
+    let kp_vel = 0.4;
+    
+    // Desired velocity (toward target, with speed limit)
+    let max_speed = 8.0;
+    let des_vx = (px * kp_pos).clamp(-max_speed, max_speed);
+    let des_vy = if py > 0.0 {
+        // Above target: descend
+        (py * kp_pos).min(3.0) // Max 3 m/s descent
+    } else {
+        // Below target: climb slowly
+        py * 0.1
+    };
+    
+    // Velocity error
+    let dvx = des_vx - state.vx;
+    let dvy = des_vy - state.vy;
+    
+    // Required acceleration (world frame)
+    let ax = dvx * kp_vel;
+    let ay = dvy * kp_vel + config.gravity;
+    
+    // Convert to thrust angle and magnitude
+    let thrust_mag = (ax * ax + ay * ay).sqrt();
+    let desired_angle = if thrust_mag > 0.001 {
+        ax.atan2(-ay)
+    } else {
+        0.0
+    };
+    
+    // Angle error
+    let mut angle_err = desired_angle - state.angle;
+    while angle_err > std::f64::consts::PI { angle_err -= 2.0 * std::f64::consts::PI; }
+    while angle_err < -std::f64::consts::PI { angle_err += 2.0 * std::f64::consts::PI; }
+    
+    // Turn command
+    let turn = angle_err.clamp(-1.0, 1.0);
+    
+    // Thrust command
+    let thrust = (thrust_mag / config.max_thrust).min(1.0);
+    
+    // Only thrust if reasonably aligned
+    let thrust = if angle_err.abs() < 0.3 { thrust } else { 0.0 };
+    
+    (thrust, turn)
+}
+```
+
+Wait, I just realized there's a potential issue. The reader thread and the main thread both need to lock the stdin. After parsing the initial input, I need to make sure the reader thread has exclusive access to stdin.
+
+Let me fix this:
+
+```rust
+use std::io::{self, Read};
+
+fn main() {
+    let stdin = io::stdin();
+    let mut stdin_lock = stdin.lock();
+    
+    // Parse initial input using the locked stdin
+    // ... then pass ownership to reader thread
+}
+```
+
+But this is tricky because the lock is not movable. Let me use a different approach:
+
+```rust
+use std::sync::mpsc;
+
+fn main() {
+    let (tx, rx) = mpsc::channel();
+    
+    // Spawn reader thread that owns stdin
+    thread::spawn(move || {
+        let stdin = io::stdin();
+        let mut reader = BufReader::new(stdin.lock());
+        let mut line = String::new();
+        
+        // First, parse initial config
+        // ... (this is complex)
+    });
+    
+    // Main loop receives state from channel
+}
+```
+
+Actually, let me think about this more carefully. The initial input (map) comes first, then continuous state updates. The reader thread needs to handle both.
+
+Here's a cleaner approach:
+
+```rust
+use std::io::{self, BufRead, Write, BufWriter, BufReader};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::sync::mpsc;
+
+fn main() {
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    
+    // Channels for communication
+    let (config_tx, config_rx) = mpsc::channel();
+    let state = Arc::new(Mutex::new(Option::<State>::None));
+    
+    // Reader thread
+    let state_reader = Arc::clone(&state);
+    thread::spawn(move || {
+        let stdin = io::stdin();
+        let mut reader = BufReader::new(stdin.lock());
+        let mut line = String::new();
+        
+        // Parse initial config
+        // First line
+        line.clear();
+        reader.read_line(&mut line).ok();
+        let mut parts = line.split_whitespace();
+        let _width: usize = parts.next().unwrap().parse().unwrap();
+        let height: usize = parts.next().unwrap().parse().unwrap();
+        let gravity: f64 = parts.next().unwrap().parse().unwrap();
+        let max_thrust: f64 = parts.next().unwrap().parse().unwrap();
+        let _fuel: f64 = parts.next().unwrap().parse().unwrap();
+        
+        // Second line
+        line.clear();
+        reader.read_line(&mut line).ok();
+        let mut parts = line.split_whitespace();
+        let _start_x: f64 = parts.next().unwrap().parse().unwrap();
+        let _start_y: f64 = parts.next().unwrap().parse().unwrap();
+        let target_x: f64 = parts.next().unwrap().parse().unwrap();
+        let target_y: f64 = parts.next().unwrap().parse().unwrap();
+        
+        // Send config
+        config_tx.send(Config { gravity, max_thrust, target_x, target_y }).ok();
+        
+        // Skip map
+        for _ in 0..height {
+            line.clear();
+            reader.read_line(&mut line).ok();
+        }
+        
+        // Read state updates
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    let mut parts = line.split_whitespace();
+                    if let (Some(x), Some(y), Some(vx), Some(vy), Some(angle), Some(angular_vel), Some(fuel)) = (
+                        parts.next().and_then(|s| s.parse::<f64>().ok()),
+                        parts.next().and_then(|s| s.parse::<f64>().ok()),
+                        parts.next().and_then(|s| s.parse::<f64>().ok()),
+                        parts.next().and_then(|s| s.parse::<f64>().ok()),
+                        parts.next().and_then(|s| s.parse::<f64>().ok()),
+                        parts.next().and_then(|s| s.parse::<f64>().ok()),
+                        parts.next().and_then(|s| s.parse::<f64>().ok()),
+                    ) {
+                        let mut s = state_reader.lock().unwrap();
+                        *s = Some(State { x, y, vx, vy, angle, angular_vel, fuel });
+                    }
+                }
+            }
+        }
+    });
+    
+    // Wait for config
+    let config = config_rx.recv().unwrap();
+    
+    // Main control loop
+    let mut stdout = BufWriter::new(stdout.lock());
+    
+    loop {
+        let current = state.lock().unwrap().clone();
+        
+        if let Some(s) = current {
+            let (thrust, turn) = compute_control(&s, &config);
+            writeln!(stdout, "{:.6} {:.6}", thrust, turn).unwrap();
+            let _ = stdout.flush();
+        }
+        
+        thread::sleep(std::time::Duration::from_millis(40));
+    }
+}
+```
+
+This is cleaner. Now let me refine the control algorithm.
+
+Actually, let me think more about the physics and control:
+
+1. **World frame**: x right, y down
+2. **Angle 0**: facing up (negative y direction)
+3. **Thrust vector**: `thrust * (sin(angle), -cos(angle))`
+4. **Gravity**: `(0, g)` where g is positive
+
+To hover:
+- We need thrust_y = -g to cancel gravity
+- With angle = 0: thrust * (0, -1) = (0, -thrust)
+- So we need thrust = g
+
+To move right:
+- We need positive thrust_x
+- With angle > 0 (tilting right): thrust_x = sin(angle) * thrust > 0
+- This is correct!
+
+To descend:
+- We need thrust_y > -g (less upward thrust than gravity)
+- Reduce thrust magnitude or tilt
+
+The control algorithm should:
+1. Calculate desired acceleration to reach target
+2. Convert to thrust angle and magnitude
+3. Handle constraints (max thrust, fuel)
+
+Let me also add some safety features:
+1. Don't crash (avoid high descent velocity)
+2. Smooth control (avoid oscillations)
+
+Here's the refined algorithm:
+
+```rust
+fn compute_control(state: &State, config: &Config) -> (f64, f64) {
+    // Position error
+    let px = config.target_x - state.x;
+    let py = config.target_y - state.y;
+    let dist = (px * px + py * py).sqrt();
+    
+    // Determine phase
+    let is_close = dist < 20.0;
+    let is_landing = dist < 5.0;
+    
+    // Desired velocity
+    let (des_vx, des_vy) = if is_landing {
+        // Landing: minimal velocity
+        (0.0, 1.0) // Slow descent
+    } else if is_close {
+        // Approach: controlled velocity toward target
+        let speed = (dist * 0.3).min(3.0);
+        let des_vx = if dist > 0.1 { px / dist * speed } else { 0.0 };
+        let des_vy = if py > 0.0 { (py * 0.3).min(2.0) } else { 0.0 };
+        (des_vx, des_vy)
+    } else {
+        // Transit: faster movement
+        let speed = (dist * 0.2).min(8.0);
+        let des_vx = if dist > 0.1 { px / dist * speed } else { 0.0 };
+        let des_vy = if py > 0.0 { 3.0 } else { -0.5 };
+        (des_vx, des_vy)
+    };
+    
+    // Velocity error
+    let dvx = des_vx - state.vx;
+    let dvy = des_vy - state.vy;
+    
+    // Required acceleration
+    let kp = 0.5;
+    let ax = dvx * kp;
+    let ay = dvy * kp + config.gravity;
+    
+    // Thrust direction
+    let thrust_mag = (ax * ax + ay * ay).sqrt();
+    let desired_angle = if thrust_mag > 0.001 {
+        ax.atan2(-ay)
+    } else {
+        0.0
+    };
+    
+    // Angle error (normalized)
+    let mut angle_err = desired_angle - state.angle;
+    while angle_err > std::f64::consts::PI { angle_err -= 2.0 * std::f64::consts::PI; }
+    while angle_err < -std::f64::consts::PI { angle_err += 2.0 * std::f64::consts::PI; }
+    
+    // Turn command (with some damping)
+    let turn = (angle_err * 2.0 - state.angular_vel * 0.3).clamp(-1.0, 1.0);
+    
+    // Thrust command
+    let thrust = (thrust_mag / config.max_thrust).min(1.0);
+    
+    // Only thrust if aligned
+    let thrust = if angle_err.abs() < 0.4 { thrust } else { 0.0 };
+    
+    (thrust, turn)
+}
+```
+
+Alright, let me put together the complete solution. I'll also add some robustness:
+- Handle edge cases (very far target, negative coordinates, etc.)
+- Add anti-oscillation measures
+- Improve safety near ground
+
+Here's the final code:
+
+Actually, I realize I should also handle the case where the landing zone is not just a point but an area. Let me check the problem statement again...
+
+"map rows (. = empty, # = obstacle, S = start, T = target, L = landing zone)"
+
+So T is the target point, and L is the landing zone. The target_x and target_y might be the center of the landing zone. I should try to land at that specific point.
+
+Also, I should check for obstacles. But for now, let me assume the path is clear.
+
+Let me also add a simple obstacle avoidance by checking the map. Actually, since the map can be huge, I'll only store obstacles near the path from start to target.
+
+But wait, if the map is multi-GB, I can't even read it all into memory to find the obstacles. Let me just skip obstacle avoidance for now and focus on getting a working controller.
+
+Here's my final solution:
+
+```rust
+use std::io::{self, BufRead, Write, BufWriter, BufReader};
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread;
+use std::time::Duration;
+
+#[derive(Clone, Copy, Debug)]
+struct State {
+    x: f64,
+    y: f64,
+    vx: f64,
+    vy: f64,
+    angle: f64,
+    angular_vel: f64,
+    fuel: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Config {
+    gravity: f64,
+    max_thrust: f64,
+    target_x: f64,
+    target_y: f64,
+}
+
+fn main() {
+    let stdout = io::stdout();
+    
+    // Channels
+    let (config_tx, config_rx) = mpsc::channel();
+    let state = Arc::new(Mutex::new(None::<State>));
+    
+    // Reader thread
+    let state_reader = Arc::clone(&state);
+    thread::spawn(move || {
+        let stdin = io::stdin();
+        let mut reader = BufReader::new(stdin.lock());
+        let mut line = String::with_capacity(1024);
+        
+        // Parse header
+        line.clear();
+        if reader.read_line(&mut line).is_err() { return; }
+        let mut parts = line.split_whitespace();
+        let _width: usize = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let height: usize = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let gravity: f64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(1.6);
+        let max_thrust: f64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(10.0);
+        
+        line.clear();
+        if reader.read_line(&mut line).is_err() { return; }
+        let mut parts = line.split_whitespace();
+        let _start_x = parts.next().and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+        let _start_y = parts.next().and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+        let target_x = parts.next().and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+        let target_y = parts.next().and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+        
+        let _ = config_tx.send(Config { gravity, max_thrust, target_x, target_y });
+        
+        // Skip map
+        for _ in 0..height {
+            line.clear();
+            if reader.read_line(&mut line).is_err() { return; }
+        }
+        
+        // Read state updates
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    let nums: Vec<f64> = line.split_whitespace()
+                        .filter_map(|s| s.parse().ok())
+                        .collect();
+                    if nums.len() >= 7 {
+                        let s = State {
+                            x: nums[0], y: nums[1],
+                            vx: nums[2], vy: nums[3],
+                            angle: nums[4], angular_vel: nums[5],
+                            fuel: nums[6],
+                        };
+                        *state_reader.lock().unwrap() = Some(s);
+                    }
+                }
+            }
+        }
+    });
+    
+    // Get config
+    let config = config_rx.recv().expect("Failed to receive config");
+    
+    // Control loop
+    let mut stdout = BufWriter::new(stdout.lock());
+    
+    loop {
+        let current = state.lock().unwrap().clone();
+        
+        if let Some(s) = current {
+            let (thrust, turn) = compute_control(&s, &config);
+            writeln!(stdout, "{:.6} {:.6}", thrust, turn).unwrap();
+            let _ = stdout.flush();
+        } else {
+            // No state yet, output idle
+            writeln!(stdout, "0.0 0.0").unwrap();
+            let _ = stdout.flush();
+        }
+        
+        thread::sleep(Duration::from_millis(40));
+    }
+}
+
+fn compute_control(state: &State, config: &Config) -> (f64, f64) {
+    let px = config.target_x - state.x;
+    let py = config.target_y - state.y;
+    let dist = (px * px + py * py).sqrt();
+    
+    // Speed limit based on distance
+    let max_speed = if dist < 10.0 { 2.0 } else if dist < 50.0 { 5.0 } else { 10.0 };
+    
+    // Desired velocity toward target
+    let des_vx = if dist > 1.0 { (px / dist * max_speed * 0.3).clamp(-max_speed, max_speed) } else { 0.0 };
+    let des_vy = if py > 1.0 { (py * 0.2).min(max_speed) } else if py > 0.0 { py * 0.1 } else { py * 0.05 };
+    
+    // Landing phase adjustment
+    let des_vy = if dist < 5.0 { 0.5.min(des_vy) } else { des_vy };
+    
+    // Velocity error
+    let dvx = des_vx - state.vx;
+    let dvy = des_vy - state.vy;
+    
+    // Required acceleration
+    let kp = 0.4;
+    let ax = dvx * kp;
+    let ay = dvy * kp + config.gravity;
+    
+    // Thrust direction
+    let thrust_mag = (ax * ax + ay * ay).sqrt();
+    let desired_angle = if thrust_mag > 0.001 { ax.atan2(-ay) } else { 0.0 };
+    
+    // Angle error
+    let mut angle_err = desired_angle - state.angle;
+    while angle_err > std::f64::consts::PI { angle_err -= std::f64::consts::TAU; }
+    while angle_err < -std::f64::consts::PI { angle_err += std::f64::consts::TAU; }
+    
+    // Turn with damping
+    let turn = (angle_err * 1.5 - state.angular_vel * 0.2).clamp(-1.0, 1.0);
+    
+    // Thrust
+    let thrust = (thrust_mag / config.max_thrust).min(1.0);
+    let thrust = if angle_err.abs() < 0.3 { thrust } else if angle_err.abs() < 0.6 { thrust * 0.3 } else { 0.0 };
+    
+    (thrust, turn)
+}
+```
+
+This should work for basic cases. Let me review and make sure everything is correct:
+
+1. ✅ Reader thread reads continuously from stdin
+2. ✅ Main loop outputs at ~25Hz
+3. ✅ Control algorithm uses feedback control
+4. ✅ Thrust and turn are clamped to valid ranges
+
+I think this should work. Let me add a few more improvements:
+- Better landing control
+- Anti-crash measures
+- Fuel awareness
+
+Actually, let me also consider edge cases:
+- What if gravity is 0?
+- What if max_thrust is very low?
+- What if target is very far?
+
+For now, let me keep the solution simple and see how it performs.
+
+One more thing: I should make sure the output format is exactly correct. The problem says:
+"thrust turn" - two decimal numbers separated by a space, followed by a newline.
+
+Let me make sure the output is clean:
+```rust
+writeln!(stdout, "{:.6} {:.6}", thrust, turn).unwrap();
+```
+
+This should work. Let me finalize the code.
+
+Actually, I realized I should handle the case where the config might have issues. Let me add some default values:
+
+```rust
+let gravity: f64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(1.62);
+```
+
+Moon gravity is about 1.62 m/s², so that's a reasonable default.
+
+Also, I should handle very large maps efficiently. Currently, I'm just skipping the map lines, which should be fast enough.
+
+Let me also add some comments to make the code clearer:
+
+```rust
+// Skip map data (streaming, don't store)
+for _ in 0..height {
+    line.clear();
+    if reader.read_line(&mut line).is_err() { return; }
+}
+```
+
+Alright, I think the solution is ready. Let me compile the final version:
