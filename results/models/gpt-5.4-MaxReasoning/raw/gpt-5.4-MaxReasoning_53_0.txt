@@ -1,0 +1,506 @@
+import math
+
+MU_EARTH = 3.986004418e14
+EARTH_RADIUS_M = 6378.137e3
+DEFAULT_MEAN_MOTION = 0.00113
+COMMAND_ACCEL_SCALE = 0.18
+ATT_RATE_LIMIT = 0.035
+
+_AP_MEM = {
+    "initialized": False,
+    "pos": [0.0, 0.0, 0.0],
+    "vel": [0.0, 0.0, 0.0],
+    "trim": [0.0, 0.0, 0.0],
+    "sensor_conf": {"radar": 1.0, "lidar": 1.15, "camera": 0.85},
+    "last_camera_pos": None,
+}
+
+
+def _safe_float(value, default=0.0):
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return default
+    return value if math.isfinite(value) else default
+
+
+def _clamp(value, lo, hi):
+    return lo if value < lo else hi if value > hi else value
+
+
+def _norm(vec):
+    return math.sqrt(sum(component * component for component in vec))
+
+
+def _dot(a, b):
+    return sum(x * y for x, y in zip(a, b))
+
+
+def _add(a, b):
+    return [x + y for x, y in zip(a, b)]
+
+
+def _sub(a, b):
+    return [x - y for x, y in zip(a, b)]
+
+
+def _scale(vec, scalar):
+    return [scalar * component for component in vec]
+
+
+def _unit(vec):
+    magnitude = _norm(vec)
+    if magnitude < 1e-9:
+        return [0.0, 0.0, 0.0]
+    return [component / magnitude for component in vec]
+
+
+def _median(values):
+    clean = sorted(
+        _safe_float(value)
+        for value in values
+        if value is not None and math.isfinite(_safe_float(value))
+    )
+    if not clean:
+        return None
+    middle = len(clean) // 2
+    if len(clean) % 2:
+        return clean[middle]
+    return 0.5 * (clean[middle - 1] + clean[middle])
+
+
+def _weighted_vec_average(candidates):
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return list(candidates[0][1])
+
+    total_weight = sum(weight for _, _, weight in candidates)
+    if total_weight <= 1e-9:
+        return list(candidates[0][1])
+
+    center = [
+        sum(vec[index] * weight for _, vec, weight in candidates) / total_weight
+        for index in range(3)
+    ]
+    scale = max(12.0, 0.18 * _norm(center) + 4.0)
+    filtered = [
+        item
+        for item in candidates
+        if _norm(_sub(item[1], center)) <= 2.5 * scale or len(candidates) <= 2
+    ]
+    if not filtered:
+        filtered = candidates
+
+    total_weight = sum(weight for _, _, weight in filtered)
+    return [
+        sum(vec[index] * weight for _, vec, weight in filtered) / max(total_weight, 1e-9)
+        for index in range(3)
+    ]
+
+
+def _estimate_mean_motion(state):
+    speed_valid = bool(state.get("ground_speed_ms_valid"))
+    sma_valid = bool(state.get("ground_semi_major_axis_m_valid"))
+    alt_valid = bool(state.get("ground_altitude_km_valid"))
+
+    if speed_valid and sma_valid:
+        speed = _safe_float(state.get("ground_speed_ms"))
+        semi_major_axis = _safe_float(state.get("ground_semi_major_axis_m"))
+        if speed > 0.0 and semi_major_axis > EARTH_RADIUS_M:
+            return _clamp(speed / semi_major_axis, 0.0005, 0.0025)
+
+    if sma_valid:
+        semi_major_axis = _safe_float(state.get("ground_semi_major_axis_m"))
+        if semi_major_axis > EARTH_RADIUS_M:
+            return _clamp(math.sqrt(MU_EARTH / (semi_major_axis ** 3)), 0.0005, 0.0025)
+
+    if alt_valid:
+        altitude_m = 1000.0 * _safe_float(state.get("ground_altitude_km"))
+        radius = EARTH_RADIUS_M + altitude_m
+        if radius > EARTH_RADIUS_M:
+            return _clamp(math.sqrt(MU_EARTH / (radius ** 3)), 0.0005, 0.0025)
+
+    return DEFAULT_MEAN_MOTION
+
+
+def _get_range_measurement(state):
+    values = []
+    for index in (1, 2, 3):
+        if state.get(f"range_{index}_valid"):
+            value = _safe_float(state.get(f"range_{index}_m"), None)
+            if value is not None and value > 0.0:
+                values.append(value)
+    return _median(values)
+
+
+def _get_vector(state, prefix, valid_prefix):
+    valid_flags = [
+        bool(state.get(f"{valid_prefix}_{axis}_valid"))
+        for axis in ("x", "y", "z")
+    ]
+    if not all(valid_flags):
+        return None
+    return [
+        _safe_float(state.get(f"{prefix}_{axis}_m"))
+        for axis in ("x", "y", "z")
+    ]
+
+
+def _get_velocity(state, prefix, valid_prefix):
+    valid_flags = [
+        bool(state.get(f"{valid_prefix}_{axis}_valid"))
+        for axis in ("x", "y", "z")
+    ]
+    if not all(valid_flags):
+        return None
+    return [
+        _safe_float(state.get(f"{prefix}_{axis}_ms"))
+        for axis in ("x", "y", "z")
+    ]
+
+
+def _get_camera_position(state):
+    if not state.get("dock_camera_active"):
+        return None, None
+
+    if not (
+        state.get("dock_camera_bearing_x_valid")
+        and state.get("dock_camera_bearing_y_valid")
+        and state.get("dock_camera_bearing_z_valid")
+    ):
+        return None, None
+
+    bearing = [
+        _safe_float(state.get("dock_camera_bearing_x")),
+        _safe_float(state.get("dock_camera_bearing_y")),
+        _safe_float(state.get("dock_camera_bearing_z")),
+    ]
+    bearing_norm = _norm(bearing)
+    dock_range = _safe_float(state.get("dock_camera_range_m"), -1.0)
+    if bearing_norm < 1e-9 or dock_range <= 0.0:
+        return None, None
+
+    unit_bearing = [component / bearing_norm for component in bearing]
+    return _scale(unit_bearing, dock_range), unit_bearing
+
+
+def _update_sensor_confidence(name, error, tolerance):
+    confidence = _AP_MEM["sensor_conf"].get(name, 1.0)
+    if error > 2.0 * tolerance:
+        confidence *= 0.82
+    elif error < tolerance:
+        confidence += 0.03
+    _AP_MEM["sensor_conf"][name] = _clamp(confidence, 0.25, 1.6)
+
+
+def _reset_memory():
+    _AP_MEM["initialized"] = False
+    _AP_MEM["pos"] = [0.0, 0.0, 0.0]
+    _AP_MEM["vel"] = [0.0, 0.0, 0.0]
+    _AP_MEM["trim"] = [0.0, 0.0, 0.0]
+    _AP_MEM["last_camera_pos"] = None
+    _AP_MEM["sensor_conf"] = {"radar": 1.0, "lidar": 1.15, "camera": 0.85}
+
+
+def _fuse_relative_state(state, dt):
+    mem = _AP_MEM
+    range_measurement = _get_range_measurement(state)
+    predicted_pos = _add(mem["pos"], _scale(mem["vel"], dt))
+    predicted_vel = list(mem["vel"])
+
+    radar_pos = _get_vector(state, "radar_rel_pos", "radar_rel")
+    radar_vel = _get_velocity(state, "radar_rel_vel", "radar_relv")
+    lidar_pos = _get_vector(state, "lidar_rel_pos", "lidar_rel")
+    lidar_vel = _get_velocity(state, "lidar_rel_vel", "lidar_relv")
+    camera_pos, camera_bearing = _get_camera_position(state)
+
+    if mem["initialized"]:
+        anchor_candidates = [pos for pos in (radar_pos, lidar_pos) if pos is not None]
+        if anchor_candidates:
+            anchor = (
+                [
+                    0.5 * (radar_pos[index] + lidar_pos[index])
+                    for index in range(3)
+                ]
+                if radar_pos is not None and lidar_pos is not None
+                else list(anchor_candidates[0])
+            )
+            jump = _norm(_sub(anchor, predicted_pos))
+            anchor_range = _norm(anchor)
+            agreement = (
+                radar_pos is not None
+                and lidar_pos is not None
+                and _norm(_sub(radar_pos, lidar_pos)) < max(20.0, 0.08 * anchor_range + 4.0)
+            )
+            if agreement:
+                tolerance = max(80.0, 0.40 * anchor_range + 25.0, 10.0 * _norm(mem["vel"]) * dt + 20.0)
+            else:
+                tolerance = max(180.0, 0.60 * anchor_range + 60.0, 12.0 * _norm(mem["vel"]) * dt + 40.0)
+            if jump > tolerance:
+                _reset_memory()
+                mem = _AP_MEM
+                predicted_pos = [0.0, 0.0, 0.0]
+                predicted_vel = [0.0, 0.0, 0.0]
+
+    pos_candidates = []
+    for name, pos in (("radar", radar_pos), ("lidar", lidar_pos), ("camera", camera_pos)):
+        if pos is None:
+            continue
+
+        weight = mem["sensor_conf"].get(name, 1.0)
+        if range_measurement is not None:
+            range_error = abs(_norm(pos) - range_measurement)
+            weight /= 1.0 + range_error / max(15.0, 0.12 * max(range_measurement, 1.0))
+
+        if mem["initialized"]:
+            predict_error = _norm(_sub(pos, predicted_pos))
+            weight /= 1.0 + predict_error / max(30.0, 0.20 * max(_norm(predicted_pos), 20.0))
+
+        if name == "camera":
+            reference = lidar_pos or radar_pos or (predicted_pos if mem["initialized"] else None)
+            if reference is not None and _norm(reference) > 1.0:
+                alignment = _dot(_unit(reference), _unit(pos))
+                if alignment < 0.70:
+                    weight *= 0.05
+                elif alignment < 0.90:
+                    weight *= 0.50
+
+        if weight > 0.08:
+            pos_candidates.append((name, pos, weight))
+
+    fused_pos_measurement = _weighted_vec_average(pos_candidates)
+
+    velocity_candidates = []
+    for name, vel in (("radar", radar_vel), ("lidar", lidar_vel)):
+        if vel is None:
+            continue
+
+        weight = mem["sensor_conf"].get(name, 1.0)
+        if mem["initialized"]:
+            predict_error = _norm(_sub(vel, predicted_vel))
+            weight /= 1.0 + predict_error / max(0.4, 0.5 * max(_norm(predicted_vel), 0.3))
+
+        if weight > 0.08:
+            velocity_candidates.append((name, vel, weight))
+
+    if camera_pos is not None and mem["last_camera_pos"] is not None and dt > 1e-3:
+        camera_vel = _scale(_sub(camera_pos, mem["last_camera_pos"]), 1.0 / dt)
+        velocity_candidates.append(("camera", camera_vel, 0.35 * mem["sensor_conf"].get("camera", 0.85)))
+
+    fused_vel_measurement = _weighted_vec_average(velocity_candidates)
+
+    if fused_pos_measurement is None:
+        pos_estimate = predicted_pos if mem["initialized"] else [0.0, 0.0, 0.0]
+    elif not mem["initialized"]:
+        pos_estimate = fused_pos_measurement
+    else:
+        alpha = 0.72 if (range_measurement is not None and range_measurement < 80.0) else 0.55
+        pos_estimate = _add(predicted_pos, _scale(_sub(fused_pos_measurement, predicted_pos), alpha))
+
+    if fused_vel_measurement is None:
+        if mem["initialized"] and dt > 1e-3:
+            inferred_vel = _scale(_sub(pos_estimate, mem["pos"]), 1.0 / dt)
+            vel_estimate = _add(predicted_vel, _scale(_sub(inferred_vel, predicted_vel), 0.5))
+        else:
+            vel_estimate = predicted_vel if mem["initialized"] else [0.0, 0.0, 0.0]
+    elif not mem["initialized"]:
+        vel_estimate = fused_vel_measurement
+    else:
+        beta = 0.74 if (range_measurement is not None and range_measurement < 80.0) else 0.58
+        vel_estimate = _add(predicted_vel, _scale(_sub(fused_vel_measurement, predicted_vel), beta))
+        if dt > 1e-3:
+            inferred_vel = _scale(_sub(pos_estimate, mem["pos"]), 1.0 / dt)
+            vel_estimate = [
+                0.65 * vel_estimate[index] + 0.35 * inferred_vel[index]
+                for index in range(3)
+            ]
+
+    if range_measurement is not None:
+        pos_norm = _norm(pos_estimate)
+        if pos_norm > 1e-6:
+            range_gap = abs(pos_norm - range_measurement)
+            if range_gap < max(50.0, 0.4 * max(range_measurement, 1.0)):
+                blended_norm = 0.75 * pos_norm + 0.25 * range_measurement
+                pos_estimate = _scale(_unit(pos_estimate), blended_norm)
+
+    if fused_pos_measurement is not None:
+        tolerance = max(8.0, 0.15 * max(_norm(fused_pos_measurement), 1.0) + 3.0)
+        for name, pos, _ in pos_candidates:
+            _update_sensor_confidence(name, _norm(_sub(pos, fused_pos_measurement)), tolerance)
+
+    if fused_vel_measurement is not None:
+        tolerance = max(0.15, 0.2 * max(_norm(fused_vel_measurement), 0.2) + 0.05)
+        for name, vel, _ in velocity_candidates:
+            _update_sensor_confidence(name, _norm(_sub(vel, fused_vel_measurement)), tolerance)
+
+    mem["last_camera_pos"] = list(camera_pos) if camera_pos is not None else mem["last_camera_pos"]
+    mem["initialized"] = True
+    mem["pos"] = list(pos_estimate)
+    mem["vel"] = list(vel_estimate)
+
+    return pos_estimate, vel_estimate, camera_bearing
+
+
+def _get_gyro_rate(state, axis):
+    values = []
+    for index in (1, 2, 3):
+        if state.get(f"gyro_{index}_{axis}_valid"):
+            values.append(math.radians(_safe_float(state.get(f"gyro_{index}_{axis}_dps"))))
+    return _median(values) or 0.0
+
+
+def _get_star_angle(state, axis):
+    values = []
+    for index in (1, 2):
+        if state.get(f"star_tracker_{index}_{axis}_valid"):
+            values.append(math.radians(_safe_float(state.get(f"star_tracker_{index}_{axis}_deg"))))
+    return _median(values)
+
+
+def _speed_cap(range_m, fuel_scale):
+    if range_m > 800.0:
+        return 0.85 * fuel_scale
+    if range_m > 250.0:
+        return 0.55 * fuel_scale
+    if range_m > 80.0:
+        return 0.24 * fuel_scale
+    if range_m > 20.0:
+        return 0.12 * fuel_scale
+    if range_m > 5.0:
+        return 0.06 * fuel_scale
+    return 0.03 * fuel_scale
+
+
+def _thrust_limit(range_m, low_fuel):
+    if range_m > 800.0:
+        return 0.45 if low_fuel else 0.80
+    if range_m > 180.0:
+        return 0.36 if low_fuel else 0.62
+    if range_m > 50.0:
+        return 0.24 if low_fuel else 0.36
+    if range_m > 10.0:
+        return 0.14 if low_fuel else 0.22
+    return 0.08 if low_fuel else 0.12
+
+
+def autopilot_step(state: dict, dt: float) -> dict:
+    dt = _clamp(_safe_float(dt, 1.0), 0.05, 5.0)
+    mean_motion = _estimate_mean_motion(state)
+    pos, vel, camera_bearing = _fuse_relative_state(state, dt)
+
+    x, y, z = pos
+    xdot, ydot, zdot = vel
+    range_m = max(_norm(pos), _get_range_measurement(state) or 0.0)
+    lateral_error = math.hypot(x, z)
+
+    fuel_pct = _safe_float(state.get("fuel_remaining_pct"), 100.0)
+    fuel_kg = _safe_float(state.get("fuel_remaining_kg"), 500.0)
+    low_fuel = fuel_pct < 15.0 or fuel_kg < 60.0
+    fuel_scale = 0.72 if low_fuel else 0.88 if fuel_pct < 30.0 else 1.0
+
+    speed_cap = _speed_cap(range_m, fuel_scale)
+    thrust_limit = _thrust_limit(range_m, low_fuel)
+
+    orbital_blend = _clamp((range_m - 120.0) / 110.0, 0.0, 1.0)
+    if abs(y) < 40.0 and range_m < 250.0:
+        orbital_blend *= 0.65
+
+    x_target_limit = min(380.0, 30.0 + 0.18 * range_m)
+    x_target = _clamp(0.20 * y, -x_target_limit, x_target_limit)
+    if abs(y) < 20.0:
+        x_target *= abs(y) / 20.0
+    y_drift_target = -1.5 * mean_motion * x_target
+
+    ax_orbit = -0.010 * (x - 0.35 * x_target) - 0.70 * xdot
+    ay_orbit = (
+        0.010 * (x_target - x)
+        - 0.40 * xdot
+        - 0.18 * (ydot - y_drift_target)
+        + 0.08 * math.tanh(y / max(40.0, 0.15 * max(range_m, 1.0)))
+    )
+    az_orbit = -0.012 * z - 0.70 * zdot
+
+    if range_m > 50.0:
+        gains = (0.015, 0.012, 0.015)
+        lat_cap = 0.16 * fuel_scale
+        vel_gain = 1.05
+    elif range_m > 10.0:
+        gains = (0.030, 0.025, 0.030)
+        lat_cap = 0.10 * fuel_scale
+        vel_gain = 1.35
+    else:
+        gains = (0.050, 0.040, 0.050)
+        lat_cap = 0.05 * fuel_scale + 0.015
+        vel_gain = 1.70
+
+    closure_gate = _clamp(1.0 - lateral_error / max(0.35 * max(range_m, 1.0), 1.0), 0.05, 1.0)
+    if range_m < 20.0 and lateral_error > 0.8:
+        closure_gate = min(closure_gate, 0.35)
+
+    vx_cmd = _clamp(-gains[0] * x, -lat_cap, lat_cap)
+    vy_cmd = _clamp(-gains[1] * y, -speed_cap * closure_gate, speed_cap * closure_gate)
+    vz_cmd = _clamp(-gains[2] * z, -lat_cap, lat_cap)
+
+    ax_direct = vel_gain * (vx_cmd - xdot) + 3.0 * (mean_motion ** 2) * x + 2.0 * mean_motion * ydot
+    ay_direct = vel_gain * (vy_cmd - ydot) - 2.0 * mean_motion * xdot
+    az_direct = vel_gain * (vz_cmd - zdot) + (mean_motion ** 2) * z
+
+    accel_cmd = [
+        orbital_blend * ax_orbit + (1.0 - orbital_blend) * ax_direct,
+        orbital_blend * ay_orbit + (1.0 - orbital_blend) * ay_direct,
+        orbital_blend * az_orbit + (1.0 - orbital_blend) * az_direct,
+    ]
+
+    line_of_sight = _unit(pos)
+    closing_speed = -_dot(line_of_sight, vel) if range_m > 1e-6 else 0.0
+    if closing_speed > 1.05 * speed_cap:
+        brake = min(0.60, 1.40 * (closing_speed - speed_cap))
+        accel_cmd = _add(accel_cmd, _scale(line_of_sight, brake))
+
+    if range_m < 2.0 and _norm(vel) < 0.25:
+        accel_cmd = [-1.2 * xdot, -1.2 * ydot, -1.2 * zdot]
+
+    trim = _AP_MEM["trim"]
+    if range_m < 250.0:
+        trim_update = [
+            _clamp(-0.0006 * x - 0.0015 * xdot, -0.0025, 0.0025),
+            _clamp(-0.0004 * y - 0.0012 * ydot, -0.0025, 0.0025),
+            _clamp(-0.0006 * z - 0.0015 * zdot, -0.0025, 0.0025),
+        ]
+        for index in range(3):
+            trim[index] = _clamp(trim[index] + trim_update[index] * dt, -0.04, 0.04)
+    else:
+        for index in range(3):
+            trim[index] *= 0.995
+
+    accel_cmd = _add(accel_cmd, trim)
+
+    thrust_x = _clamp(accel_cmd[0] / COMMAND_ACCEL_SCALE, -thrust_limit, thrust_limit)
+    thrust_y = _clamp(accel_cmd[1] / COMMAND_ACCEL_SCALE, -thrust_limit, thrust_limit)
+    thrust_z = _clamp(accel_cmd[2] / COMMAND_ACCEL_SCALE, -thrust_limit, thrust_limit)
+
+    gyro_roll = _get_gyro_rate(state, "roll")
+    gyro_pitch = _get_gyro_rate(state, "pitch")
+    gyro_yaw = _get_gyro_rate(state, "yaw")
+    roll_angle = _get_star_angle(state, "roll") or 0.0
+
+    roll_rate_cmd = _clamp(-0.8 * gyro_roll - 0.15 * roll_angle, -ATT_RATE_LIMIT, ATT_RATE_LIMIT)
+    pitch_rate_cmd = _clamp(-0.8 * gyro_pitch, -ATT_RATE_LIMIT, ATT_RATE_LIMIT)
+    yaw_rate_cmd = _clamp(-0.8 * gyro_yaw, -ATT_RATE_LIMIT, ATT_RATE_LIMIT)
+
+    if camera_bearing is not None:
+        forward_component = max(camera_bearing[1], 1e-4)
+        yaw_error = math.atan2(camera_bearing[0], forward_component)
+        pitch_error = -math.atan2(camera_bearing[2], forward_component)
+        pitch_rate_cmd = _clamp(1.1 * pitch_error - 0.8 * gyro_pitch, -ATT_RATE_LIMIT, ATT_RATE_LIMIT)
+        yaw_rate_cmd = _clamp(1.1 * yaw_error - 0.8 * gyro_yaw, -ATT_RATE_LIMIT, ATT_RATE_LIMIT)
+
+    return {
+        "thrust_x": thrust_x,
+        "thrust_y": thrust_y,
+        "thrust_z": thrust_z,
+        "att_rate_roll": roll_rate_cmd,
+        "att_rate_pitch": pitch_rate_cmd,
+        "att_rate_yaw": yaw_rate_cmd,
+    }

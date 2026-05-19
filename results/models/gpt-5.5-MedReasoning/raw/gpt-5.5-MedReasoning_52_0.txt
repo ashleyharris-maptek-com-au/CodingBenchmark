@@ -1,0 +1,259 @@
+import math
+from statistics import median
+
+
+_ap = {
+    "speed_ms": 0.0,
+    "lane_offset_m": 0.0,
+    "curvature": 0.0,
+    "yaw_rate_dps": 0.0,
+    "front_range_m": 120.0,
+    "front_rel_ms": 0.0,
+    "speed_limit_kmh": 130.0,
+    "steer": 0.0,
+    "throttle": 0.0,
+    "brake": 0.0,
+    "lane_change_bias": 0.0,
+    "last_time": None,
+}
+
+
+def _finite(x):
+    return isinstance(x, (int, float)) and math.isfinite(x)
+
+
+def _clip(x, lo, hi):
+    return max(lo, min(hi, x))
+
+
+def _median_good(values, lo, hi):
+    good = [float(v) for v in values if _finite(v) and lo <= float(v) <= hi]
+    return median(good) if good else None
+
+
+def _smooth(name, value, alpha, lo=None, hi=None):
+    if value is None or not _finite(value):
+        return _ap[name]
+    if lo is not None:
+        value = max(lo, value)
+    if hi is not None:
+        value = min(hi, value)
+    _ap[name] = (1.0 - alpha) * _ap[name] + alpha * value
+    return _ap[name]
+
+
+def _valid_range(state, key, lo, hi):
+    v = state.get(key)
+    return _finite(v) and lo <= float(v) <= hi
+
+
+def _lidar(state, angle):
+    key = f"lidar_{angle:+04d}_deg_range_m"
+    v = state.get(key)
+    if not _finite(v):
+        return None
+    v = float(v)
+    if 0.2 <= v <= 250.0:
+        return v
+    return None
+
+
+def autopilot_step(state: dict, dt: float) -> dict:
+    dt = float(dt if _finite(dt) and dt > 0.0 else state.get("dt", 0.05) or 0.05)
+    dt = _clip(dt, 0.01, 0.2)
+
+    # Speed fusion: valid flags are hints only; range and redundancy decide.
+    wheel = []
+    for pos in ("fl", "fr", "rl", "rr"):
+        v = state.get(f"wheel_speed_{pos}_kmh")
+        if _finite(v) and -2.0 <= float(v) <= 260.0:
+            wheel.append(float(v))
+    veh = [state.get("vehicle_speed_1_kmh"), state.get("vehicle_speed_2_kmh")]
+    gps = [state.get("gps_1_speed_kmh"), state.get("gps_2_speed_kmh")]
+    speed_kmh = _median_good(wheel + veh + gps, -2.0, 260.0)
+    speed_ms = _smooth("speed_ms", 0.0 if speed_kmh is None else speed_kmh / 3.6,
+                       0.35, 0.0, 75.0)
+
+    gyro = [state.get(f"gyro_{i}_yaw_rate_dps") for i in (1, 2, 3)]
+    yaw_rate = _smooth("yaw_rate_dps", _median_good(gyro, -90.0, 90.0), 0.35,
+                       -90.0, 90.0)
+
+    accel_lat = _median_good([state.get(f"accel_{i}_lateral_ms2") for i in (1, 2, 3)],
+                             -25.0, 25.0)
+    accel_long = _median_good([state.get(f"accel_{i}_longitudinal_ms2") for i in (1, 2, 3)],
+                              -25.0, 15.0)
+
+    # Vision fusion.  Each camera contributes independent estimates; outliers
+    # are rejected by plausible ranges and median voting.
+    offsets, curves, limits = [], [], []
+    left_dists, right_dists = [], []
+    vision_obstacles = []
+    for i in (1, 2, 3):
+        off = state.get(f"vision_{i}_lane_offset_m")
+        if _finite(off) and -2.5 <= float(off) <= 2.5:
+            offsets.append(float(off))
+        l = state.get(f"vision_{i}_left_line_dist_m")
+        r = state.get(f"vision_{i}_right_line_dist_m")
+        if _finite(l) and 0.3 <= float(l) <= 5.5:
+            left_dists.append(float(l))
+        if _finite(r) and 0.3 <= float(r) <= 5.5:
+            right_dists.append(float(r))
+        if _finite(l) and _finite(r) and 1.8 <= float(l) + float(r) <= 6.2:
+            offsets.append((float(l) - float(r)) * 0.5)
+        c = state.get(f"vision_{i}_road_curvature_1pm")
+        if _finite(c) and abs(float(c)) <= 0.04:
+            curves.append(float(c))
+        lim = state.get(f"vision_{i}_speed_limit_kmh")
+        if _finite(lim) and 20.0 <= float(lim) <= 140.0:
+            limits.append(float(lim))
+        if state.get(f"vision_{i}_obstacle_detected") and _valid_range(
+                state, f"vision_{i}_obstacle_dist_m", 0.5, 180.0):
+            dist = float(state[f"vision_{i}_obstacle_dist_m"])
+            rel = state.get(f"vision_{i}_obstacle_rel_speed_kmh", 0.0)
+            rel_ms = float(rel) / 3.6 if _finite(rel) and -180.0 <= float(rel) <= 180.0 else 0.0
+            vision_obstacles.append((dist, rel_ms))
+
+    lane_offset = _smooth("lane_offset_m", _median_good(offsets, -2.5, 2.5),
+                          0.28, -2.5, 2.5)
+    curvature = _smooth("curvature", _median_good(curves, -0.04, 0.04),
+                        0.25, -0.04, 0.04)
+    speed_limit = _smooth("speed_limit_kmh", _median_good(limits, 20.0, 140.0),
+                          0.18, 20.0, 140.0)
+
+    front_vals = [v for v in (_lidar(state, -5), _lidar(state, 5),
+                              _lidar(state, -15), _lidar(state, 15)) if v is not None]
+    front_lidar = min(front_vals) if front_vals else None
+    front_dist = front_lidar
+    front_rel_ms = 0.0
+    if vision_obstacles:
+        vd, vr = min(vision_obstacles, key=lambda x: x[0])
+        front_dist = min(front_dist, vd) if front_dist is not None else vd
+        front_rel_ms = vr
+    front_dist = _smooth("front_range_m", front_dist, 0.45, 0.2, 250.0)
+    front_rel_ms = _smooth("front_rel_ms", front_rel_ms, 0.35, -60.0, 60.0)
+
+    mu = state.get("estimated_mu", 1.0)
+    mu = _clip(float(mu), 0.08, 1.2) if _finite(mu) else 0.7
+    rain = bool(state.get("rain_sensor"))
+    temp = state.get("temperature_c")
+    if rain:
+        mu = min(mu, 0.65)
+    if _finite(temp) and float(temp) <= 1.0:
+        mu = min(mu, 0.45)
+
+    # Safe speed and following distance scale strongly with available grip.
+    target_kmh = state.get("target_speed_kmh", 110.0)
+    target_kmh = float(target_kmh) if _finite(target_kmh) else 100.0
+    mu_speed_factor = _clip(0.35 + 0.65 * mu, 0.28, 1.0)
+    desired_kmh = min(target_kmh, speed_limit + 3.0) * mu_speed_factor
+    if abs(curvature) > 0.001:
+        curve_limit_ms = math.sqrt(max(0.5, 0.55 * mu * 9.81 / abs(curvature)))
+        desired_kmh = min(desired_kmh, curve_limit_ms * 3.6)
+
+    closing_ms = max(0.0, -front_rel_ms)
+    ttc = front_dist / max(0.1, closing_ms) if closing_ms > 0.1 else 99.0
+    base_gap = 8.0 + speed_ms * (1.2 + 1.6 * (1.0 - min(mu, 1.0)))
+    caution_gap = base_gap + 0.5 * speed_ms
+    emergency = front_dist < max(8.0, 0.35 * speed_ms) or ttc < 1.1
+    obstacle = front_dist < caution_gap or ttc < 3.0
+    if obstacle:
+        desired_kmh = min(desired_kmh, max(0.0, (front_dist - base_gap) * 1.8 * 3.6))
+
+    # Lane choice: obey requested lane when reasonable, but use a temporary
+    # adjacent-lane bias for a slow/stopped object if side lidar says it is open.
+    current_lane = int(state.get("current_lane", 1) if _finite(state.get("current_lane", 1)) else 1)
+    target_lane = int(state.get("target_lane", current_lane) if _finite(state.get("target_lane", current_lane)) else current_lane)
+    current_lane = int(_clip(current_lane, 0, 2))
+    target_lane = int(_clip(target_lane, 0, 2))
+
+    left_clear = min([v for v in (_lidar(state, -45), _lidar(state, -60), _lidar(state, -90))
+                      if v is not None] or [80.0])
+    right_clear = min([v for v in (_lidar(state, 45), _lidar(state, 60), _lidar(state, 90))
+                       if v is not None] or [80.0])
+    needed_side = max(10.0, 0.7 * speed_ms)
+    lane_delta = target_lane - current_lane
+    if obstacle and not emergency:
+        can_left = current_lane > 0 and left_clear > needed_side
+        can_right = current_lane < 2 and right_clear > needed_side
+        if lane_delta == 0:
+            if can_left and (left_clear >= right_clear or not can_right):
+                lane_delta = -1
+            elif can_right:
+                lane_delta = 1
+        elif lane_delta < 0 and not can_left:
+            lane_delta = 0
+        elif lane_delta > 0 and not can_right:
+            lane_delta = 0
+    elif lane_delta < 0 and left_clear <= needed_side:
+        lane_delta = 0
+    elif lane_delta > 0 and right_clear <= needed_side:
+        lane_delta = 0
+
+    max_lane_bias = 0.75 if mu > 0.55 else 0.35
+    requested_bias = _clip(0.55 * lane_delta, -max_lane_bias, max_lane_bias)
+    _ap["lane_change_bias"] = 0.86 * _ap["lane_change_bias"] + 0.14 * requested_bias
+
+    # Steering: positive is right.  Lane offset is interpreted as positive when
+    # the vehicle is right of center, so correction is negative.
+    k_off = 0.34 if mu >= 0.5 else 0.20
+    k_yaw = 0.010 if mu >= 0.5 else 0.006
+    steer_cmd = (-k_off * lane_offset
+                 - k_yaw * yaw_rate
+                 + 7.0 * curvature
+                 + _ap["lane_change_bias"])
+    if accel_lat is not None and abs(accel_lat) > 0.75 * mu * 9.81:
+        steer_cmd *= 0.55
+    max_steer = _clip(0.18 + 0.75 * mu, 0.18, 0.92)
+    max_step = (0.55 if mu >= 0.5 else 0.22) * dt
+    steer_cmd = _clip(steer_cmd, _ap["steer"] - max_step, _ap["steer"] + max_step)
+    steer_cmd = _clip(steer_cmd, -max_steer, max_steer)
+
+    # Speed controller with hard safety overrides.  Commands are deliberately
+    # gentle on low grip to preserve stability and survive flickering sensors.
+    desired_ms = desired_kmh / 3.6
+    speed_err = desired_ms - speed_ms
+    if emergency:
+        throttle = 0.0
+        brake = 1.0
+    elif obstacle and speed_err < 0.0:
+        throttle = 0.0
+        brake = _clip((-speed_err) / max(2.0, 4.0 * mu) + (3.0 - min(ttc, 3.0)) * 0.18,
+                      0.15, 0.85)
+    elif speed_err >= 0.0:
+        throttle = _clip(0.10 + speed_err / 12.0, 0.0, 0.85 * mu_speed_factor)
+        brake = 0.0
+    else:
+        throttle = 0.0
+        brake = _clip((-speed_err) / 10.0, 0.0, 0.45)
+
+    if accel_long is not None and accel_long < -6.0 * mu and brake > 0.2:
+        brake *= 0.75
+    if abs(steer_cmd) > 0.55:
+        throttle *= 0.45
+    if mu < 0.35:
+        throttle = min(throttle, 0.32)
+        brake = min(brake, 0.72 if not emergency else 1.0)
+
+    # Detect likely brake failure or stuck throttle from actuator sensors and
+    # bias the command toward the safest available request.
+    brake_press = _median_good([state.get("brake_pressure_1_pct"),
+                                state.get("brake_pressure_2_pct")], 0.0, 100.0)
+    if brake > 0.5 and brake_press is not None and brake_press < 5.0:
+        throttle = 0.0
+        brake = 1.0
+    if speed_err < -1.0:
+        throttle = 0.0
+
+    alpha_cmd = 0.45 if mu >= 0.5 else 0.25
+    _ap["steer"] = steer_cmd
+    _ap["throttle"] = (1.0 - alpha_cmd) * _ap["throttle"] + alpha_cmd * throttle
+    _ap["brake"] = (1.0 - alpha_cmd) * _ap["brake"] + alpha_cmd * brake
+    if emergency:
+        _ap["throttle"] = 0.0
+        _ap["brake"] = max(_ap["brake"], 0.95)
+
+    return {
+        "steering": _clip(_ap["steer"], -1.0, 1.0),
+        "throttle": _clip(_ap["throttle"], 0.0, 1.0),
+        "brake": _clip(_ap["brake"], 0.0, 1.0),
+    }

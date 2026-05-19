@@ -1,0 +1,551 @@
+use std::io::{self, Read, Write, BufReader, BufWriter};
+
+// Simple, fast PRNG (xorshift) so we don't pull in external crates.
+struct XorShift {
+    state: u64,
+}
+
+impl XorShift {
+    fn new(seed: u64) -> Self {
+        let s = if seed == 0 { 0x9E3779B97F4A7C15 } else { seed };
+        Self { state: s }
+    }
+    #[inline]
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.state = x;
+        x
+    }
+    #[inline]
+    fn next_range(&mut self, n: u64) -> u64 {
+        self.next_u64() % n
+    }
+    #[inline]
+    fn next_f32(&mut self) -> f32 {
+        ((self.next_u64() >> 40) as f32) / ((1u64 << 24) as f32)
+    }
+}
+
+#[inline]
+fn sqr_dist(a: &[f32; 3], b: &[f32; 3]) -> f32 {
+    let dx = a[0] - b[0];
+    let dy = a[1] - b[1];
+    let dz = a[2] - b[2];
+    dx * dx + dy * dy + dz * dz
+}
+
+#[inline]
+fn nearest_centroid(p: &[f32; 3], centroids: &[[f32; 3]]) -> (usize, f32) {
+    let mut best = 0usize;
+    let mut bestd = f32::INFINITY;
+    for (i, c) in centroids.iter().enumerate() {
+        let d = sqr_dist(p, c);
+        if d < bestd {
+            bestd = d;
+            best = i;
+        }
+    }
+    (best, bestd)
+}
+
+// Header parsing: the spec writes "num_points num_clusters" before the
+// binary data. We try to be robust about how that header is encoded:
+//  - Two u64 little-endian values (16 bytes).
+//  - Two u32 values (8 bytes).
+//  - ASCII text terminated by a newline.
+fn parse_header(reader: &mut BufReader<io::StdinLock>) -> io::Result<(u64, u32, Vec<u8>)> {
+    let mut head = [0u8; 16];
+    let mut have = 0usize;
+    while have < 16 {
+        match reader.read(&mut head[have..]) {
+            Ok(0) => break,
+            Ok(n) => have += n,
+            Err(e) => return Err(e),
+        }
+    }
+
+    // Detect ASCII: digits and whitespace only in the first chunk.
+    let mut is_ascii = true;
+    let mut saw_digit = false;
+    for &b in head[..have].iter() {
+        if b.is_ascii_digit() {
+            saw_digit = true;
+        } else if b == b' ' || b == b'\t' || b == b'\n' || b == b'\r' {
+            // ok
+        } else {
+            is_ascii = false;
+            break;
+        }
+    }
+
+    if is_ascii && saw_digit {
+        let mut line = Vec::with_capacity(64);
+        line.extend_from_slice(&head[..have]);
+        if !line.iter().any(|&b| b == b'\n') {
+            let mut byte = [0u8; 1];
+            loop {
+                let n = reader.read(&mut byte)?;
+                if n == 0 {
+                    break;
+                }
+                line.push(byte[0]);
+                if byte[0] == b'\n' {
+                    break;
+                }
+            }
+        }
+        let nl = line.iter().position(|&b| b == b'\n').unwrap_or(line.len());
+        let header_str = std::str::from_utf8(&line[..nl])
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "non utf8 header"))?;
+        let mut parts = header_str.split_ascii_whitespace();
+        let np: u64 = parts
+            .next()
+            .and_then(|s| s.parse().ok())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no num_points"))?;
+        let nc: u32 = parts
+            .next()
+            .and_then(|s| s.parse().ok())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no num_clusters"))?;
+        let leftover: Vec<u8> = if nl + 1 < line.len() {
+            line[nl + 1..].to_vec()
+        } else {
+            Vec::new()
+        };
+        return Ok((np, nc, leftover));
+    }
+
+    if have >= 16 {
+        // Try u64 + u64 header (16 bytes).
+        let np = u64::from_le_bytes(head[0..8].try_into().unwrap());
+        let nc64 = u64::from_le_bytes(head[8..16].try_into().unwrap());
+        if nc64 > 0 && nc64 < 1u64 << 32 && np > 0 {
+            return Ok((np, nc64 as u32, Vec::new()));
+        }
+    }
+    if have >= 8 {
+        let np = u32::from_le_bytes(head[0..4].try_into().unwrap()) as u64;
+        let nc = u32::from_le_bytes(head[4..8].try_into().unwrap());
+        let leftover: Vec<u8> = head[8..have].to_vec();
+        return Ok((np, nc, leftover));
+    }
+
+    Err(io::Error::new(io::ErrorKind::UnexpectedEof, "short header"))
+}
+
+// Reader that yields the optional leftover bytes first, then continues from
+// the wrapped reader.
+struct ChainedReader<R: Read> {
+    leftover: Vec<u8>,
+    pos: usize,
+    inner: R,
+}
+
+impl<R: Read> ChainedReader<R> {
+    fn new(leftover: Vec<u8>, inner: R) -> Self {
+        Self { leftover, pos: 0, inner }
+    }
+}
+
+impl<R: Read> Read for ChainedReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.pos < self.leftover.len() {
+            let n = (self.leftover.len() - self.pos).min(buf.len());
+            buf[..n].copy_from_slice(&self.leftover[self.pos..self.pos + n]);
+            self.pos += n;
+            return Ok(n);
+        }
+        self.inner.read(buf)
+    }
+}
+
+// Read up to `n` points. Returns count actually read; less than n -> EOF.
+fn read_points_block<R: Read>(r: &mut R, out: &mut Vec<[f32; 3]>, n: usize) -> io::Result<usize> {
+    out.clear();
+    let byte_len = n.checked_mul(12).expect("overflow");
+    let mut buf = vec![0u8; byte_len];
+    let mut filled = 0usize;
+    while filled < byte_len {
+        match r.read(&mut buf[filled..])? {
+            0 => break,
+            k => filled += k,
+        }
+    }
+    let pts = filled / 12;
+    out.reserve(pts);
+    for i in 0..pts {
+        let off = i * 12;
+        out.push([
+            f32::from_le_bytes(buf[off..off + 4].try_into().unwrap()),
+            f32::from_le_bytes(buf[off + 4..off + 8].try_into().unwrap()),
+            f32::from_le_bytes(buf[off + 8..off + 12].try_into().unwrap()),
+        ]);
+    }
+    Ok(pts)
+}
+
+// k-means++ style seeding from in-memory points. Falls back to random
+// selection when k is very large.
+fn seed_centroids_in_memory(points: &[[f32; 3]], k: usize, rng: &mut XorShift) -> Vec<[f32; 3]> {
+    let n = points.len();
+    let mut centroids: Vec<[f32; 3]> = Vec::with_capacity(k);
+    if n == 0 {
+        for _ in 0..k {
+            centroids.push([0.0, 0.0, 0.0]);
+        }
+        return centroids;
+    }
+    if k > 2048 || (n as u128) * (k as u128) > 50_000_000_000u128 {
+        for _ in 0..k {
+            let idx = rng.next_range(n as u64) as usize;
+            centroids.push(points[idx]);
+        }
+        return centroids;
+    }
+    let first = rng.next_range(n as u64) as usize;
+    centroids.push(points[first]);
+    let mut dists: Vec<f32> = points.iter().map(|p| sqr_dist(p, &centroids[0])).collect();
+    for _ in 1..k {
+        let total: f64 = dists.iter().map(|&d| d as f64).sum();
+        if total <= 0.0 {
+            let idx = rng.next_range(n as u64) as usize;
+            centroids.push(points[idx]);
+            continue;
+        }
+        let target = rng.next_f32() as f64 * total;
+        let mut cum = 0.0f64;
+        let mut chosen = n - 1;
+        for (i, &d) in dists.iter().enumerate() {
+            cum += d as f64;
+            if cum >= target {
+                chosen = i;
+                break;
+            }
+        }
+        centroids.push(points[chosen]);
+        let cnew = *centroids.last().unwrap();
+        for (i, p) in points.iter().enumerate() {
+            let d = sqr_dist(p, &cnew);
+            if d < dists[i] {
+                dists[i] = d;
+            }
+        }
+    }
+    centroids
+}
+
+// Lloyd's k-means iterations on an in-memory dataset.
+fn lloyd_in_memory(
+    points: &[[f32; 3]],
+    centroids: &mut Vec<[f32; 3]>,
+    assign: &mut Vec<u32>,
+    max_iters: usize,
+    tol: f32,
+    rng: &mut XorShift,
+) {
+    let k = centroids.len();
+    let n = points.len();
+    assign.clear();
+    assign.resize(n, 0);
+
+    let mut sums: Vec<[f64; 3]> = vec![[0.0; 3]; k];
+    let mut counts: Vec<u64> = vec![0; k];
+
+    for it in 0..max_iters {
+        for s in sums.iter_mut() {
+            *s = [0.0, 0.0, 0.0];
+        }
+        for c in counts.iter_mut() {
+            *c = 0;
+        }
+        for (i, p) in points.iter().enumerate() {
+            let (idx, _) = nearest_centroid(p, centroids);
+            assign[i] = idx as u32;
+            sums[idx][0] += p[0] as f64;
+            sums[idx][1] += p[1] as f64;
+            sums[idx][2] += p[2] as f64;
+            counts[idx] += 1;
+        }
+        let mut max_shift = 0.0f32;
+        for c in 0..k {
+            if counts[c] > 0 {
+                let cn = counts[c] as f64;
+                let new_c = [
+                    (sums[c][0] / cn) as f32,
+                    (sums[c][1] / cn) as f32,
+                    (sums[c][2] / cn) as f32,
+                ];
+                let shift = sqr_dist(&centroids[c], &new_c);
+                if shift > max_shift {
+                    max_shift = shift;
+                }
+                centroids[c] = new_c;
+            } else if n > 0 {
+                let idx = rng.next_range(n as u64) as usize;
+                centroids[c] = points[idx];
+                max_shift = f32::INFINITY;
+            }
+        }
+        if it > 0 && max_shift <= tol {
+            break;
+        }
+    }
+}
+
+// Mini-batch k-means over in-memory dataset.
+fn minibatch_in_memory(
+    points: &[[f32; 3]],
+    centroids: &mut Vec<[f32; 3]>,
+    batch_size: usize,
+    iters: usize,
+    rng: &mut XorShift,
+) {
+    let n = points.len();
+    if n == 0 {
+        return;
+    }
+    let k = centroids.len();
+    let mut visit_counts: Vec<u64> = vec![0; k];
+    let bs = batch_size.min(n);
+    for _ in 0..iters {
+        for _ in 0..bs {
+            let idx = rng.next_range(n as u64) as usize;
+            let p = &points[idx];
+            let (cidx, _) = nearest_centroid(p, centroids);
+            visit_counts[cidx] += 1;
+            let eta = 1.0f32 / (visit_counts[cidx] as f32);
+            let c = &mut centroids[cidx];
+            c[0] += eta * (p[0] - c[0]);
+            c[1] += eta * (p[1] - c[1]);
+            c[2] += eta * (p[2] - c[2]);
+        }
+    }
+}
+
+fn assign_in_memory(points: &[[f32; 3]], centroids: &[[f32; 3]], assign: &mut Vec<u32>) {
+    assign.clear();
+    assign.resize(points.len(), 0);
+    for (i, p) in points.iter().enumerate() {
+        let (idx, _) = nearest_centroid(p, centroids);
+        assign[i] = idx as u32;
+    }
+}
+
+fn main() -> io::Result<()> {
+    let stdin = io::stdin();
+    let stdin_lock = stdin.lock();
+    let mut reader = BufReader::with_capacity(1 << 20, stdin_lock);
+
+    let (num_points, num_clusters, leftover) = parse_header(&mut reader)?;
+    let mut data_reader = ChainedReader::new(leftover, reader);
+
+    let stdout = io::stdout();
+    let stdout_lock = stdout.lock();
+    let mut writer = BufWriter::with_capacity(1 << 20, stdout_lock);
+
+    if num_points == 0 {
+        writer.flush()?;
+        return Ok(());
+    }
+    let k = num_clusters as usize;
+    if k == 0 {
+        let zero = 0u32.to_le_bytes();
+        for _ in 0..num_points {
+            writer.write_all(&zero)?;
+        }
+        writer.flush()?;
+        return Ok(());
+    }
+
+    let mut rng = XorShift::new(0xC0FFEE_u64 ^ num_points ^ ((k as u64) << 17));
+
+    // Adaptive strategy:
+    //   - small (<=2M)        -> full Lloyd
+    //   - medium (<=20M)      -> mini-batch + a few Lloyd passes (in memory)
+    //   - large/extreme (>20M)-> reservoir-sampled centroid training + streaming
+    //                            assignment via a temp spill file.
+    let small_threshold: u64 = 2_000_000;
+    let medium_threshold: u64 = 20_000_000;
+
+    let sample_target: usize = {
+        let by_k = (k as u64).saturating_mul(200).min(2_000_000) as usize;
+        let base = 200_000usize.max(by_k);
+        base.min(500_000)
+    };
+
+    if num_points <= small_threshold {
+        // Path A: full in-memory Lloyd.
+        let want = num_points as usize;
+        let mut all: Vec<[f32; 3]> = Vec::with_capacity(want);
+        let mut block = Vec::with_capacity(65_536);
+        loop {
+            let got = read_points_block(&mut data_reader, &mut block, 65_536)?;
+            if got == 0 {
+                break;
+            }
+            all.extend_from_slice(&block[..got]);
+            if all.len() >= want {
+                break;
+            }
+        }
+        all.truncate(want);
+        let mut centroids = seed_centroids_in_memory(&all, k, &mut rng);
+        let mut assign: Vec<u32> = Vec::with_capacity(all.len());
+        let max_iters = if k <= 32 { 30 } else if k <= 256 { 20 } else { 12 };
+        lloyd_in_memory(&all, &mut centroids, &mut assign, max_iters, 1e-5, &mut rng);
+        assign_in_memory(&all, &centroids, &mut assign);
+        let written = assign.len();
+        for a in &assign {
+            writer.write_all(&a.to_le_bytes())?;
+        }
+        for _ in written..(num_points as usize) {
+            writer.write_all(&0u32.to_le_bytes())?;
+        }
+        writer.flush()?;
+        return Ok(());
+    }
+
+    if num_points <= medium_threshold {
+        // Path B: full data in memory, mini-batch warm-up + Lloyd refinement.
+        let want = num_points as usize;
+        let mut all: Vec<[f32; 3]> = Vec::with_capacity(want);
+        let mut block = Vec::with_capacity(131_072);
+        loop {
+            let got = read_points_block(&mut data_reader, &mut block, 131_072)?;
+            if got == 0 {
+                break;
+            }
+            all.extend_from_slice(&block[..got]);
+            if all.len() >= want {
+                break;
+            }
+        }
+        all.truncate(want);
+        let mut centroids = seed_centroids_in_memory(&all, k, &mut rng);
+        let batch_size = 8192usize.min(all.len());
+        let mb_iters = if k <= 256 { 8 } else { 4 };
+        minibatch_in_memory(&all, &mut centroids, batch_size, mb_iters, &mut rng);
+        let mut assign: Vec<u32> = Vec::with_capacity(all.len());
+        let lloyd_iters = if k <= 256 { 6 } else { 3 };
+        lloyd_in_memory(&all, &mut centroids, &mut assign, lloyd_iters, 1e-4, &mut rng);
+        assign_in_memory(&all, &centroids, &mut assign);
+        let written = assign.len();
+        for a in &assign {
+            writer.write_all(&a.to_le_bytes())?;
+        }
+        for _ in written..(num_points as usize) {
+            writer.write_all(&0u32.to_le_bytes())?;
+        }
+        writer.flush()?;
+        return Ok(());
+    }
+
+    // Path C: streaming. Reservoir-sample on a first pass while spilling
+    // points to a temp file, then train centroids on the sample, then read
+    // the spill file to write assignments.
+    let tmp_path = std::env::temp_dir().join(format!(
+        "kmeans_stream_{}_{}.bin",
+        std::process::id(),
+        num_points
+    ));
+    let tmp = std::fs::File::create(&tmp_path)?;
+    let mut tmp_writer = BufWriter::with_capacity(1 << 20, tmp);
+
+    let mut sample: Vec<[f32; 3]> = Vec::with_capacity(sample_target);
+    let mut i: u64 = 0;
+    let mut block: Vec<[f32; 3]> = Vec::with_capacity(131_072);
+    let mut byte_buf: Vec<u8> = vec![0u8; 12 * 131_072];
+    while i < num_points {
+        let want = (num_points - i).min(131_072) as usize;
+        let got = read_points_block(&mut data_reader, &mut block, want)?;
+        if got == 0 {
+            break;
+        }
+        for j in 0..got {
+            let p = block[j];
+            byte_buf[j * 12..j * 12 + 4].copy_from_slice(&p[0].to_le_bytes());
+            byte_buf[j * 12 + 4..j * 12 + 8].copy_from_slice(&p[1].to_le_bytes());
+            byte_buf[j * 12 + 8..j * 12 + 12].copy_from_slice(&p[2].to_le_bytes());
+        }
+        tmp_writer.write_all(&byte_buf[..got * 12])?;
+        for j in 0..got {
+            let p = block[j];
+            if (sample.len() as u64) < sample_target as u64 {
+                sample.push(p);
+            } else {
+                let r = rng.next_range(i + 1) as usize;
+                if r < sample_target {
+                    sample[r] = p;
+                }
+            }
+            i += 1;
+        }
+    }
+    tmp_writer.flush()?;
+    drop(tmp_writer);
+
+    let mut centroids = seed_centroids_in_memory(&sample, k, &mut rng);
+    let mut assign_scratch: Vec<u32> = Vec::with_capacity(sample.len());
+    let lloyd_iters = if k <= 64 {
+        20
+    } else if k <= 512 {
+        12
+    } else if k <= 4096 {
+        8
+    } else {
+        5
+    };
+    lloyd_in_memory(&sample, &mut centroids, &mut assign_scratch, lloyd_iters, 1e-4, &mut rng);
+    drop(assign_scratch);
+    drop(sample);
+
+    let tmp_in = std::fs::File::open(&tmp_path)?;
+    let mut tmp_reader = BufReader::with_capacity(1 << 20, tmp_in);
+    let mut written: u64 = 0;
+    let chunk_pts = 131_072usize;
+    let mut chunk_bytes: Vec<u8> = vec![0u8; 12 * chunk_pts];
+    let mut out_bytes: Vec<u8> = vec![0u8; 4 * chunk_pts];
+    while written < i {
+        let want = ((i - written) as usize).min(chunk_pts);
+        let need = want * 12;
+        let mut filled = 0usize;
+        while filled < need {
+            match tmp_reader.read(&mut chunk_bytes[filled..need])? {
+                0 => break,
+                n => filled += n,
+            }
+        }
+        let got_pts = filled / 12;
+        if got_pts == 0 {
+            break;
+        }
+        for j in 0..got_pts {
+            let off = j * 12;
+            let p = [
+                f32::from_le_bytes(chunk_bytes[off..off + 4].try_into().unwrap()),
+                f32::from_le_bytes(chunk_bytes[off + 4..off + 8].try_into().unwrap()),
+                f32::from_le_bytes(chunk_bytes[off + 8..off + 12].try_into().unwrap()),
+            ];
+            let (idx, _) = nearest_centroid(&p, &centroids);
+            let bytes = (idx as u32).to_le_bytes();
+            let oo = j * 4;
+            out_bytes[oo] = bytes[0];
+            out_bytes[oo + 1] = bytes[1];
+            out_bytes[oo + 2] = bytes[2];
+            out_bytes[oo + 3] = bytes[3];
+        }
+        writer.write_all(&out_bytes[..got_pts * 4])?;
+        written += got_pts as u64;
+    }
+    while written < num_points {
+        writer.write_all(&0u32.to_le_bytes())?;
+        written += 1;
+    }
+    writer.flush()?;
+
+    let _ = std::fs::remove_file(&tmp_path);
+
+    Ok(())
+}

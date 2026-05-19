@@ -1,0 +1,1043 @@
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cctype>
+#include <cmath>
+#include <condition_variable>
+#include <cstdint>
+#include <deque>
+#include <fstream>
+#include <iostream>
+#include <limits>
+#include <memory>
+#include <mutex>
+#include <numbers>
+#include <optional>
+#include <sstream>
+#include <string>
+#include <thread>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
+
+struct Vec2 {
+    double x = 0.0;
+    double y = 0.0;
+};
+
+struct Vec3 {
+    double x = 0.0;
+    double y = 0.0;
+    double z = 0.0;
+};
+
+struct Command {
+    double thrust = 0.0;
+    double pitchCmd = 0.0;
+    double yawCmd = 0.0;
+    double rollCmd = 0.0;
+};
+
+struct State {
+    double x = 0.0;
+    double y = 0.0;
+    double z = 0.0;
+    double vx = 0.0;
+    double vy = 0.0;
+    double vz = 0.0;
+    double pitch = 0.0;
+    double yaw = 0.0;
+    double roll = 0.0;
+    double pitchRate = 0.0;
+    double yawRate = 0.0;
+    double rollRate = 0.0;
+    double fuelRemaining = 0.0;
+    std::uint64_t seq = 0;
+    std::chrono::steady_clock::time_point stamp = std::chrono::steady_clock::now();
+};
+
+struct SharedState {
+    std::mutex mutex;
+    State latest;
+    bool hasState = false;
+    bool inputClosed = false;
+};
+
+static Vec2 operator+(const Vec2& a, const Vec2& b) {
+    return {a.x + b.x, a.y + b.y};
+}
+
+static Vec2 operator-(const Vec2& a, const Vec2& b) {
+    return {a.x - b.x, a.y - b.y};
+}
+
+static Vec2 operator*(const Vec2& a, double s) {
+    return {a.x * s, a.y * s};
+}
+
+static Vec2 operator/(const Vec2& a, double s) {
+    return {a.x / s, a.y / s};
+}
+
+static Vec3 operator+(const Vec3& a, const Vec3& b) {
+    return {a.x + b.x, a.y + b.y, a.z + b.z};
+}
+
+static Vec3 operator-(const Vec3& a, const Vec3& b) {
+    return {a.x - b.x, a.y - b.y, a.z - b.z};
+}
+
+static Vec3 operator*(const Vec3& a, double s) {
+    return {a.x * s, a.y * s, a.z * s};
+}
+
+static double norm(const Vec2& v) {
+    return std::sqrt(v.x * v.x + v.y * v.y);
+}
+
+static double norm(const Vec3& v) {
+    return std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
+}
+
+static double distance(const Vec2& a, const Vec2& b) {
+    return norm(a - b);
+}
+
+static double clampUnit(double v) {
+    return std::clamp(v, -1.0, 1.0);
+}
+
+static double wrapAngle(double a) {
+    while (a > std::numbers::pi_v<double>) {
+        a -= 2.0 * std::numbers::pi_v<double>;
+    }
+    while (a < -std::numbers::pi_v<double>) {
+        a += 2.0 * std::numbers::pi_v<double>;
+    }
+    return a;
+}
+
+static int clampInt(int v, int lo, int hi) {
+    return std::clamp(v, lo, hi);
+}
+
+struct Column {
+    std::uint16_t groundTop = 0;
+    std::uint16_t rockBottom = 0;
+    std::uint16_t rockTop = 0;
+};
+
+struct Tile {
+    int tx = 0;
+    int ty = 0;
+    int x0 = 0;
+    int y0 = 0;
+    int w = 0;
+    int h = 0;
+    std::uint16_t maxTop = 0;
+    std::vector<Column> columns;
+
+    const Column& at(int lx, int ly) const {
+        return columns[static_cast<std::size_t>(lx) * static_cast<std::size_t>(h) + static_cast<std::size_t>(ly)];
+    }
+};
+
+class TerrainCache {
+public:
+    struct CorridorStats {
+        double maxTop = 0.0;
+        int known = 0;
+        int total = 0;
+    };
+
+    TerrainCache(int width, int depth, int tileSize, const std::string& filePath)
+        : width_(width), depth_(depth), tileSize_(tileSize), filePath_(filePath) {}
+
+    ~TerrainCache() {
+        stop();
+    }
+
+    void start() {
+        worker_ = std::thread([this]() { workerLoop(); });
+    }
+
+    void stop() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stop_ = true;
+        }
+        cv_.notify_all();
+        if (worker_.joinable()) {
+            worker_.join();
+        }
+    }
+
+    void requestTile(int tx, int ty) {
+        if (tx < 0 || ty < 0) {
+            return;
+        }
+        const int maxTx = (width_ - 1) / tileSize_;
+        const int maxTy = (depth_ - 1) / tileSize_;
+        if (tx > maxTx || ty > maxTy) {
+            return;
+        }
+        const std::uint64_t key = makeKey(tx, ty);
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (loaded_.find(key) != loaded_.end() || pending_.find(key) != pending_.end()) {
+            return;
+        }
+        pending_.insert(key);
+        queue_.push_back({tx, ty});
+        cv_.notify_one();
+    }
+
+    void requestBox(int x0, int y0, int x1, int y1) {
+        x0 = clampInt(x0, 0, width_ - 1);
+        y0 = clampInt(y0, 0, depth_ - 1);
+        x1 = clampInt(x1, 0, width_ - 1);
+        y1 = clampInt(y1, 0, depth_ - 1);
+        if (x1 < x0 || y1 < y0) {
+            return;
+        }
+        const int tx0 = x0 / tileSize_;
+        const int ty0 = y0 / tileSize_;
+        const int tx1 = x1 / tileSize_;
+        const int ty1 = y1 / tileSize_;
+        for (int tx = tx0; tx <= tx1; ++tx) {
+            for (int ty = ty0; ty <= ty1; ++ty) {
+                requestTile(tx, ty);
+            }
+        }
+    }
+
+    void requestAround(double x, double y, int radius) {
+        const int xi = static_cast<int>(std::floor(x));
+        const int yi = static_cast<int>(std::floor(y));
+        requestBox(xi - radius, yi - radius, xi + radius, yi + radius);
+    }
+
+    void requestCorridor(const Vec2& a, const Vec2& b, int halfWidthCells) {
+        const int tileRadius = std::max(0, (halfWidthCells + tileSize_ - 1) / tileSize_);
+        const double length = distance(a, b);
+        const int steps = std::max(1, static_cast<int>(std::ceil(length / (tileSize_ * 0.5))));
+        for (int i = 0; i <= steps; ++i) {
+            const double t = static_cast<double>(i) / static_cast<double>(steps);
+            const double px = a.x + (b.x - a.x) * t;
+            const double py = a.y + (b.y - a.y) * t;
+            const int tx = static_cast<int>(std::floor(px / static_cast<double>(tileSize_)));
+            const int ty = static_cast<int>(std::floor(py / static_cast<double>(tileSize_)));
+            for (int dx = -tileRadius; dx <= tileRadius; ++dx) {
+                for (int dy = -tileRadius; dy <= tileRadius; ++dy) {
+                    requestTile(tx + dx, ty + dy);
+                }
+            }
+        }
+    }
+
+    bool queryColumn(int x, int y, Column& out) const {
+        if (x < 0 || x >= width_ || y < 0 || y >= depth_) {
+            return false;
+        }
+        const int tx = x / tileSize_;
+        const int ty = y / tileSize_;
+        const std::uint64_t key = makeKey(tx, ty);
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = loaded_.find(key);
+        if (it == loaded_.end()) {
+            return false;
+        }
+        const Tile& tile = *it->second;
+        out = tile.at(x - tile.x0, y - tile.y0);
+        return true;
+    }
+
+    CorridorStats sampleCorridorMaxTop(const Vec2& a, const Vec2& b, int halfWidthCells) {
+        CorridorStats stats;
+        const int tileRadius = std::max(0, (halfWidthCells + tileSize_ - 1) / tileSize_);
+        const double length = distance(a, b);
+        const int steps = std::max(1, static_cast<int>(std::ceil(length / (tileSize_ * 0.5))));
+        std::unordered_set<std::uint64_t> seen;
+        seen.reserve(static_cast<std::size_t>((steps + 1) * (2 * tileRadius + 1) * (2 * tileRadius + 1)));
+
+        for (int i = 0; i <= steps; ++i) {
+            const double t = static_cast<double>(i) / static_cast<double>(steps);
+            const double px = a.x + (b.x - a.x) * t;
+            const double py = a.y + (b.y - a.y) * t;
+            const int tx = static_cast<int>(std::floor(px / static_cast<double>(tileSize_)));
+            const int ty = static_cast<int>(std::floor(py / static_cast<double>(tileSize_)));
+            for (int dx = -tileRadius; dx <= tileRadius; ++dx) {
+                for (int dy = -tileRadius; dy <= tileRadius; ++dy) {
+                    const int qx = tx + dx;
+                    const int qy = ty + dy;
+                    if (qx < 0 || qy < 0 || qx > (width_ - 1) / tileSize_ || qy > (depth_ - 1) / tileSize_) {
+                        continue;
+                    }
+                    const std::uint64_t key = makeKey(qx, qy);
+                    if (!seen.insert(key).second) {
+                        continue;
+                    }
+                    requestTile(qx, qy);
+                    ++stats.total;
+                    double maxTop = 0.0;
+                    if (queryTileMaxTop(qx, qy, maxTop)) {
+                        ++stats.known;
+                        stats.maxTop = std::max(stats.maxTop, maxTop);
+                    }
+                }
+            }
+        }
+        return stats;
+    }
+
+private:
+    static std::uint64_t makeKey(int tx, int ty) {
+        return (static_cast<std::uint64_t>(static_cast<std::uint32_t>(tx)) << 32U) |
+               static_cast<std::uint32_t>(ty);
+    }
+
+    bool queryTileMaxTop(int tx, int ty, double& out) const {
+        const std::uint64_t key = makeKey(tx, ty);
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = loaded_.find(key);
+        if (it == loaded_.end()) {
+            return false;
+        }
+        out = static_cast<double>(it->second->maxTop);
+        return true;
+    }
+
+    std::shared_ptr<Tile> loadTile(std::ifstream& file, int tx, int ty) {
+        auto tile = std::make_shared<Tile>();
+        tile->tx = tx;
+        tile->ty = ty;
+        tile->x0 = tx * tileSize_;
+        tile->y0 = ty * tileSize_;
+        tile->w = std::min(tileSize_, width_ - tile->x0);
+        tile->h = std::min(tileSize_, depth_ - tile->y0);
+        tile->columns.resize(static_cast<std::size_t>(tile->w) * static_cast<std::size_t>(tile->h));
+
+        std::vector<unsigned char> row(static_cast<std::size_t>(tile->h) * 6U);
+        std::uint16_t maxTop = 0;
+
+        for (int lx = 0; lx < tile->w; ++lx) {
+            const int x = tile->x0 + lx;
+            const std::uint64_t baseIndex =
+                (static_cast<std::uint64_t>(x) * static_cast<std::uint64_t>(depth_) +
+                 static_cast<std::uint64_t>(tile->y0)) *
+                6ULL;
+            file.seekg(static_cast<std::streamoff>(baseIndex), std::ios::beg);
+            file.read(reinterpret_cast<char*>(row.data()), static_cast<std::streamsize>(row.size()));
+            if (file.gcount() != static_cast<std::streamsize>(row.size())) {
+                break;
+            }
+
+            for (int ly = 0; ly < tile->h; ++ly) {
+                const std::size_t off = static_cast<std::size_t>(ly) * 6U;
+                Column c;
+                c.groundTop = static_cast<std::uint16_t>(row[off] | (row[off + 1] << 8U));
+                c.rockBottom = static_cast<std::uint16_t>(row[off + 2] | (row[off + 3] << 8U));
+                c.rockTop = static_cast<std::uint16_t>(row[off + 4] | (row[off + 5] << 8U));
+                tile->columns[static_cast<std::size_t>(lx) * static_cast<std::size_t>(tile->h) +
+                              static_cast<std::size_t>(ly)] = c;
+                maxTop = std::max(maxTop, std::max(c.groundTop, c.rockTop));
+            }
+        }
+
+        tile->maxTop = maxTop;
+        return tile;
+    }
+
+    void workerLoop() {
+        std::ifstream file(filePath_, std::ios::binary);
+        if (!file) {
+            return;
+        }
+
+        for (;;) {
+            std::pair<int, int> next{-1, -1};
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                cv_.wait(lock, [this]() { return stop_ || !queue_.empty(); });
+                if (stop_ && queue_.empty()) {
+                    return;
+                }
+                next = queue_.front();
+                queue_.pop_front();
+            }
+
+            auto tile = loadTile(file, next.first, next.second);
+            const std::uint64_t key = makeKey(next.first, next.second);
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                loaded_[key] = tile;
+                pending_.erase(key);
+            }
+        }
+    }
+
+    int width_;
+    int depth_;
+    int tileSize_;
+    std::string filePath_;
+
+    mutable std::mutex mutex_;
+    std::condition_variable cv_;
+    std::deque<std::pair<int, int>> queue_;
+    std::unordered_map<std::uint64_t, std::shared_ptr<Tile>> loaded_;
+    std::unordered_set<std::uint64_t> pending_;
+    std::thread worker_;
+    bool stop_ = false;
+};
+
+class Autopilot {
+public:
+    Autopilot(int width,
+              int depth,
+              int height,
+              double gravity,
+              double maxThrust,
+              double fuelCapacity,
+              const Vec3& start,
+              const Vec3& target,
+              TerrainCache& terrain)
+        : width_(width),
+          depth_(depth),
+          height_(height),
+          gravity_(gravity),
+          maxThrust_(maxThrust),
+          fuelCapacity_(fuelCapacity),
+          start_(start),
+          target_(target),
+          terrain_(terrain),
+          landingRadius_(std::max(5.0, std::min(width, depth) * 0.02)) {}
+
+    Command bootstrapCommand() const {
+        const double hover = std::clamp((gravity_ / std::max(0.1, maxThrust_)) * 1.02, 0.0, 1.0);
+        return {hover, 0.0, 0.0, 0.0};
+    }
+
+    Command compute(const State& s) {
+        const Vec2 pos{s.x, s.y};
+        const Vec2 vel{s.vx, s.vy};
+        const Vec2 targetXY{target_.x, target_.y};
+
+        terrain_.requestAround(start_.x, start_.y, 96);
+        terrain_.requestAround(s.x, s.y, 96);
+        terrain_.requestAround(target_.x, target_.y, targetSheltered_ ? static_cast<int>(entrySearchRadius_ + 64.0) : 128);
+
+        updateTargetInfo();
+        maybeUpdateEntryPlan(s);
+
+        Vec2 highGoal = targetXY;
+        if (targetSheltered_ && entryPoint_) {
+            highGoal = *entryPoint_;
+        }
+
+        terrain_.requestCorridor(pos, highGoal, 32);
+        if (targetSheltered_) {
+            terrain_.requestCorridor(highGoal, targetXY, 12);
+        }
+
+        const auto corridor = terrain_.sampleCorridorMaxTop(pos, highGoal, 32);
+        const double coverage = corridor.total > 0 ? static_cast<double>(corridor.known) / static_cast<double>(corridor.total) : 0.0;
+
+        Column currentColumn;
+        const bool hasCurrentColumn = terrain_.queryColumn(toCellX(s.x), toCellY(s.y), currentColumn);
+
+        const double currentSupportTop = hasCurrentColumn ? solidTopBelow(currentColumn, s.z) : 0.0;
+        const double clearance = std::clamp(8.0 + 0.01 * distance(pos, highGoal), 8.0, 60.0);
+
+        double baseCruise = target_.z + std::max(10.0, landingRadius_ * 1.2);
+        if (targetInfoKnown_) {
+            if (targetSheltered_) {
+                baseCruise = std::max(baseCruise, targetRoofTop_ + 8.0);
+                baseCruise = std::max(baseCruise, approachZ_ + 8.0);
+            } else {
+                baseCruise = std::max(baseCruise, approachZ_);
+            }
+        }
+
+        double cruiseZ = std::max(baseCruise, corridor.maxTop + clearance);
+        if (hasCurrentColumn) {
+            double immediateTop = currentSupportTop;
+            if (currentColumn.rockBottom < currentColumn.rockTop && s.z >= static_cast<double>(currentColumn.rockTop)) {
+                immediateTop = std::max(immediateTop, static_cast<double>(currentColumn.rockTop));
+            }
+            cruiseZ = std::max(cruiseZ, immediateTop + 6.0);
+        }
+        if (coverage < 0.85) {
+            const double unknownBoost = (0.85 - coverage) * 50.0;
+            cruiseZ = std::max(cruiseZ, std::min(static_cast<double>(height_) - 2.0, std::max(s.z + 18.0, baseCruise + unknownBoost)));
+        }
+        cruiseZ = std::clamp(cruiseZ, target_.z + 4.0, static_cast<double>(height_) - 2.0);
+
+        const double distToTarget = distance(pos, targetXY);
+        const double hspeed = norm(vel);
+        const double distToEntry = entryPoint_ ? distance(pos, *entryPoint_) : std::numeric_limits<double>::infinity();
+
+        if (stage_ == Stage::DescendToEntry || stage_ == Stage::LowTransit) {
+            if (!entryPoint_) {
+                stage_ = Stage::HighTransit;
+            }
+        }
+
+        if (!targetSheltered_) {
+            if (targetInfoKnown_ &&
+                stage_ != Stage::Final &&
+                distToTarget < std::max(landingRadius_ * 4.0, 20.0) &&
+                s.z > target_.z + 4.0 &&
+                hspeed < std::max(12.0, std::sqrt(distToTarget + 1.0) * 1.6)) {
+                stage_ = Stage::Final;
+            }
+            if (stage_ == Stage::Final && distToTarget > std::max(landingRadius_ * 6.0, 40.0)) {
+                stage_ = Stage::HighTransit;
+            }
+        } else {
+            if (stage_ == Stage::HighTransit &&
+                entryPoint_ &&
+                distToEntry < std::max(landingRadius_ * 2.5, 15.0) &&
+                std::abs(s.z - cruiseZ) < 14.0 &&
+                hspeed < 10.0) {
+                stage_ = Stage::DescendToEntry;
+            } else if (stage_ == Stage::DescendToEntry &&
+                       std::abs(s.z - approachZ_) < 3.0 &&
+                       std::abs(s.vz) < 5.0) {
+                stage_ = Stage::LowTransit;
+            } else if (stage_ == Stage::LowTransit &&
+                       distToTarget < std::max(landingRadius_ * 2.5, 12.0) &&
+                       hspeed < 6.0) {
+                stage_ = Stage::Final;
+            } else if (stage_ == Stage::Final &&
+                       distToTarget > std::max(landingRadius_ * 5.0, 32.0)) {
+                stage_ = Stage::HighTransit;
+            }
+        }
+
+        Vec3 waypoint{};
+        double horizCap = 0.0;
+        double tiltMax = 0.3;
+        bool finalStage = false;
+
+        switch (stage_) {
+        case Stage::HighTransit: {
+            const double distHigh = distance(pos, highGoal);
+            const bool climbFirst =
+                (s.z < cruiseZ - 8.0) &&
+                (coverage < 0.9 || distHigh > std::max(landingRadius_ * 3.0, 24.0));
+            if (climbFirst) {
+                waypoint = {s.x, s.y, cruiseZ};
+                horizCap = 0.0;
+            } else {
+                waypoint = {highGoal.x, highGoal.y, cruiseZ};
+                horizCap = std::clamp(std::sqrt(distHigh + 1.0) * 4.5, 12.0, 220.0);
+                horizCap *= 0.35 + 0.65 * coverage;
+            }
+            tiltMax = 0.72;
+            break;
+        }
+        case Stage::DescendToEntry: {
+            const Vec2 entry = entryPoint_.value_or(targetXY);
+            waypoint = {entry.x, entry.y, approachZ_};
+            horizCap = std::clamp(std::sqrt(distToEntry + 1.0) * 1.4, 0.0, 10.0);
+            tiltMax = 0.50;
+            break;
+        }
+        case Stage::LowTransit:
+            waypoint = {target_.x, target_.y, approachZ_};
+            horizCap = std::clamp(std::sqrt(distToTarget + 1.0) * 2.2, 4.0, 35.0);
+            tiltMax = 0.48;
+            break;
+        case Stage::Final:
+            waypoint = {target_.x, target_.y, target_.z + 0.35};
+            horizCap = std::clamp(std::sqrt(distToTarget + 1.0) * 0.9, 0.0, 6.0);
+            tiltMax = 0.32;
+            finalStage = true;
+            break;
+        }
+
+        if (hasCurrentColumn) {
+            if (!isOpenAt(currentColumn, s.z + 0.05)) {
+                const double escapeZ = std::min(static_cast<double>(height_) - 2.0, solidTopBelow(currentColumn, s.z) + 14.0);
+                waypoint = {s.x, s.y, escapeZ};
+                horizCap = 0.0;
+                tiltMax = 0.25;
+                finalStage = false;
+                stage_ = Stage::HighTransit;
+            } else {
+                const double floorGap = s.z - solidTopBelow(currentColumn, s.z);
+                const bool landingWindow =
+                    finalStage &&
+                    distToTarget < std::max(landingRadius_ * 1.2, 8.0) &&
+                    s.z <= target_.z + 3.0 &&
+                    hspeed < 3.0;
+                if (floorGap < 2.0 && !landingWindow) {
+                    waypoint = {s.x, s.y, std::min(static_cast<double>(height_) - 2.0, solidTopBelow(currentColumn, s.z) + 10.0)};
+                    horizCap = 0.0;
+                    tiltMax = 0.25;
+                    finalStage = false;
+                    stage_ = Stage::HighTransit;
+                }
+                if (currentColumn.rockBottom < currentColumn.rockTop &&
+                    s.z < static_cast<double>(currentColumn.rockBottom) &&
+                    s.z > static_cast<double>(currentColumn.rockBottom) - 1.0 &&
+                    waypoint.z > s.z) {
+                    waypoint.z = s.z;
+                }
+            }
+        }
+
+        waypoint.x = std::clamp(waypoint.x, 1.0, static_cast<double>(width_) - 2.0);
+        waypoint.y = std::clamp(waypoint.y, 1.0, static_cast<double>(depth_) - 2.0);
+        waypoint.z = std::clamp(waypoint.z, 0.5, static_cast<double>(height_) - 1.0);
+
+        return commandToWaypoint(s, waypoint, horizCap, tiltMax, finalStage);
+    }
+
+private:
+    enum class Stage {
+        HighTransit,
+        DescendToEntry,
+        LowTransit,
+        Final
+    };
+
+    enum class LineStatus {
+        Clear,
+        Blocked,
+        Unknown
+    };
+
+    static bool isOpenAt(const Column& c, double z) {
+        if (z < static_cast<double>(c.groundTop)) {
+            return false;
+        }
+        if (c.rockBottom < c.rockTop &&
+            z >= static_cast<double>(c.rockBottom) &&
+            z < static_cast<double>(c.rockTop)) {
+            return false;
+        }
+        return true;
+    }
+
+    static double solidTopBelow(const Column& c, double z) {
+        if (c.rockBottom < c.rockTop) {
+            if (z >= static_cast<double>(c.rockTop)) {
+                return static_cast<double>(c.rockTop);
+            }
+            if (z >= static_cast<double>(c.rockBottom)) {
+                return static_cast<double>(c.rockTop);
+            }
+        }
+        return static_cast<double>(c.groundTop);
+    }
+
+    static bool hasVerticalSkyAccess(const Column& c, double z) {
+        if (c.rockBottom < c.rockTop && static_cast<double>(c.rockTop) > z + 0.25) {
+            return false;
+        }
+        return true;
+    }
+
+    int toCellX(double x) const {
+        return clampInt(static_cast<int>(std::floor(x)), 0, width_ - 1);
+    }
+
+    int toCellY(double y) const {
+        return clampInt(static_cast<int>(std::floor(y)), 0, depth_ - 1);
+    }
+
+    void updateTargetInfo() {
+        Column c;
+        if (!terrain_.queryColumn(toCellX(target_.x), toCellY(target_.y), c)) {
+            return;
+        }
+
+        targetInfoKnown_ = true;
+        targetGround_ = static_cast<double>(c.groundTop);
+        targetRoofBottom_ = static_cast<double>(c.rockBottom);
+        targetRoofTop_ = static_cast<double>(c.rockTop);
+        targetSheltered_ = (c.rockBottom < c.rockTop) && (target_.z + 1.0 < static_cast<double>(c.rockBottom) - 0.25);
+
+        if (targetSheltered_) {
+            approachZ_ = std::max(target_.z + 2.5, targetGround_ + 2.5);
+            approachZ_ = std::min(approachZ_, targetRoofBottom_ - 2.0);
+            if (approachZ_ < target_.z + 0.5) {
+                approachZ_ = target_.z + 0.5;
+            }
+        } else {
+            approachZ_ = target_.z + std::max(6.0, landingRadius_ * 1.25);
+            entryPoint_.reset();
+        }
+
+        approachZ_ = std::clamp(approachZ_, target_.z + 0.5, static_cast<double>(height_) - 2.0);
+    }
+
+    LineStatus lineOpenAtZ(const Vec2& a, const Vec2& b, double z, double stepMeters) {
+        terrain_.requestCorridor(a, b, 8);
+        const double length = distance(a, b);
+        const int steps = std::max(1, static_cast<int>(std::ceil(length / std::max(0.75, stepMeters))));
+        bool anyUnknown = false;
+        for (int i = 0; i <= steps; ++i) {
+            const double t = static_cast<double>(i) / static_cast<double>(steps);
+            const int x = toCellX(a.x + (b.x - a.x) * t);
+            const int y = toCellY(a.y + (b.y - a.y) * t);
+            Column c;
+            if (!terrain_.queryColumn(x, y, c)) {
+                anyUnknown = true;
+                continue;
+            }
+            if (!isOpenAt(c, z)) {
+                return LineStatus::Blocked;
+            }
+        }
+        return anyUnknown ? LineStatus::Unknown : LineStatus::Clear;
+    }
+
+    void maybeUpdateEntryPlan(const State& s) {
+        if (!targetSheltered_) {
+            entryPoint_.reset();
+            return;
+        }
+
+        const auto now = std::chrono::steady_clock::now();
+        if (now - lastEntrySearch_ < std::chrono::milliseconds(400)) {
+            return;
+        }
+        lastEntrySearch_ = now;
+
+        if (entryPoint_) {
+            Column c;
+            if (terrain_.queryColumn(toCellX(entryPoint_->x), toCellY(entryPoint_->y), c)) {
+                const auto lineState = lineOpenAtZ(*entryPoint_, {target_.x, target_.y}, approachZ_, 1.5);
+                if (!isOpenAt(c, approachZ_) || !hasVerticalSkyAccess(c, approachZ_) || lineState == LineStatus::Blocked) {
+                    entryPoint_.reset();
+                }
+            }
+        }
+
+        if (entryPoint_) {
+            return;
+        }
+
+        terrain_.requestAround(target_.x, target_.y, static_cast<int>(entrySearchRadius_ + 64.0));
+
+        const Vec2 targetXY{target_.x, target_.y};
+        const Vec2 currentXY{s.x, s.y};
+        std::optional<Vec2> best;
+        double bestCost = std::numeric_limits<double>::infinity();
+        bool sawUnknown = false;
+
+        std::unordered_set<std::uint64_t> seenCells;
+
+        for (int radius = 12; radius <= static_cast<int>(entrySearchRadius_); radius += 12) {
+            const int samples = std::max(8, static_cast<int>(std::ceil(2.0 * std::numbers::pi_v<double> * radius / 12.0)));
+            for (int i = 0; i < samples; ++i) {
+                const double ang = (2.0 * std::numbers::pi_v<double> * static_cast<double>(i)) / static_cast<double>(samples);
+                const int x = toCellX(target_.x + std::cos(ang) * radius);
+                const int y = toCellY(target_.y + std::sin(ang) * radius);
+                const std::uint64_t key =
+                    (static_cast<std::uint64_t>(static_cast<std::uint32_t>(x)) << 32U) |
+                    static_cast<std::uint32_t>(y);
+                if (!seenCells.insert(key).second) {
+                    continue;
+                }
+
+                Column c;
+                if (!terrain_.queryColumn(x, y, c)) {
+                    sawUnknown = true;
+                    continue;
+                }
+                if (!isOpenAt(c, approachZ_) || !hasVerticalSkyAccess(c, approachZ_)) {
+                    continue;
+                }
+
+                const Vec2 candidate{static_cast<double>(x) + 0.5, static_cast<double>(y) + 0.5};
+                const auto lineState = lineOpenAtZ(candidate, targetXY, approachZ_, 3.0);
+                if (lineState == LineStatus::Unknown) {
+                    sawUnknown = true;
+                    continue;
+                }
+                if (lineState == LineStatus::Blocked) {
+                    continue;
+                }
+
+                const double cost = static_cast<double>(radius) + 0.20 * distance(candidate, currentXY);
+                if (cost < bestCost) {
+                    best = candidate;
+                    bestCost = cost;
+                }
+            }
+        }
+
+        if (best) {
+            entryPoint_ = best;
+        } else if (!sawUnknown && entrySearchRadius_ < 320.0) {
+            entrySearchRadius_ += 48.0;
+        }
+    }
+
+    Command commandToWaypoint(const State& s, const Vec3& waypoint, double horizCap, double tiltMax, bool finalStage) const {
+        const Vec2 pos{s.x, s.y};
+        const Vec2 vel{s.vx, s.vy};
+        const Vec2 toXY{waypoint.x - pos.x, waypoint.y - pos.y};
+        const double distXY = norm(toXY);
+
+        const double rawLatAccel = std::sqrt(std::max(0.0, maxThrust_ * maxThrust_ - gravity_ * gravity_));
+        const double maxLatAccel = std::max(0.35, std::min(rawLatAccel, gravity_ * std::tan(tiltMax) * 1.25));
+
+        Vec2 desiredVelXY{0.0, 0.0};
+        if (distXY > 1e-6) {
+            const double stopSpeed = std::sqrt(std::max(0.0, 2.0 * maxLatAccel * distXY));
+            double desiredSpeed = std::min(horizCap, stopSpeed * (finalStage ? 0.65 : 0.92));
+            if (finalStage) {
+                desiredSpeed = std::min(desiredSpeed, 2.0);
+            }
+            desiredVelXY = toXY * (desiredSpeed / distXY);
+        }
+
+        Vec2 accelXY = (desiredVelXY - vel) * (finalStage ? 1.35 : 0.95);
+        const double accelXYMag = norm(accelXY);
+        if (accelXYMag > maxLatAccel && accelXYMag > 1e-6) {
+            accelXY = accelXY * (maxLatAccel / accelXYMag);
+        }
+
+        const double dz = waypoint.z - s.z;
+        const double upStopDecel = std::max(0.6, gravity_ * 0.95);
+        const double downStopDecel = std::max(0.8, maxThrust_ - gravity_);
+
+        double desiredVz = 0.0;
+        if (dz > 0.0) {
+            const double climbCap = std::clamp(std::sqrt(dz + 1.0) * (finalStage ? 1.0 : 2.0), 1.0, finalStage ? 5.0 : 35.0);
+            const double stopVz = std::sqrt(std::max(0.0, 2.0 * upStopDecel * dz));
+            desiredVz = std::min(climbCap, stopVz * 0.85 + 0.3);
+        } else {
+            const double downDist = -dz;
+            const double descendCap =
+                finalStage ? std::clamp(std::sqrt(downDist + 1.0) * 0.7, 0.25, 2.2)
+                           : std::clamp(std::sqrt(downDist + 1.0) * 1.8, 1.0, 30.0);
+            const double stopVz = std::sqrt(std::max(0.0, 2.0 * downStopDecel * downDist));
+            desiredVz = -std::min(descendCap, stopVz * (finalStage ? 0.45 : 0.80) + (finalStage ? 0.05 : 0.30));
+        }
+
+        if (finalStage) {
+            const double hspeed = norm(vel);
+            const double altToPad = s.z - target_.z;
+            if (distXY > landingRadius_ * 0.75 || hspeed > 2.5) {
+                desiredVz = std::max(desiredVz, -0.8);
+            }
+            if (altToPad < 3.0) {
+                desiredVz = std::max(desiredVz, -0.55);
+            }
+            if (altToPad < 1.0) {
+                desiredVz = std::max(desiredVz, -0.25);
+            }
+        }
+
+        double accelZ = (desiredVz - s.vz) * (finalStage ? 1.5 : 1.1);
+        accelZ = std::clamp(accelZ, -gravity_ * 0.95, maxThrust_ - gravity_ * 0.30);
+
+        Vec3 thrustVec{accelXY.x, accelXY.y, accelZ + gravity_};
+        thrustVec.z = std::max(0.10, thrustVec.z);
+
+        const double horiz = std::sqrt(thrustVec.x * thrustVec.x + thrustVec.y * thrustVec.y);
+        const double maxHorizForTilt = thrustVec.z * std::tan(tiltMax);
+        if (horiz > maxHorizForTilt && horiz > 1e-6) {
+            const double scale = maxHorizForTilt / horiz;
+            thrustVec.x *= scale;
+            thrustVec.y *= scale;
+        }
+
+        double thrustMag = norm(thrustVec);
+        if (thrustMag > maxThrust_ && thrustMag > 1e-6) {
+            const double scale = maxThrust_ / thrustMag;
+            thrustVec.x *= scale;
+            thrustVec.y *= scale;
+            thrustVec.z *= scale;
+            thrustMag = maxThrust_;
+        }
+
+        double thrust = std::clamp(thrustMag / std::max(0.1, maxThrust_), 0.0, 1.0);
+
+        const double hover = std::clamp((gravity_ / std::max(0.1, maxThrust_)) * 1.01, 0.0, 1.0);
+        double desiredYaw = s.yaw;
+        const double horizThrust = std::sqrt(thrustVec.x * thrustVec.x + thrustVec.y * thrustVec.y);
+        if (horizThrust > 1e-6) {
+            desiredYaw = wrapAngle(std::atan2(-thrustVec.y, -thrustVec.x));
+        }
+        const double desiredPitch = std::atan2(horizThrust, std::max(0.05, thrustVec.z));
+
+        const double pitchErr = desiredPitch - s.pitch;
+        const double yawErr = wrapAngle(desiredYaw - s.yaw);
+        const double alignErr = std::max(std::abs(pitchErr), 0.5 * std::abs(yawErr));
+        if (alignErr > 1.0 && desiredPitch > 0.25) {
+            thrust = std::max(hover, thrust * 0.75);
+        }
+
+        const double pitchCmd = clampUnit(1.8 * pitchErr - 0.55 * s.pitchRate);
+        const double yawCmd = clampUnit(1.6 * yawErr - 0.50 * s.yawRate);
+        const double rollCmd = clampUnit(-1.2 * s.roll - 0.40 * s.rollRate);
+
+        return {thrust, pitchCmd, yawCmd, rollCmd};
+    }
+
+    int width_;
+    int depth_;
+    int height_;
+    double gravity_;
+    double maxThrust_;
+    double fuelCapacity_;
+    Vec3 start_;
+    Vec3 target_;
+    TerrainCache& terrain_;
+    double landingRadius_;
+    Stage stage_ = Stage::HighTransit;
+    bool targetInfoKnown_ = false;
+    bool targetSheltered_ = false;
+    double targetGround_ = 0.0;
+    double targetRoofBottom_ = 0.0;
+    double targetRoofTop_ = 0.0;
+    double approachZ_ = 0.0;
+    std::optional<Vec2> entryPoint_;
+    double entrySearchRadius_ = 48.0;
+    std::chrono::steady_clock::time_point lastEntrySearch_{};
+};
+
+static bool readMeaningfulLine(std::istream& in, std::string& out) {
+    while (std::getline(in, out)) {
+        if (!out.empty() && out.back() == '\r') {
+            out.pop_back();
+        }
+        if (!out.empty()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static std::string trimCopy(const std::string& s) {
+    std::size_t begin = 0;
+    while (begin < s.size() && std::isspace(static_cast<unsigned char>(s[begin])) != 0) {
+        ++begin;
+    }
+    std::size_t end = s.size();
+    while (end > begin && std::isspace(static_cast<unsigned char>(s[end - 1])) != 0) {
+        --end;
+    }
+    return s.substr(begin, end - begin);
+}
+
+int main() {
+    std::ios::sync_with_stdio(false);
+    std::cin.tie(nullptr);
+
+    double widthIn = 0.0;
+    double depthIn = 0.0;
+    double heightIn = 0.0;
+    double gravity = 0.0;
+    double maxThrust = 0.0;
+    double fuelCapacity = 0.0;
+    if (!(std::cin >> widthIn >> depthIn >> heightIn >> gravity >> maxThrust >> fuelCapacity)) {
+        return 0;
+    }
+
+    Vec3 start{};
+    Vec3 target{};
+    if (!(std::cin >> start.x >> start.y >> start.z >> target.x >> target.y >> target.z)) {
+        return 0;
+    }
+
+    const int width = std::max(1, static_cast<int>(std::llround(widthIn)));
+    const int depth = std::max(1, static_cast<int>(std::llround(depthIn)));
+    const int height = std::max(1, static_cast<int>(std::llround(heightIn)));
+
+    std::string terrainPath;
+    if (!readMeaningfulLine(std::cin, terrainPath)) {
+        return 0;
+    }
+
+    std::string marker;
+    if (!readMeaningfulLine(std::cin, marker)) {
+        return 0;
+    }
+
+    std::optional<State> seededState;
+    if (trimCopy(marker) != "STATE") {
+        State s;
+        std::istringstream iss(marker);
+        if (!(iss >> s.x >> s.y >> s.z >> s.vx >> s.vy >> s.vz >> s.pitch >> s.yaw >> s.roll >>
+              s.pitchRate >> s.yawRate >> s.rollRate >> s.fuelRemaining)) {
+            return 0;
+        }
+        s.seq = 1;
+        s.stamp = std::chrono::steady_clock::now();
+        seededState = s;
+    }
+
+    TerrainCache terrain(width, depth, 64, terrainPath);
+    terrain.start();
+    terrain.requestAround(start.x, start.y, 128);
+    terrain.requestAround(target.x, target.y, 192);
+    terrain.requestCorridor({start.x, start.y}, {target.x, target.y}, 32);
+
+    Autopilot autopilot(width, depth, height, gravity, maxThrust, fuelCapacity, start, target, terrain);
+    SharedState shared;
+    if (seededState) {
+        shared.latest = *seededState;
+        shared.hasState = true;
+    }
+
+    const std::uint64_t startSeq = seededState ? seededState->seq : 0;
+    std::thread inputThread([&shared, startSeq]() {
+        std::uint64_t seq = startSeq;
+        for (;;) {
+            State s;
+            if (!(std::cin >> s.x >> s.y >> s.z >> s.vx >> s.vy >> s.vz >> s.pitch >> s.yaw >> s.roll >>
+                  s.pitchRate >> s.yawRate >> s.rollRate >> s.fuelRemaining)) {
+                std::lock_guard<std::mutex> lock(shared.mutex);
+                shared.inputClosed = true;
+                return;
+            }
+            s.seq = ++seq;
+            s.stamp = std::chrono::steady_clock::now();
+            std::lock_guard<std::mutex> lock(shared.mutex);
+            shared.latest = s;
+            shared.hasState = true;
+        }
+    });
+
+    const auto tick = std::chrono::milliseconds(50);
+    auto nextWake = std::chrono::steady_clock::now();
+
+    for (;;) {
+        State stateCopy;
+        bool hasState = false;
+        bool inputClosed = false;
+        {
+            std::lock_guard<std::mutex> lock(shared.mutex);
+            hasState = shared.hasState;
+            inputClosed = shared.inputClosed;
+            if (hasState) {
+                stateCopy = shared.latest;
+            }
+        }
+
+        Command cmd = hasState ? autopilot.compute(stateCopy) : autopilot.bootstrapCommand();
+        std::cout.setf(std::ios::fixed);
+        std::cout.precision(6);
+        std::cout << cmd.thrust << ' ' << cmd.pitchCmd << ' ' << cmd.yawCmd << ' ' << cmd.rollCmd << '\n' << std::flush;
+
+        if (inputClosed) {
+            const auto now = std::chrono::steady_clock::now();
+            if (!hasState || now - stateCopy.stamp > std::chrono::milliseconds(250)) {
+                break;
+            }
+        }
+
+        nextWake += tick;
+        std::this_thread::sleep_until(nextWake);
+    }
+
+    inputThread.join();
+    terrain.stop();
+    return 0;
+}

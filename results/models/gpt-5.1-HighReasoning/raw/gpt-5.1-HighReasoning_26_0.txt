@@ -1,1 +1,671 @@
-{'__exception__': "Can't run here - we're trying to get this working in codex."}
+```rust
+// Rust 2021
+// Single-binary solution: adaptive k-means / streaming k-means for 3D points.
+// Reads:
+//   text header: "<num_points> <num_clusters>\n"
+//   then num_points triples of f32 (x,y,z) in little-endian binary
+// Writes:
+//   num_points u32 cluster indices in little-endian binary
+
+use std::cmp;
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
+
+// ------------ Basic types ------------
+
+#[derive(Copy, Clone, Debug)]
+struct Point3 {
+    x: f32,
+    y: f32,
+    z: f32,
+}
+
+#[derive(Copy, Clone, Debug)]
+struct Centroid {
+    x: f32,
+    y: f32,
+    z: f32,
+    count: u64,
+}
+
+// ------------ Simple RNG (no external crates) ------------
+
+struct XorShift64 {
+    state: u64,
+}
+
+impl XorShift64 {
+    fn new(seed: u64) -> Self {
+        let s = if seed == 0 { 0xdead_beef_cafe_f00d } else { seed };
+        XorShift64 { state: s }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.state;
+        // xorshift64*
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.state = x;
+        x.wrapping_mul(0x2545F4914F6CDD1D)
+    }
+
+    fn next_usize(&mut self, bound: usize) -> usize {
+        if bound <= 1 {
+            return 0;
+        }
+        // Simple rejection sampling
+        let limit = (u64::MAX / bound as u64) * bound as u64;
+        loop {
+            let v = self.next_u64();
+            if v < limit {
+                return (v % bound as u64) as usize;
+            }
+        }
+    }
+
+    fn next_f64(&mut self) -> f64 {
+        let v = self.next_u64() >> 11; // 53 bits
+        (v as f64) * (1.0 / ((1u64 << 53) as f64))
+    }
+}
+
+// ------------ Distance helpers ------------
+
+#[inline]
+fn sq_dist_point_centroid(p: &Point3, c: &Centroid) -> f32 {
+    let dx = p.x - c.x;
+    let dy = p.y - c.y;
+    let dz = p.z - c.z;
+    dx * dx + dy * dy + dz * dz
+}
+
+#[inline]
+fn sq_dist_point_coords(p: &Point3, x: f32, y: f32, z: f32) -> f32 {
+    let dx = p.x - x;
+    let dy = p.y - y;
+    let dz = p.z - z;
+    dx * dx + dy * dy + dz * dz
+}
+
+// ------------ Binary I/O helpers ------------
+
+fn read_point<R: Read>(r: &mut R) -> io::Result<Point3> {
+    let mut buf = [0u8; 12];
+    r.read_exact(&mut buf)?;
+    let x = f32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    let y = f32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+    let z = f32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
+    Ok(Point3 { x, y, z })
+}
+
+fn write_cluster_index<W: Write>(w: &mut W, idx: u32) -> io::Result<()> {
+    w.write_all(&idx.to_le_bytes())
+}
+
+// ------------ K-means++ initialization on a slice of points ------------
+
+fn kmeans_plus_plus_init(
+    points: &[Point3],
+    k: usize,
+    max_work: u128,
+    rng: &mut XorShift64,
+) -> Vec<Centroid> {
+    let n = points.len();
+    let k = cmp::min(k, n.max(1));
+    if k == 0 {
+        return Vec::new();
+    }
+
+    // If estimated work too high, fall back to random sampling.
+    let est_work = (k as u128) * (n as u128);
+    if est_work > max_work {
+        return random_centroid_init(points, k, rng);
+    }
+
+    let mut centroids: Vec<Centroid> = Vec::with_capacity(k);
+    let mut min_dist2: Vec<f32> = vec![f32::INFINITY; n];
+
+    // Pick first center randomly
+    let first_idx = rng.next_usize(n);
+    let p0 = &points[first_idx];
+    centroids.push(Centroid {
+        x: p0.x,
+        y: p0.y,
+        z: p0.z,
+        count: 0,
+    });
+
+    // Subsequent centers
+    for _ in 1..k {
+        // Update min_dist2 to nearest existing center
+        let last = centroids.last().unwrap();
+        for (i, p) in points.iter().enumerate() {
+            let d2 = sq_dist_point_coords(p, last.x, last.y, last.z);
+            if d2 < min_dist2[i] {
+                min_dist2[i] = d2;
+            }
+        }
+
+        // Choose new center with probability proportional to min_dist2
+        let mut sum: f64 = 0.0;
+        for &d2 in &min_dist2 {
+            sum += d2 as f64;
+        }
+        if sum == 0.0 {
+            // All points identical; just duplicate
+            let p = &points[rng.next_usize(n)];
+            centroids.push(Centroid {
+                x: p.x,
+                y: p.y,
+                z: p.z,
+                count: 0,
+            });
+            continue;
+        }
+        let mut r = rng.next_f64() * sum;
+        let mut chosen = 0;
+        for (i, &d2) in min_dist2.iter().enumerate() {
+            r -= d2 as f64;
+            if r <= 0.0 {
+                chosen = i;
+                break;
+            }
+        }
+        let p = &points[chosen];
+        centroids.push(Centroid {
+            x: p.x,
+            y: p.y,
+            z: p.z,
+            count: 0,
+        });
+    }
+
+    centroids
+}
+
+// Fallback simple random initialization (without replacement if possible)
+fn random_centroid_init(points: &[Point3], k: usize, rng: &mut XorShift64) -> Vec<Centroid> {
+    let n = points.len();
+    let k = cmp::min(k, n.max(1));
+    if k == 0 {
+        return Vec::new();
+    }
+    let mut indices: Vec<usize> = (0..n).collect();
+    // Fisher-Yates shuffle up to k
+    for i in 0..k {
+        let j = i + rng.next_usize(n - i);
+        indices.swap(i, j);
+    }
+    let mut centroids = Vec::with_capacity(k);
+    for i in 0..k {
+        let p = &points[indices[i]];
+        centroids.push(Centroid {
+            x: p.x,
+            y: p.y,
+            z: p.z,
+            count: 0,
+        });
+    }
+    centroids
+}
+
+// ------------ Macro-cluster acceleration for many centroids ------------
+
+struct MacroIndex {
+    macro_centers: Vec<Point3>,    // macro center coordinates
+    macro_members: Vec<Vec<usize>>, // for each macro, list of centroid indices
+}
+
+fn build_macro_index(
+    centroids: &[Centroid],
+    desired_macros: usize,
+    rng: &mut XorShift64,
+) -> MacroIndex {
+    let k = centroids.len();
+    let m = cmp::min(desired_macros.max(1), k);
+    if k == 0 {
+        return MacroIndex {
+            macro_centers: Vec::new(),
+            macro_members: Vec::new(),
+        };
+    }
+    if m >= k {
+        // Each centroid is its own macro
+        let mut centers = Vec::with_capacity(k);
+        let mut members = Vec::with_capacity(k);
+        for (i, c) in centroids.iter().enumerate() {
+            centers.push(Point3 {
+                x: c.x,
+                y: c.y,
+                z: c.z,
+            });
+            members.push(vec![i]);
+        }
+        return MacroIndex {
+            macro_centers: centers,
+            macro_members: members,
+        };
+    }
+
+    // K-means on the centroid positions themselves (dataset size = k, clusters = m)
+    let mut macro_centers: Vec<Point3> = Vec::with_capacity(m);
+
+    // Randomly initialize macro centers from centroids
+    let mut indices: Vec<usize> = (0..k).collect();
+    for i in 0..m {
+        let j = i + rng.next_usize(k - i);
+        indices.swap(i, j);
+    }
+    for i in 0..m {
+        let c = &centroids[indices[i]];
+        macro_centers.push(Point3 {
+            x: c.x,
+            y: c.y,
+            z: c.z,
+        });
+    }
+
+    let mut assign: Vec<usize> = vec![0; k];
+    let max_iters = 5;
+    for _ in 0..max_iters {
+        let mut sum_x = vec![0.0f32; m];
+        let mut sum_y = vec![0.0f32; m];
+        let mut sum_z = vec![0.0f32; m];
+        let mut count = vec![0u64; m];
+
+        // Assign step
+        for (i, c) in centroids.iter().enumerate() {
+            let mut best_j = 0usize;
+            let mut best_d2 = f32::INFINITY;
+            for (j, mc) in macro_centers.iter().enumerate() {
+                let dx = c.x - mc.x;
+                let dy = c.y - mc.y;
+                let dz = c.z - mc.z;
+                let d2 = dx * dx + dy * dy + dz * dz;
+                if d2 < best_d2 {
+                    best_d2 = d2;
+                    best_j = j;
+                }
+            }
+            assign[i] = best_j;
+            sum_x[best_j] += c.x;
+            sum_y[best_j] += c.y;
+            sum_z[best_j] += c.z;
+            count[best_j] += 1;
+        }
+
+        // Update step
+        for j in 0..m {
+            if count[j] > 0 {
+                let inv = 1.0f32 / (count[j] as f32);
+                macro_centers[j].x = sum_x[j] * inv;
+                macro_centers[j].y = sum_y[j] * inv;
+                macro_centers[j].z = sum_z[j] * inv;
+            }
+        }
+    }
+
+    // Build members, drop empty macros
+    let mut members: Vec<Vec<usize>> = vec![Vec::new(); m];
+    for (i, &mj) in assign.iter().enumerate() {
+        members[mj].push(i);
+    }
+
+    let mut final_centers = Vec::new();
+    let mut final_members = Vec::new();
+    for j in 0..m {
+        if !members[j].is_empty() {
+            final_centers.push(macro_centers[j]);
+            final_members.push(std::mem::take(&mut members[j]));
+        }
+    }
+
+    MacroIndex {
+        macro_centers: final_centers,
+        macro_members: final_members,
+    }
+}
+
+// Find nearest centroid (index) given optional macro-index speedup
+fn find_nearest_centroid(
+    p: &Point3,
+    centroids: &[Centroid],
+    macro_index: Option<&MacroIndex>,
+) -> usize {
+    let k = centroids.len();
+    if k == 0 {
+        return 0;
+    }
+    if let Some(mi) = macro_index {
+        let m = mi.macro_centers.len();
+        if m == 0 {
+            // fallback
+            let mut best = 0usize;
+            let mut best_d2 = f32::INFINITY;
+            for (j, c) in centroids.iter().enumerate() {
+                let d2 = sq_dist_point_centroid(p, c);
+                if d2 < best_d2 {
+                    best_d2 = d2;
+                    best = j;
+                }
+            }
+            return best;
+        }
+        // First, nearest macro center
+        let mut best_macro = 0usize;
+        let mut best_macro_d2 = f32::INFINITY;
+        for (j, mc) in mi.macro_centers.iter().enumerate() {
+            let d2 = sq_dist_point_coords(p, mc.x, mc.y, mc.z);
+            if d2 < best_macro_d2 {
+                best_macro_d2 = d2;
+                best_macro = j;
+            }
+        }
+        // Then, nearest centroid in that macro
+        let mut best = mi.macro_members[best_macro][0];
+        let mut best_d2 = f32::INFINITY;
+        for &cid in &mi.macro_members[best_macro] {
+            let d2 = sq_dist_point_centroid(p, &centroids[cid]);
+            if d2 < best_d2 {
+                best_d2 = d2;
+                best = cid;
+            }
+        }
+        best
+    } else {
+        // Brute force
+        let mut best = 0usize;
+        let mut best_d2 = f32::INFINITY;
+        for (j, c) in centroids.iter().enumerate() {
+            let d2 = sq_dist_point_centroid(p, c);
+            if d2 < best_d2 {
+                best_d2 = d2;
+                best = j;
+            }
+        }
+        best
+    }
+}
+
+// ------------ In-memory k-means for "small" problems ------------
+
+fn run_in_memory_kmeans<R: Read>(
+    reader: &mut R,
+    num_points: usize,
+    num_clusters: usize,
+) -> io::Result<()> {
+    let mut rng = XorShift64::new(0x1234_5678_9abc_def0);
+
+    // Read all points
+    let mut points: Vec<Point3> = Vec::with_capacity(num_points);
+    for _ in 0..num_points {
+        let p = read_point(reader)?;
+        points.push(p);
+    }
+
+    let k = cmp::min(num_clusters, num_points.max(1));
+    if k == 0 {
+        // No points, nothing to output
+        return Ok(());
+    }
+
+    let max_kpp_work: u128 = 200_000_000; // limit for k-means++ work
+    let mut centroids = kmeans_plus_plus_init(&points, k, max_kpp_work, &mut rng);
+
+    // K-means iterations
+    let max_iters = 20usize;
+    let mut assignments: Vec<usize> = vec![0; num_points];
+    let mut changed = num_points;
+
+    for _iter in 0..max_iters {
+        if changed == 0 {
+            break;
+        }
+        changed = 0;
+
+        // Reset accumulators
+        let mut sum_x = vec![0.0f32; k];
+        let mut sum_y = vec![0.0f32; k];
+        let mut sum_z = vec![0.0f32; k];
+        let mut count = vec![0u64; k];
+
+        // Assignment step
+        for (i, p) in points.iter().enumerate() {
+            let mut best = 0usize;
+            let mut best_d2 = f32::INFINITY;
+            for (j, c) in centroids.iter().enumerate() {
+                let d2 = sq_dist_point_centroid(p, c);
+                if d2 < best_d2 {
+                    best_d2 = d2;
+                    best = j;
+                }
+            }
+            if assignments[i] != best {
+                assignments[i] = best;
+                changed += 1;
+            }
+            sum_x[best] += p.x;
+            sum_y[best] += p.y;
+            sum_z[best] += p.z;
+            count[best] += 1;
+        }
+
+        // Update step
+        for j in 0..k {
+            if count[j] > 0 {
+                let inv = 1.0f32 / (count[j] as f32);
+                centroids[j].x = sum_x[j] * inv;
+                centroids[j].y = sum_y[j] * inv;
+                centroids[j].z = sum_z[j] * inv;
+                centroids[j].count = count[j];
+            } else {
+                // Keep old centroid; may remain empty
+            }
+        }
+    }
+
+    // Output assignments
+    let stdout = io::stdout();
+    let mut writer = BufWriter::new(stdout.lock());
+    for &a in &assignments {
+        write_cluster_index(&mut writer, a as u32)?;
+    }
+    writer.flush()?;
+    Ok(())
+}
+
+// ------------ Streaming k-means for large problems ------------
+
+fn run_streaming_kmeans<R: Read>(
+    reader: &mut R,
+    num_points: u64,
+    num_clusters: usize,
+) -> io::Result<()> {
+    let stdout = io::stdout();
+    let mut writer = BufWriter::new(stdout.lock());
+    let mut rng = XorShift64::new(0x9e37_79b9_7f4a_7c15);
+
+    let k = cmp::min(num_clusters, (num_points as usize).max(1));
+    if k == 0 || num_points == 0 {
+        return Ok(());
+    }
+
+    // Special case: fewer points than clusters (cannot avoid empty clusters)
+    // Just assign each point to a distinct cluster index until we run out.
+    if num_points as usize <= k {
+        for idx in 0..num_points {
+            // consume the points but ignore values
+            let _ = read_point(reader)?;
+            write_cluster_index(&mut writer, idx as u32)?;
+        }
+        writer.flush()?;
+        return Ok(());
+    }
+
+    // Step 1: Read a small sample for initialization
+    // Use up to max(10*k, 100_000) points, but not more than num_points.
+    let max_sample: u64 = 200_000;
+    let base = (10u64).saturating_mul(k as u64);
+    let sample_size_u64 = cmp::min(cmp::max(base, 100_000), max_sample);
+    let actual_sample_size_u64 = cmp::min(sample_size_u64, num_points);
+    let sample_size: usize = actual_sample_size_u64 as usize;
+
+    let mut sample: Vec<Point3> = Vec::with_capacity(sample_size);
+    for _ in 0..sample_size {
+        let p = read_point(reader)?;
+        sample.push(p);
+    }
+
+    // Step 2: Initialize centroids from sample
+    let k_small_init: usize = 2000;
+    let max_kpp_work: u128 = 200_000_000;
+    let centroids_init = if k <= k_small_init {
+        kmeans_plus_plus_init(&sample, k, max_kpp_work, &mut rng)
+    } else {
+        random_centroid_init(&sample, k, &mut rng)
+    };
+    let mut centroids: Vec<Centroid> = centroids_init;
+
+    // Optionally refine centroids with a few k-means iterations on the sample
+    let refine_iters = if k <= 1024 { 5 } else if k <= 8192 { 3 } else { 1 };
+    if !sample.is_empty() && k > 0 {
+        let n_sample = sample.len();
+        let mut assignments: Vec<usize> = vec![0; n_sample];
+        for _ in 0..refine_iters {
+            // Assign
+            for (i, p) in sample.iter().enumerate() {
+                let mut best = 0usize;
+                let mut best_d2 = f32::INFINITY;
+                for (j, c) in centroids.iter().enumerate() {
+                    let d2 = sq_dist_point_centroid(p, c);
+                    if d2 < best_d2 {
+                        best_d2 = d2;
+                        best = j;
+                    }
+                }
+                assignments[i] = best;
+            }
+            // Update
+            let mut sum_x = vec![0.0f32; k];
+            let mut sum_y = vec![0.0f32; k];
+            let mut sum_z = vec![0.0f32; k];
+            let mut count = vec![0u64; k];
+            for (i, &cid) in assignments.iter().enumerate() {
+                let p = &sample[i];
+                sum_x[cid] += p.x;
+                sum_y[cid] += p.y;
+                sum_z[cid] += p.z;
+                count[cid] += 1;
+            }
+            for j in 0..k {
+                if count[j] > 0 {
+                    let inv = 1.0f32 / (count[j] as f32);
+                    centroids[j].x = sum_x[j] * inv;
+                    centroids[j].y = sum_y[j] * inv;
+                    centroids[j].z = sum_z[j] * inv;
+                    centroids[j].count = 0; // will be recomputed in streaming
+                }
+            }
+        }
+    }
+
+    // Reset counts before streaming proper so each point contributes once
+    for c in &mut centroids {
+        c.count = 0;
+    }
+
+    // Build macro index for speed if many clusters
+    let macro_threshold = 256usize;
+    let macro_index = if k >= macro_threshold {
+        let m = {
+            let mut s = (k as f64).sqrt().round() as usize;
+            if s < 32 {
+                s = 32;
+            }
+            if s > k {
+                s = k;
+            }
+            s
+        };
+        Some(build_macro_index(&centroids, m, &mut rng))
+    } else {
+        None
+    };
+
+    // Step 3: Streaming phase: process sample again then remaining points
+    // 3a: process sample (we have them in memory)
+    for p in &sample {
+        let cid = find_nearest_centroid(p, &centroids, macro_index.as_ref());
+        let c = &mut centroids[cid];
+        c.count += 1;
+        let inv = 1.0f32 / (c.count as f32);
+        c.x += (p.x - c.x) * inv;
+        c.y += (p.y - c.y) * inv;
+        c.z += (p.z - c.z) * inv;
+        write_cluster_index(&mut writer, cid as u32)?;
+    }
+
+    // 3b: process remaining points from the stream
+    let mut remaining = num_points - (sample.len() as u64);
+    while remaining > 0 {
+        remaining -= 1;
+        let p = read_point(reader)?;
+        let cid = find_nearest_centroid(&p, &centroids, macro_index.as_ref());
+        let c = &mut centroids[cid];
+        c.count += 1;
+        let inv = 1.0f32 / (c.count as f32);
+        c.x += (p.x - c.x) * inv;
+        c.y += (p.y - c.y) * inv;
+        c.z += (p.z - c.z) * inv;
+        write_cluster_index(&mut writer, cid as u32)?;
+    }
+
+    writer.flush()?;
+    Ok(())
+}
+
+// ------------ Main: dispatch between modes ------------
+
+fn main() -> io::Result<()> {
+    let stdin = io::stdin();
+    let mut reader = BufReader::new(stdin.lock());
+
+    // Read header line: "num_points num_clusters"
+    let mut header = String::new();
+    reader.read_line(&mut header)?;
+    if header.trim().is_empty() {
+        return Ok(());
+    }
+    let mut parts = header.split_whitespace();
+    let num_points_str = parts.next().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "Missing num_points in header")
+    })?;
+    let num_clusters_str = parts.next().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "Missing num_clusters in header")
+    })?;
+
+    let num_points: u64 = num_points_str
+        .parse()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid num_points"))?;
+    let num_clusters: usize = num_clusters_str
+        .parse()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid num_clusters"))?;
+
+    // Decide strategy
+    // In-memory if num_points modest AND n*k not too large.
+    const IN_MEMORY_MAX_POINTS: u64 = 10_000_000;
+    const IN_MEMORY_NK_THRESHOLD: u128 = 2_000_000_000; // approx <= 2e9 distance evals
+
+    let use_in_memory = num_points <= IN_MEMORY_MAX_POINTS
+        && (num_points as u128) * (num_clusters as u128) <= IN_MEMORY_NK_THRESHOLD;
+
+    if use_in_memory {
+        let n_usize = num_points as usize;
+        run_in_memory_kmeans(&mut reader, n_usize, num_clusters)?;
+    } else {
+        run_streaming_kmeans(&mut reader, num_points, num_clusters)?;
+    }
+
+    Ok(())
+}
+```

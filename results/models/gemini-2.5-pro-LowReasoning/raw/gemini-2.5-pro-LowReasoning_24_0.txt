@@ -1,0 +1,228 @@
+#include <iostream>
+#include <string>
+#include <vector>
+#include <fstream>
+#include <cmath>
+#include <thread>
+#include <mutex>
+#include <chrono>
+#include <atomic>
+
+const double G = 1.62;
+
+struct State {
+    double x, y, z;
+    double vx, vy, vz;
+    double pitch, yaw, roll;
+    double pitch_rate, yaw_rate, roll_rate;
+    double fuel;
+};
+
+struct Control {
+    double thrust = 0.0;
+    double pitch_cmd = 0.0;
+    double yaw_cmd = 0.0;
+    double roll_cmd = 0.0;
+};
+
+struct TerrainCol {
+    uint16_t ground;
+    uint16_t float_bottom;
+    uint16_t float_top;
+};
+
+std::vector<std::vector<TerrainCol>> terrain;
+int width, depth, height;
+double max_thrust;
+State initial_state;
+State target_pos;
+std::atomic<bool> terrain_loaded(false);
+std::mutex state_mutex;
+State current_state;
+
+void parse_terrain(const std::string& path) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file) {
+        // This is a big problem, but we can't do much.
+        // The main loop will have to deal with it.
+        return;
+    }
+
+    terrain.resize(width, std::vector<TerrainCol>(depth));
+    for (int i = 0; i < width; ++i) {
+        for (int j = 0; j < depth; ++j) {
+            file.read(reinterpret_cast<char*>(&terrain[i][j].ground), sizeof(uint16_t));
+            file.read(reinterpret_cast<char*>(&terrain[i][j].float_bottom), sizeof(uint16_t));
+            file.read(reinterpret_cast<char*>(&terrain[i][j].float_top), sizeof(uint16_t));
+        }
+    }
+    terrain_loaded = true;
+}
+
+double get_ground_height(double x, double y) {
+    if (!terrain_loaded || x < 0 || x >= width || y < 0 || y >= depth) {
+        return 0;
+    }
+    int ix = static_cast<int>(x);
+    int iy = static_cast<int>(y);
+
+    if (ix < 0) ix = 0;
+    if (ix >= width) ix = width - 1;
+    if (iy < 0) iy = 0;
+    if (iy >= depth) iy = depth - 1;
+
+
+    const auto& col = terrain[ix][iy];
+    if (current_state.z >= col.float_top) {
+        return col.float_top > col.ground ? col.float_top : col.ground;
+    }
+    if (current_state.z > col.float_bottom && current_state.z < col.float_top) {
+         return col.float_bottom;
+    }
+    return col.ground;
+}
+
+Control calculate_control(const State& state) {
+    Control control;
+
+    // Target position for the lander, considering the landing spot is on the ground.
+    double target_x = target_pos.x;
+    double target_y = target_pos.y;
+    double target_z = get_ground_height(target_x, target_y) + 2.0; // Hover 2m above
+
+    // PID controller for altitude
+    double altitude_error = target_z - state.z;
+    double altitude_p = 0.5;
+    double altitude_d = 0.8;
+    double desired_vz = altitude_error * altitude_p - state.vz * altitude_d;
+
+    // PID controller for lateral movement (X and Y)
+    double x_error = target_x - state.x;
+    double y_error = target_y - state.y;
+
+    double lateral_p = 0.05;
+    double lateral_d = 0.2;
+
+    double desired_vx = x_error * lateral_p - state.vx * lateral_d;
+    double desired_vy = y_error * lateral_p - state.vy * lateral_d;
+
+    // Thrust logic
+    double vertical_thrust = G + desired_vz;
+    double required_thrust = sqrt(pow(desired_vx, 2) + pow(desired_vy, 2) + pow(vertical_thrust, 2));
+
+
+    if (state.z < target_z + 5.0) { // Final approach
+        desired_vz = -0.5; // Slow descent
+        if(state.vz < -2.5) {
+             vertical_thrust = G + 2.0;
+        } else {
+             vertical_thrust = G + desired_vz;
+        }
+    }
+
+
+    double total_speed_sq = state.vx * state.vx + state.vy * state.vy + state.vz * state.vz;
+    if (state.z < target_z + 1.0 && total_speed_sq < 1.0) {
+        control.thrust = 0;
+        return control;
+    }
+
+
+    double pitch_target = -atan2(desired_vx, vertical_thrust);
+    double yaw_target = atan2(desired_vy, vertical_thrust);
+
+
+    control.thrust = std::min(1.0, std::max(0.0, required_thrust / max_thrust));
+
+
+    // Pitch and Yaw control
+    double pitch_error = pitch_target - state.pitch;
+    double yaw_error = yaw_target - state.yaw;
+
+    double angle_p = 2.0;
+    double angle_d = 3.0;
+
+    control.pitch_cmd = std::clamp(pitch_error * angle_p - state.pitch_rate * angle_d, -1.0, 1.0);
+    control.yaw_cmd = std::clamp(yaw_error * angle_p - state.yaw_rate * angle_d, -1.0, 1.0);
+
+
+    // If we are close to the ground, prioritize being upright
+    double ground_h = get_ground_height(state.x, state.y);
+    if (state.z - ground_h < 10.0) {
+        control.pitch_cmd = std::clamp((0.0 - state.pitch) * 2.0 - state.pitch_rate * 1.5, -1.0, 1.0);
+        control.yaw_cmd = std::clamp((0.0 - state.yaw) * 2.0 - state.yaw_rate * 1.5, -1.0, 1.0);
+
+        // Kill horizontal velocity
+        control.pitch_cmd -= std::clamp(state.vx * 0.5, -1.0, 1.0);
+        control.yaw_cmd -= std::clamp(state.vy * 0.5, -1.0, 1.0);
+
+
+        double landing_speed_error = -1.0 - state.vz;
+        double landing_thrust_p = 2.0;
+        double thrust_correction = landing_speed_error * landing_thrust_p;
+        control.thrust = std::clamp((G + thrust_correction) / max_thrust, 0.0, 1.0);
+
+    }
+
+
+     if (state.z - ground_h < 3.0) {
+        if(state.vz < -2.8) {
+            control.thrust = 1.0;
+        }
+    }
+
+
+    if (state.fuel < 5) {
+        control.thrust = 0;
+    }
+
+    return control;
+}
+
+
+int main() {
+    std::ios_base::sync_with_stdio(false);
+    std::cin.tie(NULL);
+
+    double gravity_in;
+    double fuel_in;
+    std::cin >> width >> depth >> height >> gravity_in >> max_thrust >> fuel_in;
+    std::cin >> initial_state.x >> initial_state.y >> initial_state.z;
+    std::cin >> target_pos.x >> target_pos.y >> target_pos.z;
+
+    std::string terrain_path;
+    std::string state_header;
+    std::cin >> std::ws;
+    std::getline(std::cin, terrain_path);
+    std::cin >> state_header; // "STATE"
+
+    current_state = initial_state;
+    current_state.fuel = fuel_in;
+
+    std::thread terrain_thread(parse_terrain, terrain_path);
+
+    while (std::cin >> current_state.x >> current_state.y >> current_state.z >>
+           current_state.vx >> current_state.vy >> current_state.vz >>
+           current_state.pitch >> current_state.yaw >> current_state.roll >>
+           current_state.pitch_rate >> current_state.yaw_rate >> current_state.roll_rate >>
+           current_state.fuel) {
+
+        Control control;
+        if (terrain_loaded) {
+            control = calculate_control(current_state);
+        } else {
+            // Basic hover until terrain loads
+            double hover_thrust = G / max_thrust;
+            control.thrust = std::min(1.0, std::max(0.0, hover_thrust));
+        }
+
+
+        std::cout << control.thrust << " " << control.pitch_cmd << " " << control.yaw_cmd << " " << control.roll_cmd << std::endl;
+    }
+
+    if (terrain_thread.joinable()) {
+        terrain_thread.join();
+    }
+
+    return 0;
+}

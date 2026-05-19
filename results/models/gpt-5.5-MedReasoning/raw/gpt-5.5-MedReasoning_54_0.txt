@@ -1,0 +1,222 @@
+import math
+
+
+_last = {}
+
+
+def autopilot_step(state: dict, dt: float) -> dict:
+    """
+    Conservative ILS/autoland controller.
+
+    The function intentionally keeps no aircraft-type-specific assumptions beyond
+    normal transport-category landing values.  It votes redundant sensors, rejects
+    obvious outliers, tracks localizer/glideslope until the flare, then uses radio
+    altitude (or DME-derived height if radio altitude is unusable) for touchdown
+    and rollout.
+    """
+
+    global _last
+    dt = max(0.02, min(float(dt or 0.1), 1.0))
+
+    def clamp(x, lo, hi):
+        return max(lo, min(hi, x))
+
+    def median(vals):
+        vals = sorted(vals)
+        n = len(vals)
+        if n == 0:
+            return None
+        if n & 1:
+            return vals[n // 2]
+        return 0.5 * (vals[n // 2 - 1] + vals[n // 2])
+
+    def voted(prefix, suffix, n=3, valid_suffix="_valid", lo=None, hi=None):
+        vals = []
+        for i in range(1, n + 1):
+            v = state.get(f"{prefix}_{i}_{suffix}")
+            valid = state.get(f"{prefix}_{i}{valid_suffix}", True)
+            if valid and isinstance(v, (int, float)) and math.isfinite(v):
+                if (lo is None or v >= lo) and (hi is None or v <= hi):
+                    vals.append(float(v))
+        if not vals:
+            return None
+        m = median(vals)
+        # With three channels, remove a failed/stuck outlier when possible.
+        if len(vals) >= 3:
+            close = [v for v in vals if abs(v - m) <= max(0.35, abs(m) * 0.25)]
+            if len(close) >= 2:
+                return median(close)
+        return m
+
+    def voted_plain(prefix, suffix, n=3, lo=None, hi=None):
+        vals = []
+        for i in range(1, n + 1):
+            v = state.get(f"{prefix}_{i}_{suffix}")
+            if isinstance(v, (int, float)) and math.isfinite(v):
+                if (lo is None or v >= lo) and (hi is None or v <= hi):
+                    vals.append(float(v))
+        return median(vals)
+
+    def wrap180(deg):
+        return (deg + 180.0) % 360.0 - 180.0
+
+    def smooth(name, value, tau):
+        if value is None:
+            return _last.get(name)
+        old = _last.get(name, value)
+        a = clamp(dt / max(tau, dt), 0.0, 1.0)
+        value = old + (value - old) * a
+        _last[name] = value
+        return value
+
+    # Sensor fusion.
+    gs_dot = voted("glideslope", "dots", lo=-4.0, hi=4.0)
+    loc_dot = voted("localizer", "dots", lo=-4.0, hi=4.0)
+    ias = voted("ias", "kt", lo=40.0, hi=330.0)
+    aoa = voted("aoa", "deg", lo=-10.0, hi=25.0)
+    pitch = voted("irs", "pitch_deg", lo=-30.0, hi=30.0)
+    roll = voted("irs", "roll_deg", lo=-60.0, hi=60.0)
+    heading = voted("irs", "heading_deg", lo=0.0, hi=360.0)
+    vs = voted("irs", "vs_fpm", lo=-6000.0, hi=6000.0)
+    gs_kt = voted_plain("gps", "gs_kt", lo=0.0, hi=350.0)
+    if gs_kt is None:
+        gs_kt = voted("irs", "gs_kt", lo=0.0, hi=350.0)
+
+    dmes = [x for x in (state.get("dme_1_nm"), state.get("dme_2_nm"))
+            if isinstance(x, (int, float)) and math.isfinite(x) and x >= 0.0]
+    dme = median([float(x) for x in dmes]) if dmes else None
+
+    raw_ra = state.get("radio_alt_ft")
+    radio_ok = isinstance(raw_ra, (int, float)) and math.isfinite(raw_ra) and -5.0 <= raw_ra <= 3000.0
+    ra = float(raw_ra) if radio_ok else None
+    # A 3 degree glide path is about 318 ft/nm.  This is a good fallback for
+    # flare timing when all radar altimeters have failed.
+    dme_height = None if dme is None else max(0.0, 318.0 * dme)
+    if ra is None or (not state.get("on_ground") and ra < 3.0 and dme_height and dme_height > 80.0):
+        ra = dme_height
+    if ra is None:
+        ra = voted("baro_alt", "ft", lo=-1000.0, hi=50000.0) or 1000.0
+
+    gs_dot = smooth("gs_dot", 0.0 if gs_dot is None else gs_dot, 0.35)
+    loc_dot = smooth("loc_dot", 0.0 if loc_dot is None else loc_dot, 0.25)
+    ias = smooth("ias", ias if ias is not None else state.get("target_vref_kt", 137.0), 0.45)
+    pitch = smooth("pitch", 0.0 if pitch is None else pitch, 0.25)
+    roll = smooth("roll", 0.0 if roll is None else roll, 0.2)
+    vs = smooth("vs", -700.0 if vs is None else vs, 0.35)
+    gs_kt = smooth("gs_kt", gs_kt if gs_kt is not None else ias, 0.5)
+
+    vref = float(state.get("target_vref_kt") or state.get("target_ias_kt") or 137.0)
+    target_ias = float(state.get("target_ias_kt") or vref + 5.0)
+    target_hdg = float(state.get("target_hdg_deg") or (heading if heading is not None else 0.0))
+
+    on_ground = bool(state.get("on_ground") or state.get("weight_on_wheels"))
+    engine1 = not state.get("engine_1_fire", False) and state.get("engine_1_running", True)
+    engine2 = not state.get("engine_2_fire", False) and state.get("engine_2_running", True)
+
+    # Configuration and speed targets.
+    if on_ground:
+        phase = "rollout"
+    elif ra <= 55.0:
+        phase = "flare"
+    elif ra <= 1000.0:
+        phase = "approach"
+    else:
+        phase = "intercept"
+
+    desired_speed = max(vref + (8.0 if phase == "intercept" else 5.0), target_ias)
+    if phase == "flare":
+        desired_speed = vref
+
+    # Lateral control: localizer is primary; runway heading damps the final
+    # alignment and keeps tracking acceptable through localizer flicker.
+    if heading is None:
+        hdg_error = 0.0
+    else:
+        desired_hdg = target_hdg - clamp(loc_dot, -2.5, 2.5) * (9.0 if ra > 200.0 else 5.0)
+        hdg_error = wrap180(desired_hdg - heading)
+
+    aileron = 0.018 * hdg_error - 0.075 * roll - 0.18 * clamp(loc_dot, -2.5, 2.5)
+    # Cross-control a little rudder for de-crab/alignment and asymmetric thrust.
+    rudder = -0.10 * clamp(loc_dot, -2.0, 2.0) + 0.004 * hdg_error - 0.01 * roll
+
+    # Vertical control.  Positive elevator pitches up.
+    if phase == "flare":
+        h = clamp(ra, 0.0, 55.0)
+        target_vs = -45.0 - 3.0 * h       # about -210 fpm at 55 ft, -45 near ground
+        elevator = 0.0021 * (target_vs - vs) - 0.030 * pitch + 0.12
+        elevator_trim = clamp(0.20 - 0.01 * pitch, -0.3, 0.5)
+    else:
+        base_vs = float(state.get("target_vs_fpm") or -720.0)
+        target_vs = clamp(base_vs - 330.0 * clamp(gs_dot, -2.2, 2.2), -1450.0, -250.0)
+        # If very low, stop chasing the beam aggressively and protect terrain.
+        if ra < 180.0:
+            target_vs = max(target_vs, -650.0)
+        elevator = 0.00125 * (target_vs - vs) - 0.030 * pitch - 0.18 * clamp(gs_dot, -2.0, 2.0)
+        if aoa is not None and aoa > 10.0:
+            elevator -= 0.035 * (aoa - 10.0)
+        elevator_trim = clamp(0.10 - 0.015 * pitch - 0.04 * clamp(gs_dot, -1.5, 1.5), -0.4, 0.4)
+
+    # Throttle.  Maintain approach speed, idle in flare, and handle engine loss
+    # by commanding available thrust only.
+    speed_err = desired_speed - ias
+    base_thr = 0.48 if phase in ("intercept", "approach") else 0.0
+    if phase == "intercept" and gs_dot > 0.8:
+        base_thr -= 0.08
+    throttle = clamp(base_thr + 0.018 * speed_err - 0.00008 * (vs + 700.0), 0.0, 1.0)
+    if phase == "flare":
+        throttle = 0.0
+    if not engine1 and not engine2:
+        throttle = 0.0
+
+    # Drag management: full landing configuration early; speedbrake only for a
+    # fast/high approach and never during flare or rollout.
+    gear = 1.0
+    flaps = 30.0 if phase == "intercept" else 40.0
+    speedbrake = 0.0
+    if not on_ground and phase != "flare":
+        if ias > desired_speed + 22.0 or (gs_dot > 1.2 and ra > 250.0):
+            speedbrake = 0.45
+        if ias > desired_speed + 40.0:
+            speedbrake = 0.75
+
+    # Rollout: stop straight, use all stopping devices.  Below taxi speed release
+    # reverse to avoid accelerating backwards in simple simulators.
+    spoiler = 0.0
+    autobrake = 0.0
+    reverse = 0.0
+    if on_ground:
+        phase = "rollout"
+        spoiler = 1.0
+        speedbrake = 1.0
+        autobrake = 1.0 if gs_kt > 45.0 else 0.35
+        reverse = 1.0 if gs_kt > 70.0 else (0.45 if gs_kt > 35.0 else 0.0)
+        throttle = 0.0
+        elevator = 0.15 if gs_kt > 80.0 else -0.05
+        elevator_trim = 0.0
+        aileron = clamp(-0.16 * loc_dot - 0.05 * roll, -0.6, 0.6)
+        rudder = clamp(-0.25 * loc_dot + 0.006 * hdg_error, -0.8, 0.8)
+
+    # Saturate and add small asymmetry compensation if one engine is failed.
+    if engine1 and not engine2:
+        rudder -= 0.12 * throttle
+    elif engine2 and not engine1:
+        rudder += 0.12 * throttle
+
+    out = {
+        "elevator": clamp(elevator, -1.0, 1.0),
+        "aileron": clamp(aileron, -1.0, 1.0),
+        "rudder": clamp(rudder, -1.0, 1.0),
+        "throttle_1": throttle if engine1 else 0.0,
+        "throttle_2": throttle if engine2 else 0.0,
+        "elevator_trim": clamp(elevator_trim, -1.0, 1.0),
+        "flaps": flaps,
+        "gear": gear,
+        "speedbrake": clamp(speedbrake, 0.0, 1.0),
+        "spoiler": spoiler,
+        "autobrake": clamp(autobrake, 0.0, 1.0),
+        "reverse_1": reverse if engine1 else 0.0,
+        "reverse_2": reverse if engine2 else 0.0,
+    }
+
+    _last["phase"] = phase
+    return out

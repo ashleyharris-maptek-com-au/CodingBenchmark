@@ -1,1 +1,333 @@
-{'__exception__': "Can't run here - we're trying to get this working in codex."}
+```python
+"""
+Simple rendezvous & docking autopilot.
+
+Key ideas:
+- Work in LVLH frame: x=radial, y=along-track, z=cross-track.
+- Fuse radar/lidar (and camera when needed) for relative state.
+- Use linearized Hill/Clohessy–Wiltshire dynamics with PD control to
+  get physically correct along-track behavior (retrograde to catch up).
+- Limit closing speed vs range and target_dock_speed.
+- Be conservative with thrust and fuel, with deadbands to avoid chattering.
+"""
+
+import math
+
+# --- Persistent module-level state (persists across calls within a scenario) ---
+
+_initialized = False
+_r_est = [0.0, 0.0, 0.0]    # filtered relative position [m]
+_v_est = [0.0, 0.0, 0.0]    # filtered relative velocity [m/s]
+_prev_r = [0.0, 0.0, 0.0]   # last position for finite-difference dv
+_range_est = 1000.0         # filtered scalar range [m]
+_n_est = 0.0011             # orbital mean motion [rad/s], ~400 km LEO default
+
+
+def _bool(state, key):
+    """Return True if key exists and is nonzero/True."""
+    return bool(state.get(key, 0))
+
+
+def autopilot_step(state: dict, dt: float) -> dict:
+    global _initialized, _r_est, _v_est, _prev_r, _range_est, _n_est
+
+    # --- Basic time sanity ---
+    if dt is None or dt <= 0.0:
+        dt = 1.0
+    elif dt > 10.0:
+        dt = 10.0
+
+    # --- Update mean motion n from ground semi-major axis if available ---
+    if _bool(state, "ground_semi_major_axis_m_valid"):
+        a = state.get("ground_semi_major_axis_m", 0.0)
+        if a > 0.0:
+            mu_earth = 3.986004418e14  # m^3/s^2
+            try:
+                _n_est = math.sqrt(mu_earth / (a ** 3))
+            except Exception:
+                pass  # keep previous _n_est on any numerical issue
+    n = _n_est
+
+    # --- Sensor fusion: relative position/velocity ---
+
+    axes = ("x", "y", "z")
+    pos_raw = [None, None, None]
+    vel_raw = [None, None, None]
+    any_vector_sensor = False  # any direct vector sensor valid this step?
+
+    for i, axis in enumerate(axes):
+        # Position from radar / lidar
+        vals = []
+        if _bool(state, f"radar_rel_{axis}_valid"):
+            vals.append(state.get(f"radar_rel_pos_{axis}_m", 0.0))
+        if _bool(state, f"lidar_rel_{axis}_valid"):
+            vals.append(state.get(f"lidar_rel_pos_{axis}_m", 0.0))
+        if vals:
+            pos_raw[i] = sum(vals) / len(vals)
+            any_vector_sensor = True
+
+        # Velocity from radar / lidar
+        vvals = []
+        if _bool(state, f"radar_relv_{axis}_valid"):
+            vvals.append(state.get(f"radar_rel_vel_{axis}_ms", 0.0))
+        if _bool(state, f"lidar_relv_{axis}_valid"):
+            vvals.append(state.get(f"lidar_rel_vel_{axis}_ms", 0.0))
+        if vvals:
+            vel_raw[i] = sum(vvals) / len(vvals)
+            any_vector_sensor = True
+
+    # If we have no radar/lidar vector data, try to reconstruct from docking camera
+    used_camera_vector = False
+    if not any_vector_sensor:
+        if _bool(state, "dock_camera_active"):
+            rng_cam = state.get("dock_camera_range_m", 0.0)
+            bx = state.get("dock_camera_bearing_x", 0.0)
+            by = state.get("dock_camera_bearing_y", 0.0)
+            bz = state.get("dock_camera_bearing_z", 0.0)
+            if (
+                rng_cam > 0.0
+                and _bool(state, "dock_camera_bearing_x_valid")
+                and _bool(state, "dock_camera_bearing_y_valid")
+                and _bool(state, "dock_camera_bearing_z_valid")
+            ):
+                norm_b = math.sqrt(bx * bx + by * by + bz * bz)
+                if norm_b > 1e-6:
+                    ux, uy, uz = bx / norm_b, by / norm_b, bz / norm_b
+                    pos_raw = [ux * rng_cam, uy * rng_cam, uz * rng_cam]
+                    any_vector_sensor = True
+                    used_camera_vector = True
+                    # Velocity still unknown here; will infer from position history
+
+    # If we still have absolutely no current vector info, safest is to hold thrusts off
+    # and keep previous state estimate unchanged.
+    if not any_vector_sensor and _initialized:
+        return {
+            "thrust_x": 0.0,
+            "thrust_y": 0.0,
+            "thrust_z": 0.0,
+            "att_rate_roll": 0.0,
+            "att_rate_pitch": 0.0,
+            "att_rate_yaw": 0.0,
+        }
+
+    # --- Initialize state on first valid data ---
+    if not _initialized:
+        for i in range(3):
+            _r_est[i] = pos_raw[i] if pos_raw[i] is not None else 0.0
+            _v_est[i] = vel_raw[i] if vel_raw[i] is not None else 0.0
+        _prev_r = list(_r_est)
+        # Crude initial range guess
+        _range_est = math.sqrt(_r_est[0] ** 2 + _r_est[1] ** 2 + _r_est[2] ** 2) or 1000.0
+        _initialized = True
+
+    # --- Filter position ---
+    pos_alpha = 0.3  # low-pass; 0 = no update, 1 = replace
+    for i in range(3):
+        if pos_raw[i] is not None:
+            _r_est[i] = _r_est[i] + pos_alpha * (pos_raw[i] - _r_est[i])
+
+    # --- Estimate velocity (sensor + finite difference) ---
+    if dt > 0.0:
+        dv_from_pos = [( _r_est[i] - _prev_r[i]) / dt for i in range(3)]
+    else:
+        dv_from_pos = [0.0, 0.0, 0.0]
+
+    vel_alpha = 0.4
+    for i in range(3):
+        if vel_raw[i] is not None:
+            desired_v = vel_raw[i]
+        else:
+            desired_v = dv_from_pos[i]
+        _v_est[i] = _v_est[i] + vel_alpha * (desired_v - _v_est[i])
+
+    _prev_r = list(_r_est)
+
+    rx, ry, rz = _r_est
+    vx, vy, vz = _v_est
+
+    # --- Scalar range estimation (fuse vector norm, range finders, camera range) ---
+    scalar_ranges = []
+
+    # Range finders
+    for i in (1, 2, 3):
+        if _bool(state, f"range_{i}_valid"):
+            val = state.get(f"range_{i}_m", 0.0)
+            if val > 0.0:
+                scalar_ranges.append(val)
+
+    # Docking camera range
+    if _bool(state, "dock_camera_active"):
+        r_cam = state.get("dock_camera_range_m", 0.0)
+        if r_cam > 0.0:
+            scalar_ranges.append(r_cam)
+
+    # Vector magnitude
+    r_mag = math.sqrt(rx * rx + ry * ry + rz * rz)
+    if r_mag > 0.1 or not scalar_ranges:
+        scalar_ranges.append(r_mag)
+
+    if scalar_ranges:
+        scalar_ranges.sort()
+        r_meas = scalar_ranges[len(scalar_ranges) // 2]  # median
+        range_alpha = 0.2
+        _range_est = _range_est + range_alpha * (r_meas - _range_est)
+
+    range_m = max(_range_est, 1e-3)
+
+    # --- Relative closing speed along line-of-sight ---
+    if range_m > 1e-3:
+        closing_speed = (rx * vx + ry * vy + rz * vz) / range_m
+    else:
+        closing_speed = 0.0
+
+    # --- Docking target constraints ---
+    target_range = state.get("target_dock_range_m", 2.0)
+    target_speed = state.get("target_dock_speed_ms", 0.3)
+
+    rel_speed_mag = math.sqrt(vx * vx + vy * vy + vz * vz)
+
+    # If already within dock envelope, cut thrust and let capture system work
+    if range_m <= target_range and rel_speed_mag <= target_speed:
+        return {
+            "thrust_x": 0.0,
+            "thrust_y": 0.0,
+            "thrust_z": 0.0,
+            "att_rate_roll": 0.0,
+            "att_rate_pitch": 0.0,
+            "att_rate_yaw": 0.0,
+        }
+
+    # --- Choose control gains based on range regime ---
+    if range_m > 500.0:
+        kp = 1e-5
+        kv = 5e-4
+    elif range_m > 200.0:
+        kp = 5e-5
+        kv = 1e-3
+    elif range_m > 50.0:
+        kp = 1e-4
+        kv = 2e-3
+    else:
+        # Near-field: stronger gains, linear regime
+        kp = 5e-4
+        kv = 5e-3
+
+    # --- Base PD control in LVLH ---
+    u_x = -kp * rx - kv * vx
+    u_y = -kp * ry - kv * vy
+    u_z = -kp * rz - kv * vz
+
+    # --- Hill/CW dynamic compensation (far & medium ranges) ---
+    if n > 0.0 and range_m > 50.0:
+        # Equations:
+        # x'' - 3n^2 x - 2n y' = a_x
+        # y'' + 2n x'          = a_y
+        # z'' + n^2 z          = a_z
+        # Choose a such that closed-loop: x''=u_x, y''=u_y, z''=u_z
+        a_x = u_x - (3.0 * n * n * rx + 2.0 * n * vy)
+        a_y = u_y + 2.0 * n * vx
+        a_z = u_z + n * n * rz
+    else:
+        # Near-field or unknown n: simple PD is fine
+        a_x, a_y, a_z = u_x, u_y, u_z
+
+    # --- Approach-speed limiter along line-of-sight ---
+    # Set maximum allowed closing speed magnitude vs range.
+    if range_m > 200.0:
+        v_max = 0.5  # m/s far away
+    elif range_m > 50.0:
+        # 0.1 m/s at 50 m, up to ~0.4 m/s at 200 m
+        v_max = 0.1 + 0.002 * (range_m - 50.0)
+    else:
+        # Very close: gentle, <0.1 m/s, scale ~sqrt(r)
+        v_max = min(0.1, 0.03 * math.sqrt(max(range_m, 1.0)))
+
+    # Enforce tighter limit near final capture
+    if range_m < 5.0:
+        v_max = min(v_max, target_speed)
+
+    # If closing faster than v_max (more negative), brake along LOS
+    if range_m > 1.0 and closing_speed < -v_max:
+        excess = closing_speed + v_max  # negative
+        k_brake = 1.0
+        a_los_mag = -k_brake * excess  # positive magnitude
+        urx, ury, urz = rx / range_m, ry / range_m, rz / range_m
+        a_x += a_los_mag * urx
+        a_y += a_los_mag * ury
+        a_z += a_los_mag * urz
+
+    # --- Map desired accelerations to normalized thrust commands [-1, 1] ---
+    # Assume full-scale command corresponds to about 0.01 m/s^2 acceleration.
+    a_max_design = 0.01
+    thrust_x = max(min(a_x / a_max_design, 1.0), -1.0)
+    thrust_y = max(min(a_y / a_max_design, 1.0), -1.0)
+    thrust_z = max(min(a_z / a_max_design, 1.0), -1.0)
+
+    # --- Fuel-aware scaling ---
+    fuel_pct = state.get("fuel_remaining_pct", 100.0) or 100.0
+    fuel_kg = state.get("fuel_remaining_kg", 500.0) or 500.0
+    fuel_scale = 1.0
+    if fuel_pct < 20.0 or fuel_kg < 100.0:
+        fuel_scale *= 0.7
+    if fuel_pct < 10.0 or fuel_kg < 50.0:
+        fuel_scale *= 0.5
+
+    thrust_x *= fuel_scale
+    thrust_y *= fuel_scale
+    thrust_z *= fuel_scale
+
+    # --- Axis-specific fallback if some components are clearly invalid ---
+    # If an axis has no valid position info at all, don't command it.
+    x_pos_valid = (
+        _bool(state, "radar_rel_x_valid")
+        or _bool(state, "lidar_rel_x_valid")
+        or (_bool(state, "dock_camera_active") and _bool(state, "dock_camera_bearing_x_valid"))
+    )
+    y_pos_valid = (
+        _bool(state, "radar_rel_y_valid")
+        or _bool(state, "lidar_rel_y_valid")
+        or (_bool(state, "dock_camera_active") and _bool(state, "dock_camera_bearing_y_valid"))
+    )
+    z_pos_valid = (
+        _bool(state, "radar_rel_z_valid")
+        or _bool(state, "lidar_rel_z_valid")
+        or (_bool(state, "dock_camera_active") and _bool(state, "dock_camera_bearing_z_valid"))
+    )
+
+    if not x_pos_valid:
+        thrust_x = 0.0
+    if not y_pos_valid:
+        thrust_y = 0.0
+    if not z_pos_valid:
+        thrust_z = 0.0
+
+    # --- Deadband to avoid needless limit-cycle firing ---
+    deadband = 0.02
+    if abs(thrust_x) < deadband:
+        thrust_x = 0.0
+    if abs(thrust_y) < deadband:
+        thrust_y = 0.0
+    if abs(thrust_z) < deadband:
+        thrust_z = 0.0
+
+    # --- Attitude: keep rates zero (hold current attitude) ---
+    # Could be extended to point docking port using star trackers/gyros.
+    att_rate_roll = 0.0
+    att_rate_pitch = 0.0
+    att_rate_yaw = 0.0
+
+    # Clip to specified attitude rate limits (±0.035 rad/s), though we're at 0
+    limit_att = 0.035
+    att_rate_roll = max(min(att_rate_roll, limit_att), -limit_att)
+    att_rate_pitch = max(min(att_rate_pitch, limit_att), -limit_att)
+    att_rate_yaw = max(min(att_rate_yaw, limit_att), -limit_att)
+
+    return {
+        "thrust_x": float(thrust_x),
+        "thrust_y": float(thrust_y),
+        "thrust_z": float(thrust_z),
+        "att_rate_roll": float(att_rate_roll),
+        "att_rate_pitch": float(att_rate_pitch),
+        "att_rate_yaw": float(att_rate_yaw),
+    }
+```
