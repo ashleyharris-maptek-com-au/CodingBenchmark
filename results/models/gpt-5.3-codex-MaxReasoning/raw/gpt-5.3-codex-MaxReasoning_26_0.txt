@@ -1,0 +1,697 @@
+use std::collections::HashSet;
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
+
+const SMALL_DATASET_MAX: u64 = 10_000_000;
+const MEDIUM_DATASET_MAX: u64 = 1_000_000_000;
+
+#[derive(Clone, Copy, Debug, Default)]
+struct Point3 {
+    x: f32,
+    y: f32,
+    z: f32,
+}
+
+impl Point3 {
+    #[inline]
+    fn dist2(self, other: Point3) -> f32 {
+        let dx = self.x - other.x;
+        let dy = self.y - other.y;
+        let dz = self.z - other.z;
+        dx * dx + dy * dy + dz * dz
+    }
+
+    #[inline]
+    fn add_assign(&mut self, other: Point3) {
+        self.x += other.x;
+        self.y += other.y;
+        self.z += other.z;
+    }
+
+    #[inline]
+    fn scale(self, inv: f32) -> Point3 {
+        Point3 {
+            x: self.x * inv,
+            y: self.y * inv,
+            z: self.z * inv,
+        }
+    }
+}
+
+struct SplitMix64 {
+    state: u64,
+}
+
+impl SplitMix64 {
+    fn new(seed: u64) -> Self {
+        Self { state: seed }
+    }
+
+    #[inline]
+    fn next_u64(&mut self) -> u64 {
+        self.state = self.state.wrapping_add(0x9E3779B97F4A7C15);
+        let mut z = self.state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+        z ^ (z >> 31)
+    }
+
+    #[inline]
+    fn gen_usize(&mut self, upper: usize) -> usize {
+        if upper <= 1 {
+            return 0;
+        }
+        ((self.next_u64() as u128 * upper as u128) >> 64) as usize
+    }
+
+    #[inline]
+    fn gen_f64(&mut self) -> f64 {
+        (self.next_u64() as f64) / (u64::MAX as f64)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Strategy {
+    InMemory,
+    StreamingMiniBatch,
+    StreamingExtreme,
+}
+
+struct CoarseIndex {
+    macro_centers: Vec<Point3>,
+    buckets: Vec<Vec<usize>>,
+}
+
+impl CoarseIndex {
+    fn build(centers: &[Point3]) -> Self {
+        let k = centers.len();
+        if k == 0 {
+            return Self {
+                macro_centers: Vec::new(),
+                buckets: Vec::new(),
+            };
+        }
+        if k == 1 {
+            return Self {
+                macro_centers: vec![centers[0]],
+                buckets: vec![vec![0]],
+            };
+        }
+
+        let macro_count = ((k as f64).sqrt().round() as usize).clamp(1, 256).min(k);
+        let mut macro_centers = Vec::with_capacity(macro_count);
+        for i in 0..macro_count {
+            macro_centers.push(centers[(i * k) / macro_count]);
+        }
+
+        let mut assignments = vec![0usize; k];
+
+        for _ in 0..2 {
+            let mut sums = vec![Point3::default(); macro_count];
+            let mut counts = vec![0u32; macro_count];
+
+            for (ci, &c) in centers.iter().enumerate() {
+                let m = nearest_in_slice(c, &macro_centers);
+                assignments[ci] = m;
+                sums[m].add_assign(c);
+                counts[m] += 1;
+            }
+
+            for m in 0..macro_count {
+                if counts[m] > 0 {
+                    macro_centers[m] = sums[m].scale(1.0 / counts[m] as f32);
+                }
+            }
+        }
+
+        let mut buckets = vec![Vec::<usize>::new(); macro_count];
+        for (ci, &m) in assignments.iter().enumerate() {
+            buckets[m].push(ci);
+        }
+
+        for m in 0..macro_count {
+            if buckets[m].is_empty() {
+                buckets[m].push((m * k) / macro_count);
+            }
+        }
+
+        Self {
+            macro_centers,
+            buckets,
+        }
+    }
+}
+
+fn main() -> io::Result<()> {
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+
+    let mut reader = BufReader::with_capacity(8 * 1024 * 1024, stdin.lock());
+    let mut writer = BufWriter::with_capacity(8 * 1024 * 1024, stdout.lock());
+
+    let (num_points, num_clusters) = read_header(&mut reader)?;
+
+    if num_clusters == 0 || num_points == 0 {
+        writer.flush()?;
+        return Ok(());
+    }
+
+    if num_clusters > u32::MAX as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "num_clusters must fit into u32",
+        ));
+    }
+
+    let strategy = choose_strategy(num_points);
+
+    match strategy {
+        Strategy::InMemory => run_in_memory(&mut reader, &mut writer, num_points, num_clusters)?,
+        Strategy::StreamingMiniBatch => {
+            run_streaming(&mut reader, &mut writer, num_points, num_clusters, false)?
+        }
+        Strategy::StreamingExtreme => {
+            run_streaming(&mut reader, &mut writer, num_points, num_clusters, true)?
+        }
+    }
+
+    writer.flush()?;
+    Ok(())
+}
+
+fn choose_strategy(num_points: u64) -> Strategy {
+    if num_points <= SMALL_DATASET_MAX {
+        Strategy::InMemory
+    } else if num_points <= MEDIUM_DATASET_MAX {
+        Strategy::StreamingMiniBatch
+    } else {
+        Strategy::StreamingExtreme
+    }
+}
+
+fn read_header<R: BufRead>(reader: &mut R) -> io::Result<(u64, usize)> {
+    let mut header = String::new();
+    let bytes = reader.read_line(&mut header)?;
+    if bytes == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "missing header line",
+        ));
+    }
+
+    let mut it = header.split_whitespace();
+    let num_points = it
+        .next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing num_points"))?
+        .parse::<u64>()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("bad num_points: {e}")))?;
+
+    let num_clusters = it
+        .next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing num_clusters"))?
+        .parse::<usize>()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("bad num_clusters: {e}")))?;
+
+    Ok((num_points, num_clusters))
+}
+
+fn read_point<R: Read>(reader: &mut R, buf: &mut [u8; 12]) -> io::Result<Option<Point3>> {
+    let mut read = 0usize;
+    while read < 12 {
+        let n = reader.read(&mut buf[read..])?;
+        if n == 0 {
+            if read == 0 {
+                return Ok(None);
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "truncated point data",
+            ));
+        }
+        read += n;
+    }
+
+    let x = f32::from_le_bytes(buf[0..4].try_into().unwrap());
+    let y = f32::from_le_bytes(buf[4..8].try_into().unwrap());
+    let z = f32::from_le_bytes(buf[8..12].try_into().unwrap());
+
+    Ok(Some(Point3 { x, y, z }))
+}
+
+fn write_u32<W: Write>(writer: &mut W, value: usize) -> io::Result<()> {
+    writer.write_all(&(value as u32).to_le_bytes())
+}
+
+fn run_in_memory<R: Read, W: Write>(
+    reader: &mut BufReader<R>,
+    writer: &mut BufWriter<W>,
+    num_points: u64,
+    num_clusters: usize,
+) -> io::Result<()> {
+    let n = usize::try_from(num_points).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "num_points too large for this platform",
+        )
+    })?;
+
+    let mut points = Vec::with_capacity(n);
+    let mut buf = [0u8; 12];
+
+    for _ in 0..n {
+        match read_point(reader, &mut buf)? {
+            Some(p) => points.push(p),
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "input ended before all points were read",
+                ));
+            }
+        }
+    }
+
+    let mut rng = SplitMix64::new(seed_from(num_points, num_clusters as u64));
+    let mut centers = init_centers(&points, num_clusters, &mut rng);
+
+    let max_iters = if n <= 1_000_000 {
+        25
+    } else if num_clusters <= 512 {
+        15
+    } else {
+        10
+    };
+
+    let assignments = lloyd_kmeans(&points, &mut centers, max_iters, 1e-4, &mut rng);
+
+    for idx in assignments {
+        write_u32(writer, idx)?;
+    }
+
+    Ok(())
+}
+
+fn run_streaming<R: Read, W: Write>(
+    reader: &mut BufReader<R>,
+    writer: &mut BufWriter<W>,
+    num_points: u64,
+    num_clusters: usize,
+    extreme: bool,
+) -> io::Result<()> {
+    let warmup_size = compute_warmup_size(num_points, num_clusters, extreme);
+    let warmup_u64 = warmup_size as u64;
+
+    let mut sample = Vec::with_capacity(warmup_size);
+    let mut buf = [0u8; 12];
+
+    for _ in 0..warmup_u64.min(num_points) {
+        match read_point(reader, &mut buf)? {
+            Some(p) => sample.push(p),
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "input ended before warmup points were read",
+                ));
+            }
+        }
+    }
+
+    if sample.is_empty() {
+        return Ok(());
+    }
+
+    let mut rng = SplitMix64::new(seed_from(num_points ^ 0xA5A5A5A5A5A5A5A5, num_clusters as u64));
+    let mut centers = init_centers(&sample, num_clusters, &mut rng);
+
+    let refine_iters = if extreme { 4 } else { 8 };
+    let batch_size = sample.len().min(if extreme { 120_000 } else { 400_000 });
+    mini_batch_refine(&sample, &mut centers, refine_iters, batch_size, &mut rng);
+
+    let mut counts = vec![0u64; num_clusters];
+    let mut coarse = if num_clusters > 1024 {
+        Some(CoarseIndex::build(&centers))
+    } else {
+        None
+    };
+
+    for &p in &sample {
+        let (idx, _) = nearest_center(p, &centers, coarse.as_ref());
+        counts[idx] += 1;
+        online_update(&mut centers[idx], p, counts[idx], extreme);
+        write_u32(writer, idx)?;
+    }
+
+    if num_clusters > 1024 {
+        coarse = Some(CoarseIndex::build(&centers));
+    }
+
+    let mut produced = sample.len() as u64;
+    let rebuild_every = if extreme { 5_000_000u64 } else { 1_000_000u64 };
+    let mut since_rebuild = 0u64;
+
+    while produced < num_points {
+        let p = read_point(reader, &mut buf)?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "input ended before all points were read",
+            )
+        })?;
+
+        let (idx, _) = nearest_center(p, &centers, coarse.as_ref());
+        counts[idx] += 1;
+        online_update(&mut centers[idx], p, counts[idx], extreme);
+        write_u32(writer, idx)?;
+
+        produced += 1;
+        since_rebuild += 1;
+
+        if num_clusters > 1024 && since_rebuild >= rebuild_every {
+            coarse = Some(CoarseIndex::build(&centers));
+            since_rebuild = 0;
+        }
+    }
+
+    Ok(())
+}
+
+fn compute_warmup_size(num_points: u64, num_clusters: usize, extreme: bool) -> usize {
+    let max_points = usize::try_from(num_points).unwrap_or(usize::MAX);
+
+    let mut target = num_clusters.saturating_mul(if extreme { 48 } else { 64 });
+    target = target.max(if extreme { 50_000 } else { 200_000 });
+    target = target.min(if extreme { 600_000 } else { 2_000_000 });
+
+    let min_needed = num_clusters.min(max_points);
+    target = target.max(min_needed);
+
+    target.min(max_points)
+}
+
+fn init_centers(points: &[Point3], k: usize, rng: &mut SplitMix64) -> Vec<Point3> {
+    if k == 0 {
+        return Vec::new();
+    }
+    if points.is_empty() {
+        return vec![Point3::default(); k];
+    }
+
+    let n = points.len();
+
+    if k <= 128 && n <= 1_000_000 {
+        return kmeans_plus_plus(points, k, rng);
+    }
+
+    let mut centers = Vec::with_capacity(k);
+
+    if k <= n {
+        let mut picked = HashSet::with_capacity(k.saturating_mul(2));
+        while centers.len() < k {
+            let idx = rng.gen_usize(n);
+            if picked.insert(idx) {
+                centers.push(points[idx]);
+            }
+        }
+    } else {
+        centers.extend_from_slice(points);
+        while centers.len() < k {
+            centers.push(points[rng.gen_usize(n)]);
+        }
+    }
+
+    centers
+}
+
+fn kmeans_plus_plus(points: &[Point3], k: usize, rng: &mut SplitMix64) -> Vec<Point3> {
+    if points.is_empty() || k == 0 {
+        return Vec::new();
+    }
+
+    let n = points.len();
+    let max_unique = k.min(n);
+
+    let mut centers = Vec::with_capacity(k);
+    centers.push(points[rng.gen_usize(n)]);
+
+    let mut min_d2 = vec![f32::INFINITY; n];
+
+    while centers.len() < max_unique {
+        let last = *centers.last().unwrap();
+        let mut total = 0.0f64;
+
+        for (i, &p) in points.iter().enumerate() {
+            let d = p.dist2(last);
+            if d < min_d2[i] {
+                min_d2[i] = d;
+            }
+            total += min_d2[i] as f64;
+        }
+
+        if total <= 0.0 {
+            centers.push(points[rng.gen_usize(n)]);
+            continue;
+        }
+
+        let mut target = rng.gen_f64() * total;
+        let mut chosen = n - 1;
+
+        for (i, &d) in min_d2.iter().enumerate() {
+            target -= d as f64;
+            if target <= 0.0 {
+                chosen = i;
+                break;
+            }
+        }
+
+        centers.push(points[chosen]);
+    }
+
+    while centers.len() < k {
+        centers.push(points[rng.gen_usize(n)]);
+    }
+
+    centers
+}
+
+fn lloyd_kmeans(
+    points: &[Point3],
+    centers: &mut [Point3],
+    max_iters: usize,
+    tolerance: f32,
+    rng: &mut SplitMix64,
+) -> Vec<usize> {
+    let n = points.len();
+    let k = centers.len();
+
+    let mut assignments = vec![0usize; n];
+    if n == 0 || k == 0 {
+        return assignments;
+    }
+
+    let tol2 = tolerance * tolerance;
+
+    for _ in 0..max_iters {
+        let coarse = if k > 1024 {
+            Some(CoarseIndex::build(centers))
+        } else {
+            None
+        };
+
+        let mut sums = vec![Point3::default(); k];
+        let mut counts = vec![0u64; k];
+
+        for (i, &p) in points.iter().enumerate() {
+            let (idx, _) = nearest_center(p, centers, coarse.as_ref());
+            assignments[i] = idx;
+            sums[idx].add_assign(p);
+            counts[idx] += 1;
+        }
+
+        let mut max_shift = 0.0f32;
+
+        for c in 0..k {
+            let next = if counts[c] > 0 {
+                sums[c].scale(1.0 / counts[c] as f32)
+            } else {
+                points[rng.gen_usize(n)]
+            };
+
+            let shift = centers[c].dist2(next);
+            if shift > max_shift {
+                max_shift = shift;
+            }
+            centers[c] = next;
+        }
+
+        if max_shift <= tol2 {
+            break;
+        }
+    }
+
+    let coarse = if k > 1024 {
+        Some(CoarseIndex::build(centers))
+    } else {
+        None
+    };
+
+    for (i, &p) in points.iter().enumerate() {
+        assignments[i] = nearest_center(p, centers, coarse.as_ref()).0;
+    }
+
+    assignments
+}
+
+fn mini_batch_refine(
+    sample: &[Point3],
+    centers: &mut [Point3],
+    iters: usize,
+    batch_size: usize,
+    rng: &mut SplitMix64,
+) {
+    if sample.is_empty() || centers.is_empty() || batch_size == 0 || iters == 0 {
+        return;
+    }
+
+    let k = centers.len();
+    let mut counts = vec![0u64; k];
+
+    for _ in 0..iters {
+        let coarse = if k > 1024 {
+            Some(CoarseIndex::build(centers))
+        } else {
+            None
+        };
+
+        for _ in 0..batch_size {
+            let p = sample[rng.gen_usize(sample.len())];
+            let (idx, _) = nearest_center(p, centers, coarse.as_ref());
+            counts[idx] += 1;
+
+            let seen = counts[idx];
+            let cap = 4096u64;
+            let eta = if seen < cap {
+                1.0 / seen as f32
+            } else {
+                1.0 / cap as f32
+            };
+
+            centers[idx].x += (p.x - centers[idx].x) * eta;
+            centers[idx].y += (p.y - centers[idx].y) * eta;
+            centers[idx].z += (p.z - centers[idx].z) * eta;
+        }
+    }
+}
+
+#[inline]
+fn online_update(center: &mut Point3, p: Point3, seen: u64, extreme: bool) {
+    let cap = if extreme { 16384u64 } else { 4096u64 };
+    let eta = if seen < cap {
+        1.0 / seen as f32
+    } else {
+        1.0 / cap as f32
+    };
+
+    center.x += (p.x - center.x) * eta;
+    center.y += (p.y - center.y) * eta;
+    center.z += (p.z - center.z) * eta;
+}
+
+#[inline]
+fn nearest_in_slice(p: Point3, centers: &[Point3]) -> usize {
+    let mut best_idx = 0usize;
+    let mut best_dist = f32::INFINITY;
+
+    for (i, &c) in centers.iter().enumerate() {
+        let d = p.dist2(c);
+        if d < best_dist {
+            best_dist = d;
+            best_idx = i;
+        }
+    }
+
+    best_idx
+}
+
+#[inline]
+fn nearest_two_macros(p: Point3, macros: &[Point3]) -> (usize, usize) {
+    if macros.len() <= 1 {
+        return (0, 0);
+    }
+
+    let mut best1 = 0usize;
+    let mut best2 = 1usize;
+    let mut d1 = p.dist2(macros[best1]);
+    let mut d2 = p.dist2(macros[best2]);
+
+    if d2 < d1 {
+        std::mem::swap(&mut best1, &mut best2);
+        std::mem::swap(&mut d1, &mut d2);
+    }
+
+    for (i, &m) in macros.iter().enumerate().skip(2) {
+        let d = p.dist2(m);
+        if d < d1 {
+            best2 = best1;
+            d2 = d1;
+            best1 = i;
+            d1 = d;
+        } else if d < d2 {
+            best2 = i;
+            d2 = d;
+        }
+    }
+
+    (best1, best2)
+}
+
+#[inline]
+fn nearest_center(p: Point3, centers: &[Point3], coarse: Option<&CoarseIndex>) -> (usize, f32) {
+    if let Some(index) = coarse {
+        if !index.macro_centers.is_empty() {
+            let (m1, m2) = nearest_two_macros(p, &index.macro_centers);
+            let mut best_idx = 0usize;
+            let mut best_dist = f32::INFINITY;
+
+            for &ci in &index.buckets[m1] {
+                let d = p.dist2(centers[ci]);
+                if d < best_dist {
+                    best_dist = d;
+                    best_idx = ci;
+                }
+            }
+
+            if m2 != m1 {
+                for &ci in &index.buckets[m2] {
+                    let d = p.dist2(centers[ci]);
+                    if d < best_dist {
+                        best_dist = d;
+                        best_idx = ci;
+                    }
+                }
+            }
+
+            if best_dist.is_finite() {
+                return (best_idx, best_dist);
+            }
+        }
+    }
+
+    let mut best_idx = 0usize;
+    let mut best_dist = f32::INFINITY;
+
+    for (i, &c) in centers.iter().enumerate() {
+        let d = p.dist2(c);
+        if d < best_dist {
+            best_dist = d;
+            best_idx = i;
+        }
+    }
+
+    (best_idx, best_dist)
+}
+
+#[inline]
+fn seed_from(a: u64, b: u64) -> u64 {
+    let mut x = a ^ b.rotate_left(17) ^ 0xD6E8FEB86659FD93;
+    x ^= x >> 32;
+    x = x.wrapping_mul(0x9E3779B97F4A7C15);
+    x ^= x >> 29;
+    x
+}

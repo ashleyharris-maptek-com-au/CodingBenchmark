@@ -1,0 +1,188 @@
+use std::io::{self, BufRead, Write, BufWriter, Read};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
+
+#[derive(Clone, Copy, Default, Debug)]
+struct State {
+    x: f64, y: f64,
+    vx: f64, vy: f64,
+    angle: f64, angular_vel: f64,
+    fuel: f64,
+    stamp: Option<Instant>,
+}
+
+struct Header {
+    width: f64, height: f64,
+    gravity: f64, max_thrust: f64, _fuel: f64,
+    _sx: f64, _sy: f64,
+    tx: f64, ty: f64,
+}
+
+fn read_n_tokens<R: BufRead>(r: &mut R, n: usize) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut buf = String::new();
+    while out.len() < n {
+        buf.clear();
+        let bytes = r.read_line(&mut buf).unwrap_or(0);
+        if bytes == 0 { break; }
+        for tok in buf.split_whitespace() {
+            out.push(tok.to_string());
+            if out.len() >= n { return out; }
+        }
+    }
+    out
+}
+
+fn parse_header<R: BufRead>(r: &mut R) -> Header {
+    let toks = read_n_tokens(r, 9);
+    let p: Vec<f64> = toks.iter().take(9).map(|s| s.parse::<f64>().unwrap_or(0.0)).collect();
+    let h = Header {
+        width: p[0], height: p[1],
+        gravity: p[2], max_thrust: p[3], _fuel: p[4],
+        _sx: p[5], _sy: p[6],
+        tx: p[7], ty: p[8],
+    };
+    // Consume the map rows (height lines of map characters).
+    let height = h.height as usize;
+    let width = h.width as usize;
+    let mut rows_read = 0usize;
+    while rows_read < height {
+        let mut line = String::new();
+        let n = r.read_line(&mut line).unwrap_or(0);
+        if n == 0 { break; }
+        let trimmed = line.trim_end_matches(|c: char| c == '\n' || c == '\r');
+        if trimmed.is_empty() { continue; }
+        let is_map = trimmed.chars().all(|c| matches!(c, '.' | '#' | 'S' | 'T' | 'L' | ' '));
+        if is_map && trimmed.len() >= width.saturating_sub(2).max(1) {
+            rows_read += 1;
+        } else {
+            // unexpected non-map line; stop trying to consume map
+            break;
+        }
+    }
+    h
+}
+
+fn main() {
+    let stdin = io::stdin();
+    let mut reader = stdin.lock();
+    let hdr = parse_header(&mut reader);
+    drop(reader);
+
+    let state = Arc::new(Mutex::new(State::default()));
+    let initialized = Arc::new(Mutex::new(false));
+
+    // Reader thread: continuously parses 7-number state updates.
+    let state_r = state.clone();
+    let init_r = initialized.clone();
+    thread::spawn(move || {
+        let mut stdin = io::stdin();
+        let mut tokbuf: Vec<f64> = Vec::with_capacity(8);
+        let mut pending = String::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let n = match stdin.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(_) => break,
+            };
+            pending.push_str(&String::from_utf8_lossy(&chunk[..n]));
+            let ends_with_ws = pending.chars().last().map(|c| c.is_whitespace()).unwrap_or(false);
+            let parts: Vec<String> = pending.split_whitespace().map(|s| s.to_string()).collect();
+            let (complete, partial) = if ends_with_ws {
+                (parts, String::new())
+            } else {
+                let mut p = parts;
+                let last = p.pop().unwrap_or_default();
+                (p, last)
+            };
+            pending = partial;
+            for tok in complete {
+                if let Ok(v) = tok.parse::<f64>() {
+                    tokbuf.push(v);
+                    if tokbuf.len() >= 7 {
+                        let s = State {
+                            x: tokbuf[0], y: tokbuf[1],
+                            vx: tokbuf[2], vy: tokbuf[3],
+                            angle: tokbuf[4], angular_vel: tokbuf[5],
+                            fuel: tokbuf[6],
+                            stamp: Some(Instant::now()),
+                        };
+                        if let Ok(mut st) = state_r.lock() { *st = s; }
+                        if let Ok(mut ini) = init_r.lock() { *ini = true; }
+                        tokbuf.clear();
+                    }
+                } else {
+                    tokbuf.clear();
+                }
+            }
+        }
+    });
+
+    let stdout = io::stdout();
+    let mut out = BufWriter::new(stdout.lock());
+
+    let g = hdr.gravity;
+    let max_thrust = if hdr.max_thrust > 0.001 { hdr.max_thrust } else { 1.0 };
+    let tx = hdr.tx;
+    let ty = hdr.ty;
+
+    let dt_ctrl = Duration::from_millis(20);
+
+    // Wait briefly for first state.
+    for _ in 0..200 {
+        if *initialized.lock().unwrap() { break; }
+        thread::sleep(Duration::from_millis(5));
+    }
+
+    loop {
+        let s = { *state.lock().unwrap() };
+
+        let dx = tx - s.x;
+        let dy = ty - s.y;
+
+        // Horizontal: desired vx proportional to dx, then desired ax.
+        let vx_des = clamp(0.5 * dx, -6.0, 6.0);
+        let ax_des = clamp(0.8 * (vx_des - s.vx), -6.0, 6.0);
+
+        // Vertical: descent capped by physics so we can brake before ground.
+        let descent_cap = if dy > 0.5 {
+            let safe_decel = (max_thrust * 0.6 - g).max(0.5);
+            (2.0 * safe_decel * dy).sqrt().min(8.0)
+        } else {
+            // at or above target -> climb slightly / hold
+            -1.5
+        };
+        let vy_des = clamp(0.6 * dy, -3.0, descent_cap);
+        let ay_des = clamp(0.9 * (vy_des - s.vy), -8.0, 8.0);
+
+        // Coordinate frame: angle 0 -> facing up; positive (clockwise) tilts so thrust pushes +x.
+        // Net accel: ax = T*sin(angle); ay = g - T*cos(angle).
+        let vert_needed = (g - ay_des).max(0.1); // = T*cos(angle)
+        let target_angle = clamp((ax_des / vert_needed).atan(), -0.5, 0.5);
+
+        let ang_err = target_angle - s.angle;
+        let turn = clamp(3.0 * ang_err - 0.5 * s.angular_vel, -1.0, 1.0);
+
+        let cos_a = s.angle.cos().abs().max(0.2);
+        let thrust_accel = vert_needed / cos_a;
+        let mut thrust = clamp(thrust_accel / max_thrust, 0.0, 1.0);
+
+        if s.fuel <= 0.0 { thrust = 0.0; }
+
+        // Gentle hover when essentially landed.
+        if dy.abs() < 1.0 && s.vy.abs() < 1.0 && s.vx.abs() < 1.0 && dx.abs() < 1.0 {
+            thrust = clamp(g / max_thrust * 0.95, 0.0, 1.0);
+        }
+
+        let _ = writeln!(out, "{:.3} {:.3}", thrust, turn);
+        let _ = out.flush();
+
+        thread::sleep(dt_ctrl);
+    }
+}
+
+fn clamp(v: f64, lo: f64, hi: f64) -> f64 {
+    if v < lo { lo } else if v > hi { hi } else { v }
+}

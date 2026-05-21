@@ -1,0 +1,467 @@
+```python
+import math
+from typing import Optional
+
+# Persistent state for PID controllers
+_pitch_integral = 0.0
+_roll_integral = 0.0
+_yaw_integral = 0.0
+_speed_integral = 0.0
+_alt_integral = 0.0
+_hdg_integral = 0.0
+
+_prev_pitch_error = 0.0
+_prev_roll_error = 0.0
+_prev_yaw_error = 0.0
+_prev_speed_error = 0.0
+_prev_alt_error = 0.0
+_prev_hdg_error = 0.0
+
+_trim_integral = 0.0
+_last_valid_altitude = None
+_last_valid_airspeed = None
+_last_valid_heading = None
+
+
+def median_of_three(v1, v2, v3):
+    """Return median value, handling None values."""
+    values = [v for v in [v1, v2, v3] if v is not None]
+    if not values:
+        return None
+    if len(values) == 1:
+        return values[0]
+    return sorted(values)[len(values) // 2]
+
+
+def vote_sensors(val1, valid1, val2, valid2, val3, valid3, threshold=10.0):
+    """
+    Cross-check three redundant sensors using median voting.
+    Returns best estimate or None if all appear failed.
+    Also checks for outliers that disagree significantly.
+    """
+    candidates = []
+    if valid1 and val1 is not None:
+        candidates.append(val1)
+    if valid2 and val2 is not None:
+        candidates.append(val2)
+    if valid3 and val3 is not None:
+        candidates.append(val3)
+
+    # If we have multiple values, use median and check for outliers
+    if len(candidates) >= 2:
+        result = sorted(candidates)[len(candidates) // 2]
+
+        # Check if any value is a major outlier (possible failure)
+        for val in [val1, val2, val3]:
+            if val is not None and abs(val - result) > threshold:
+                # Detected outlier, prefer median of remaining
+                filtered = [v for v in candidates if abs(v - result) <= threshold]
+                if filtered:
+                    return sorted(filtered)[len(filtered) // 2]
+
+        return result
+    elif len(candidates) == 1:
+        return candidates[0]
+    else:
+        # All sensors failed, try any value regardless of valid flag
+        for val in [val1, val2, val3]:
+            if val is not None:
+                return val
+        return None
+
+
+def normalize_angle(angle):
+    """Normalize angle to [-180, 180]."""
+    while angle > 180:
+        angle -= 360
+    while angle < -180:
+        angle += 360
+    return angle
+
+
+def pid_controller(error, integral, prev_error, dt, kp, ki, kd, int_limit=None):
+    """Generic PID controller."""
+    integral += error * dt
+    if int_limit is not None:
+        integral = max(-int_limit, min(int_limit, integral))
+
+    derivative = (error - prev_error) / dt if dt > 0 else 0.0
+    output = kp * error + ki * integral + kd * derivative
+
+    return output, integral, error
+
+
+def autopilot_step(state: dict, dt: float) -> dict:
+    """
+    Autopilot for twin-engine airliner with full sensor fusion and failure handling.
+    """
+    global _pitch_integral, _roll_integral, _yaw_integral
+    global _speed_integral, _alt_integral, _hdg_integral
+    global _prev_pitch_error, _prev_roll_error, _prev_yaw_error
+    global _prev_speed_error, _prev_alt_error, _prev_hdg_error
+    global _trim_integral, _last_valid_altitude, _last_valid_airspeed, _last_valid_heading
+
+    controls = {}
+
+    # === SENSOR FUSION ===
+
+    # Altitude fusion (barometric primary, GPS backup, radar for ground proximity)
+    baro_alt = vote_sensors(
+        state.get('baro_alt_1_ft'), state.get('baro_alt_1_valid'),
+        state.get('baro_alt_2_ft'), state.get('baro_alt_2_valid'),
+        state.get('baro_alt_3_ft'), state.get('baro_alt_3_valid'),
+        threshold=50.0
+    )
+
+    gps_alt = vote_sensors(
+        state.get('gps_1_alt_ft'), state.get('gps_1_valid'),
+        state.get('gps_2_alt_ft'), state.get('gps_2_valid'),
+        state.get('gps_3_alt_ft'), state.get('gps_3_valid'),
+        threshold=50.0
+    )
+
+    radar_alt = vote_sensors(
+        state.get('radar_alt_1_ft'), state.get('radar_alt_1_valid'),
+        state.get('radar_alt_2_ft'), state.get('radar_alt_2_valid'),
+        state.get('radar_alt_3_ft'), state.get('radar_alt_3_valid'),
+        threshold=20.0
+    )
+
+    # Cross-check altimeters
+    altitude = baro_alt
+    if baro_alt is not None and gps_alt is not None:
+        if abs(baro_alt - gps_alt) > 500:
+            # Major disagreement - use both plus radar if available
+            altitude = median_of_three(baro_alt, gps_alt, radar_alt if radar_alt and radar_alt > 500 else None)
+    elif gps_alt is not None:
+        altitude = gps_alt
+
+    if altitude is not None:
+        _last_valid_altitude = altitude
+    elif _last_valid_altitude is not None:
+        altitude = _last_valid_altitude
+
+    # Airspeed fusion
+    ias = vote_sensors(
+        state.get('ias_1_kt'), state.get('ias_1_valid'),
+        state.get('ias_2_kt'), state.get('ias_2_valid'),
+        state.get('ias_3_kt'), state.get('ias_3_valid'),
+        threshold=10.0
+    )
+
+    # Cross-check with GPS/IRS ground speed and wind
+    gps_gs = vote_sensors(
+        state.get('gps_1_gs_kt'), state.get('gps_1_valid'),
+        state.get('gps_2_gs_kt'), state.get('gps_2_valid'),
+        state.get('gps_3_gs_kt'), state.get('gps_3_valid'),
+        threshold=10.0
+    )
+
+    irs_gs = vote_sensors(
+        state.get('irs_1_gs_kt'), state.get('irs_1_valid'),
+        state.get('irs_2_gs_kt'), state.get('irs_2_valid'),
+        state.get('irs_3_gs_kt'), state.get('irs_3_valid'),
+        threshold=10.0
+    )
+
+    if ias is not None:
+        _last_valid_airspeed = ias
+    elif _last_valid_airspeed is not None:
+        ias = _last_valid_airspeed
+    else:
+        # Emergency: estimate from ground speed
+        gs = gps_gs if gps_gs is not None else irs_gs
+        wind_speed = state.get('wind_speed_kt', 0)
+        if gs is not None:
+            ias = max(80, gs - wind_speed)  # Rough estimate
+
+    # Attitude fusion (IRS primary)
+    pitch = vote_sensors(
+        state.get('irs_1_pitch_deg'), state.get('irs_1_valid'),
+        state.get('irs_2_pitch_deg'), state.get('irs_2_valid'),
+        state.get('irs_3_pitch_deg'), state.get('irs_3_valid'),
+        threshold=5.0
+    )
+
+    roll = vote_sensors(
+        state.get('irs_1_roll_deg'), state.get('irs_1_valid'),
+        state.get('irs_2_roll_deg'), state.get('irs_2_valid'),
+        state.get('irs_3_roll_deg'), state.get('irs_3_valid'),
+        threshold=5.0
+    )
+
+    heading = vote_sensors(
+        state.get('irs_1_heading_deg'), state.get('irs_1_valid'),
+        state.get('irs_2_heading_deg'), state.get('irs_2_valid'),
+        state.get('irs_3_heading_deg'), state.get('irs_3_valid'),
+        threshold=5.0
+    )
+
+    if heading is not None:
+        _last_valid_heading = heading
+    elif _last_valid_heading is not None:
+        heading = _last_valid_heading
+
+    # Vertical speed
+    vs = vote_sensors(
+        state.get('irs_1_vs_fpm'), state.get('irs_1_valid'),
+        state.get('irs_2_vs_fpm'), state.get('irs_2_valid'),
+        state.get('irs_3_vs_fpm'), state.get('irs_3_valid'),
+        threshold=200.0
+    )
+
+    # Angle of attack (critical for stall prevention)
+    aoa = vote_sensors(
+        state.get('aoa_1_deg'), state.get('aoa_1_valid'),
+        state.get('aoa_2_deg'), state.get('aoa_2_valid'),
+        state.get('aoa_3_deg'), state.get('aoa_3_valid'),
+        threshold=2.0
+    )
+
+    # Rate sensors
+    pitch_rate = vote_sensors(
+        state.get('gyro_1_pitch_rate_dps'), state.get('gyro_1_valid'),
+        state.get('gyro_2_pitch_rate_dps'), state.get('gyro_2_valid'),
+        state.get('gyro_3_pitch_rate_dps'), state.get('gyro_3_valid'),
+        threshold=5.0
+    )
+
+    roll_rate = vote_sensors(
+        state.get('gyro_1_roll_rate_dps'), state.get('gyro_1_valid'),
+        state.get('gyro_2_roll_rate_dps'), state.get('gyro_2_valid'),
+        state.get('gyro_3_roll_rate_dps'), state.get('gyro_3_valid'),
+        threshold=5.0
+    )
+
+    yaw_rate = vote_sensors(
+        state.get('gyro_1_yaw_rate_dps'), state.get('gyro_1_valid'),
+        state.get('gyro_2_yaw_rate_dps'), state.get('gyro_2_valid'),
+        state.get('gyro_3_yaw_rate_dps'), state.get('gyro_3_valid'),
+        threshold=5.0
+    )
+
+    # Mach number
+    mach = median_of_three(state.get('mach_1'), state.get('mach_2'), state.get('mach_3'))
+
+    # === TARGETS ===
+    target_alt = state.get('target_alt_ft', altitude if altitude else 10000)
+    target_hdg = state.get('target_hdg_deg', heading if heading else 0)
+    target_ias = state.get('target_ias_kt', 250)
+    target_vs = state.get('target_vs_fpm', 0)
+
+    # === ENGINE STATUS ===
+    engine_1_running = state.get('engine_1_running', False)
+    engine_2_running = state.get('engine_2_running', False)
+    engine_1_fire = state.get('engine_1_fire', False)
+    engine_2_fire = state.get('engine_2_fire', False)
+    engine_1_thrust = state.get('engine_1_thrust_pct', 0)
+    engine_2_thrust = state.get('engine_2_thrust_pct', 0)
+
+    # === FLIGHT PHASE DETECTION ===
+    weight_on_wheels = (state.get('weight_on_wheels_left', False) or
+                       state.get('weight_on_wheels_right', False) or
+                       state.get('weight_on_wheels_nose', False))
+
+    on_ground = weight_on_wheels or (radar_alt is not None and radar_alt < 5)
+    near_ground = radar_alt is not None and radar_alt < 200
+
+    # === SAFETY LIMITS ===
+
+    # Stall protection
+    stall_aoa = 15.0  # Approximate stall AOA
+    if aoa is not None and aoa > stall_aoa - 3:
+        # Approaching stall - pitch down aggressively
+        stall_protection = True
+    else:
+        stall_protection = False
+
+    # Overspeed protection
+    overspeed = False
+    if ias is not None and ias > 350:
+        overspeed = True
+    if mach is not None and mach > 0.80:
+        overspeed = True
+
+    # === ALTITUDE CONTROL ===
+
+    if altitude is not None and not on_ground:
+        alt_error = target_alt - altitude
+
+        # Compute desired vertical speed based on altitude error
+        desired_vs = max(-3000, min(3000, alt_error * 2.0))
+
+        # Blend with target VS if specified
+        if abs(target_vs) > 100:
+            desired_vs = target_vs
+
+        # Compute pitch target based on desired VS
+        if vs is not None:
+            vs_error = desired_vs - vs
+        else:
+            vs_error = desired_vs
+
+        # Pitch angle for desired VS (rough approximation)
+        target_pitch = vs_error / 300.0  # ~300 fpm per degree pitch
+        target_pitch = max(-10, min(15, target_pitch))
+
+        # Reduce pitch if overspeed
+        if overspeed:
+            target_pitch = min(target_pitch, -2)
+
+        # Stall protection overrides
+        if stall_protection:
+            target_pitch = -5
+
+        if pitch is not None:
+            pitch_error = target_pitch - pitch
+            elevator_cmd, _pitch_integral, _prev_pitch_error = pid_controller(
+                pitch_error, _pitch_integral, _prev_pitch_error, dt,
+                kp=0.08, ki=0.005, kd=0.15, int_limit=10.0
+            )
+
+            # Add pitch rate damping
+            if pitch_rate is not None:
+                elevator_cmd -= pitch_rate * 0.02
+
+            controls['elevator'] = max(-1.0, min(1.0, elevator_cmd))
+
+        # Trim management - slowly adjust trim to reduce elevator deflection
+        if pitch is not None and not near_ground:
+            trim_error = pitch - target_pitch
+            _trim_integral += trim_error * dt * 0.001
+            _trim_integral = max(-1.0, min(1.0, _trim_integral))
+            controls['elevator_trim'] = _trim_integral
+
+    # === HEADING CONTROL ===
+
+    if heading is not None and not on_ground:
+        hdg_error = normalize_angle(target_hdg - heading)
+
+        # Compute desired roll angle based on heading error
+        desired_roll = hdg_error * 0.5
+        desired_roll = max(-30, min(30, desired_roll))
+
+        if roll is not None:
+            roll_error = desired_roll - roll
+            aileron_cmd, _roll_integral, _prev_roll_error = pid_controller(
+                roll_error, _roll_integral, _prev_roll_error, dt,
+                kp=0.06, ki=0.003, kd=0.12, int_limit=15.0
+            )
+
+            # Add roll rate damping
+            if roll_rate is not None:
+                aileron_cmd -= roll_rate * 0.015
+
+            controls['aileron'] = max(-1.0, min(1.0, aileron_cmd))
+
+    # === YAW DAMPER & COORDINATION ===
+
+    if yaw_rate is not None:
+        # Yaw damper to reduce dutch roll and provide coordination
+        yaw_damping = -yaw_rate * 0.03
+
+        # Add slip correction based on roll
+        if roll is not None:
+            # Need some rudder in turns to coordinate
+            slip_correction = roll * 0.008
+            rudder_cmd = yaw_damping + slip_correction
+        else:
+            rudder_cmd = yaw_damping
+
+        # Asymmetric thrust compensation
+        if engine_1_running and not engine_2_running:
+            rudder_cmd += 0.3  # Right rudder for left engine only
+        elif engine_2_running and not engine_1_running:
+            rudder_cmd -= 0.3  # Left rudder for right engine only
+
+        controls['rudder'] = max(-1.0, min(1.0, rudder_cmd))
+
+    # === SPEED CONTROL (AUTOTHROTTLE) ===
+
+    if ias is not None and state.get('at_engaged', False):
+        speed_error = target_ias - ias
+
+        throttle_cmd, _speed_integral, _prev_speed_error = pid_controller(
+            speed_error, _speed_integral, _prev_speed_error, dt,
+            kp=0.015, ki=0.001, kd=0.02, int_limit=50.0
+        )
+
+        # Base throttle on altitude and speed
+        base_throttle = 0.5
+        if altitude is not None:
+            if altitude > 30000:
+                base_throttle = 0.7  # Higher throttle at altitude
+            elif altitude < 10000:
+                base_throttle = 0.4
+
+        throttle = base_throttle + throttle_cmd
+        throttle = max(0.0, min(1.0, throttle))
+
+        # Reduce throttle if overspeed
+        if overspeed:
+            throttle = min(throttle, 0.3)
+
+        # Handle engine failures
+        if engine_1_fire or not engine_1_running:
+            controls['throttle_1'] = 0.0
+            # Increase other engine
+            if engine_2_running and not engine_2_fire:
+                controls['throttle_2'] = min(1.0, throttle * 1.3)
+        elif engine_2_fire or not engine_2_running:
+            controls['throttle_2'] = 0.0
+            if engine_1_running and not engine_1_fire:
+                controls['throttle_1'] = min(1.0, throttle * 1.3)
+        else:
+            # Both engines nominal
+            controls['throttle_1'] = throttle
+            controls['throttle_2'] = throttle
+    elif not state.get('at_engaged', False):
+        # Autothrottle not engaged, maintain current
+        pass
+
+    # === FLAPS CONTROL ===
+
+    if ias is not None:
+        current_flaps = state.get('flap_pos_left_deg', 0)
+
+        if on_ground:
+            # On ground, use takeoff flaps
+            if ias < 80:
+                controls['flaps'] = 10
+        elif near_ground and altitude is not None and altitude < 3000:
+            # Approach and landing
+            if ias < 180:
+                controls['flaps'] = 30
+            elif ias < 200:
+                controls['flaps'] = 20
+            elif ias < 220:
+                controls['flaps'] = 10
+            else:
+                controls['flaps'] = 5
+        else:
+            # Cruise - clean configuration
+            if ias > 250:
+                controls['flaps'] = 0
+            elif ias > 230:
+                controls['flaps'] = max(0, current_flaps - 5)
+
+    # === GEAR CONTROL ===
+
+    if on_ground or (near_ground and altitude is not None and altitude < 1500):
+        controls['gear'] = 1
+    elif altitude is not None and altitude > 2000:
+        controls['gear'] = 0
+
+    # === SPEEDBRAKE ===
+
+    if overspeed:
+        controls['speedbrake'] = 0.8
+    elif altitude is not None and target_alt is not None:
+        if altitude - target_alt > 2000 and ias is not None and ias < 300:
+            # Deploy speedbrake for rapid descent
+            controls['speedbrake'] = 0.5
+        else:
+            controls['speedbrake'] = 0.0
+
+    return controls
+```

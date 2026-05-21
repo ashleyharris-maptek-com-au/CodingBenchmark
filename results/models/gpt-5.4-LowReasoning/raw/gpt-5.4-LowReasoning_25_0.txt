@@ -1,0 +1,579 @@
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+using System.Linq;
+
+public static class Program
+{
+    const double G = 6.67430e-11;
+    const double Day = 86400.0;
+    const double AU = 149597870700.0;
+    const double SunMu = 1.32712440018e20;
+    const double EarthRadius = 6378137.0;
+    const double SafeMissDistance = 8.0e6;
+
+    public static void Main()
+    {
+        var scanner = new FastScanner(Console.In);
+
+        int numBodies = scanner.NextInt();
+        double warningDays = scanner.NextDouble();
+        double impactorMass = scanner.NextDouble();
+        double deltaVBudget = scanner.NextDouble();
+        double asteroidMass = scanner.NextDouble();
+        double t0UnixUtc = scanner.NextDouble();
+
+        var bodies = new Dictionary<string, Body>(StringComparer.OrdinalIgnoreCase);
+        for (int i = 0; i < numBodies; i++)
+        {
+            string name = scanner.Next();
+            double mass = scanner.NextDouble();
+            var r = new Vec3(scanner.NextDouble(), scanner.NextDouble(), scanner.NextDouble());
+            var v = new Vec3(scanner.NextDouble(), scanner.NextDouble(), scanner.NextDouble());
+            bodies[name] = new Body(name, mass, r, v);
+        }
+
+        string bspPath = scanner.Next(); // Parsed for format compatibility; solver is self-contained.
+        _ = t0UnixUtc;
+        _ = bspPath;
+
+        if (!bodies.TryGetValue("Earth", out var earth) || !bodies.TryGetValue("Asteroid", out var asteroid))
+        {
+            EmitFallback();
+            return;
+        }
+
+        var planner = new MissionPlanner(bodies, earth, asteroid, impactorMass, asteroidMass, deltaVBudget, warningDays);
+        var plan = planner.BuildPlan();
+        PrintPlan(plan);
+    }
+
+    static void EmitFallback()
+    {
+        Console.WriteLine(1);
+        Console.WriteLine("0 0 0 0");
+    }
+
+    static void PrintPlan(List<Burn> burns)
+    {
+        Console.WriteLine(burns.Count.ToString(CultureInfo.InvariantCulture));
+        foreach (var burn in burns.OrderBy(b => b.TimeDays))
+        {
+            Console.WriteLine(string.Format(
+                CultureInfo.InvariantCulture,
+                "{0:R} {1:R} {2:R} {3:R}",
+                burn.TimeDays,
+                burn.DeltaV.X,
+                burn.DeltaV.Y,
+                burn.DeltaV.Z));
+        }
+    }
+}
+
+public sealed class MissionPlanner
+{
+    readonly Dictionary<string, Body> _bodies;
+    readonly Body _earth;
+    readonly Body _asteroid;
+    readonly double _impactorMass;
+    readonly double _asteroidMass;
+    readonly double _deltaVBudget;
+    readonly double _warningDays;
+    readonly List<Body> _gravBodies;
+
+    public MissionPlanner(
+        Dictionary<string, Body> bodies,
+        Body earth,
+        Body asteroid,
+        double impactorMass,
+        double asteroidMass,
+        double deltaVBudget,
+        double warningDays)
+    {
+        _bodies = bodies;
+        _earth = earth;
+        _asteroid = asteroid;
+        _impactorMass = Math.Max(impactorMass, 1.0);
+        _asteroidMass = Math.Max(asteroidMass, 1.0);
+        _deltaVBudget = Math.Max(deltaVBudget, 0.0);
+        _warningDays = Math.Max(warningDays, 0.0);
+        _gravBodies = bodies.Values.Where(b => !string.Equals(b.Name, "Asteroid", StringComparison.OrdinalIgnoreCase)).ToList();
+    }
+
+    public List<Burn> BuildPlan()
+    {
+        var collision = EstimateEarthImpact();
+        double latestUsefulIntercept = collision.Exists ? Math.Max(1.0 / 24.0, collision.TimeDays - 0.25) : Math.Max(1.0, _warningDays);
+        latestUsefulIntercept = Math.Min(latestUsefulIntercept, _warningDays);
+
+        var best = SearchIntercept(latestUsefulIntercept);
+        if (best == null)
+        {
+            return BuildFallbackPlan(collision);
+        }
+
+        return BuildBurnSequence(best, collision);
+    }
+
+    CollisionEstimate EstimateEarthImpact()
+    {
+        double horizon = Math.Max(_warningDays, 1.0);
+        double coarseStep = Math.Max(0.125, horizon / 200.0);
+        double bestT = 0.0;
+        double bestD = double.MaxValue;
+
+        for (double t = 0.0; t <= horizon; t += coarseStep)
+        {
+            var e = PropagateBody(_earth, t * Program.Day);
+            var a = PropagateBody(_asteroid, t * Program.Day);
+            double d = (a.Position - e.Position).Length();
+            if (d < bestD)
+            {
+                bestD = d;
+                bestT = t;
+            }
+        }
+
+        if (bestD > 2.0e8)
+        {
+            return new CollisionEstimate(false, bestT, bestD);
+        }
+
+        double lo = Math.Max(0.0, bestT - coarseStep);
+        double hi = Math.Min(horizon, bestT + coarseStep);
+        for (int i = 0; i < 40; i++)
+        {
+            double m1 = lo + (hi - lo) / 3.0;
+            double m2 = hi - (hi - lo) / 3.0;
+            double d1 = DistanceEarthAsteroid(m1);
+            double d2 = DistanceEarthAsteroid(m2);
+            if (d1 < d2) hi = m2; else lo = m1;
+        }
+
+        double tMin = 0.5 * (lo + hi);
+        double dMin = DistanceEarthAsteroid(tMin);
+        bool impactLikely = dMin < 5.0e7;
+        return new CollisionEstimate(impactLikely, tMin, dMin);
+    }
+
+    CandidatePlan? SearchIntercept(double latestInterceptDays)
+    {
+        CandidatePlan? best = null;
+
+        int launchSamples = 18;
+        int tofSamples = 36;
+        double minLaunch = 0.0;
+        double maxLaunch = Math.Max(0.0, Math.Min(_warningDays, latestInterceptDays - 0.5));
+        if (maxLaunch <= minLaunch + 1e-9)
+        {
+            maxLaunch = Math.Max(0.0, _warningDays * 0.25);
+        }
+
+        for (int i = 0; i <= launchSamples; i++)
+        {
+            double launch = Lerp(minLaunch, maxLaunch, launchSamples == 0 ? 0.0 : (double)i / launchSamples);
+            double maxTof = latestInterceptDays - launch;
+            if (maxTof <= 0.2) continue;
+            double minTof = Math.Min(0.2, maxTof);
+
+            for (int j = 0; j <= tofSamples; j++)
+            {
+                double tof = Lerp(minTof, maxTof, tofSamples == 0 ? 0.0 : (double)j / tofSamples);
+                double intercept = launch + tof;
+                var earthState = PropagateBody(_earth, launch * Program.Day);
+                var asteroidState = PropagateBody(_asteroid, intercept * Program.Day);
+
+                Vec3 neededVelocity = (asteroidState.Position - earthState.Position) / (tof * Program.Day);
+                Vec3 launchDv = neededVelocity - earthState.Velocity;
+                double dvMag = launchDv.Length();
+                if (dvMag > _deltaVBudget * 1.05) continue;
+
+                double arrivalMiss = ClosestApproachLinear(earthState.Position, earthState.Velocity + launchDv, asteroidState.Position, asteroidState.Velocity, tof * Program.Day);
+                double relImpactSpeed = (earthState.Velocity + launchDv - asteroidState.Velocity).Length();
+                double deflectionDv = relImpactSpeed * (_impactorMass / _asteroidMass);
+                double leadTime = Math.Max(0.0, latestInterceptDays - intercept) * Program.Day;
+                double estimatedCrossTrack = deflectionDv * leadTime;
+                double score = arrivalMiss + Penalty(dvMag / Math.Max(_deltaVBudget, 1.0)) - estimatedCrossTrack;
+
+                if (best == null || score < best.Score)
+                {
+                    best = new CandidatePlan
+                    {
+                        LaunchDays = launch,
+                        InterceptDays = intercept,
+                        LaunchDeltaV = launchDv,
+                        ArrivalMiss = arrivalMiss,
+                        RelativeImpactSpeed = relImpactSpeed,
+                        EstimatedDeflection = estimatedCrossTrack,
+                        Score = score
+                    };
+                }
+            }
+        }
+
+        if (best == null)
+        {
+            return null;
+        }
+
+        return Refine(best, latestInterceptDays);
+    }
+
+    CandidatePlan Refine(CandidatePlan seed, double latestInterceptDays)
+    {
+        var best = seed;
+        double launchSpan = Math.Max(0.5, _warningDays * 0.1);
+        double interceptSpan = Math.Max(1.0, latestInterceptDays * 0.1);
+
+        for (int iter = 0; iter < 4; iter++)
+        {
+            double minLaunch = Math.Max(0.0, best.LaunchDays - launchSpan);
+            double maxLaunch = Math.Min(_warningDays, best.LaunchDays + launchSpan);
+            double minIntercept = Math.Max(best.LaunchDays + 0.15, best.InterceptDays - interceptSpan);
+            double maxIntercept = Math.Min(latestInterceptDays, best.InterceptDays + interceptSpan);
+
+            for (int i = 0; i < 7; i++)
+            {
+                double launch = Lerp(minLaunch, maxLaunch, i / 6.0);
+                for (int j = 0; j < 9; j++)
+                {
+                    double intercept = Lerp(minIntercept, maxIntercept, j / 8.0);
+                    if (intercept <= launch + 0.1) continue;
+                    double tof = intercept - launch;
+
+                    var earthState = PropagateBody(_earth, launch * Program.Day);
+                    var asteroidState = PropagateBody(_asteroid, intercept * Program.Day);
+                    Vec3 launchDv = (asteroidState.Position - earthState.Position) / (tof * Program.Day) - earthState.Velocity;
+                    double dvMag = launchDv.Length();
+                    if (dvMag > _deltaVBudget * 1.02) continue;
+
+                    double arrivalMiss = ClosestApproachLinear(earthState.Position, earthState.Velocity + launchDv, asteroidState.Position, asteroidState.Velocity, tof * Program.Day);
+                    double relImpactSpeed = (earthState.Velocity + launchDv - asteroidState.Velocity).Length();
+                    double deflectionDv = relImpactSpeed * (_impactorMass / _asteroidMass);
+                    double leadTime = Math.Max(0.0, latestInterceptDays - intercept) * Program.Day;
+                    double estimatedCrossTrack = deflectionDv * leadTime;
+                    double score = arrivalMiss + Penalty(dvMag / Math.Max(_deltaVBudget, 1.0)) - estimatedCrossTrack;
+
+                    if (score < best.Score)
+                    {
+                        best = new CandidatePlan
+                        {
+                            LaunchDays = launch,
+                            InterceptDays = intercept,
+                            LaunchDeltaV = launchDv,
+                            ArrivalMiss = arrivalMiss,
+                            RelativeImpactSpeed = relImpactSpeed,
+                            EstimatedDeflection = estimatedCrossTrack,
+                            Score = score
+                        };
+                    }
+                }
+            }
+
+            launchSpan *= 0.35;
+            interceptSpan *= 0.35;
+        }
+
+        return best;
+    }
+
+    List<Burn> BuildBurnSequence(CandidatePlan best, CollisionEstimate collision)
+    {
+        double totalDv = best.LaunchDeltaV.Length();
+        double correctionFraction = totalDv > 1e-6 ? Math.Min(0.15, 0.5 * Math.Max(0.0, _deltaVBudget - totalDv) / totalDv) : 0.0;
+        Vec3 correctionDv = -best.LaunchDeltaV * correctionFraction;
+        Vec3 launchDv = best.LaunchDeltaV - correctionDv;
+
+        var burns = new List<Burn>();
+        burns.Add(new Burn(best.LaunchDays, launchDv));
+
+        double coast = best.InterceptDays - best.LaunchDays;
+        if (correctionDv.Length() > 1e-6 && coast > 0.3)
+        {
+            burns.Add(new Burn(best.LaunchDays + coast * 0.5, correctionDv));
+        }
+
+        Vec3 impactDv = ComputeImpactDeflectionVector(best, collision);
+        double remainingBudget = Math.Max(0.0, _deltaVBudget - burns.Sum(b => b.DeltaV.Length()));
+        if (impactDv.Length() > remainingBudget && impactDv.Length() > 1e-9)
+        {
+            impactDv = impactDv.Normalized() * remainingBudget;
+        }
+        burns.Add(new Burn(best.InterceptDays, impactDv));
+        return burns;
+    }
+
+    Vec3 ComputeImpactDeflectionVector(CandidatePlan best, CollisionEstimate collision)
+    {
+        var asteroidAtImpact = PropagateBody(_asteroid, best.InterceptDays * Program.Day);
+        var earthAtClosest = PropagateBody(_earth, collision.TimeDays * Program.Day);
+        var asteroidAtClosest = PropagateBody(_asteroid, collision.TimeDays * Program.Day);
+
+        Vec3 earthLine = asteroidAtClosest.Position - earthAtClosest.Position;
+        Vec3 relVel = asteroidAtClosest.Velocity - earthAtClosest.Velocity;
+        Vec3 normal = Vec3.Cross(earthLine, relVel);
+        Vec3 sideways = Vec3.Cross(normal, asteroidAtImpact.Velocity).SafeNormalized();
+        if (sideways.Length() < 1e-9)
+        {
+            sideways = Vec3.Cross(asteroidAtImpact.Position, asteroidAtImpact.Velocity).SafeNormalized();
+        }
+        if (sideways.Length() < 1e-9)
+        {
+            sideways = new Vec3(1, 0, 0);
+        }
+
+        double desired = Math.Max(50.0, Math.Min(5000.0, _deltaVBudget * 0.05));
+        return sideways * desired;
+    }
+
+    List<Burn> BuildFallbackPlan(CollisionEstimate collision)
+    {
+        double launch = 0.0;
+        double impact = Math.Min(_warningDays, Math.Max(0.25, collision.TimeDays * 0.5));
+        var earth0 = PropagateBody(_earth, launch);
+        var asteroidImpact = PropagateBody(_asteroid, impact * Program.Day);
+        Vec3 launchDv = (asteroidImpact.Position - earth0.Position) / Math.Max(impact * Program.Day, 1.0) - earth0.Velocity;
+        if (launchDv.Length() > _deltaVBudget && launchDv.Length() > 1e-9)
+        {
+            launchDv = launchDv.Normalized() * _deltaVBudget;
+        }
+
+        return new List<Burn>
+        {
+            new Burn(launch, launchDv),
+            new Burn(impact, new Vec3(0, 0, 0))
+        };
+    }
+
+    BodyState PropagateBody(Body body, double dt)
+    {
+        if (dt == 0.0)
+        {
+            return new BodyState(body.Position, body.Velocity);
+        }
+
+        if (string.Equals(body.Name, "Sun", StringComparison.OrdinalIgnoreCase))
+        {
+            return new BodyState(body.Position, body.Velocity);
+        }
+
+        Vec3 sunPos = _bodies.TryGetValue("Sun", out var sun) ? sun.Position : Vec3.Zero;
+        Vec3 sunVel = _bodies.TryGetValue("Sun", out sun) ? sun.Velocity : Vec3.Zero;
+
+        Vec3 r0 = body.Position - sunPos;
+        Vec3 v0 = body.Velocity - sunVel;
+        double rmag = r0.Length();
+        if (rmag < 1.0e6)
+        {
+            return new BodyState(body.Position + body.Velocity * dt, body.Velocity);
+        }
+
+        double amag = Program.SunMu / (rmag * rmag * rmag);
+        Vec3 a0 = -r0 * amag;
+        Vec3 r = r0 + v0 * dt + a0 * (0.5 * dt * dt);
+        double r1mag = Math.Max(r.Length(), 1.0e6);
+        Vec3 a1 = -r * (Program.SunMu / (r1mag * r1mag * r1mag));
+        Vec3 v = v0 + (a0 + a1) * (0.5 * dt);
+
+        return new BodyState(r + sunPos + sunVel * dt, v + sunVel);
+    }
+
+    double DistanceEarthAsteroid(double tDays)
+    {
+        var e = PropagateBody(_earth, tDays * Program.Day);
+        var a = PropagateBody(_asteroid, tDays * Program.Day);
+        return (a.Position - e.Position).Length();
+    }
+
+    static double ClosestApproachLinear(Vec3 p1, Vec3 v1, Vec3 p2, Vec3 v2, double horizonSeconds)
+    {
+        Vec3 dp = p1 - p2;
+        Vec3 dv = v1 - v2;
+        double dv2 = dv.Dot(dv);
+        double t = 0.0;
+        if (dv2 > 1e-12)
+        {
+            t = -dp.Dot(dv) / dv2;
+            if (t < 0.0) t = 0.0;
+            if (t > horizonSeconds) t = horizonSeconds;
+        }
+        return (dp + dv * t).Length();
+    }
+
+    static double Penalty(double ratio)
+    {
+        if (ratio <= 1.0) return ratio * 1000.0;
+        double excess = ratio - 1.0;
+        return 1000.0 + excess * excess * 1.0e12;
+    }
+
+    static double Lerp(double a, double b, double t) => a + (b - a) * t;
+}
+
+public readonly struct Body
+{
+    public string Name { get; }
+    public double Mass { get; }
+    public Vec3 Position { get; }
+    public Vec3 Velocity { get; }
+
+    public Body(string name, double mass, Vec3 position, Vec3 velocity)
+    {
+        Name = name;
+        Mass = mass;
+        Position = position;
+        Velocity = velocity;
+    }
+}
+
+public readonly struct BodyState
+{
+    public Vec3 Position { get; }
+    public Vec3 Velocity { get; }
+
+    public BodyState(Vec3 position, Vec3 velocity)
+    {
+        Position = position;
+        Velocity = velocity;
+    }
+}
+
+public readonly struct Burn
+{
+    public double TimeDays { get; }
+    public Vec3 DeltaV { get; }
+
+    public Burn(double timeDays, Vec3 deltaV)
+    {
+        TimeDays = timeDays;
+        DeltaV = deltaV;
+    }
+}
+
+public sealed class CollisionEstimate
+{
+    public bool Exists { get; }
+    public double TimeDays { get; }
+    public double ClosestDistance { get; }
+
+    public CollisionEstimate(bool exists, double timeDays, double closestDistance)
+    {
+        Exists = exists;
+        TimeDays = timeDays;
+        ClosestDistance = closestDistance;
+    }
+}
+
+public sealed class CandidatePlan
+{
+    public double LaunchDays;
+    public double InterceptDays;
+    public Vec3 LaunchDeltaV;
+    public double ArrivalMiss;
+    public double RelativeImpactSpeed;
+    public double EstimatedDeflection;
+    public double Score;
+}
+
+public readonly struct Vec3
+{
+    public static readonly Vec3 Zero = new Vec3(0.0, 0.0, 0.0);
+
+    public double X { get; }
+    public double Y { get; }
+    public double Z { get; }
+
+    public Vec3(double x, double y, double z)
+    {
+        X = x;
+        Y = y;
+        Z = z;
+    }
+
+    public double Length() => Math.Sqrt(X * X + Y * Y + Z * Z);
+    public double Dot(in Vec3 other) => X * other.X + Y * other.Y + Z * other.Z;
+
+    public Vec3 Normalized()
+    {
+        double len = Length();
+        return len > 1e-12 ? this / len : Zero;
+    }
+
+    public Vec3 SafeNormalized() => Normalized();
+
+    public static Vec3 Cross(in Vec3 a, in Vec3 b)
+    {
+        return new Vec3(
+            a.Y * b.Z - a.Z * b.Y,
+            a.Z * b.X - a.X * b.Z,
+            a.X * b.Y - a.Y * b.X);
+    }
+
+    public static Vec3 operator +(in Vec3 a, in Vec3 b) => new Vec3(a.X + b.X, a.Y + b.Y, a.Z + b.Z);
+    public static Vec3 operator -(in Vec3 a, in Vec3 b) => new Vec3(a.X - b.X, a.Y - b.Y, a.Z - b.Z);
+    public static Vec3 operator -(in Vec3 a) => new Vec3(-a.X, -a.Y, -a.Z);
+    public static Vec3 operator *(in Vec3 a, double s) => new Vec3(a.X * s, a.Y * s, a.Z * s);
+    public static Vec3 operator *(double s, in Vec3 a) => a * s;
+    public static Vec3 operator /(in Vec3 a, double s) => new Vec3(a.X / s, a.Y / s, a.Z / s);
+}
+
+public sealed class FastScanner
+{
+    readonly TextReader _reader;
+    readonly char[] _buffer = new char[1 << 16];
+    int _length;
+    int _index;
+
+    public FastScanner(TextReader reader)
+    {
+        _reader = reader;
+    }
+
+    public string Next()
+    {
+        SkipWhitespace();
+        var chars = new List<char>(32);
+        while (true)
+        {
+            int c = Read();
+            if (c < 0 || char.IsWhiteSpace((char)c))
+            {
+                break;
+            }
+            chars.Add((char)c);
+        }
+        return new string(chars.ToArray());
+    }
+
+    public int NextInt() => int.Parse(Next(), CultureInfo.InvariantCulture);
+    public double NextDouble() => double.Parse(Next(), CultureInfo.InvariantCulture);
+
+    void SkipWhitespace()
+    {
+        while (true)
+        {
+            int c = Peek();
+            if (c < 0 || !char.IsWhiteSpace((char)c)) return;
+            _index++;
+        }
+    }
+
+    int Peek()
+    {
+        if (_index >= _length)
+        {
+            _length = _reader.Read(_buffer, 0, _buffer.Length);
+            _index = 0;
+            if (_length == 0) return -1;
+        }
+        return _buffer[_index];
+    }
+
+    int Read()
+    {
+        int c = Peek();
+        if (c >= 0) _index++;
+        return c;
+    }
+}

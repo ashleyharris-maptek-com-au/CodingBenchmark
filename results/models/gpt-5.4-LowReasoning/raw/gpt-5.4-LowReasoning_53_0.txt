@@ -1,0 +1,314 @@
+# Persistent controller memory across calls within a scenario.
+_AP_STATE = {
+    "initialized": False,
+    "pos": [0.0, 0.0, 0.0],
+    "vel": [0.0, 0.0, 0.0],
+    "range": None,
+    "bias_y": 0.0,
+    "last_cmd_y": 0.0,
+    "att": [0.0, 0.0, 0.0],  # roll, pitch, yaw [rad]
+}
+
+
+def autopilot_step(state: dict, dt: float) -> dict:
+    """
+    Spacecraft docking autopilot in LVLH frame.
+
+    Axes:
+      x = radial (+ away from Earth)
+      y = along-track (+ prograde)
+      z = cross-track (+ north)
+
+    Strategy:
+      - Far range: exploit orbital mechanics heuristic.
+        If behind the station (y < 0), thrust retrograde (negative y)
+        to drop slightly and speed up catch-up.
+      - Mid range: transition to damped V-bar/R-bar corrections.
+      - Close range: use direct linear feedback with tight speed limits.
+      - Final meters: nearly stop all lateral error, creep in gently.
+
+    The controller is conservative with invalid/flickering sensors and uses
+    persistent low-pass estimates plus a learned along-track trim to counter
+    small uncommanded thrust biases.
+    """
+    global _AP_STATE
+
+    if dt <= 0.0:
+        dt = 0.1
+    dt = max(0.02, min(dt, 2.0))
+
+    def clamp(v, lo, hi):
+        return lo if v < lo else hi if v > hi else v
+
+    def median(values):
+        vals = sorted(values)
+        n = len(vals)
+        if n == 0:
+            return None
+        if n % 2:
+            return vals[n // 2]
+        return 0.5 * (vals[n // 2 - 1] + vals[n // 2])
+
+    def norm3(v):
+        return hypot(v[0], hypot(v[1], v[2]))
+
+    def blend(old, new, alpha):
+        return [(1.0 - alpha) * old[i] + alpha * new[i] for i in range(3)]
+
+    def sensor_triplet(prefix):
+        out = []
+        for axis in ("x", "y", "z"):
+            valid = state.get(f"{prefix}_{axis}_valid", False)
+            value = state.get(f"{prefix}_{axis}_m")
+            if prefix.endswith("vel"):
+                value = state.get(f"{prefix}_{axis}_ms")
+            out.append(value if valid and isinstance(value, (int, float)) else None)
+        return out
+
+    def gather_rel(source):
+        pos = [
+            state.get(f"{source}_rel_pos_x_m") if state.get(f"{source}_rel_x_valid") else None,
+            state.get(f"{source}_rel_pos_y_m") if state.get(f"{source}_rel_y_valid") else None,
+            state.get(f"{source}_rel_pos_z_m") if state.get(f"{source}_rel_z_valid") else None,
+        ]
+        vel = [
+            state.get(f"{source}_rel_vel_x_ms") if state.get(f"{source}_relv_x_valid") else None,
+            state.get(f"{source}_rel_vel_y_ms") if state.get(f"{source}_relv_y_valid") else None,
+            state.get(f"{source}_rel_vel_z_ms") if state.get(f"{source}_relv_z_valid") else None,
+        ]
+        return pos, vel
+
+    def fuse_axis(values, fallback):
+        good = [v for v in values if isinstance(v, (int, float))]
+        if good:
+            if len(good) >= 2:
+                m = median(good)
+                # Reject gross outliers from flickering sensors.
+                close = [v for v in good if abs(v - m) <= max(2.0, 0.2 * abs(m) + 0.5)]
+                if close:
+                    return sum(close) / len(close)
+            return sum(good) / len(good)
+        return fallback
+
+    radar_pos, radar_vel = gather_rel("radar")
+    lidar_pos, lidar_vel = gather_rel("lidar")
+
+    est_pos = [0.0, 0.0, 0.0]
+    est_vel = [0.0, 0.0, 0.0]
+    for i in range(3):
+        est_pos[i] = fuse_axis([radar_pos[i], lidar_pos[i]], _AP_STATE["pos"][i])
+        est_vel[i] = fuse_axis([radar_vel[i], lidar_vel[i]], _AP_STATE["vel"][i])
+
+    ranges = []
+    for i in (1, 2, 3):
+        if state.get(f"range_{i}_valid"):
+            r = state.get(f"range_{i}_m")
+            if isinstance(r, (int, float)) and r >= 0.0:
+                ranges.append(r)
+    vector_range = norm3(est_pos)
+    measured_range = median(ranges) if ranges else None
+    if measured_range is None:
+        measured_range = vector_range
+    elif vector_range > 1e-6 and abs(measured_range - vector_range) > max(15.0, 0.35 * measured_range):
+        # Prefer vector geometry when scalar range strongly disagrees.
+        measured_range = 0.75 * vector_range + 0.25 * measured_range
+
+    alpha = 0.18 if _AP_STATE["initialized"] else 1.0
+    _AP_STATE["pos"] = blend(_AP_STATE["pos"], est_pos, alpha)
+    _AP_STATE["vel"] = blend(_AP_STATE["vel"], est_vel, alpha)
+    _AP_STATE["range"] = measured_range if _AP_STATE["range"] is None else (1.0 - alpha) * _AP_STATE["range"] + alpha * measured_range
+    _AP_STATE["initialized"] = True
+
+    pos = _AP_STATE["pos"][:]
+    vel = _AP_STATE["vel"][:]
+    rng = max(_AP_STATE["range"], 0.0)
+
+    # Camera refinement inside 500 m if available.
+    if state.get("dock_camera_active"):
+        bx_ok = state.get("dock_camera_bearing_x_valid")
+        by_ok = state.get("dock_camera_bearing_y_valid")
+        bz_ok = state.get("dock_camera_bearing_z_valid")
+        cam_r = state.get("dock_camera_range_m")
+        if bx_ok and by_ok and bz_ok and isinstance(cam_r, (int, float)) and cam_r > 0.0:
+            bx = float(state.get("dock_camera_bearing_x", 0.0))
+            by = float(state.get("dock_camera_bearing_y", 0.0))
+            bz = float(state.get("dock_camera_bearing_z", 0.0))
+            mag = norm3([bx, by, bz])
+            if mag > 1e-6:
+                cam_pos = [cam_r * bx / mag, cam_r * by / mag, cam_r * bz / mag]
+                w = 0.35 if cam_r < 120.0 else 0.15
+                pos = [(1.0 - w) * pos[i] + w * cam_pos[i] for i in range(3)]
+                rng = norm3(pos)
+                _AP_STATE["pos"] = pos[:]
+                _AP_STATE["range"] = rng
+
+    fuel_pct = float(state.get("fuel_remaining_pct", 100.0) or 0.0)
+    fuel_kg = float(state.get("fuel_remaining_kg", 500.0) or 0.0)
+    low_fuel = fuel_pct < 15.0 or fuel_kg < 75.0
+
+    target_range = state.get("target_dock_range_m")
+    if not isinstance(target_range, (int, float)):
+        target_range = 0.0
+
+    # Desired closing speed along the docking line. We reserve y for primary approach.
+    if rng > 800.0:
+        close_speed = 8.0
+    elif rng > 300.0:
+        close_speed = 4.0
+    elif rng > 100.0:
+        close_speed = 1.5
+    elif rng > 30.0:
+        close_speed = 0.6
+    elif rng > 10.0:
+        close_speed = 0.2
+    else:
+        close_speed = 0.06
+    if low_fuel:
+        close_speed *= 0.7
+
+    thrust_x = 0.0
+    thrust_y = 0.0
+    thrust_z = 0.0
+
+    x, y, z = pos
+    vx, vy, vz = vel
+
+    # Regime 1: far field orbital guidance.
+    if rng > 200.0:
+        # Along-track logic honors orbital mechanics: if behind (y < 0), burn retrograde.
+        if y < -20.0:
+            y_term = -0.0035 * min(abs(y), 1200.0) - 0.9 * max(vy + close_speed, 0.0)
+        elif y > 20.0:
+            y_term = 0.0035 * min(abs(y), 1200.0) - 0.9 * min(vy - close_speed, 0.0)
+        else:
+            y_term = -0.8 * vy
+
+        # Radial/cross-track are damped gently to avoid wasting fuel on oscillatory motion.
+        x_term = -0.0025 * x - 0.85 * vx
+        z_term = -0.0030 * z - 0.90 * vz
+
+        # If primarily radial offset, bias toward a mild R-bar style correction.
+        if abs(x) > 1.5 * max(20.0, abs(y)):
+            x_term += -0.0020 * x
+
+        thrust_x = clamp(x_term, -0.45, 0.45)
+        thrust_y = clamp(y_term, -0.65, 0.65)
+        thrust_z = clamp(z_term, -0.40, 0.40)
+
+    # Regime 2: medium range transition.
+    elif rng > 50.0:
+        desired_vx = clamp(-0.012 * x, -0.35, 0.35)
+        desired_vz = clamp(-0.012 * z, -0.35, 0.35)
+        desired_vy = clamp(-0.010 * y, -close_speed, close_speed)
+
+        thrust_x = clamp(0.90 * (desired_vx - vx), -0.40, 0.40)
+        thrust_y = clamp(1.10 * (desired_vy - vy), -0.45, 0.45)
+        thrust_z = clamp(0.90 * (desired_vz - vz), -0.40, 0.40)
+
+    # Regime 3: close linearized control.
+    elif rng > 10.0:
+        desired_vx = clamp(-0.035 * x, -0.12, 0.12)
+        desired_vz = clamp(-0.035 * z, -0.12, 0.12)
+        desired_vy = clamp(-0.030 * y, -close_speed, close_speed)
+
+        thrust_x = clamp(1.6 * (desired_vx - vx), -0.28, 0.28)
+        thrust_y = clamp(1.8 * (desired_vy - vy), -0.30, 0.30)
+        thrust_z = clamp(1.6 * (desired_vz - vz), -0.28, 0.28)
+
+    # Regime 4: final docking.
+    else:
+        # Null lateral error aggressively, then creep in very slowly.
+        desired_vx = clamp(-0.08 * x, -0.05, 0.05)
+        desired_vz = clamp(-0.08 * z, -0.05, 0.05)
+        desired_vy = clamp(-0.06 * y, -0.06, 0.06)
+
+        # If already within the success envelope, bias to stop.
+        if rng < 2.0:
+            desired_vx *= 0.5
+            desired_vy *= 0.5
+            desired_vz *= 0.5
+
+        thrust_x = clamp(2.0 * (desired_vx - vx), -0.18, 0.18)
+        thrust_y = clamp(2.2 * (desired_vy - vy), -0.18, 0.18)
+        thrust_z = clamp(2.0 * (desired_vz - vz), -0.18, 0.18)
+
+    # Learn and cancel persistent along-track disturbance when dynamics disagree.
+    expected_ay = (_AP_STATE["last_cmd_y"] - _AP_STATE["bias_y"])
+    residual_ay = vy / dt if abs(vy) < 5.0 else 0.0
+    adapt = clamp(residual_ay - expected_ay, -0.05, 0.05)
+    _AP_STATE["bias_y"] = clamp(0.995 * _AP_STATE["bias_y"] + 0.005 * adapt, -0.2, 0.2)
+    thrust_y -= _AP_STATE["bias_y"]
+
+    # Extra fuel conservation near depletion.
+    if low_fuel:
+        thrust_x *= 0.75
+        thrust_y *= 0.75
+        thrust_z *= 0.75
+
+    # Avoid commanding stronger closure when already closing too fast.
+    speed = norm3(vel)
+    if rng < 20.0 and speed > 0.25:
+        thrust_x += clamp(-1.2 * vx, -0.12, 0.12)
+        thrust_y += clamp(-1.2 * vy, -0.12, 0.12)
+        thrust_z += clamp(-1.2 * vz, -0.12, 0.12)
+
+    thrust_x = clamp(thrust_x, -1.0, 1.0)
+    thrust_y = clamp(thrust_y, -1.0, 1.0)
+    thrust_z = clamp(thrust_z, -1.0, 1.0)
+    _AP_STATE["last_cmd_y"] = thrust_y
+
+    # Attitude control: point docking axis approximately toward target with rates only.
+    desired_yaw = clamp(atan2(z, max(abs(y), 1e-3)), -0.35, 0.35)
+    desired_pitch = clamp(-atan2(x, max(abs(y), 1e-3)), -0.35, 0.35)
+    desired_roll = 0.0
+
+    # Fuse star trackers if valid; otherwise integrate gyro rates.
+    attitude_meas = [None, None, None]  # roll, pitch, yaw in rad
+    star_sets = []
+    for i in (1, 2):
+        if state.get(f"star_tracker_{i}_roll_valid") and state.get(f"star_tracker_{i}_pitch_valid") and state.get(f"star_tracker_{i}_yaw_valid"):
+            star_sets.append([
+                float(state.get(f"star_tracker_{i}_roll_deg", 0.0)) * pi / 180.0,
+                float(state.get(f"star_tracker_{i}_pitch_deg", 0.0)) * pi / 180.0,
+                float(state.get(f"star_tracker_{i}_yaw_deg", 0.0)) * pi / 180.0,
+            ])
+    if star_sets:
+        for k in range(3):
+            vals = [s[k] for s in star_sets]
+            attitude_meas[k] = sum(vals) / len(vals)
+
+    gyro_rates = [0.0, 0.0, 0.0]  # roll, pitch, yaw [rad/s]
+    gyro_map = [("roll", 0), ("pitch", 1), ("yaw", 2)]
+    for axis_name, idx in gyro_map:
+        vals = []
+        for i in (1, 2, 3):
+            if state.get(f"gyro_{i}_{axis_name}_valid"):
+                vals.append(float(state.get(f"gyro_{i}_{axis_name}_dps", 0.0)) * pi / 180.0)
+        gyro_rates[idx] = median(vals) if vals else 0.0
+
+    if all(v is None for v in attitude_meas):
+        for i in range(3):
+            _AP_STATE["att"][i] += gyro_rates[i] * dt
+    else:
+        meas = [
+            _AP_STATE["att"][0] if attitude_meas[0] is None else attitude_meas[0],
+            _AP_STATE["att"][1] if attitude_meas[1] is None else attitude_meas[1],
+            _AP_STATE["att"][2] if attitude_meas[2] is None else attitude_meas[2],
+        ]
+        for i in range(3):
+            pred = _AP_STATE["att"][i] + gyro_rates[i] * dt
+            _AP_STATE["att"][i] = 0.75 * pred + 0.25 * meas[i]
+
+    roll, pitch, yaw = _AP_STATE["att"]
+    att_rate_roll = clamp(1.5 * (desired_roll - roll) - 0.3 * gyro_rates[0], -0.035, 0.035)
+    att_rate_pitch = clamp(1.5 * (desired_pitch - pitch) - 0.3 * gyro_rates[1], -0.035, 0.035)
+    att_rate_yaw = clamp(1.5 * (desired_yaw - yaw) - 0.3 * gyro_rates[2], -0.035, 0.035)
+
+    return {
+        "thrust_x": thrust_x,
+        "thrust_y": thrust_y,
+        "thrust_z": thrust_z,
+        "att_rate_roll": att_rate_roll,
+        "att_rate_pitch": att_rate_pitch,
+        "att_rate_yaw": att_rate_yaw,
+    }

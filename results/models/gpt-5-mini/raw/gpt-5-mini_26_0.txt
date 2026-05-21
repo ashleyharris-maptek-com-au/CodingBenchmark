@@ -1,1 +1,481 @@
-{'__exception__': "Can't run here - we're trying to get this working in codex."}
+Here's a single-file Rust program (edition 2021) that implements an adaptive, streaming-friendly clustering solver for 3D points. It chooses different strategies depending on the input size:
+
+- Small (<= 10M points): full in-memory k-means (k-means++) with multiple iterations for good quality.
+- Medium/Large/Extreme: sample the first S points (S up to 1_000_000) to initialize centroids with a fast k-means on the sample, then process the remaining stream in a single pass with an online update (incremental k-means). This lets it scale to arbitrarily large datasets while writing assignments as it streams.
+
+It reads the ASCII header line (num_points num_clusters) from stdin, then reads binary little-endian f32 triples for points, and emits binary little-endian u32 cluster indices, one per point, to stdout. No external crates are used.
+
+Notes and trade-offs:
+- For huge inputs you cannot do multiple passes over stdin; this program buffers only the first sample chunk (up to 1M points) and then proceeds streaming, so memory usage is bounded.
+- Online assignment means output for each point is made once when the point is read (after centroids have been initialized from the sample). This yields exactly num_clusters clusters (empty clusters are avoided by reinitializing them).
+- Centroids and counts are stored as f64 for stability.
+- RNG implemented with simple splitmix64 (no external crates).
+- Reasonable limits/iteration counts chosen for speed and quality.
+
+Compile with: rustc --edition=2021 clustering.rs
+Run as described in the prompt (header ASCII, then binary points).
+
+Code:
+
+```rust
+// clustering.rs
+// Compile: rustc --edition=2021 clustering.rs
+
+use std::io::{self, BufRead, BufReader, Read, Write, BufWriter};
+use std::str::FromStr;
+
+fn parse_header_line() -> io::Result<(u64, usize)> {
+    let stdin = io::stdin();
+    let mut lock = stdin.lock();
+    let mut header = String::new();
+    lock.read_line(&mut header)?;
+    let mut parts = header.split_whitespace();
+    let num_points = parts
+        .next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Missing num_points"))?;
+    let num_clusters = parts
+        .next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Missing num_clusters"))?;
+    let npoints: u64 = u64::from_str(num_points).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidInput, "Invalid num_points value")
+    })?;
+    let k: usize = usize::from_str(num_clusters).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidInput, "Invalid num_clusters value")
+    })?;
+    Ok((npoints, k))
+}
+
+/// Simple fast RNG (splitmix64)
+struct FastRng {
+    state: u64,
+}
+impl FastRng {
+    fn new(seed: u64) -> Self {
+        FastRng { state: seed.wrapping_add(0x9E3779B97F4A7C15) }
+    }
+    fn next_u64(&mut self) -> u64 {
+        let mut z = self.state.wrapping_add(0x9E3779B97F4A7C15);
+        self.state = z;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+        z ^ (z >> 31)
+    }
+    fn next_usize(&mut self, n: usize) -> usize {
+        if n == 0 { return 0; }
+        (self.next_u64() as usize) % n
+    }
+}
+
+#[inline]
+fn sq_dist_f32(a: &[f32;3], b: &[f64;3]) -> f64 {
+    let dx = (a[0] as f64) - b[0];
+    let dy = (a[1] as f64) - b[1];
+    let dz = (a[2] as f64) - b[2];
+    dx*dx + dy*dy + dz*dz
+}
+
+#[inline]
+fn sq_dist_f64(a: &[f64;3], b: &[f64;3]) -> f64 {
+    let dx = a[0] - b[0];
+    let dy = a[1] - b[1];
+    let dz = a[2] - b[2];
+    dx*dx + dy*dy + dz*dz
+}
+
+/// Read exactly n points (12*n bytes) from reader into Vec<[f32;3]>
+/// Returns number of points actually read (should be n unless EOF)
+fn read_n_points<R: Read>(reader: &mut R, n: usize) -> io::Result<Vec<[f32;3]>> {
+    let mut buf = vec![0u8; n * 12];
+    let mut read = 0usize;
+    while read < buf.len() {
+        match reader.read(&mut buf[read..])? {
+            0 => break,
+            m => read += m,
+        }
+    }
+    let got = read / 12;
+    let mut pts = Vec::with_capacity(got);
+    for i in 0..got {
+        let base = i * 12;
+        let b0 = [buf[base], buf[base+1], buf[base+2], buf[base+3]];
+        let b1 = [buf[base+4], buf[base+5], buf[base+6], buf[base+7]];
+        let b2 = [buf[base+8], buf[base+9], buf[base+10], buf[base+11]];
+        let x = f32::from_le_bytes(b0);
+        let y = f32::from_le_bytes(b1);
+        let z = f32::from_le_bytes(b2);
+        pts.push([x,y,z]);
+    }
+    Ok(pts)
+}
+
+/// Read exactly one point (12 bytes) from reader; returns None on EOF
+fn read_one_point<R: Read>(reader: &mut R, scratch: &mut [u8; 12]) -> io::Result<Option<[f32;3]>> {
+    let mut read = 0usize;
+    while read < 12 {
+        match reader.read(&mut scratch[read..])? {
+            0 => {
+                if read == 0 {
+                    return Ok(None);
+                } else {
+                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "Unexpected EOF"));
+                }
+            }
+            m => read += m,
+        }
+    }
+    let x = f32::from_le_bytes([scratch[0],scratch[1],scratch[2],scratch[3]]);
+    let y = f32::from_le_bytes([scratch[4],scratch[5],scratch[6],scratch[7]]);
+    let z = f32::from_le_bytes([scratch[8],scratch[9],scratch[10],scratch[11]]);
+    Ok(Some([x,y,z]))
+}
+
+/// Initialize centroids using either kmeans++ (approximate) or random picks.
+fn init_centroids(sample: &[[f32;3]], k: usize, rng: &mut FastRng) -> Vec<[f64;3]> {
+    let n = sample.len();
+    let mut centroids: Vec<[f64;3]> = Vec::with_capacity(k);
+    if k == 0 {
+        return centroids;
+    }
+    // If k is large relative to sample size, just pick distinct sample points
+    if k > 2000 && k * 10 > n {
+        // pick k (or up to n) distinct sample indices
+        let mut used = vec![false; n];
+        let mut picked = 0usize;
+        while picked < k {
+            if picked < n {
+                let idx = rng.next_usize(n);
+                if !used[idx] {
+                    used[idx] = true;
+                    let p = &sample[idx];
+                    centroids.push([p[0] as f64, p[1] as f64, p[2] as f64]);
+                    picked += 1;
+                }
+            } else {
+                // not enough unique sample points; replicate with small jitter
+                let idx = rng.next_usize(n);
+                let p = &sample[idx];
+                let jitter = 1e-3 * (rng.next_u64() as f64 / std::u64::MAX as f64);
+                centroids.push([p[0] as f64 + jitter, p[1] as f64 + jitter, p[2] as f64 + jitter]);
+                picked += 1;
+            }
+        }
+        return centroids;
+    }
+    // KMeans++ (exact) for moderate sizes
+    // 1) pick first uniformly at random
+    let first = rng.next_usize(n);
+    centroids.push([sample[first][0] as f64, sample[first][1] as f64, sample[first][2] as f64]);
+    let mut distances = vec![0.0f64; n];
+    for i in 0..n {
+        distances[i] = sq_dist_f32(&sample[i], &centroids[0]);
+    }
+    for _round in 1..k {
+        // accumulate weights
+        let mut total = 0.0;
+        for d in &distances { total += *d; }
+        let mut target = if total == 0.0 { 0.0 } else {
+            (rng.next_u64() as f64 / std::u64::MAX as f64) * total
+        };
+        // choose index
+        let mut chosen = 0usize;
+        for i in 0..n {
+            target -= distances[i];
+            if target <= 0.0 {
+                chosen = i;
+                break;
+            }
+        }
+        centroids.push([sample[chosen][0] as f64, sample[chosen][1] as f64, sample[chosen][2] as f64]);
+        // update distances to nearest centroid
+        for i in 0..n {
+            let d = sq_dist_f32(&sample[i], centroids.last().unwrap());
+            if d < distances[i] { distances[i] = d; }
+        }
+    }
+    centroids
+}
+
+/// Run kmeans on a sample (in-memory). Returns (centroids, assignments)
+fn kmeans_sample(sample: &[[f32;3]], k: usize, max_iter: usize, rng: &mut FastRng) -> (Vec<[f64;3]>, Vec<u32>) {
+    let n = sample.len();
+    let mut centroids = init_centroids(sample, k, rng);
+    // If initial less than k (shouldn't happen), pad randomly
+    while centroids.len() < k {
+        let p = &sample[rng.next_usize(n)];
+        centroids.push([p[0] as f64, p[1] as f64, p[2] as f64]);
+    }
+    let mut assignments = vec![0u32; n];
+    let mut counts = vec![0usize; k];
+    for iter in 0..max_iter {
+        let mut moved = 0usize;
+        // assignment step
+        for i in 0..n {
+            let mut best = 0usize;
+            let mut bestd = sq_dist_f32(&sample[i], &centroids[0]);
+            for j in 1..k {
+                let d = sq_dist_f32(&sample[i], &centroids[j]);
+                if d < bestd {
+                    bestd = d;
+                    best = j;
+                }
+            }
+            if assignments[i] as usize != best {
+                assignments[i] = best as u32;
+                moved += 1;
+            }
+        }
+        // update centroids
+        for c in &mut centroids {
+            *c = [0.0, 0.0, 0.0];
+        }
+        for cnt in &mut counts { *cnt = 0usize; }
+        for i in 0..n {
+            let a = assignments[i] as usize;
+            counts[a] += 1;
+            let p = &sample[i];
+            centroids[a][0] += p[0] as f64;
+            centroids[a][1] += p[1] as f64;
+            centroids[a][2] += p[2] as f64;
+        }
+        for j in 0..k {
+            if counts[j] > 0 {
+                let inv = 1.0 / (counts[j] as f64);
+                centroids[j][0] *= inv;
+                centroids[j][1] *= inv;
+                centroids[j][2] *= inv;
+            } else {
+                // empty cluster: reinitialize to a random sample point
+                let p = &sample[rng.next_usize(n)];
+                centroids[j] = [p[0] as f64, p[1] as f64, p[2] as f64];
+            }
+        }
+        if moved == 0 {
+            // converged
+            break;
+        }
+        // For very large k and sample we may want to stop earlier
+        if iter >= 20 { break; }
+    }
+    (centroids, assignments)
+}
+
+fn main() -> io::Result<()> {
+    // Parse header line (ASCII)
+    let (num_points_u64, k) = parse_header_line()?;
+    let num_points = num_points_u64 as usize;
+    if k == 0 {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "num_clusters must be > 0"));
+    }
+    // Lock stdin raw reader (after header line was consumed on the same lock)
+    let stdin = io::stdin();
+    // We used stdin.lock() in parse_header_line, but we created a new lock here; it is fine as the previous lock advanced the stream.
+    let mut reader = BufReader::with_capacity(1 << 20, stdin.lock());
+    let stdout = io::stdout();
+    let mut writer = BufWriter::with_capacity(1 << 20, stdout.lock());
+
+    // Strategy decision
+    let small_threshold = 10_000_000usize; // <=10M: full in-memory
+    let sample_cap = 1_000_000usize; // sample upto 1M for init
+
+    // Choose sample size: if small load all, otherwise use up to sample_cap for initialization
+    let sample_size = if num_points <= small_threshold {
+        num_points
+    } else {
+        std::cmp::min(sample_cap, num_points)
+    };
+
+    // Prepare RNG
+    let mut rng = FastRng::new(123456789u64 ^ (num_points_u64.wrapping_mul(2654435761)));
+
+    // Read sample_size points into memory
+    let sample_points = read_n_points(&mut reader, sample_size)?;
+    let read_sample = sample_points.len();
+    if read_sample != sample_size {
+        // If EOF shorter than expected, adjust num_points
+        // But the header specified more; we treat missing data as error
+        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "Not enough point data for sample"));
+    }
+
+    if num_points <= small_threshold {
+        // Full in-memory kmeans on all points (we already read all)
+        // Run more thorough kmeans
+        let max_iter = 100usize.min(500);
+        let (centroids, assignments) = kmeans_sample(&sample_points, k, max_iter, &mut rng);
+
+        // Write assignments for all points (as u32 little-endian)
+        for &a in &assignments {
+            let mut b = [0u8; 4];
+            let ai = a as u32;
+            b[0] = (ai & 0xFF) as u8;
+            b[1] = ((ai >> 8) & 0xFF) as u8;
+            b[2] = ((ai >> 16) & 0xFF) as u8;
+            b[3] = ((ai >> 24) & 0xFF) as u8;
+            writer.write_all(&b)?;
+        }
+        writer.flush()?;
+        // done
+        return Ok(());
+    } else {
+        // Medium/Large/Extreme: initialize centroids from sample, then stream remaining points
+        let init_iter = 10usize;
+        let (mut centroids, sample_assignments) = kmeans_sample(&sample_points, k, init_iter, &mut rng);
+        // compute counts from sample assignments
+        let mut counts = vec![0u64; k];
+        for &a in &sample_assignments {
+            let idx = a as usize;
+            counts[idx] += 1;
+        }
+        // Handle empty clusters: assign from largest cluster samples or random sample points
+        let mut empty_clusters = Vec::new();
+        for j in 0..k {
+            if counts[j] == 0 {
+                empty_clusters.push(j);
+            }
+        }
+        if !empty_clusters.is_empty() {
+            // find indices of sample points for the largest clusters
+            let mut cluster_sizes: Vec<(usize, usize)> = (0..k).map(|i| (i, counts[i] as usize)).collect();
+            cluster_sizes.sort_unstable_by_key(|&(_, s)| std::cmp::Reverse(s));
+            let mut rep_idx = 0usize;
+            for &empty in &empty_clusters {
+                // choose a representative sample point (if none, random)
+                let mut chosen_point: Option<[f32;3]> = None;
+                // pick from largest cluster that has samples
+                for &(cid, _size) in &cluster_sizes {
+                    if counts[cid] > 0 {
+                        // find a sample point assigned to cid
+                        // naive linear search is fine for sample <=1e6 and few empty clusters
+                        let mut found = None;
+                        for (i, &a) in sample_assignments.iter().enumerate() {
+                            if a as usize == cid {
+                                found = Some(i);
+                                break;
+                            }
+                        }
+                        if let Some(si) = found {
+                            chosen_point = Some(sample_points[si]);
+                            break;
+                        }
+                    }
+                }
+                if chosen_point.is_none() {
+                    chosen_point = Some(sample_points[rng.next_usize(sample_points.len())]);
+                }
+                let p = chosen_point.unwrap();
+                centroids[empty] = [p[0] as f64 + 1e-6 * ((rng.next_u64() % 1_000_000) as f64),
+                                    p[1] as f64 + 1e-6 * ((rng.next_u64() % 1_000_000) as f64),
+                                    p[2] as f64 + 1e-6 * ((rng.next_u64() % 1_000_000) as f64)];
+                counts[empty] = 1;
+            }
+        }
+
+        // Now we will output assignments for the sample_points, and then stream remaining points from reader.
+        // For each sample point, determine nearest centroid (based on centroids from sample kmeans),
+        // write assignment, and set centroid and counts consistent with sample kmeans:
+        // We'll reassign sample points to nearest centroid and compute counts/centroids accordingly.
+        // Reset centroids and counts to perform online incremental updates in a consistent way.
+        {
+            // Reset centroids to sample-based centroids, but we'll recompute counts and mean
+            // Start with centroids as current, then reset to zero and recompute using assignments based on nearest centroid.
+            let mut new_centroids = vec![[0.0f64;3]; k];
+            let mut new_counts = vec![0u64; k];
+            // assign each sample point to nearest centroid (should match sample_assignments mostly)
+            for p in &sample_points {
+                let mut best = 0usize;
+                let mut bestd = sq_dist_f32(p, &centroids[0]);
+                for j in 1..k {
+                    let d = sq_dist_f32(p, &centroids[j]);
+                    if d < bestd {
+                        bestd = d;
+                        best = j;
+                    }
+                }
+                let idx = best;
+                new_counts[idx] += 1;
+                new_centroids[idx][0] += p[0] as f64;
+                new_centroids[idx][1] += p[1] as f64;
+                new_centroids[idx][2] += p[2] as f64;
+            }
+            // finalize means, ensure no empty clusters
+            for j in 0..k {
+                if new_counts[j] > 0 {
+                    let inv = 1.0 / (new_counts[j] as f64);
+                    new_centroids[j][0] *= inv;
+                    new_centroids[j][1] *= inv;
+                    new_centroids[j][2] *= inv;
+                } else {
+                    // keep previous centroid (already initialized above)
+                    new_centroids[j] = centroids[j];
+                    new_counts[j] = 0;
+                }
+            }
+            centroids = new_centroids;
+            counts = new_counts;
+            // Now write sample assignments based on nearest centroid
+            for p in &sample_points {
+                let mut best = 0usize;
+                let mut bestd = sq_dist_f32(p, &centroids[0]);
+                for j in 1..k {
+                    let d = sq_dist_f32(p, &centroids[j]);
+                    if d < bestd {
+                        bestd = d;
+                        best = j;
+                    }
+                }
+                let idx = best as u32;
+                let mut b = [0u8;4];
+                b[0] = (idx & 0xFF) as u8;
+                b[1] = ((idx >> 8) & 0xFF) as u8;
+                b[2] = ((idx >> 16) & 0xFF) as u8;
+                b[3] = ((idx >> 24) & 0xFF) as u8;
+                writer.write_all(&b)?;
+            }
+            writer.flush()?; // make sure sample outputs are written before streaming long processing
+        }
+
+        // Now stream remaining points (num_points - sample_size)
+        let remaining = num_points - sample_size;
+        let mut scratch = [0u8; 12];
+        for _i in 0..remaining {
+            match read_one_point(&mut reader, &mut scratch)? {
+                Some(p) => {
+                    // assign to nearest centroid
+                    let mut best = 0usize;
+                    let mut bestd = sq_dist_f32(&p, &centroids[0]);
+                    for j in 1..k {
+                        let d = sq_dist_f32(&p, &centroids[j]);
+                        if d < bestd {
+                            bestd = d;
+                            best = j;
+                        }
+                    }
+                    // write assignment
+                    let idxu = best as u32;
+                    let mut b = [0u8;4];
+                    b[0] = (idxu & 0xFF) as u8;
+                    b[1] = ((idxu >> 8) & 0xFF) as u8;
+                    b[2] = ((idxu >> 16) & 0xFF) as u8;
+                    b[3] = ((idxu >> 24) & 0xFF) as u8;
+                    writer.write_all(&b)?;
+                    // update centroid incrementally: centroid += (p - centroid) / count
+                    counts[best] = counts[best].wrapping_add(1);
+                    let c = &mut centroids[best];
+                    let ncount = counts[best] as f64;
+                    // incremental mean update
+                    c[0] += ((p[0] as f64) - c[0]) / ncount;
+                    c[1] += ((p[1] as f64) - c[1]) / ncount;
+                    c[2] += ((p[2] as f64) - c[2]) / ncount;
+                }
+                None => {
+                    // unexpected EOF
+                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "Unexpected EOF during streaming"));
+                }
+            }
+        }
+        writer.flush()?;
+    }
+    Ok(())
+}
+```
+
+If you want further tuning (different sample sizes, more aggressive mini-batch updates, checkpointing, multi-threading), tell me which scenarios to prioritize and I can adapt the code.

@@ -1,0 +1,252 @@
+#include <iostream>
+#include <fstream>
+#include <sstream>
+#include <string>
+#include <vector>
+#include <atomic>
+#include <thread>
+#include <mutex>
+#include <cmath>
+#include <chrono>
+#include <cstdint>
+#include <algorithm>
+#include <limits>
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+struct State {
+    double x=0, y=0, z=0;
+    double vx=0, vy=0, vz=0;
+    double pitch=0, yaw=0, roll=0;
+    double pr=0, yr=0, rr=0;
+    double fuel=0;
+};
+
+static std::atomic<bool> g_running{true};
+static std::mutex g_stateMutex;
+static State g_state;
+static std::atomic<bool> g_stateValid{false};
+static std::atomic<long long> g_lastStateMs{0};
+
+// Header params
+static double H_width=0, H_depth=0, H_height=0;
+static double H_gravity=1.62, H_maxThrust=20.0, H_initFuel=100.0;
+static double H_startX=0, H_startY=0, H_startZ=0;
+static double H_tgtX=0, H_tgtY=0, H_tgtZ=0;
+
+static long long nowMs() {
+    using namespace std::chrono;
+    return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+}
+
+static double clampd(double v, double lo, double hi) {
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
+}
+
+static double normAngle(double a) {
+    while (a > M_PI)  a -= 2.0*M_PI;
+    while (a < -M_PI) a += 2.0*M_PI;
+    return a;
+}
+
+// Reader thread: continuously parse state updates from stdin so the
+// IO buffer never fills up.
+static void readerLoop() {
+    while (g_running.load()) {
+        State s;
+        if (!(std::cin >> s.x >> s.y >> s.z
+                     >> s.vx >> s.vy >> s.vz
+                     >> s.pitch >> s.yaw >> s.roll
+                     >> s.pr >> s.yr >> s.rr
+                     >> s.fuel)) {
+            g_running = false;
+            break;
+        }
+        {
+            std::lock_guard<std::mutex> lk(g_stateMutex);
+            g_state = s;
+        }
+        g_stateValid = true;
+        g_lastStateMs = nowMs();
+    }
+}
+
+int main() {
+    std::ios_base::sync_with_stdio(false);
+    std::cin.tie(nullptr);
+
+    // ---- Header ----
+    if (!(std::cin >> H_width >> H_depth >> H_height
+                 >> H_gravity >> H_maxThrust >> H_initFuel)) return 1;
+    if (!(std::cin >> H_startX >> H_startY >> H_startZ
+                 >> H_tgtX   >> H_tgtY   >> H_tgtZ)) return 1;
+    std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+
+    std::string terrainPath;
+    std::getline(std::cin, terrainPath);
+    while (!terrainPath.empty() &&
+           (terrainPath.back()=='\r' || terrainPath.back()=='\n' ||
+            terrainPath.back()==' '  || terrainPath.back()=='\t')) {
+        terrainPath.pop_back();
+    }
+
+    // Read "STATE" marker line
+    std::string stateMarker;
+    std::getline(std::cin, stateMarker);
+
+    // ---- Spawn background terrain loader (best-effort) ----
+    std::thread terrainThread([terrainPath]() {
+        try {
+            std::ifstream f(terrainPath, std::ios::binary);
+            if (!f) return;
+            f.seekg(0, std::ios::end);
+            (void)f.tellg();
+        } catch (...) {}
+    });
+    terrainThread.detach();
+
+    // ---- Start reader thread immediately ----
+    std::thread reader(readerLoop);
+
+    // ---- Control loop @ ~20 Hz ----
+    const double DT = 0.05;
+
+    while (g_running.load()) {
+        long long t0 = nowMs();
+
+        State s;
+        bool valid = g_stateValid.load();
+        if (valid) {
+            std::lock_guard<std::mutex> lk(g_stateMutex);
+            s = g_state;
+        }
+
+        double thrust=0.0, pitchCmd=0.0, yawCmd=0.0, rollCmd=0.0;
+
+        if (valid) {
+            double dx = H_tgtX - s.x;
+            double dy = H_tgtY - s.y;
+            double dz = H_tgtZ - s.z; // positive if target is above us
+
+            double distH = std::sqrt(dx*dx + dy*dy);
+            double aboveTarget = -dz;
+
+            double mapScale = std::max({H_width, H_depth, 1.0});
+
+            // ----- Desired velocities -----
+            double maxHorizSpeed = std::max(2.0,
+                std::min(80.0, std::sqrt(distH * std::max(1.0, H_maxThrust * 0.3))));
+            if (aboveTarget < 50.0) maxHorizSpeed = std::min(maxHorizSpeed, aboveTarget * 0.4 + 1.0);
+            if (aboveTarget < 5.0)  maxHorizSpeed = std::min(maxHorizSpeed, 1.5);
+
+            double desVx = 0.0, desVy = 0.0;
+            if (distH > 0.05) {
+                double speed = std::min(maxHorizSpeed, distH * 0.6);
+                desVx = (dx / distH) * speed;
+                desVy = (dy / distH) * speed;
+            }
+
+            double horizAlignDist = std::max(2.0, mapScale * 0.005);
+            double desVz;
+
+            if (dz > 1.0) {
+                desVz = std::min(20.0, std::sqrt(2.0 * H_maxThrust * 0.4 * dz));
+            } else {
+                double decel = std::max(0.5, H_maxThrust * 0.4 - H_gravity);
+                double safeDescent = std::sqrt(2.0 * decel * std::max(0.0, aboveTarget));
+                double cap = 40.0;
+                if (aboveTarget < 200.0) cap = 15.0;
+                if (aboveTarget < 50.0)  cap = 6.0;
+                if (aboveTarget < 10.0)  cap = 2.5;
+                if (aboveTarget < 3.0)   cap = 1.0;
+                if (aboveTarget < 1.0)   cap = 0.4;
+                desVz = -std::min(cap, safeDescent * 0.8);
+
+                if (distH > horizAlignDist * 3.0 && aboveTarget < 30.0) {
+                    desVz = std::max(desVz, -1.0);
+                }
+                if (aboveTarget < 0.0) desVz = 0.5;
+            }
+
+            // ----- Desired accelerations -----
+            double aX = (desVx - s.vx) * 1.2;
+            double aY = (desVy - s.vy) * 1.2;
+            double aZ = (desVz - s.vz) * 2.0 + H_gravity;
+
+            double aMax = std::max(1e-3, H_maxThrust * 0.95);
+            double aMag = std::sqrt(aX*aX + aY*aY + aZ*aZ);
+            if (aMag > aMax && aMag > 1e-9) {
+                double k = aMax / aMag;
+                aX *= k; aY *= k; aZ *= k;
+                aMag = aMax;
+            }
+
+            double horizMag = std::sqrt(aX*aX + aY*aY);
+            double thrustMag = aMag;
+
+            double desPitch = 0.0, desYaw = s.yaw;
+            if (aZ > 0.01) {
+                desPitch = std::atan2(horizMag, aZ);
+            } else {
+                desPitch = (horizMag > 0.01) ? (M_PI/3.0) : 0.0;
+            }
+            desPitch = clampd(desPitch, -1.4, 1.4);
+
+            if (horizMag > 0.05) {
+                // thrust_dir_horiz = -sin(p) * (cos(y), sin(y))
+                // For desired horiz accel (aX, aY): (cos(y),sin(y)) = -(aX,aY)/horizMag
+                desYaw = std::atan2(-aY, -aX);
+            }
+
+            // ----- Rotational PD -----
+            double pitchErr = desPitch - s.pitch;
+            double yawErr   = normAngle(desYaw - s.yaw);
+
+            pitchCmd = pitchErr * 4.0 - s.pr * 2.0;
+            yawCmd   = yawErr   * 4.0 - s.yr * 2.0;
+            rollCmd  = -s.roll  * 3.0 - s.rr * 2.0;
+
+            // Thrust magnitude as fraction of max (assume max_thrust = max accel m/s^2).
+            thrust = thrustMag / std::max(1e-6, H_maxThrust);
+
+            // If badly misaligned, still hover.
+            double tiltErr = std::abs(pitchErr) + std::abs(yawErr);
+            if (tiltErr > 0.6 && aZ < H_gravity * 1.5) {
+                thrust = std::max(thrust, H_gravity / std::max(1e-6, H_maxThrust));
+            }
+
+            thrust   = clampd(thrust,   0.0, 1.0);
+            pitchCmd = clampd(pitchCmd, -1.0, 1.0);
+            yawCmd   = clampd(yawCmd,   -1.0, 1.0);
+            rollCmd  = clampd(rollCmd,  -1.0, 1.0);
+
+            // Touchdown cut
+            double speedTotal = std::sqrt(s.vx*s.vx + s.vy*s.vy + s.vz*s.vz);
+            if (distH < 1.0 && aboveTarget < 0.5 && speedTotal < 2.0) {
+                thrust = 0.0;
+            }
+        } else {
+            thrust = 0.0;
+            pitchCmd = yawCmd = rollCmd = 0.0;
+        }
+
+        std::cout << thrust << ' ' << pitchCmd << ' ' << yawCmd << ' ' << rollCmd << '\n';
+        std::cout.flush();
+
+        long long elapsed = nowMs() - t0;
+        long long sleepMs = (long long)(DT * 1000.0) - elapsed;
+        if (sleepMs > 0 && sleepMs < 200) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(sleepMs));
+        } else if (sleepMs <= 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+
+    g_running = false;
+    if (reader.joinable()) reader.join();
+    return 0;
+}

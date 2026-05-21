@@ -1,0 +1,427 @@
+﻿import math
+from statistics import median
+
+# Persistent controller state
+_AP_STATE = {
+    "initialized": False,
+    "speed_int": 0.0,
+    "prev_speed_err": 0.0,
+    "lane_int": 0.0,
+    "prev_lane_err": 0.0,
+    "yaw_lp": 0.0,
+    "last_lane_center": 0.0,
+    "last_front_dist": 120.0,
+    "danger_hold_s": 0.0,
+    "lane_change_cooldown_s": 0.0,
+    "last_steer": 0.0,
+    "last_speed_limit": 130.0,
+}
+
+
+def _clamp(x, lo, hi):
+    return lo if x < lo else hi if x > hi else x
+
+
+def _is_finite_num(v):
+    return isinstance(v, (int, float)) and math.isfinite(v)
+
+
+def _fused_scalar(candidates, fallback=None, outlier_sigma=3.0):
+    """
+    candidates: list of (value, sensor_valid_hint)
+    Uses robust median + MAD outlier rejection.
+    Ignores obviously non-finite values and suspicious hints only weakly.
+    """
+    vals = []
+    for value, hinted_valid in candidates:
+        if not _is_finite_num(value):
+            continue
+        # Soft trust on valid hint: keep all, but downweight invalid by duplication trick
+        if hinted_valid:
+            vals.append(float(value))
+            vals.append(float(value))
+        else:
+            vals.append(float(value))
+
+    if not vals:
+        return fallback
+
+    m = median(vals)
+    abs_dev = [abs(v - m) for v in vals]
+    mad = median(abs_dev) if abs_dev else 0.0
+
+    if mad < 1e-6:
+        return m
+
+    thr = outlier_sigma * 1.4826 * mad
+    kept = [v for v in vals if abs(v - m) <= thr]
+    if not kept:
+        return m
+    return sum(kept) / len(kept)
+
+
+def _read_speed_kmh(state):
+    wheel = []
+    for p in ("fl", "fr", "rl", "rr"):
+        k = f"wheel_speed_{p}_kmh"
+        vk = f"wheel_speed_{p}_valid"
+        wheel.append((state.get(k), bool(state.get(vk, True))))
+
+    spd = _fused_scalar(wheel, fallback=None)
+
+    veh = [
+        (state.get("vehicle_speed_1_kmh"), True),
+        (state.get("vehicle_speed_2_kmh"), True),
+        (state.get("gps_1_speed_kmh"), bool(state.get("gps_1_valid", True))),
+        (state.get("gps_2_speed_kmh"), bool(state.get("gps_2_valid", True))),
+    ]
+    aux = _fused_scalar(veh, fallback=spd)
+
+    if spd is None and aux is None:
+        return 0.0
+    if spd is None:
+        return max(0.0, aux)
+    if aux is None:
+        return max(0.0, spd)
+
+    # Blend wheel and auxiliary sources
+    return max(0.0, 0.6 * spd + 0.4 * aux)
+
+
+def _read_yaw_rate_dps(state, dt):
+    candidates = []
+    for i in (1, 2, 3):
+        candidates.append((state.get(f"gyro_{i}_yaw_rate_dps"), bool(state.get(f"gyro_{i}_valid", True))))
+    yaw = _fused_scalar(candidates, fallback=_AP_STATE["yaw_lp"])
+    if yaw is None:
+        yaw = 0.0
+
+    # LP filter to suppress flicker spikes
+    alpha = _clamp(dt * 4.0, 0.05, 0.5)
+    _AP_STATE["yaw_lp"] = (1 - alpha) * _AP_STATE["yaw_lp"] + alpha * yaw
+    return _AP_STATE["yaw_lp"]
+
+
+def _read_mu(state):
+    mu = state.get("estimated_mu")
+    if not _is_finite_num(mu):
+        return 0.7
+    return _clamp(float(mu), 0.1, 1.2)
+
+
+def _read_speed_limit_kmh(state):
+    vals = []
+    for i in (1, 2, 3):
+        vals.append((state.get(f"vision_{i}_speed_limit_kmh"), bool(state.get(f"vision_{i}_speed_limit_valid", True))))
+    lim = _fused_scalar(vals, fallback=None)
+    if lim is None or lim < 20 or lim > 180:
+        lim = _AP_STATE["last_speed_limit"]
+    _AP_STATE["last_speed_limit"] = 0.9 * _AP_STATE["last_speed_limit"] + 0.1 * lim
+    return _AP_STATE["last_speed_limit"]
+
+
+def _lane_estimate(state):
+    """
+    Returns lane center error (m): + means vehicle is right of center.
+    Robustly fuses vision systems.
+    """
+    ests = []
+    for i in (1, 2, 3):
+        lv = bool(state.get(f"vision_{i}_left_line_valid", False))
+        rv = bool(state.get(f"vision_{i}_right_line_valid", False))
+
+        left_d = state.get(f"vision_{i}_left_line_dist_m")
+        right_d = state.get(f"vision_{i}_right_line_dist_m")
+        off = state.get(f"vision_{i}_lane_offset_m")
+
+        vals = []
+        if lv and rv and _is_finite_num(left_d) and _is_finite_num(right_d):
+            # Convention: positive right_line_dist means right boundary on right;
+            # center error approx (left - right)/2 if symmetric signs are not guaranteed.
+            vals.append((float(left_d) - float(right_d)) * 0.5)
+        if _is_finite_num(off):
+            vals.append(float(off))
+
+        if vals:
+            est = sum(vals) / len(vals)
+            conf = 1.0 + (1.0 if (lv and rv) else 0.0)
+            for _ in range(int(conf)):
+                ests.append((est, True))
+
+    lane_err = _fused_scalar(ests, fallback=_AP_STATE["last_lane_center"], outlier_sigma=2.5)
+    if lane_err is None:
+        lane_err = 0.0
+
+    lane_err = _clamp(lane_err, -2.5, 2.5)
+    _AP_STATE["last_lane_center"] = 0.8 * _AP_STATE["last_lane_center"] + 0.2 * lane_err
+    return _AP_STATE["last_lane_center"]
+
+
+def _lidar_range(state, ang):
+    key = f"lidar_{ang:+04d}_deg_range_m" if ang >= 0 else f"lidar_{ang:+04d}_deg_range_m"
+    vkey = f"lidar_{ang:+04d}_deg_valid" if ang >= 0 else f"lidar_{ang:+04d}_deg_valid"
+    v = state.get(key)
+    ok = bool(state.get(vkey, True))
+    if not ok or not _is_finite_num(v) or v <= 0.1:
+        return None
+    return float(v)
+
+
+def _front_obstacle(state):
+    # Vision obstacle fusion
+    vis_d = []
+    vis_rel = []
+    for i in (1, 2, 3):
+        ov = bool(state.get(f"vision_{i}_obstacle_valid", False))
+        od = bool(state.get(f"vision_{i}_obstacle_detected", False))
+        d = state.get(f"vision_{i}_obstacle_dist_m")
+        rv = state.get(f"vision_{i}_obstacle_rel_speed_kmh")
+        if ov and od and _is_finite_num(d):
+            vis_d.append((float(d), True))
+        if ov and od and _is_finite_num(rv):
+            vis_rel.append((float(rv), True))
+
+    vision_dist = _fused_scalar(vis_d, fallback=None)
+    rel_kmh = _fused_scalar(vis_rel, fallback=0.0)
+
+    # Lidar forward beams
+    beams = []
+    for a in (-15, -5, 5, 15):
+        r = _lidar_range(state, a)
+        if r is not None:
+            beams.append(r)
+    lidar_dist = min(beams) if beams else None
+
+    # Fuse nearest conservative distance
+    dist_candidates = [d for d in (vision_dist, lidar_dist) if d is not None]
+    if not dist_candidates:
+        front_dist = _AP_STATE["last_front_dist"] + 2.0
+    else:
+        front_dist = min(dist_candidates)
+
+    front_dist = _clamp(front_dist, 0.0, 250.0)
+    _AP_STATE["last_front_dist"] = 0.7 * _AP_STATE["last_front_dist"] + 0.3 * front_dist
+
+    return _AP_STATE["last_front_dist"], rel_kmh
+
+
+def _lane_free_score(state, side):
+    """side: -1 left, +1 right; larger score means safer"""
+    # Use side lidar sector + side vision obstacle hints
+    if side < 0:
+        angs = (-90, -60, -45, -30)
+    else:
+        angs = (30, 45, 60, 90)
+
+    vals = []
+    for a in angs:
+        r = _lidar_range(state, a)
+        if r is not None:
+            vals.append(r)
+
+    if not vals:
+        return 0.0
+
+    score = sum(vals) / len(vals)
+
+    # Penalize if any vision sees close obstacle
+    for i in (1, 2, 3):
+        ov = bool(state.get(f"vision_{i}_obstacle_valid", False))
+        od = bool(state.get(f"vision_{i}_obstacle_detected", False))
+        d = state.get(f"vision_{i}_obstacle_dist_m")
+        if ov and od and _is_finite_num(d) and d < 20:
+            score -= (20 - float(d)) * 0.8
+
+    return score
+
+
+def autopilot_step(state: dict, dt: float) -> dict:
+    global _AP_STATE
+
+    if not _AP_STATE["initialized"]:
+        _AP_STATE["initialized"] = True
+
+    # Prefer provided dt if sane
+    st_dt = state.get("dt")
+    if _is_finite_num(st_dt) and 0.001 <= st_dt <= 0.5:
+        dt = float(st_dt)
+    if not _is_finite_num(dt) or dt <= 0:
+        dt = 0.05
+    dt = _clamp(dt, 0.01, 0.2)
+
+    speed_kmh = _read_speed_kmh(state)
+    speed_ms = speed_kmh / 3.6
+    mu = _read_mu(state)
+    rain = bool(state.get("rain_sensor", False))
+
+    yaw_dps = _read_yaw_rate_dps(state, dt)
+    lane_err = _lane_estimate(state)
+    front_dist, rel_kmh = _front_obstacle(state)
+
+    # Target planning
+    target_lane = int(_clamp(state.get("target_lane", state.get("current_lane", 1)), 0, 2))
+    current_lane = int(_clamp(state.get("current_lane", target_lane), 0, 2))
+    base_target = state.get("target_speed_kmh", 100.0)
+    if not _is_finite_num(base_target):
+        base_target = 100.0
+
+    speed_limit = _read_speed_limit_kmh(state)
+
+    # Surface-aware caps
+    traction_cap = 130.0 * _clamp((mu / 0.9) ** 0.5, 0.35, 1.0)
+    if rain:
+        traction_cap *= 0.85
+
+    target_kmh = min(float(base_target), speed_limit, traction_cap)
+
+    # Curvature-aware speed moderation
+    curv_vals = []
+    for i in (1, 2, 3):
+        c = state.get(f"vision_{i}_road_curvature_1pm")
+        if _is_finite_num(c):
+            curv_vals.append((abs(float(c)), True))
+    curv = _fused_scalar(curv_vals, fallback=0.0)
+    if curv is None:
+        curv = 0.0
+    if curv > 0:
+        curve_cap = _clamp(110.0 / (1.0 + 40.0 * curv), 40.0, 130.0)
+        target_kmh = min(target_kmh, curve_cap)
+
+    # Headway logic
+    rel_ms = rel_kmh / 3.6
+    closing_ms = max(0.0, speed_ms - max(0.0, speed_ms + rel_ms))
+    safe_headway_s = 1.6 + (0.8 if mu < 0.5 else 0.0) + (0.5 if rain else 0.0)
+    safe_dist = max(8.0, safe_headway_s * speed_ms)
+
+    ttc = 999.0
+    if speed_ms > 0.5 and front_dist > 0.1:
+        rel_closing = max(0.0, speed_ms - max(0.0, speed_ms + rel_ms))
+        if rel_closing > 0.1:
+            ttc = front_dist / rel_closing
+
+    imminent = (front_dist < max(6.0, 0.6 * safe_dist)) or (ttc < 1.2)
+    caution = (front_dist < safe_dist) or (ttc < 3.0)
+
+    # Lane-change decision for obstacle avoidance
+    lane_shift = 0
+    if _AP_STATE["lane_change_cooldown_s"] > 0:
+        _AP_STATE["lane_change_cooldown_s"] = max(0.0, _AP_STATE["lane_change_cooldown_s"] - dt)
+
+    if caution and _AP_STATE["lane_change_cooldown_s"] <= 0:
+        left_ok = current_lane > 0
+        right_ok = current_lane < 2
+        left_score = _lane_free_score(state, -1) if left_ok else -1e9
+        right_score = _lane_free_score(state, +1) if right_ok else -1e9
+
+        # Prefer target lane, else best free side if significant gain
+        pref = target_lane - current_lane
+        if pref < 0 and left_ok and left_score > 12:
+            lane_shift = -1
+        elif pref > 0 and right_ok and right_score > 12:
+            lane_shift = +1
+        else:
+            if left_score > right_score + 4 and left_score > 12:
+                lane_shift = -1
+            elif right_score > left_score + 4 and right_score > 12:
+                lane_shift = +1
+
+        if lane_shift != 0:
+            _AP_STATE["lane_change_cooldown_s"] = 2.0
+
+    desired_lane = _clamp(current_lane + lane_shift, 0, 2)
+
+    # Steering control (lane centering + yaw damping)
+    # Approx lane width 3.6 m. Target center shift when changing lane.
+    lane_change_offset = (desired_lane - current_lane) * 3.6
+    steer_err_m = lane_err - lane_change_offset
+
+    # Low-mu: reduce aggressiveness and limit steering
+    steer_kp = 0.28 * _clamp(mu / 0.8, 0.45, 1.1)
+    steer_kd = 0.025
+    steer_ki = 0.035 * _clamp(mu / 0.8, 0.4, 1.0)
+
+    _AP_STATE["lane_int"] += steer_err_m * dt
+    _AP_STATE["lane_int"] = _clamp(_AP_STATE["lane_int"], -2.0, 2.0)
+
+    d_lane = (steer_err_m - _AP_STATE["prev_lane_err"]) / dt
+    _AP_STATE["prev_lane_err"] = steer_err_m
+
+    steer_cmd = (
+        -steer_kp * steer_err_m
+        - steer_kd * d_lane
+        - steer_ki * _AP_STATE["lane_int"]
+        - 0.010 * yaw_dps
+    )
+
+    # Crosswind / sudden yaw rejection
+    if abs(yaw_dps) > 8.0:
+        steer_cmd += -0.006 * yaw_dps
+
+    max_steer = 0.75 * _clamp(mu / 0.8, 0.5, 1.0)
+    if speed_kmh > 110:
+        max_steer *= 0.8
+    steer_cmd = _clamp(steer_cmd, -max_steer, max_steer)
+
+    # Rate limit steering for stability / jam scenarios
+    max_delta = 1.6 * dt
+    steer_cmd = _clamp(steer_cmd, _AP_STATE["last_steer"] - max_delta, _AP_STATE["last_steer"] + max_delta)
+    _AP_STATE["last_steer"] = steer_cmd
+
+    # Speed controller (PID + hazard override)
+    # Obstacle-following speed suggestion
+    follow_target = target_kmh
+    if caution:
+        # Blend down according to available distance
+        ratio = _clamp((front_dist - 6.0) / max(1.0, (safe_dist - 6.0)), 0.0, 1.0)
+        follow_target = min(target_kmh, ratio * target_kmh)
+
+    cmd_target = min(target_kmh, follow_target)
+
+    speed_err = cmd_target - speed_kmh
+    kp = 0.030 * _clamp(mu / 0.8, 0.6, 1.0)
+    ki = 0.020 * _clamp(mu / 0.8, 0.5, 1.0)
+    kd = 0.006
+
+    _AP_STATE["speed_int"] += speed_err * dt
+    _AP_STATE["speed_int"] = _clamp(_AP_STATE["speed_int"], -40.0, 40.0)
+
+    d_err = (speed_err - _AP_STATE["prev_speed_err"]) / dt
+    _AP_STATE["prev_speed_err"] = speed_err
+
+    u = kp * speed_err + ki * _AP_STATE["speed_int"] + kd * d_err
+
+    throttle = _clamp(u, 0.0, 1.0)
+    brake = _clamp(-u, 0.0, 1.0)
+
+    # Hazard overrides
+    if imminent:
+        _AP_STATE["danger_hold_s"] = max(_AP_STATE["danger_hold_s"], 0.8)
+    _AP_STATE["danger_hold_s"] = max(0.0, _AP_STATE["danger_hold_s"] - dt)
+
+    if _AP_STATE["danger_hold_s"] > 0.0:
+        throttle = 0.0
+        # Emergency brake scaled by traction to avoid lockup instability
+        brake = max(brake, _clamp(0.85 * _clamp(mu / 0.8, 0.5, 1.0), 0.35, 1.0))
+
+    # Additional caution shaping
+    if caution and not imminent:
+        throttle *= 0.4
+        brake = max(brake, 0.10)
+
+    # High-speed steering + low-mu => soften power
+    if abs(steer_cmd) > 0.4 and speed_kmh > 90:
+        throttle *= 0.7
+
+    if mu < 0.35:
+        throttle = min(throttle, 0.35)
+        brake = min(brake, 0.55)
+
+    # Prevent simultaneous heavy throttle and brake
+    if brake > 0.2:
+        throttle = min(throttle, 0.05)
+
+    return {
+        "steering": float(_clamp(steer_cmd, -1.0, 1.0)),
+        "throttle": float(_clamp(throttle, 0.0, 1.0)),
+        "brake": float(_clamp(brake, 0.0, 1.0)),
+    }

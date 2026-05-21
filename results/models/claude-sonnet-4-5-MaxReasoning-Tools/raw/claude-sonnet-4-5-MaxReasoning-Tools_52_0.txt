@@ -1,0 +1,302 @@
+import math
+from typing import Dict, List, Optional, Tuple
+
+# Module-level variables for state persistence
+_speed_filter = []
+_lateral_offset_filter = []
+_yaw_rate_filter = []
+_speed_error_integral = 0.0
+_lateral_error_integral = 0.0
+_last_valid_obstacle_dist = None
+_last_valid_obstacle_speed = None
+_obstacle_confidence = 0.0
+_emergency_brake_active = False
+_emergency_brake_timer = 0.0
+
+def autopilot_step(state: dict, dt: float) -> dict:
+    global _speed_filter, _lateral_offset_filter, _yaw_rate_filter
+    global _speed_error_integral, _lateral_error_integral
+    global _last_valid_obstacle_dist, _last_valid_obstacle_speed
+    global _obstacle_confidence, _emergency_brake_active, _emergency_brake_timer
+
+    # === SENSOR FUSION ===
+
+    # 1. Speed estimation (km/h)
+    speed_estimates = []
+
+    # Wheel speeds
+    wheel_speeds = [
+        (state.get('wheel_speed_fl_kmh'), state.get('wheel_speed_fl_valid')),
+        (state.get('wheel_speed_fr_kmh'), state.get('wheel_speed_fr_valid')),
+        (state.get('wheel_speed_rl_kmh'), state.get('wheel_speed_rl_valid')),
+        (state.get('wheel_speed_rr_kmh'), state.get('wheel_speed_rr_valid'))
+    ]
+    valid_wheel_speeds = [s for s, v in wheel_speeds if v and s is not None and 0 <= s <= 250]
+    if valid_wheel_speeds:
+        speed_estimates.extend(valid_wheel_speeds)
+
+    # GPS speeds
+    if state.get('gps_1_valid') and state.get('gps_1_speed_kmh') is not None:
+        speed_estimates.append(state['gps_1_speed_kmh'])
+    if state.get('gps_2_valid') and state.get('gps_2_speed_kmh') is not None:
+        speed_estimates.append(state['gps_2_speed_kmh'])
+
+    # Vehicle speed sensors
+    if state.get('vehicle_speed_1_kmh') is not None and 0 <= state['vehicle_speed_1_kmh'] <= 250:
+        speed_estimates.append(state['vehicle_speed_1_kmh'])
+    if state.get('vehicle_speed_2_kmh') is not None and 0 <= state['vehicle_speed_2_kmh'] <= 250:
+        speed_estimates.append(state['vehicle_speed_2_kmh'])
+
+    # Robust speed estimation using median
+    if speed_estimates:
+        speed_estimates.sort()
+        current_speed = speed_estimates[len(speed_estimates) // 2]
+    else:
+        current_speed = 0.0
+
+    # Temporal filtering
+    _speed_filter.append(current_speed)
+    if len(_speed_filter) > 5:
+        _speed_filter.pop(0)
+    current_speed = sum(_speed_filter) / len(_speed_filter)
+
+    # 2. Yaw rate estimation (deg/s)
+    yaw_rates = []
+    gyros = [
+        (state.get('gyro_1_yaw_rate_dps'), state.get('gyro_1_valid')),
+        (state.get('gyro_2_yaw_rate_dps'), state.get('gyro_2_valid')),
+        (state.get('gyro_3_yaw_rate_dps'), state.get('gyro_3_valid'))
+    ]
+    for rate, valid in gyros:
+        if valid and rate is not None and -180 <= rate <= 180:
+            yaw_rates.append(rate)
+
+    if yaw_rates:
+        yaw_rates.sort()
+        yaw_rate = yaw_rates[len(yaw_rates) // 2]
+    else:
+        yaw_rate = 0.0
+
+    _yaw_rate_filter.append(yaw_rate)
+    if len(_yaw_rate_filter) > 3:
+        _yaw_rate_filter.pop(0)
+    yaw_rate = sum(_yaw_rate_filter) / len(_yaw_rate_filter)
+
+    # 3. Lane offset estimation (m)
+    lane_offsets = []
+
+    # Vision systems
+    for i in [1, 2, 3]:
+        offset = state.get(f'vision_{i}_lane_offset_m')
+        left_valid = state.get(f'vision_{i}_left_line_valid')
+        right_valid = state.get(f'vision_{i}_right_line_valid')
+
+        if offset is not None and (left_valid or right_valid) and -5 <= offset <= 5:
+            lane_offsets.append(offset)
+
+    # Lidar-based lane estimation (check side distances)
+    lidar_left = state.get('lidar_-090_deg_range_m')
+    lidar_right = state.get('lidar_+090_deg_range_m')
+    if (lidar_left is not None and state.get('lidar_-090_deg_valid') and
+        lidar_right is not None and state.get('lidar_+090_deg_valid')):
+        if 0.5 < lidar_left < 10 and 0.5 < lidar_right < 10:
+            lidar_offset = (lidar_right - lidar_left) / 2.0
+            if -5 <= lidar_offset <= 5:
+                lane_offsets.append(lidar_offset)
+
+    if lane_offsets:
+        lane_offsets.sort()
+        lateral_offset = lane_offsets[len(lane_offsets) // 2]
+    else:
+        lateral_offset = 0.0
+
+    _lateral_offset_filter.append(lateral_offset)
+    if len(_lateral_offset_filter) > 5:
+        _lateral_offset_filter.pop(0)
+    lateral_offset = sum(_lateral_offset_filter) / len(_lateral_offset_filter)
+
+    # 4. Road curvature estimation
+    curvatures = []
+    for i in [1, 2, 3]:
+        curv = state.get(f'vision_{i}_road_curvature_1pm')
+        left_valid = state.get(f'vision_{i}_left_line_valid')
+        right_valid = state.get(f'vision_{i}_right_line_valid')
+        if curv is not None and (left_valid or right_valid) and -0.1 <= curv <= 0.1:
+            curvatures.append(curv)
+
+    road_curvature = sum(curvatures) / len(curvatures) if curvatures else 0.0
+
+    # 5. Obstacle detection
+    obstacle_detected = False
+    obstacle_distance = float('inf')
+    obstacle_rel_speed = 0.0
+
+    obstacle_detections = []
+    for i in [1, 2, 3]:
+        detected = state.get(f'vision_{i}_obstacle_detected')
+        valid = state.get(f'vision_{i}_obstacle_valid')
+        dist = state.get(f'vision_{i}_obstacle_dist_m')
+        rel_speed = state.get(f'vision_{i}_obstacle_rel_speed_kmh')
+
+        if detected and valid and dist is not None and 0 < dist < 300:
+            obstacle_detections.append((dist, rel_speed if rel_speed is not None else 0.0))
+
+    # Lidar forward beams
+    forward_lidar_angles = ['-005', '+005', '-015', '+015', '-030', '+030']
+    for angle in forward_lidar_angles:
+        dist = state.get(f'lidar_{angle}_deg_range_m')
+        valid = state.get(f'lidar_{angle}_deg_valid')
+        if valid and dist is not None and 0 < dist < 100:
+            obstacle_detections.append((dist, 0.0))
+
+    if obstacle_detections:
+        obstacle_detections.sort(key=lambda x: x[0])
+        obstacle_distance = obstacle_detections[0][0]
+        obstacle_rel_speed = obstacle_detections[0][1]
+        obstacle_detected = True
+
+        # Update confidence
+        _obstacle_confidence = min(1.0, _obstacle_confidence + 0.3)
+        _last_valid_obstacle_dist = obstacle_distance
+        _last_valid_obstacle_speed = obstacle_rel_speed
+    else:
+        _obstacle_confidence = max(0.0, _obstacle_confidence - 0.1)
+        if _obstacle_confidence > 0.3 and _last_valid_obstacle_dist is not None:
+            obstacle_detected = True
+            obstacle_distance = _last_valid_obstacle_dist
+            obstacle_rel_speed = _last_valid_obstacle_speed or 0.0
+
+    # 6. Speed limit
+    speed_limits = []
+    for i in [1, 2, 3]:
+        limit = state.get(f'vision_{i}_speed_limit_kmh')
+        valid = state.get(f'vision_{i}_speed_limit_valid')
+        if valid and limit is not None and 20 <= limit <= 200:
+            speed_limits.append(limit)
+
+    speed_limit = min(speed_limits) if speed_limits else None
+
+    # 7. Traction estimation
+    mu = state.get('estimated_mu', 1.0)
+    mu = max(0.1, min(1.0, mu))
+
+    # === CONTROL LOGIC ===
+
+    target_speed = state.get('target_speed_kmh', 100.0)
+    current_lane = state.get('current_lane', 1)
+    target_lane = state.get('target_lane', current_lane)
+
+    # Apply speed limit
+    if speed_limit is not None:
+        target_speed = min(target_speed, speed_limit)
+
+    # Adjust target speed for low traction
+    if mu < 0.5:
+        target_speed = min(target_speed, 80.0 * mu)
+
+    # === LONGITUDINAL CONTROL ===
+
+    # Speed error
+    speed_error = target_speed - current_speed
+    _speed_error_integral += speed_error * dt
+    _speed_error_integral = max(-50, min(50, _speed_error_integral))
+
+    # Obstacle handling
+    time_to_collision = float('inf')
+    if obstacle_detected and obstacle_distance < 200:
+        closing_speed_ms = (current_speed - obstacle_rel_speed) / 3.6
+        if closing_speed_ms > 0.1:
+            time_to_collision = obstacle_distance / closing_speed_ms
+
+    # Emergency braking logic
+    if time_to_collision < 2.0 or (obstacle_detected and obstacle_distance < 10):
+        _emergency_brake_active = True
+        _emergency_brake_timer = 3.0
+
+    if _emergency_brake_active:
+        _emergency_brake_timer -= dt
+        if _emergency_brake_timer <= 0:
+            _emergency_brake_active = False
+
+    # Calculate throttle and brake
+    if _emergency_brake_active:
+        throttle = 0.0
+        brake = 1.0
+    elif time_to_collision < 5.0:
+        # Progressive braking
+        safe_distance = max(20, current_speed / 3.6 * 2.0)
+        distance_error = obstacle_distance - safe_distance
+
+        if distance_error < 0:
+            brake_intensity = min(1.0, -distance_error / 20.0)
+            brake = brake_intensity * (1.0 if mu > 0.5 else 0.7)
+            throttle = 0.0
+        else:
+            brake = 0.0
+            throttle = max(0.0, min(0.3, speed_error / 20.0))
+    else:
+        # Normal speed control
+        kp_speed = 0.05
+        ki_speed = 0.01
+
+        throttle_cmd = kp_speed * speed_error + ki_speed * _speed_error_integral
+
+        if throttle_cmd > 0:
+            throttle = min(1.0, throttle_cmd) * (1.0 if mu > 0.5 else 0.5)
+            brake = 0.0
+        else:
+            throttle = 0.0
+            brake = min(1.0, -throttle_cmd * 2.0)
+
+    # Limit acceleration on low traction
+    if mu < 0.3:
+        throttle *= 0.3
+
+    # === LATERAL CONTROL ===
+
+    # Lateral error (negative = left of center, positive = right)
+    lateral_error = lateral_offset
+
+    # Lane change adjustment
+    lane_change_offset = (target_lane - current_lane) * 3.5
+    lateral_error += lane_change_offset
+
+    _lateral_error_integral += lateral_error * dt
+    _lateral_error_integral = max(-5, min(5, _lateral_error_integral))
+
+    # PID for steering
+    kp_lateral = 0.4
+    kd_lateral = 0.8
+    ki_lateral = 0.05
+
+    # Feedforward for curvature
+    speed_ms = current_speed / 3.6
+    if speed_ms > 0.1:
+        curvature_compensation = road_curvature * speed_ms * 0.5
+    else:
+        curvature_compensation = 0.0
+
+    # Lateral velocity estimate from yaw rate
+    lateral_velocity = math.radians(yaw_rate) * speed_ms if speed_ms > 0.1 else 0.0
+
+    steering = -(kp_lateral * lateral_error +
+                 kd_lateral * lateral_velocity +
+                 ki_lateral * _lateral_error_integral +
+                 curvature_compensation)
+
+    # Reduce steering gain on low traction
+    if mu < 0.5:
+        steering *= (0.3 + 0.4 * mu)
+
+    # Limit steering
+    steering = max(-1.0, min(1.0, steering))
+
+    # Reduce steering at high speeds
+    if current_speed > 120:
+        steering *= 0.8
+
+    return {
+        'steering': steering,
+        'throttle': throttle,
+        'brake': brake
+    }

@@ -1,0 +1,480 @@
+use std::cmp::Ordering;
+use std::collections::HashMap;
+use std::io::{self, Read};
+
+const SMALL_DATASET_SAMPLES: usize = 3_500;
+const TARGET_NEIGHBORS: usize = 24;
+const MIN_NEIGHBORS_STRONG: usize = 6;
+const MIN_NEIGHBORS_WEAK: usize = 3;
+const MAX_GRID_SHELL: i32 = 6;
+const MAX_STATS_SAMPLE: usize = 100_000;
+const EPS: f64 = 1e-9;
+
+#[derive(Clone)]
+struct HoleSample {
+    point_idx: usize,
+}
+
+#[derive(Clone)]
+struct Hole {
+    id: String,
+    samples: Vec<HoleSample>,
+}
+
+#[derive(Clone)]
+struct Point {
+    hole_idx: usize,
+    sample_idx: usize,
+    pos: [f64; 3],
+    values: Vec<f64>,
+}
+
+#[derive(Clone, Copy)]
+struct RobustStats {
+    median: f64,
+    mad: f64,
+    scale: f64,
+}
+
+#[derive(Clone)]
+struct Suspect {
+    hole_id: String,
+    sample_idx: usize,
+    property_name: String,
+    confidence: f64,
+}
+
+#[derive(Clone, Copy)]
+enum NeighborStrategy {
+    BruteForce,
+    SpatialHash,
+}
+
+struct SpatialHash {
+    cell_size: f64,
+    min: [f64; 3],
+    cells: HashMap<(i32, i32, i32), Vec<usize>>,
+}
+
+impl SpatialHash {
+    fn build(points: &[Point]) -> Self {
+        let mut min = [f64::INFINITY; 3];
+        let mut max = [f64::NEG_INFINITY; 3];
+        for p in points {
+            for axis in 0..3 {
+                min[axis] = min[axis].min(p.pos[axis]);
+                max[axis] = max[axis].max(p.pos[axis]);
+            }
+        }
+
+        let spans = [
+            (max[0] - min[0]).max(1.0),
+            (max[1] - min[1]).max(1.0),
+            (max[2] - min[2]).max(1.0),
+        ];
+        let volume = (spans[0] * spans[1] * spans[2]).max(1.0);
+        let approx_spacing = (volume / (points.len().max(1) as f64)).cbrt();
+        let cell_size = (approx_spacing * 1.75).max(1e-3);
+
+        let mut cells: HashMap<(i32, i32, i32), Vec<usize>> = HashMap::new();
+        for (idx, point) in points.iter().enumerate() {
+            let key = Self::cell_key_raw(point.pos, min, cell_size);
+            cells.entry(key).or_default().push(idx);
+        }
+
+        Self { cell_size, min, cells }
+    }
+
+    fn cell_key(&self, pos: [f64; 3]) -> (i32, i32, i32) {
+        Self::cell_key_raw(pos, self.min, self.cell_size)
+    }
+
+    fn cell_key_raw(pos: [f64; 3], min: [f64; 3], cell_size: f64) -> (i32, i32, i32) {
+        let fx = ((pos[0] - min[0]) / cell_size).floor();
+        let fy = ((pos[1] - min[1]) / cell_size).floor();
+        let fz = ((pos[2] - min[2]) / cell_size).floor();
+        (fx as i32, fy as i32, fz as i32)
+    }
+
+    fn neighbors(&self, points: &[Point], point_idx: usize, target: usize) -> Vec<usize> {
+        let center = self.cell_key(points[point_idx].pos);
+        let mut candidates: Vec<(f64, usize)> = Vec::with_capacity(target * 4);
+
+        for shell in 0..=MAX_GRID_SHELL {
+            for dx in -shell..=shell {
+                for dy in -shell..=shell {
+                    for dz in -shell..=shell {
+                        if shell > 0
+                            && dx.abs() != shell
+                            && dy.abs() != shell
+                            && dz.abs() != shell
+                        {
+                            continue;
+                        }
+                        let key = (center.0 + dx, center.1 + dy, center.2 + dz);
+                        if let Some(bucket) = self.cells.get(&key) {
+                            for &other_idx in bucket {
+                                if other_idx == point_idx {
+                                    continue;
+                                }
+                                let d2 = squared_distance(points[point_idx].pos, points[other_idx].pos);
+                                candidates.push((d2, other_idx));
+                            }
+                        }
+                    }
+                }
+            }
+            if candidates.len() >= target * 2 || (shell >= 2 && candidates.len() >= target) {
+                break;
+            }
+        }
+
+        candidates.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
+        candidates.truncate(target);
+        candidates.into_iter().map(|(_, idx)| idx).collect()
+    }
+}
+
+fn squared_distance(a: [f64; 3], b: [f64; 3]) -> f64 {
+    let dx = a[0] - b[0];
+    let dy = a[1] - b[1];
+    let dz = a[2] - b[2];
+    dx * dx + dy * dy + dz * dz
+}
+
+fn cmp_f64(a: &f64, b: &f64) -> Ordering {
+    a.partial_cmp(b).unwrap_or(Ordering::Equal)
+}
+
+fn median_sorted(values: &[f64]) -> f64 {
+    let n = values.len();
+    if n == 0 {
+        return f64::NAN;
+    }
+    if n % 2 == 1 {
+        values[n / 2]
+    } else {
+        (values[n / 2 - 1] + values[n / 2]) * 0.5
+    }
+}
+
+fn robust_stats(values: &[f64]) -> Option<RobustStats> {
+    let mut clean: Vec<f64> = values.iter().copied().filter(|v| v.is_finite()).collect();
+    if clean.is_empty() {
+        return None;
+    }
+
+    if clean.len() > MAX_STATS_SAMPLE {
+        let step = clean.len().div_ceil(MAX_STATS_SAMPLE);
+        clean = clean.into_iter().step_by(step).collect();
+    }
+
+    clean.sort_by(cmp_f64);
+    let median = median_sorted(&clean);
+
+    let mut deviations: Vec<f64> = clean.iter().map(|v| (v - median).abs()).collect();
+    deviations.sort_by(cmp_f64);
+    let mad = median_sorted(&deviations);
+    let scale = (mad * 1.4826).max(EPS);
+
+    Some(RobustStats { median, mad, scale })
+}
+
+fn local_stats(values: &mut Vec<f64>) -> Option<RobustStats> {
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_by(cmp_f64);
+    let median = median_sorted(values);
+    let mut deviations: Vec<f64> = values.iter().map(|v| (v - median).abs()).collect();
+    deviations.sort_by(cmp_f64);
+    let mad = median_sorted(&deviations);
+    let scale = (mad * 1.4826).max(EPS);
+    Some(RobustStats { median, mad, scale })
+}
+
+fn parse_f64(token: Option<&str>) -> f64 {
+    token.and_then(|s| s.parse::<f64>().ok()).unwrap_or(f64::NAN)
+}
+
+fn adaptive_strategy(total_samples: usize) -> NeighborStrategy {
+    if total_samples <= SMALL_DATASET_SAMPLES {
+        NeighborStrategy::BruteForce
+    } else {
+        NeighborStrategy::SpatialHash
+    }
+}
+
+fn brute_force_neighbors(points: &[Point], point_idx: usize, target: usize) -> Vec<usize> {
+    let mut distances: Vec<(f64, usize)> = Vec::with_capacity(points.len().saturating_sub(1));
+    for idx in 0..points.len() {
+        if idx == point_idx {
+            continue;
+        }
+        let d2 = squared_distance(points[point_idx].pos, points[idx].pos);
+        distances.push((d2, idx));
+    }
+    distances.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
+    distances.truncate(target);
+    distances.into_iter().map(|(_, idx)| idx).collect()
+}
+
+fn collect_neighbor_values(
+    points: &[Point],
+    point_idx: usize,
+    property_idx: usize,
+    neighbor_indices: &[usize],
+    holes: &[Hole],
+) -> Vec<f64> {
+    let mut values = Vec::with_capacity(neighbor_indices.len() + 2);
+    for &idx in neighbor_indices {
+        let v = points[idx].values[property_idx];
+        if v.is_finite() {
+            values.push(v);
+        }
+    }
+
+    let point = &points[point_idx];
+    let samples = &holes[point.hole_idx].samples;
+    if point.sample_idx > 0 {
+        let prev_idx = samples[point.sample_idx - 1].point_idx;
+        let v = points[prev_idx].values[property_idx];
+        if v.is_finite() {
+            values.push(v);
+        }
+    }
+    if point.sample_idx + 1 < samples.len() {
+        let next_idx = samples[point.sample_idx + 1].point_idx;
+        let v = points[next_idx].values[property_idx];
+        if v.is_finite() {
+            values.push(v);
+        }
+    }
+
+    values
+}
+
+fn confidence_from_scores(local_z: f64, global_z: f64, gap_ratio: f64) -> f64 {
+    let composite = local_z * 0.70 + global_z * 0.20 + gap_ratio.min(12.0) * 0.10;
+    let confidence = 1.0 - (-composite / 6.0).exp();
+    confidence.clamp(0.0, 0.999_999)
+}
+
+fn main() {
+    let mut input = String::new();
+    if io::stdin().read_to_string(&mut input).is_err() {
+        println!("0");
+        return;
+    }
+
+    let tokens: Vec<&str> = input.split_whitespace().collect();
+    if tokens.len() < 2 {
+        println!("0");
+        return;
+    }
+
+    let mut idx = 0usize;
+    let num_holes = tokens[idx].parse::<usize>().unwrap_or(0);
+    idx += 1;
+    let num_properties = tokens[idx].parse::<usize>().unwrap_or(0);
+    idx += 1;
+
+    if num_properties == 0 {
+        println!("0");
+        return;
+    }
+    if idx + num_properties > tokens.len() {
+        println!("0");
+        return;
+    }
+
+    let property_names: Vec<String> = tokens[idx..idx + num_properties]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    idx += num_properties;
+
+    let mut holes: Vec<Hole> = Vec::with_capacity(num_holes);
+    let mut points: Vec<Point> = Vec::new();
+    let mut property_columns: Vec<Vec<f64>> = vec![Vec::new(); num_properties];
+
+    for hole_idx in 0..num_holes {
+        if idx >= tokens.len() {
+            break;
+        }
+
+        if idx + 8 >= tokens.len() {
+            break;
+        }
+
+        let hole_id = tokens[idx].to_string();
+        idx += 1;
+        let start_x = parse_f64(tokens.get(idx).copied());
+        idx += 1;
+        let start_y = parse_f64(tokens.get(idx).copied());
+        idx += 1;
+        let start_z = parse_f64(tokens.get(idx).copied());
+        idx += 1;
+        let dir_x = parse_f64(tokens.get(idx).copied());
+        idx += 1;
+        let dir_y = parse_f64(tokens.get(idx).copied());
+        idx += 1;
+        let dir_z = parse_f64(tokens.get(idx).copied());
+        idx += 1;
+        let length = parse_f64(tokens.get(idx).copied());
+        idx += 1;
+        let num_samples = tokens.get(idx).and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
+        idx += 1;
+
+        let dir_len = (dir_x * dir_x + dir_y * dir_y + dir_z * dir_z).sqrt();
+        let unit_dir = if dir_len.is_finite() && dir_len > EPS {
+            [dir_x / dir_len, dir_y / dir_len, dir_z / dir_len]
+        } else {
+            [0.0, 0.0, 1.0]
+        };
+
+        let mut hole_samples = Vec::with_capacity(num_samples);
+        for sample_idx in 0..num_samples {
+            if idx >= tokens.len() {
+                break;
+            }
+            let depth = parse_f64(tokens.get(idx).copied());
+            idx += 1;
+
+            let clamped_depth = if depth.is_finite() && length.is_finite() {
+                depth.clamp(0.0, length.max(0.0))
+            } else {
+                depth
+            };
+            let pos = if clamped_depth.is_finite() {
+                [
+                    start_x + unit_dir[0] * clamped_depth,
+                    start_y + unit_dir[1] * clamped_depth,
+                    start_z + unit_dir[2] * clamped_depth,
+                ]
+            } else {
+                [start_x, start_y, start_z]
+            };
+
+            let mut values = Vec::with_capacity(num_properties);
+            for prop_idx in 0..num_properties {
+                let value = parse_f64(tokens.get(idx).copied());
+                idx += usize::from(idx < tokens.len());
+                values.push(value);
+                property_columns[prop_idx].push(value);
+            }
+
+            let point_idx = points.len();
+            points.push(Point {
+                hole_idx,
+                sample_idx,
+                pos,
+                values,
+            });
+            hole_samples.push(HoleSample {
+                point_idx,
+            });
+        }
+
+        holes.push(Hole {
+            id: hole_id,
+            samples: hole_samples,
+        });
+    }
+
+    if points.is_empty() {
+        println!("0");
+        return;
+    }
+
+    let strategy = adaptive_strategy(points.len());
+    let spatial_hash = match strategy {
+        NeighborStrategy::BruteForce => None,
+        NeighborStrategy::SpatialHash => Some(SpatialHash::build(&points)),
+    };
+
+    let global_stats: Vec<Option<RobustStats>> = property_columns.iter().map(|col| robust_stats(col)).collect();
+
+    let mut suspects: Vec<Suspect> = Vec::new();
+    for point_idx in 0..points.len() {
+        let neighbor_indices = match strategy {
+            NeighborStrategy::BruteForce => brute_force_neighbors(&points, point_idx, TARGET_NEIGHBORS),
+            NeighborStrategy::SpatialHash => spatial_hash
+                .as_ref()
+                .map(|grid| grid.neighbors(&points, point_idx, TARGET_NEIGHBORS))
+                .unwrap_or_default(),
+        };
+
+        for prop_idx in 0..num_properties {
+            let value = points[point_idx].values[prop_idx];
+            if !value.is_finite() {
+                continue;
+            }
+
+            let global = match global_stats[prop_idx] {
+                Some(stats) => stats,
+                None => continue,
+            };
+
+            let mut local_values =
+                collect_neighbor_values(&points, point_idx, prop_idx, &neighbor_indices, &holes);
+            local_values.retain(|v| v.is_finite());
+            let local_count = local_values.len();
+            let local = local_stats(&mut local_values);
+
+            let global_z = (value - global.median).abs() / global.scale;
+            let mut flagged = false;
+            let mut confidence = 0.0;
+
+            if let Some(local_stats) = local {
+                let local_gap = (value - local_stats.median).abs();
+                let local_z = local_gap / local_stats.scale;
+                let gap_ratio = local_gap / global.scale.max(local_stats.scale);
+
+                if local_count >= MIN_NEIGHBORS_STRONG {
+                    if local_z >= 3.5 && (local_z >= global_z * 0.85 || global_z >= 4.5) {
+                        flagged = true;
+                        confidence = confidence_from_scores(local_z, global_z, gap_ratio);
+                    }
+                } else if local_count >= MIN_NEIGHBORS_WEAK {
+                    if local_z >= 4.5 && global_z >= 3.0 {
+                        flagged = true;
+                        confidence = confidence_from_scores(local_z, global_z, gap_ratio);
+                    }
+                }
+            }
+
+            if !flagged && global_z >= 8.0 && global.mad > EPS {
+                let confidence_floor = 1.0 - (-global_z / 8.0).exp();
+                confidence = confidence.max(confidence_floor.clamp(0.0, 0.98));
+                flagged = true;
+            }
+
+            if flagged {
+                suspects.push(Suspect {
+                    hole_id: holes[points[point_idx].hole_idx].id.clone(),
+                    sample_idx: points[point_idx].sample_idx,
+                    property_name: property_names[prop_idx].clone(),
+                    confidence,
+                });
+            }
+        }
+    }
+
+    suspects.sort_by(|a, b| {
+        b.confidence
+            .partial_cmp(&a.confidence)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| a.hole_id.cmp(&b.hole_id))
+            .then_with(|| a.sample_idx.cmp(&b.sample_idx))
+            .then_with(|| a.property_name.cmp(&b.property_name))
+    });
+
+    println!("{}", suspects.len());
+    for suspect in suspects {
+        println!(
+            "{} {} {} {:.6}",
+            suspect.hole_id, suspect.sample_idx, suspect.property_name, suspect.confidence
+        );
+    }
+}

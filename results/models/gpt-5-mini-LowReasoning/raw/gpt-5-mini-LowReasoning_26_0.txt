@@ -1,1 +1,427 @@
-{'__exception__': "Can't run here - we're trying to get this working in codex."}
+Here's a single-file Rust program (edition 2021) that implements an adaptive clustering solver for 3D points. It reads a text header line from stdin containing "num_points num_clusters" then reads the binary float32 triples (little-endian) and writes binary cluster indices (u32 little-endian) to stdout.
+
+High-level strategy implemented:
+- Always streams the binary point data into a temp file so we can re-scan it as needed (stdin cannot be rewound).
+- Builds centroids via k-means++ initialization using a sample (bounded by memory).
+- Chooses algorithm based on dataset size:
+  - Small (<= 10 million points): load everything into memory and run standard Lloyd k-means until convergence.
+  - Medium (<= 100 million): mini-batch-like: multiple passes over temp file (bounded sample batches) to refine centroids.
+  - Large (<= 1 billion): multiple streaming passes over temp file, but with smaller batches.
+  - Very large (> 1 billion): single pass online (streaming) updates with learning-rate style updates (approximate).
+- Writes final assignments in a final pass through the temp file.
+- Ensures exactly N clusters by post-processing empty clusters after initialization.
+
+Notes/assumptions:
+- Input header is ASCII text: two integers separated by whitespace (num_points num_clusters).
+- Input points are exactly num_points * 12 bytes following the header.
+- Uses no external crates. RNG implemented as a small xorshift64.
+- Temp file is placed in the system temp directory and cleaned up when done.
+
+This code is intended to be robust and memory-conscious. It makes pragmatic trade-offs to handle billions of points by using streaming and single-pass approximate updates where necessary. It should compile with rustc (2021 edition).
+
+Copy/paste and compile with:
+rustc -C opt-level=3 -edition=2021 clustering.rs
+Run by piping the binary point data after the header into the program.
+
+Code:
+
+```rust
+use std::env;
+use std::fs::{File, remove_file};
+use std::io::{self, Read, Write, BufReader, BufWriter, Seek, SeekFrom};
+use std::path::PathBuf;
+use std::time::{Instant};
+
+type F = f32;
+
+#[derive(Clone, Copy, Debug)]
+struct Point { x: F, y: F, z: F }
+
+impl Point {
+    fn zero() -> Point { Point { x: 0.0, y: 0.0, z: 0.0 } }
+    fn add_assign(&mut self, other: &Point) {
+        self.x += other.x; self.y += other.y; self.z += other.z;
+    }
+    fn scale(&mut self, s: F) {
+        self.x *= s; self.y *= s; self.z *= s;
+    }
+    fn distance2(&self, other: &Point) -> F {
+        let dx = self.x - other.x;
+        let dy = self.y - other.y;
+        let dz = self.z - other.z;
+        dx*dx + dy*dy + dz*dz
+    }
+}
+
+struct XorShift64 {
+    s: u64,
+}
+
+impl XorShift64 {
+    fn new(seed: u64) -> Self { let s = if seed != 0 { seed } else { 0xdeadbeefcafebabe }; XorShift64 { s } }
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.s;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.s = x;
+        x
+    }
+    fn next_usize(&mut self, n: usize) -> usize {
+        (self.next_u64() as usize).wrapping_mul(n) >> (64 - (usize::BITS as usize).min(64))
+    }
+    fn next_f32(&mut self) -> f32 {
+        // return in [0,1)
+        let x = self.next_u64() >> 11; // 53 bits
+        (x as f64 / ((1u64 << 53) as f64)) as f32
+    }
+}
+
+fn read_header<R: Read>(r: &mut R) -> io::Result<(u64, usize)> {
+    // read until newline, parse two integers
+    let mut header = String::new();
+    let mut buf = [0u8; 1];
+    while r.read(&mut buf)? == 1 {
+        if buf[0] == b'\n' { break; }
+        header.push(buf[0] as char);
+    }
+    let mut parts = header.split_whitespace();
+    let num_points: u64 = parts.next().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing num_points"))?.parse().map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid num_points"))?;
+    let num_clusters: usize = parts.next().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing num_clusters"))?.parse().map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid num_clusters"))?;
+    Ok((num_points, num_clusters))
+}
+
+fn write_tempfile_from_stdin(num_points: u64, stdin: &mut dyn Read) -> io::Result<PathBuf> {
+    let tmp_dir = env::temp_dir();
+    let pid = std::process::id();
+    let uniq = format!("kmeans_tmp_{}_{}.bin", pid, Instant::now().elapsed().as_nanos());
+    let mut tmp_path = tmp_dir;
+    tmp_path.push(uniq);
+    let mut f = File::create(&tmp_path)?;
+    let mut remaining = num_points.checked_mul(12).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "too many points"))?;
+    let mut buf = vec![0u8; 1 << 20]; // 1MB buffer
+    while remaining > 0 {
+        let to_read = std::cmp::min(remaining as usize, buf.len());
+        stdin.read_exact(&mut buf[..to_read])?;
+        f.write_all(&buf[..to_read])?;
+        remaining -= to_read as u64;
+    }
+    f.sync_all()?;
+    Ok(tmp_path)
+}
+
+fn read_point_from_file(f: &mut File) -> io::Result<Option<Point>> {
+    let mut b = [0u8; 12];
+    match f.read_exact(&mut b) {
+        Ok(()) => {
+            let x = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+            let y = f32::from_le_bytes([b[4], b[5], b[6], b[7]]);
+            let z = f32::from_le_bytes([b[8], b[9], b[10], b[11]]);
+            Ok(Some(Point { x, y, z }))
+        }
+        Err(e) => {
+            if e.kind() == io::ErrorKind::UnexpectedEof { Ok(None) } else { Err(e) }
+        }
+    }
+}
+
+fn sample_points_from_file(f: &mut File, num_points: u64, sample_size: usize, rng: &mut XorShift64) -> io::Result<Vec<Point>> {
+    // If sample_size >= num_points, read all
+    if sample_size as u64 >= num_points {
+        f.seek(SeekFrom::Start(0))?;
+        let mut pts = Vec::with_capacity(num_points as usize);
+        for _ in 0..num_points {
+            if let Some(p) = read_point_from_file(f)? { pts.push(p); } else { break; }
+        }
+        return Ok(pts);
+    }
+    // Reservoir sampling
+    f.seek(SeekFrom::Start(0))?;
+    let mut reservoir: Vec<Point> = Vec::with_capacity(sample_size);
+    let mut i: u64 = 0;
+    while let Some(p) = read_point_from_file(f)? {
+        i += 1;
+        if reservoir.len() < sample_size {
+            reservoir.push(p);
+        } else {
+            let j = (rng.next_f32() * (i as f32)) as usize;
+            if j < sample_size {
+                reservoir[j] = p;
+            }
+        }
+    }
+    Ok(reservoir)
+}
+
+fn kmeans_pp_init(sample: &Vec<Point>, k: usize, rng: &mut XorShift64) -> Vec<Point> {
+    let n = sample.len();
+    assert!(n > 0 && k > 0);
+    let mut centers: Vec<Point> = Vec::with_capacity(k);
+    // choose first uniformly
+    let idx = rng.next_usize(n);
+    centers.push(sample[idx]);
+    let mut dist2: Vec<F> = vec![0.0; n];
+    for _ in 1..k {
+        // compute distances squared to nearest center
+        let mut sum = 0.0f64;
+        for (i, p) in sample.iter().enumerate() {
+            let d = p.distance2(centers.last().unwrap());
+            // update min
+            let v = if dist2[i] == 0.0 { d } else { dist2[i].min(d) };
+            dist2[i] = v;
+            sum += v as f64;
+        }
+        if sum == 0.0 {
+            // all points identical; choose random remaining
+            let mut chosen = false;
+            for _try in 0..10 {
+                let idx = rng.next_usize(n);
+                let mut duplicate = false;
+                for c in &centers {
+                    if sample[idx].distance2(c) == 0.0 { duplicate = true; break; }
+                }
+                if !duplicate { centers.push(sample[idx]); chosen = true; break; }
+            }
+            if !chosen {
+                centers.push(sample[rng.next_usize(n)]);
+            }
+            continue;
+        }
+        // pick by weighted probability
+        let mut r = rng.next_f32() as f64 * sum;
+        let mut chosen_idx = 0usize;
+        for (i, &d) in dist2.iter().enumerate() {
+            r -= d as f64;
+            if r <= 0.0 {
+                chosen_idx = i; break;
+            }
+        }
+        centers.push(sample[chosen_idx]);
+    }
+    centers
+}
+
+fn ensure_no_empty(centers: &mut Vec<Point>, counts: &mut Vec<u64>, sample: &Vec<Point>, rng: &mut XorShift64) {
+    let k = centers.len();
+    for i in 0..k {
+        if counts[i] == 0 {
+            // assign a random sample point to this center
+            let idx = rng.next_usize(sample.len());
+            centers[i] = sample[idx];
+            counts[i] = 1;
+        }
+    }
+}
+
+fn lloyd_full(points: &mut Vec<Point>, k: usize, max_iter: usize, tol: f32, rng: &mut XorShift64) -> Vec<u32> {
+    let n = points.len();
+    // init using sample = points (we have all)
+    let sample = points.clone();
+    let mut centers = kmeans_pp_init(&sample, k, rng);
+    let mut labels = vec![0u32; n];
+    let mut counts = vec![0u64; k];
+    for iter in 0..max_iter {
+        let mut changed = 0usize;
+        counts.fill(0);
+        let mut sums = vec![Point::zero(); k];
+        for (i, p) in points.iter().enumerate() {
+            let mut best = 0usize;
+            let mut bestd = p.distance2(&centers[0]);
+            for j in 1..k {
+                let d = p.distance2(&centers[j]);
+                if d < bestd { best = j; bestd = d; }
+            }
+            if labels[i] as usize != best { changed += 1; labels[i] = best as u32; }
+            counts[best] += 1;
+            sums[best].add_assign(p);
+        }
+        // recompute centers
+        let mut max_move = 0.0f32;
+        for j in 0..k {
+            if counts[j] > 0 {
+                let mut newc = sums[j];
+                newc.scale(1.0 / counts[j] as f32);
+                let mv = centers[j].distance2(&newc).sqrt();
+                if mv > max_move { max_move = mv; }
+                centers[j] = newc;
+            } else {
+                // reinitialize empty cluster randomly
+                let idx = rng.next_usize(n);
+                centers[j] = points[idx];
+            }
+        }
+        if changed == 0 || max_move <= tol { break; }
+        if iter == max_iter - 1 {
+            // final
+        }
+    }
+    labels
+}
+
+fn streaming_online(num_points: u64, k: usize, temp_path: &PathBuf, centers: &mut Vec<Point>, epochs: usize, rng: &mut XorShift64) -> io::Result<()> {
+    // Single or few-pass streaming update: for very large we do one pass with decaying learning rate
+    let mut f = File::open(temp_path)?;
+    let mut total_seen: u64 = 0;
+    let mut counts = vec![0u64; k];
+    for epoch in 0..epochs {
+        f.seek(SeekFrom::Start(0))?;
+        let mut idx = 0u64;
+        while let Some(p) = read_point_from_file(&mut f)? {
+            idx += 1;
+            total_seen += 1;
+            // find nearest
+            let mut best = 0usize;
+            let mut bestd = p.distance2(&centers[0]);
+            for j in 1..k {
+                let d = p.distance2(&centers[j]);
+                if d < bestd { best = j; bestd = d; }
+            }
+            counts[best] += 1;
+            // learning rate: could be 1 / count or decayed by epoch
+            let lr = (1.0f32 / (counts[best] as f32)).max(1e-6);
+            centers[best].x = centers[best].x + lr * (p.x - centers[best].x);
+            centers[best].y = centers[best].y + lr * (p.y - centers[best].y);
+            centers[best].z = centers[best].z + lr * (p.z - centers[best].z);
+        }
+        // small random jitter to avoid stuck empty clusters
+        for j in 0..k {
+            if counts[j] == 0 {
+                // pick a random point and set
+                let pick = rng.next_usize( (num_points.min(1_000_000) as usize).max(1) );
+                // fallback: slight random perturb on other centroid
+                let other = rng.next_usize(k);
+                centers[j].x = centers[other].x + (rng.next_f32() - 0.5) * 1e-3;
+                centers[j].y = centers[other].y + (rng.next_f32() - 0.5) * 1e-3;
+                centers[j].z = centers[other].z + (rng.next_f32() - 0.5) * 1e-3;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn final_assign_and_write(num_points: u64, k: usize, temp_path: &PathBuf, centers: &Vec<Point>, mut out: &mut dyn Write) -> io::Result<()> {
+    // Single pass: assign each point to nearest center and write u32 index little-endian
+    let mut f = File::open(temp_path)?;
+    f.seek(SeekFrom::Start(0))?;
+    let mut written: u64 = 0;
+    while let Some(p) = read_point_from_file(&mut f)? {
+        let mut best = 0usize;
+        let mut bestd = p.distance2(&centers[0]);
+        for j in 1..k {
+            let d = p.distance2(&centers[j]);
+            if d < bestd { best = j; bestd = d; }
+        }
+        let idx_u32 = best as u32;
+        out.write_all(&idx_u32.to_le_bytes())?;
+        written += 1;
+    }
+    out.flush()?;
+    if written != num_points {
+        // If mismatch, it's likely because the input didn't match header; ignore
+    }
+    Ok(())
+}
+
+fn main() -> io::Result<()> {
+    let start_time = Instant::now();
+    // read header from stdin
+    let stdin = io::stdin();
+    let mut stdin_lock = stdin.lock();
+    let (num_points, num_clusters) = read_header(&mut stdin_lock)?;
+    if num_clusters == 0 {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "num_clusters must be > 0"));
+    }
+    // spool binary points to tempfile so we can seek multiple times
+    let tmp_path = write_tempfile_from_stdin(num_points, &mut stdin_lock)?;
+    let mut tmp_file = File::open(&tmp_path)?;
+    let mut rng = XorShift64::new((start_time.elapsed().as_nanos() as u64).wrapping_add(num_points).wrapping_add(num_clusters as u64));
+
+    // Decide strategy based on size
+    let small_threshold = 10_000_000u64;
+    let medium_threshold = 100_000_000u64;
+    let large_threshold = 1_000_000_000u64;
+
+    let k = num_clusters;
+    let mut centers: Vec<Point> = Vec::new();
+    if num_points <= small_threshold {
+        // load all points into memory and run full k-means
+        let mut pts: Vec<Point> = Vec::with_capacity(num_points as usize);
+        tmp_file.seek(SeekFrom::Start(0))?;
+        for _ in 0..num_points {
+            if let Some(p) = read_point_from_file(&mut tmp_file)? { pts.push(p); }
+            else { break; }
+        }
+        if pts.is_empty() {
+            // nothing to cluster; nothing to output
+            let mut stdout = io::stdout();
+            stdout.lock().flush()?;
+            remove_file(&tmp_path)?;
+            return Ok(());
+        }
+        centers = kmeans_pp_init(&pts, k, &mut rng);
+        // run standard Lloyd
+        let labels = lloyd_full(&mut pts, k, 200, 1e-4, &mut rng);
+        // write labels
+        let mut w = io::stdout();
+        let mut handle = w.lock();
+        for &lab in &labels {
+            handle.write_all(&lab.to_le_bytes())?;
+        }
+        handle.flush()?;
+        remove_file(&tmp_path)?;
+        return Ok(());
+    } else {
+        // For medium/large/very large: sample a subset for initialization
+        let sample_size = if num_points <= medium_threshold { 2_000_000usize.min(num_points as usize) }
+            else if num_points <= large_threshold { 1_000_000usize.min(num_points as usize) }
+            else { 200_000usize.min(num_points as usize) };
+        let sample = sample_points_from_file(&mut tmp_file, num_points, sample_size, &mut rng)?;
+        // kmeans++ on sample
+        centers = kmeans_pp_init(&sample, k, &mut rng);
+        // ensure no empty by giving each at least one sample
+        let mut counts = vec![0u64; k];
+        for s in &sample {
+            let mut best = 0usize;
+            let mut bestd = s.distance2(&centers[0]);
+            for j in 1..k {
+                let d = s.distance2(&centers[j]);
+                if d < bestd { best = j; bestd = d; }
+            }
+            counts[best] += 1;
+        }
+        ensure_no_empty(&mut centers, &mut counts, &sample, &mut rng);
+
+        // Refinement depending on size
+        if num_points <= medium_threshold {
+            // Do multiple passes over full data (mini-batch like)
+            let passes = 10usize;
+            streaming_online(num_points, k, &tmp_path, &mut centers, passes, &mut rng)?;
+        } else if num_points <= large_threshold {
+            // A few passes but with smaller epochs
+            let passes = 5usize;
+            streaming_online(num_points, k, &tmp_path, &mut centers, passes, &mut rng)?;
+        } else {
+            // Very large: single-pass streaming
+            let passes = 1usize;
+            streaming_online(num_points, k, &tmp_path, &mut centers, passes, &mut rng)?;
+        }
+
+        // Final pass: assign and write
+        let mut stdout = io::stdout();
+        let mut writer = stdout.lock();
+        final_assign_and_write(num_points, k, &tmp_path, &centers, &mut writer)?;
+
+        // cleanup
+        remove_file(&tmp_path)?;
+        return Ok(());
+    }
+}
+```
+
+If you want further tuning:
+- Increase init sample size for better init.
+- Use more epochs for medium datasets to increase accuracy.
+- Replace the simple online learning rate with a mini-batch aggregator for improved stability.
+- Add multi-threading (read/write and centroid updates) to speed up large computations.
+
+This implementation is written to be robust for streaming and for datasets that don't fit in memory.

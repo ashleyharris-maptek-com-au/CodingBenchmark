@@ -1,0 +1,737 @@
+// CSG Union of two closed manifold meshes.
+// Strategy:
+//  1) Build BVHs for both meshes.
+//  2) Find candidate triangle-triangle intersections.
+//  3) Compute intersection segments using triangle-plane cuts.
+//  4) Per source triangle, gather constraint segments, project to 2D in the
+//     triangle's plane, run a Bowyer-Watson Delaunay then enforce constraints
+//     via edge flips.
+//  5) Classify each sub-triangle: keep iff its centroid lies outside the OTHER mesh
+//     (inside/outside test via ray casting through the BVH).
+//  6) Merge vertices via spatial hashing to produce a watertight result.
+//
+// Fast paths:
+//  - Triangles with no intersection: kept or discarded whole based on centroid test.
+//  - Disjoint meshes: no constraints at all.
+//
+// Compiles with MSVC /std:c++20.
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <iostream>
+#include <limits>
+#include <queue>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
+
+using std::size_t;
+using std::vector;
+using std::array;
+
+struct Vec3 {
+    double x, y, z;
+    Vec3() : x(0), y(0), z(0) {}
+    Vec3(double a, double b, double c) : x(a), y(b), z(c) {}
+    Vec3 operator+(const Vec3& o) const { return {x+o.x,y+o.y,z+o.z}; }
+    Vec3 operator-(const Vec3& o) const { return {x-o.x,y-o.y,z-o.z}; }
+    Vec3 operator*(double s) const { return {x*s,y*s,z*s}; }
+    double dot(const Vec3& o) const { return x*o.x+y*o.y+z*o.z; }
+    Vec3 cross(const Vec3& o) const {
+        return {y*o.z-z*o.y, z*o.x-x*o.z, x*o.y-y*o.x};
+    }
+    double norm() const { return std::sqrt(x*x+y*y+z*z); }
+};
+
+struct AABB {
+    Vec3 lo, hi;
+    AABB() {
+        lo = { std::numeric_limits<double>::infinity(),
+               std::numeric_limits<double>::infinity(),
+               std::numeric_limits<double>::infinity() };
+        hi = { -std::numeric_limits<double>::infinity(),
+               -std::numeric_limits<double>::infinity(),
+               -std::numeric_limits<double>::infinity() };
+    }
+    void expand(const Vec3& v) {
+        lo.x = std::min(lo.x, v.x); lo.y = std::min(lo.y, v.y); lo.z = std::min(lo.z, v.z);
+        hi.x = std::max(hi.x, v.x); hi.y = std::max(hi.y, v.y); hi.z = std::max(hi.z, v.z);
+    }
+    void expand(const AABB& b) { expand(b.lo); expand(b.hi); }
+    bool overlaps(const AABB& o) const {
+        return !(hi.x < o.lo.x || lo.x > o.hi.x ||
+                 hi.y < o.lo.y || lo.y > o.hi.y ||
+                 hi.z < o.lo.z || lo.z > o.hi.z);
+    }
+    Vec3 center() const { return { (lo.x+hi.x)*0.5, (lo.y+hi.y)*0.5, (lo.z+hi.z)*0.5 }; }
+};
+
+struct Mesh {
+    vector<Vec3> V;
+    vector<array<int,3>> F;
+};
+
+struct BVHNode {
+    AABB box;
+    int left = -1, right = -1;
+    int start = 0, count = 0;
+    bool leaf() const { return count > 0; }
+};
+
+struct BVH {
+    vector<BVHNode> nodes;
+    vector<int> tris;
+    vector<AABB> triBox;
+    vector<Vec3> triCenter;
+
+    void build(const Mesh& m) {
+        int n = (int)m.F.size();
+        tris.resize(n);
+        triBox.resize(n);
+        triCenter.resize(n);
+        for (int i = 0; i < n; ++i) {
+            tris[i] = i;
+            AABB b;
+            b.expand(m.V[m.F[i][0]]);
+            b.expand(m.V[m.F[i][1]]);
+            b.expand(m.V[m.F[i][2]]);
+            triBox[i] = b;
+            triCenter[i] = b.center();
+        }
+        nodes.reserve(2 * std::max(1, n));
+        if (n > 0) buildNode(0, n);
+    }
+
+    int buildNode(int start, int count) {
+        int idx = (int)nodes.size();
+        nodes.push_back({});
+        AABB box;
+        for (int i = 0; i < count; ++i) box.expand(triBox[tris[start + i]]);
+        nodes[idx].box = box;
+        if (count <= 8) {
+            nodes[idx].start = start;
+            nodes[idx].count = count;
+            return idx;
+        }
+        Vec3 ext = box.hi - box.lo;
+        int axis = 0;
+        if (ext.y > ext.x) axis = 1;
+        if (axis == 0 ? ext.z > ext.x : ext.z > ext.y) axis = 2;
+        auto getC = [&](int t) {
+            const Vec3& c = triCenter[t];
+            return axis == 0 ? c.x : (axis == 1 ? c.y : c.z);
+        };
+        int mid = start + count / 2;
+        std::nth_element(tris.begin() + start, tris.begin() + mid, tris.begin() + start + count,
+                         [&](int a, int b) { return getC(a) < getC(b); });
+        int l = buildNode(start, mid - start);
+        int r = buildNode(mid, count - (mid - start));
+        nodes[idx].left = l;
+        nodes[idx].right = r;
+        nodes[idx].count = 0;
+        return idx;
+    }
+
+    void queryPairs(const BVH& other, vector<std::pair<int,int>>& pairs) const {
+        if (nodes.empty() || other.nodes.empty()) return;
+        vector<std::pair<int,int>> stk;
+        stk.reserve(256);
+        stk.push_back({0,0});
+        while (!stk.empty()) {
+            auto [a, b] = stk.back(); stk.pop_back();
+            const BVHNode& na = nodes[a];
+            const BVHNode& nb = other.nodes[b];
+            if (!na.box.overlaps(nb.box)) continue;
+            if (na.leaf() && nb.leaf()) {
+                for (int i = 0; i < na.count; ++i) {
+                    int ti = tris[na.start + i];
+                    for (int j = 0; j < nb.count; ++j) {
+                        int tj = other.tris[nb.start + j];
+                        if (triBox[ti].overlaps(other.triBox[tj]))
+                            pairs.push_back({ti, tj});
+                    }
+                }
+            } else if (na.leaf()) {
+                stk.push_back({a, nb.left});
+                stk.push_back({a, nb.right});
+            } else if (nb.leaf()) {
+                stk.push_back({na.left, b});
+                stk.push_back({na.right, b});
+            } else {
+                stk.push_back({na.left, nb.left});
+                stk.push_back({na.left, nb.right});
+                stk.push_back({na.right, nb.left});
+                stk.push_back({na.right, nb.right});
+            }
+        }
+    }
+};
+
+static bool segmentOverlap(double a0, double a1, double b0, double b1,
+                           double& lo, double& hi) {
+    if (a0 > a1) std::swap(a0, a1);
+    if (b0 > b1) std::swap(b0, b1);
+    lo = std::max(a0, b0);
+    hi = std::min(a1, b1);
+    return lo <= hi;
+}
+
+static int triPlaneIntersect(const Vec3& a, const Vec3& b, const Vec3& c,
+                             const Vec3& n, double d, Vec3 out[2]) {
+    double da = a.dot(n) - d;
+    double db = b.dot(n) - d;
+    double dc = c.dot(n) - d;
+    const double eps = 1e-12;
+    if (std::abs(da) < eps) da = 0;
+    if (std::abs(db) < eps) db = 0;
+    if (std::abs(dc) < eps) dc = 0;
+    int cnt = 0;
+    auto cut = [&](const Vec3& p, double dp, const Vec3& q, double dq) {
+        if ((dp > 0 && dq < 0) || (dp < 0 && dq > 0)) {
+            double t = dp / (dp - dq);
+            if (cnt < 2) out[cnt++] = p + (q - p) * t;
+        }
+    };
+    if (da == 0) { if (cnt < 2) out[cnt++] = a; }
+    if (db == 0) { if (cnt < 2) out[cnt++] = b; }
+    if (dc == 0) { if (cnt < 2) out[cnt++] = c; }
+    cut(a, da, b, db);
+    cut(b, db, c, dc);
+    cut(c, dc, a, da);
+    return cnt;
+}
+
+static bool triTriIntersect(const Vec3& A0, const Vec3& A1, const Vec3& A2,
+                            const Vec3& B0, const Vec3& B1, const Vec3& B2,
+                            Vec3& P, Vec3& Q) {
+    Vec3 nA = (A1 - A0).cross(A2 - A0);
+    Vec3 nB = (B1 - B0).cross(B2 - B0);
+    double lA = nA.norm();
+    double lB = nB.norm();
+    if (lA == 0 || lB == 0) return false;
+    nA = nA * (1.0 / lA);
+    nB = nB * (1.0 / lB);
+    double dA = nA.dot(A0);
+    double dB = nB.dot(B0);
+    Vec3 sA[2], sB[2];
+    int nsA = triPlaneIntersect(A0, A1, A2, nB, dB, sA);
+    int nsB = triPlaneIntersect(B0, B1, B2, nA, dA, sB);
+    if (nsA < 2 || nsB < 2) return false;
+    Vec3 dir = nA.cross(nB);
+    double dl = dir.norm();
+    if (dl < 1e-15) return false;
+    dir = dir * (1.0 / dl);
+    double aA[2] = { sA[0].dot(dir), sA[1].dot(dir) };
+    double aB[2] = { sB[0].dot(dir), sB[1].dot(dir) };
+    double lo, hi;
+    if (!segmentOverlap(aA[0], aA[1], aB[0], aB[1], lo, hi)) return false;
+    if (hi - lo < 1e-15) return false;
+    double aLo = std::min(aA[0], aA[1]);
+    double aHi = std::max(aA[0], aA[1]);
+    double tLo = (lo - aLo) / std::max(aHi - aLo, 1e-30);
+    double tHi = (hi - aLo) / std::max(aHi - aLo, 1e-30);
+    Vec3 s0 = sA[0], s1 = sA[1];
+    if (aA[0] > aA[1]) std::swap(s0, s1);
+    P = s0 + (s1 - s0) * tLo;
+    Q = s0 + (s1 - s0) * tHi;
+    return true;
+}
+
+static int rayTriIntersect01(const Vec3& O, const Vec3& D,
+                             const Vec3& A, const Vec3& B, const Vec3& C,
+                             double& tOut, bool& degenerate) {
+    Vec3 e1 = B - A;
+    Vec3 e2 = C - A;
+    Vec3 p = D.cross(e2);
+    double det = e1.dot(p);
+    const double eps = 1e-15;
+    if (std::abs(det) < eps) { degenerate = true; return 0; }
+    double invDet = 1.0 / det;
+    Vec3 s = O - A;
+    double u = s.dot(p) * invDet;
+    if (u < -1e-12 || u > 1.0 + 1e-12) return 0;
+    Vec3 q = s.cross(e1);
+    double v = D.dot(q) * invDet;
+    if (v < -1e-12 || u + v > 1.0 + 1e-12) return 0;
+    double t = e2.dot(q) * invDet;
+    if (t <= 1e-12) return 0;
+    if (u < 1e-9 || v < 1e-9 || 1.0 - u - v < 1e-9) degenerate = true;
+    tOut = t;
+    return 1;
+}
+
+static bool pointInsideMesh(const Mesh& m, const BVH& bvh, const Vec3& p) {
+    static const Vec3 dirs[] = {
+        {1.0, 0.0001, 0.00007},
+        {0.13, 1.0, 0.27},
+        {-0.31, 0.21, 1.0},
+        {0.71, -0.43, 0.59}
+    };
+    if (bvh.nodes.empty()) return false;
+    for (int attempt = 0; attempt < 4; ++attempt) {
+        Vec3 D = dirs[attempt];
+        vector<int> stk; stk.reserve(64);
+        stk.push_back(0);
+        bool degenerate = false;
+        int parity = 0;
+        while (!stk.empty() && !degenerate) {
+            int ni = stk.back(); stk.pop_back();
+            const BVHNode& nd = bvh.nodes[ni];
+            double tmin = 0, tmax = std::numeric_limits<double>::infinity();
+            for (int ax = 0; ax < 3; ++ax) {
+                double o = (ax==0?p.x:(ax==1?p.y:p.z));
+                double d = (ax==0?D.x:(ax==1?D.y:D.z));
+                double lo = (ax==0?nd.box.lo.x:(ax==1?nd.box.lo.y:nd.box.lo.z));
+                double hi = (ax==0?nd.box.hi.x:(ax==1?nd.box.hi.y:nd.box.hi.z));
+                if (std::abs(d) < 1e-18) {
+                    if (o < lo || o > hi) { tmin = 1; tmax = 0; break; }
+                } else {
+                    double t1 = (lo - o)/d, t2 = (hi - o)/d;
+                    if (t1 > t2) std::swap(t1, t2);
+                    tmin = std::max(tmin, t1);
+                    tmax = std::min(tmax, t2);
+                }
+            }
+            if (tmin > tmax) continue;
+            if (tmax < 0) continue;
+            if (nd.leaf()) {
+                for (int i = 0; i < nd.count; ++i) {
+                    int t = bvh.tris[nd.start + i];
+                    const auto& f = m.F[t];
+                    double tt;
+                    bool deg = false;
+                    int hit = rayTriIntersect01(p, D, m.V[f[0]], m.V[f[1]], m.V[f[2]], tt, deg);
+                    if (deg) { degenerate = true; break; }
+                    if (hit) parity ^= 1;
+                }
+            } else {
+                stk.push_back(nd.left);
+                stk.push_back(nd.right);
+            }
+        }
+        if (!degenerate) return parity == 1;
+    }
+    return false;
+}
+
+static void triBasis(const Vec3& A, const Vec3& B, const Vec3& C, Vec3& u, Vec3& v, Vec3& n) {
+    Vec3 e1 = B - A;
+    double l1 = e1.norm();
+    if (l1 < 1e-30) { u = {1,0,0}; v = {0,1,0}; n = {0,0,1}; return; }
+    u = e1 * (1.0/l1);
+    Vec3 e2 = C - A;
+    n = u.cross(e2);
+    double ln = n.norm();
+    if (ln < 1e-30) { v = {0,1,0}; n = {0,0,1}; return; }
+    n = n * (1.0/ln);
+    v = n.cross(u);
+}
+
+struct P2 { double x, y; int id; };
+
+static double cross2(double ax, double ay, double bx, double by) { return ax*by - ay*bx; }
+static double orient2(const P2& a, const P2& b, const P2& c) {
+    return cross2(b.x - a.x, b.y - a.y, c.x - a.x, c.y - a.y);
+}
+static bool inTri2(const P2& p, const P2& a, const P2& b, const P2& c) {
+    double d1 = orient2(a, b, p);
+    double d2 = orient2(b, c, p);
+    double d3 = orient2(c, a, p);
+    bool hasNeg = (d1 < -1e-15) || (d2 < -1e-15) || (d3 < -1e-15);
+    bool hasPos = (d1 > 1e-15) || (d2 > 1e-15) || (d3 > 1e-15);
+    return !(hasNeg && hasPos);
+}
+
+struct Tri { int v[3]; int adj[3]; bool alive; };
+
+struct CDT {
+    vector<P2> pts;
+    vector<Tri> tris;
+    int superStart = 0;
+
+    int makeTri(int a, int b, int c) {
+        Tri t; t.v[0]=a; t.v[1]=b; t.v[2]=c;
+        t.adj[0]=t.adj[1]=t.adj[2]=-1;
+        t.alive=true;
+        tris.push_back(t);
+        return (int)tris.size() - 1;
+    }
+    static int edgeIndex(const Tri& t, int a, int b) {
+        for (int i = 0; i < 3; ++i) {
+            int p = t.v[(i+1)%3], q = t.v[(i+2)%3];
+            if ((p==a && q==b) || (p==b && q==a)) return i;
+        }
+        return -1;
+    }
+    void linkPair(int ti, int tj) {
+        if (ti < 0 || tj < 0) return;
+        for (int i = 0; i < 3; ++i) {
+            int a = tris[ti].v[(i+1)%3], b = tris[ti].v[(i+2)%3];
+            int j = edgeIndex(tris[tj], a, b);
+            if (j >= 0) {
+                tris[ti].adj[i] = tj;
+                tris[tj].adj[j] = ti;
+                return;
+            }
+        }
+    }
+    double incircle(const P2& a, const P2& b, const P2& c, const P2& d) const {
+        double ax = a.x - d.x, ay = a.y - d.y;
+        double bx = b.x - d.x, by = b.y - d.y;
+        double cx = c.x - d.x, cy = c.y - d.y;
+        double det =
+            ax * (by*(cx*cx + cy*cy) - cy*(bx*bx + by*by)) -
+            ay * (bx*(cx*cx + cy*cy) - cx*(bx*bx + by*by)) +
+            (ax*ax + ay*ay) * (bx*cy - by*cx);
+        return det;
+    }
+    int locate(const P2& p) {
+        for (int i = 0; i < (int)tris.size(); ++i) {
+            if (!tris[i].alive) continue;
+            if (inTri2(p, pts[tris[i].v[0]], pts[tris[i].v[1]], pts[tris[i].v[2]])) return i;
+        }
+        return -1;
+    }
+    void insert(int pid) {
+        const P2& p = pts[pid];
+        int seed = -1;
+        for (int i = 0; i < (int)tris.size(); ++i) {
+            if (!tris[i].alive) continue;
+            if (incircle(pts[tris[i].v[0]], pts[tris[i].v[1]], pts[tris[i].v[2]], p) > 0) {
+                seed = i; break;
+            }
+        }
+        if (seed < 0) {
+            seed = locate(p);
+            if (seed < 0) return;
+        }
+        vector<int> bad;
+        vector<char> mark(tris.size(), 0);
+        std::queue<int> q;
+        q.push(seed); mark[seed] = 1;
+        while (!q.empty()) {
+            int t = q.front(); q.pop();
+            bad.push_back(t);
+            for (int e = 0; e < 3; ++e) {
+                int nb = tris[t].adj[e];
+                if (nb < 0 || !tris[nb].alive || mark[nb]) continue;
+                if (incircle(pts[tris[nb].v[0]], pts[tris[nb].v[1]], pts[tris[nb].v[2]], p) > 0) {
+                    mark[nb] = 1;
+                    q.push(nb);
+                }
+            }
+        }
+        struct BEdge { int a, b, outer; };
+        vector<BEdge> boundary;
+        for (int t : bad) {
+            for (int e = 0; e < 3; ++e) {
+                int nb = tris[t].adj[e];
+                bool isBad = (nb >= 0 && mark[nb]);
+                if (!isBad) {
+                    int a = tris[t].v[(e+1)%3];
+                    int b = tris[t].v[(e+2)%3];
+                    boundary.push_back({a, b, nb});
+                }
+            }
+        }
+        for (int t : bad) tris[t].alive = false;
+        vector<int> newTri;
+        for (auto& be : boundary) {
+            int nt = makeTri(pid, be.a, be.b);
+            newTri.push_back(nt);
+            tris[nt].adj[0] = be.outer;
+            if (be.outer >= 0) {
+                int j = edgeIndex(tris[be.outer], be.a, be.b);
+                if (j >= 0) tris[be.outer].adj[j] = nt;
+            }
+        }
+        for (size_t i = 0; i < newTri.size(); ++i)
+            for (size_t j = i+1; j < newTri.size(); ++j)
+                linkPair(newTri[i], newTri[j]);
+    }
+    void buildSuper(double minx, double miny, double maxx, double maxy) {
+        double dx = maxx - minx;
+        double dy = maxy - miny;
+        double dm = std::max(dx, dy) * 10.0 + 1.0;
+        double mx = (minx + maxx) * 0.5;
+        double my = (miny + maxy) * 0.5;
+        int a = (int)pts.size(); pts.push_back({mx - 20*dm, my - dm, a});
+        int b = (int)pts.size(); pts.push_back({mx + 20*dm, my - dm, b});
+        int c = (int)pts.size(); pts.push_back({mx, my + 20*dm, c});
+        superStart = a;
+        makeTri(a, b, c);
+    }
+};
+
+static bool segCrossProper(const P2& a, const P2& b, const P2& c, const P2& d) {
+    double o1 = orient2(a,b,c);
+    double o2 = orient2(a,b,d);
+    double o3 = orient2(c,d,a);
+    double o4 = orient2(c,d,b);
+    if (((o1>0 && o2<0) || (o1<0 && o2>0)) &&
+        ((o3>0 && o4<0) || (o3<0 && o4>0))) return true;
+    return false;
+}
+
+static void enforceConstraint(CDT& cdt, int a, int b) {
+    auto tryStep = [&]() -> bool {
+        for (int ti = 0; ti < (int)cdt.tris.size(); ++ti) {
+            if (!cdt.tris[ti].alive) continue;
+            auto& t = cdt.tris[ti];
+            int ai = -1;
+            for (int i = 0; i < 3; ++i) if (t.v[i] == a) { ai = i; break; }
+            if (ai < 0) continue;
+            int p = t.v[(ai+1)%3];
+            int q = t.v[(ai+2)%3];
+            if (p == b || q == b) return true;
+            if (segCrossProper(cdt.pts[a], cdt.pts[b], cdt.pts[p], cdt.pts[q])) {
+                int adj = t.adj[ai];
+                if (adj < 0) return false;
+                Tri& u = cdt.tris[adj];
+                int j = CDT::edgeIndex(u, p, q);
+                if (j < 0) return false;
+                int r = u.v[j];
+                int n1 = cdt.makeTri(a, p, r);
+                int n2 = cdt.makeTri(a, r, q);
+                int t_adj_p = t.adj[(ai+1)%3];
+                int t_adj_q = t.adj[(ai+2)%3];
+                int up = u.v[(j+1)%3]; int uq = u.v[(j+2)%3];
+                int adj_pr, adj_qr;
+                if (up == p && uq == q) {
+                    adj_pr = u.adj[(j+2)%3];
+                    adj_qr = u.adj[(j+1)%3];
+                } else {
+                    adj_pr = u.adj[(j+1)%3];
+                    adj_qr = u.adj[(j+2)%3];
+                }
+                cdt.tris[ti].alive = false;
+                cdt.tris[adj].alive = false;
+                cdt.tris[n1].adj[0] = adj_pr;
+                cdt.tris[n1].adj[2] = t_adj_q;
+                cdt.tris[n2].adj[0] = adj_qr;
+                cdt.tris[n2].adj[1] = t_adj_p;
+                cdt.tris[n2].adj[2] = n1;
+                cdt.tris[n1].adj[1] = n2;
+                auto relink = [&](int nb, int nt, int va, int vb) {
+                    if (nb < 0) return;
+                    int e = CDT::edgeIndex(cdt.tris[nb], va, vb);
+                    if (e >= 0) cdt.tris[nb].adj[e] = nt;
+                };
+                relink(adj_pr, n1, p, r);
+                relink(t_adj_q, n1, a, p);
+                relink(adj_qr, n2, r, q);
+                relink(t_adj_p, n2, a, q);
+                return false;
+            }
+        }
+        return true;
+    };
+    for (int it = 0; it < 200; ++it) {
+        if (tryStep()) return;
+    }
+}
+
+struct OutMesh {
+    vector<Vec3> V;
+    vector<array<int,3>> F;
+};
+
+static double scaleEps(const Mesh& a, const Mesh& b) {
+    AABB box;
+    for (auto& v : a.V) box.expand(v);
+    for (auto& v : b.V) box.expand(v);
+    Vec3 e = box.hi - box.lo;
+    double s = std::max({e.x, e.y, e.z});
+    return std::max(1e-9, s * 1e-9);
+}
+
+struct VertexWelder {
+    double eps;
+    std::unordered_map<long long, vector<int>> bucket;
+    vector<Vec3> V;
+    int add(const Vec3& p) {
+        double s = 1.0 / (eps * 4.0);
+        for (int dx=-1; dx<=1; ++dx)
+        for (int dy=-1; dy<=1; ++dy)
+        for (int dz=-1; dz<=1; ++dz) {
+            long long ix = (long long)std::floor(p.x * s) + dx;
+            long long iy = (long long)std::floor(p.y * s) + dy;
+            long long iz = (long long)std::floor(p.z * s) + dz;
+            long long kk = ix * 73856093LL ^ iy * 19349663LL ^ iz * 83492791LL;
+            auto it = bucket.find(kk);
+            if (it == bucket.end()) continue;
+            for (int idx : it->second) {
+                Vec3 q = V[idx];
+                if (std::abs(q.x-p.x) < eps &&
+                    std::abs(q.y-p.y) < eps &&
+                    std::abs(q.z-p.z) < eps) return idx;
+            }
+        }
+        long long ix = (long long)std::floor(p.x * s);
+        long long iy = (long long)std::floor(p.y * s);
+        long long iz = (long long)std::floor(p.z * s);
+        long long k = ix * 73856093LL ^ iy * 19349663LL ^ iz * 83492791LL;
+        int id = (int)V.size();
+        V.push_back(p);
+        bucket[k].push_back(id);
+        return id;
+    }
+};
+
+static void cleanFaces(OutMesh& M) {
+    vector<array<int,3>> out;
+    out.reserve(M.F.size());
+    for (auto& f : M.F) {
+        if (f[0]==f[1] || f[1]==f[2] || f[2]==f[0]) continue;
+        const Vec3& a = M.V[f[0]];
+        const Vec3& b = M.V[f[1]];
+        const Vec3& c = M.V[f[2]];
+        Vec3 n = (b - a).cross(c - a);
+        if (n.norm() < 1e-20) continue;
+        out.push_back(f);
+    }
+    M.F.swap(out);
+}
+
+int main() {
+    std::ios_base::sync_with_stdio(false);
+    std::cin.tie(nullptr);
+
+    int VA, FA, VB, FB;
+    if (!(std::cin >> VA >> FA >> VB >> FB)) return 0;
+    Mesh A, B;
+    A.V.resize(VA); A.F.resize(FA);
+    B.V.resize(VB); B.F.resize(FB);
+    for (int i = 0; i < VA; ++i) std::cin >> A.V[i].x >> A.V[i].y >> A.V[i].z;
+    for (int i = 0; i < FA; ++i) std::cin >> A.F[i][0] >> A.F[i][1] >> A.F[i][2];
+    for (int i = 0; i < VB; ++i) std::cin >> B.V[i].x >> B.V[i].y >> B.V[i].z;
+    for (int i = 0; i < FB; ++i) std::cin >> B.F[i][0] >> B.F[i][1] >> B.F[i][2];
+
+    BVH bvhA, bvhB;
+    bvhA.build(A);
+    bvhB.build(B);
+    double eps = scaleEps(A, B);
+
+    vector<std::pair<int,int>> pairs;
+    bvhA.queryPairs(bvhB, pairs);
+
+    vector<vector<std::pair<Vec3,Vec3>>> conA(FA), conB(FB);
+    for (auto& pr : pairs) {
+        int ti = pr.first, tj = pr.second;
+        const auto& fa = A.F[ti];
+        const auto& fb = B.F[tj];
+        Vec3 P, Q;
+        if (triTriIntersect(A.V[fa[0]], A.V[fa[1]], A.V[fa[2]],
+                            B.V[fb[0]], B.V[fb[1]], B.V[fb[2]], P, Q)) {
+            if ((P - Q).norm() > eps) {
+                conA[ti].push_back({P, Q});
+                conB[tj].push_back({P, Q});
+            }
+        }
+    }
+
+    OutMesh out;
+    VertexWelder welder; welder.eps = eps;
+
+    auto emitTri = [&](const Vec3& a, const Vec3& b, const Vec3& c,
+                       const Mesh& other, const BVH& obvh) {
+        Vec3 cen = (a + b + c) * (1.0/3.0);
+        if (pointInsideMesh(other, obvh, cen)) return;
+        int ia = welder.add(a);
+        int ib = welder.add(b);
+        int ic = welder.add(c);
+        if (ia==ib||ib==ic||ic==ia) return;
+        out.F.push_back({ia, ib, ic});
+    };
+
+    auto processMesh = [&](const Mesh& M, const vector<vector<std::pair<Vec3,Vec3>>>& con,
+                           const Mesh& other, const BVH& obvh) {
+        int FN = (int)M.F.size();
+        for (int t = 0; t < FN; ++t) {
+            const auto& f = M.F[t];
+            const Vec3& A0 = M.V[f[0]];
+            const Vec3& A1 = M.V[f[1]];
+            const Vec3& A2 = M.V[f[2]];
+            if (con[t].empty()) {
+                emitTri(A0, A1, A2, other, obvh);
+                continue;
+            }
+            Vec3 u, v, n;
+            triBasis(A0, A1, A2, u, v, n);
+            auto to2 = [&](const Vec3& p) -> P2 {
+                Vec3 d = p - A0;
+                return { d.dot(u), d.dot(v), 0 };
+            };
+            vector<Vec3> pts3;
+            auto addPt = [&](const Vec3& p) -> int {
+                for (int i = 0; i < (int)pts3.size(); ++i) {
+                    if ((pts3[i]-p).norm() < eps) return i;
+                }
+                pts3.push_back(p);
+                return (int)pts3.size()-1;
+            };
+            int i0 = addPt(A0);
+            int i1 = addPt(A1);
+            int i2 = addPt(A2);
+            vector<std::pair<int,int>> cseg;
+            for (auto& s : con[t]) {
+                int a = addPt(s.first);
+                int b = addPt(s.second);
+                if (a != b) cseg.push_back({a,b});
+            }
+            double minx=1e300, miny=1e300, maxx=-1e300, maxy=-1e300;
+            vector<P2> p2(pts3.size());
+            for (int i = 0; i < (int)pts3.size(); ++i) {
+                p2[i] = to2(pts3[i]);
+                p2[i].id = i;
+                minx = std::min(minx, p2[i].x); maxx = std::max(maxx, p2[i].x);
+                miny = std::min(miny, p2[i].y); maxy = std::max(maxy, p2[i].y);
+            }
+            CDT cdt;
+            cdt.pts = p2;
+            cdt.buildSuper(minx, miny, maxx, maxy);
+            for (int i = 0; i < (int)pts3.size(); ++i) cdt.insert(i);
+            enforceConstraint(cdt, i0, i1);
+            enforceConstraint(cdt, i1, i2);
+            enforceConstraint(cdt, i2, i0);
+            for (auto& s : cseg) enforceConstraint(cdt, s.first, s.second);
+
+            const P2& T0 = cdt.pts[i0];
+            const P2& T1 = cdt.pts[i1];
+            const P2& T2 = cdt.pts[i2];
+            double oTri = orient2(T0, T1, T2);
+            bool ccw = oTri > 0;
+            for (auto& tr : cdt.tris) {
+                if (!tr.alive) continue;
+                if (tr.v[0] >= cdt.superStart || tr.v[1] >= cdt.superStart || tr.v[2] >= cdt.superStart) continue;
+                P2 c2 = { (cdt.pts[tr.v[0]].x + cdt.pts[tr.v[1]].x + cdt.pts[tr.v[2]].x)/3.0,
+                          (cdt.pts[tr.v[0]].y + cdt.pts[tr.v[1]].y + cdt.pts[tr.v[2]].y)/3.0, 0 };
+                if (!inTri2(c2, T0, T1, T2)) continue;
+                Vec3 va = pts3[tr.v[0]];
+                Vec3 vb = pts3[tr.v[1]];
+                Vec3 vc = pts3[tr.v[2]];
+                double o = orient2(cdt.pts[tr.v[0]], cdt.pts[tr.v[1]], cdt.pts[tr.v[2]]);
+                if ((o > 0) != ccw) std::swap(vb, vc);
+                emitTri(va, vb, vc, other, obvh);
+            }
+        }
+    };
+
+    processMesh(A, conA, B, bvhB);
+    processMesh(B, conB, A, bvhA);
+
+    out.V = welder.V;
+    cleanFaces(out);
+
+    std::cout << out.V.size() << " " << out.F.size() << "\n";
+    std::cout.setf(std::ios::fixed);
+    std::cout.precision(17);
+    for (auto& v : out.V) std::cout << v.x << " " << v.y << " " << v.z << "\n";
+    for (auto& f : out.F) std::cout << f[0] << " " << f[1] << " " << f[2] << "\n";
+    return 0;
+}

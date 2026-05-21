@@ -1,0 +1,581 @@
+from __future__ import annotations
+
+import math
+from typing import Any, Dict, List, Optional, Tuple
+
+
+# Module-level state persists within a scenario, but is reset between scenarios/go-arounds.
+_AP: Dict[str, Any] = {}
+
+
+def _clamp(x: float, lo: float, hi: float) -> float:
+    if x < lo:
+        return lo
+    if x > hi:
+        return hi
+    return x
+
+
+def _is_num(x: Any) -> bool:
+    return isinstance(x, (int, float)) and math.isfinite(float(x))
+
+
+def _wrap_deg(angle: float) -> float:
+    # Wrap to [-180, 180)
+    a = (angle + 180.0) % 360.0 - 180.0
+    return a
+
+
+def _median(vals: List[float]) -> float:
+    s = sorted(vals)
+    n = len(s)
+    if n == 0:
+        return 0.0
+    mid = n // 2
+    if n % 2 == 1:
+        return s[mid]
+    return 0.5 * (s[mid - 1] + s[mid])
+
+
+def _read(state: dict, key: str, default: Any = None) -> Any:
+    v = state.get(key, default)
+    return v
+
+
+def _read_triplex(
+    state: dict,
+    value_template: str,
+    valid_template: Optional[str] = None,
+    *,
+    last_hold_s: float = 0.6,
+    kind: str = "generic",
+) -> Tuple[List[Tuple[int, float, bool]], float]:
+    """
+    Returns ([(idx, value, valid)], quality in [0..1]).
+    If valid flag flickers false, holds last good value for `last_hold_s`.
+    """
+    now = float(_AP.get("t", 0.0))
+    sensors: List[Tuple[int, float, bool]] = []
+
+    per_kind = _AP.setdefault("sensors", {}).setdefault(kind, {})
+    valid_count = 0
+    for i in (1, 2, 3):
+        value_key = value_template.format(i=i)
+        valid_key = valid_template.format(i=i) if valid_template else None
+
+        raw_v = _read(state, value_key, None)
+        raw_valid = True
+        if valid_key is not None:
+            raw_valid = bool(_read(state, valid_key, False))
+
+        if not _is_num(raw_v):
+            raw_valid = False
+
+        info = per_kind.setdefault(
+            i,
+            {
+                "last_v": 0.0,
+                "last_good_t": -1e9,
+                "stuck_t": 0.0,
+                "health": 1.0,
+            },
+        )
+
+        if raw_valid:
+            v = float(raw_v)
+            if abs(v - info["last_v"]) < 1e-4:
+                info["stuck_t"] = float(info["stuck_t"]) + float(_AP.get("dt", 0.0))
+            else:
+                info["stuck_t"] = max(0.0, float(info["stuck_t"]) - 2.0 * float(_AP.get("dt", 0.0)))
+            info["last_v"] = v
+            info["last_good_t"] = now
+            sensors.append((i, v, True))
+            valid_count += 1
+        else:
+            # Hold last good value briefly to ride through flickering-valid ILS.
+            if (now - float(info["last_good_t"])) <= last_hold_s:
+                sensors.append((i, float(info["last_v"]), True))
+                valid_count += 1
+            else:
+                sensors.append((i, float(info["last_v"]), False))
+
+    quality = _clamp(valid_count / 3.0, 0.0, 1.0)
+    return sensors, quality
+
+
+def _fuse_triplex_dots(
+    sensors: List[Tuple[int, float, bool]],
+    *,
+    kind: str,
+    disagree_thr: float = 1.2,
+    stuck_thr_s: float = 2.5,
+) -> Tuple[float, float]:
+    """
+    Fuse triplex "dots" signals; returns (fused_value, confidence [0..1]).
+    - Drops sensors marked as stuck when disagreement is present.
+    - Uses median/trimmed mean for outlier rejection.
+    """
+    per_kind = _AP.setdefault("sensors", {}).setdefault(kind, {})
+    valids = [(i, v) for (i, v, ok) in sensors if ok and _is_num(v)]
+    if not valids:
+        return 0.0, 0.0
+
+    if len(valids) == 1:
+        return float(valids[0][1]), 0.35
+
+    # Identify obvious stuck sensors when there is disagreement.
+    values = [float(v) for (_, v) in valids]
+    spread = max(values) - min(values)
+    candidates = valids
+    if spread > disagree_thr:
+        tmp: List[Tuple[int, float]] = []
+        for i, v in valids:
+            stuck_t = float(per_kind.get(i, {}).get("stuck_t", 0.0))
+            if stuck_t >= stuck_thr_s:
+                continue
+            tmp.append((i, float(v)))
+        if tmp:
+            candidates = tmp
+
+    if len(candidates) == 1:
+        return float(candidates[0][1]), 0.45
+
+    vals = [float(v) for (_, v) in candidates]
+    if len(vals) == 2:
+        fused = 0.5 * (vals[0] + vals[1])
+        conf = 0.6 if abs(vals[0] - vals[1]) < disagree_thr else 0.45
+        return fused, conf
+
+    # 3 sensors: median, then if extreme disagreement, average the two closest.
+    med = _median(vals)
+    diffs = sorted([(abs(v - med), v) for v in vals], key=lambda x: x[0])
+    if spread > 2.0 * disagree_thr:
+        fused = 0.5 * (diffs[0][1] + diffs[1][1])
+        return fused, 0.55
+    return med, 0.75
+
+
+def _fuse_triplex_generic(
+    sensors: List[Tuple[int, float, bool]],
+    *,
+    default: float,
+) -> Tuple[float, float]:
+    valids = [float(v) for (_, v, ok) in sensors if ok and _is_num(v)]
+    if not valids:
+        return default, 0.0
+    if len(valids) == 1:
+        return valids[0], 0.35
+    if len(valids) == 2:
+        return 0.5 * (valids[0] + valids[1]), 0.6
+    return _median(valids), 0.75
+
+
+def autopilot_step(state: dict, dt: float) -> dict:
+    global _AP
+
+    if not _AP:
+        _AP = {
+            "t": 0.0,
+            "dt": 0.02,
+            "mode": "approach",
+            "goaround": False,
+            "trim": 0.0,
+            "speed_int": 0.0,
+            "loc_int": 0.0,
+            "gs_int": 0.0,
+            "ail_bias": 0.0,
+            "last_speed_err": 0.0,
+            "last_loc_err": 0.0,
+            "last_gs_err": 0.0,
+            "last_roll": 0.0,
+            "last_pitch": 0.0,
+            "last_ias": 0.0,
+            "unstable_t": 0.0,
+            "sensors": {},
+        }
+
+    # dt sanity
+    if not _is_num(dt) or dt <= 0:
+        dt = 0.02
+    dt = float(_clamp(float(dt), 0.01, 0.2))
+    _AP["dt"] = dt
+    _AP["t"] = float(_AP.get("t", 0.0)) + dt
+    now = float(_AP["t"])
+
+    # Basic flags
+    on_ground = bool(_read(state, "on_ground", False)) or bool(_read(state, "weight_on_wheels", False))
+    wow = bool(_read(state, "weight_on_wheels", False))
+
+    # Engines
+    eng1_ok = bool(_read(state, "engine_1_running", True)) and not bool(_read(state, "engine_1_fire", False))
+    eng2_ok = bool(_read(state, "engine_2_running", True)) and not bool(_read(state, "engine_2_fire", False))
+    dual_engine_out = (not eng1_ok) and (not eng2_ok)
+
+    # Distances / altitudes
+    dme_vals = []
+    if _is_num(_read(state, "dme_1_nm", None)):
+        dme_vals.append(float(_read(state, "dme_1_nm")))
+    if _is_num(_read(state, "dme_2_nm", None)):
+        dme_vals.append(float(_read(state, "dme_2_nm")))
+    dme_nm = min(dme_vals) if dme_vals else None
+
+    raw_ra = _read(state, "radio_alt_ft", None)
+    ra_ok = _is_num(raw_ra) and (-20.0 <= float(raw_ra) <= 5000.0)
+    ra_ft = float(raw_ra) if ra_ok else None
+
+    # If radar alt is failed/unreliable, approximate from DME on a 3° path:
+    # AGL ≈ 50 ft threshold-crossing height + 318 ft/NM * DME.
+    if ra_ft is None and dme_nm is not None and _is_num(dme_nm):
+        ra_ft = 50.0 + 318.0 * float(max(0.0, float(dme_nm)))
+
+    # Sensors: ILS
+    loc_sensors, loc_q = _read_triplex(
+        state,
+        "localizer_{i}_dots",
+        "localizer_{i}_valid",
+        kind="loc",
+    )
+    gs_sensors, gs_q = _read_triplex(
+        state,
+        "glideslope_{i}_dots",
+        "glideslope_{i}_valid",
+        kind="gs",
+    )
+    loc_dots, loc_conf = _fuse_triplex_dots(loc_sensors, kind="loc")
+    gs_dots, gs_conf = _fuse_triplex_dots(gs_sensors, kind="gs")
+
+    # Sensors: air data / IRS
+    ias_sensors, _ = _read_triplex(state, "ias_{i}_kt", "ias_{i}_valid", kind="ias")
+    ias_kt, ias_conf = _fuse_triplex_generic(ias_sensors, default=float(_read(state, "target_ias_kt", 140.0)))
+
+    pitch_sensors, _ = _read_triplex(state, "irs_{i}_pitch_deg", "irs_{i}_valid", kind="pitch")
+    roll_sensors, _ = _read_triplex(state, "irs_{i}_roll_deg", "irs_{i}_valid", kind="roll")
+    vs_sensors, _ = _read_triplex(state, "irs_{i}_vs_fpm", "irs_{i}_valid", kind="vs")
+    hdg_sensors, _ = _read_triplex(state, "irs_{i}_heading_deg", "irs_{i}_valid", kind="hdg")
+    trk_sensors, _ = _read_triplex(state, "irs_{i}_track_deg", "irs_{i}_valid", kind="trk")
+
+    pitch_deg, _ = _fuse_triplex_generic(pitch_sensors, default=0.0)
+    roll_deg, _ = _fuse_triplex_generic(roll_sensors, default=0.0)
+    vs_fpm, _ = _fuse_triplex_generic(vs_sensors, default=float(_read(state, "target_vs_fpm", -700.0)))
+    hdg_deg, _ = _fuse_triplex_generic(hdg_sensors, default=float(_read(state, "target_hdg_deg", 0.0)))
+    trk_deg, _ = _fuse_triplex_generic(trk_sensors, default=hdg_deg)
+
+    target_loc = float(_read(state, "target_loc_dots", 0.0)) if _is_num(_read(state, "target_loc_dots", 0.0)) else 0.0
+    target_gs = float(_read(state, "target_gs_dots", 0.0)) if _is_num(_read(state, "target_gs_dots", 0.0)) else 0.0
+    target_hdg = float(_read(state, "target_hdg_deg", hdg_deg)) if _is_num(_read(state, "target_hdg_deg", hdg_deg)) else hdg_deg
+
+    vref = float(_read(state, "target_vref_kt", 137.0)) if _is_num(_read(state, "target_vref_kt", 137.0)) else 137.0
+
+    # Mode selection (always prioritize rollout if WOW/ground is detected)
+    if on_ground or wow:
+        mode = "rollout"
+        _AP["goaround"] = False
+    elif _AP.get("goaround", False):
+        mode = "go_around"
+    else:
+        if ra_ft is not None and ra_ft <= 50.0:
+            mode = "flare"
+        else:
+            mode = "approach"
+    _AP["mode"] = mode
+
+    # Derived rates
+    last_roll = float(_AP.get("last_roll", roll_deg))
+    roll_rate = (roll_deg - last_roll) / dt
+    _AP["last_roll"] = roll_deg
+
+    last_pitch = float(_AP.get("last_pitch", pitch_deg))
+    pitch_rate = (pitch_deg - last_pitch) / dt
+    _AP["last_pitch"] = pitch_deg
+
+    last_ias = float(_AP.get("last_ias", ias_kt))
+    ias_rate = (ias_kt - last_ias) / dt
+    _AP["last_ias"] = ias_kt
+
+    # Targets & configuration
+    # Speed target: use provided target_ias_kt but converge to Vref+5 near the ground.
+    base_target_ias = float(_read(state, "target_ias_kt", vref + 5.0)) if _is_num(_read(state, "target_ias_kt", vref + 5.0)) else (vref + 5.0)
+    if ra_ft is None:
+        target_ias = max(vref + 5.0, base_target_ias)
+    else:
+        if ra_ft > 1200.0:
+            target_ias = max(vref + 15.0, base_target_ias)
+        elif ra_ft > 200.0:
+            # Blend down toward Vref+5
+            w = _clamp((ra_ft - 200.0) / 1000.0, 0.0, 1.0)
+            target_ias = w * max(vref + 10.0, base_target_ias) + (1.0 - w) * (vref + 5.0)
+        else:
+            target_ias = vref + 4.0
+
+    # Flaps/gear schedule (kept simple and conservative)
+    def choose_flaps_gear() -> Tuple[float, float]:
+        # In dual engine-out, delay drag until closer.
+        if dual_engine_out:
+            if ra_ft is not None and ra_ft < 600.0:
+                return 30.0, 1.0
+            if dme_nm is not None and dme_nm < 2.5:
+                return 30.0, 1.0
+            return 10.0, 0.0
+
+        if ra_ft is not None:
+            if ra_ft > 2500.0:
+                return 5.0, 0.0
+            if ra_ft > 1800.0:
+                return 10.0, 0.0
+            if ra_ft > 1200.0:
+                return 20.0, 1.0
+            if ra_ft > 400.0:
+                return 30.0, 1.0
+            return 30.0, 1.0
+
+        # Fallback by DME
+        if dme_nm is not None:
+            if dme_nm > 10.0:
+                return 5.0, 0.0
+            if dme_nm > 6.0:
+                return 10.0, 0.0
+            if dme_nm > 4.0:
+                return 20.0, 1.0
+            return 30.0, 1.0
+
+        return 20.0, 1.0
+
+    flaps_deg, gear = choose_flaps_gear()
+
+    # Unstable approach detection (for go-around decision)
+    loc_err = (loc_dots - target_loc)
+    gs_err = (gs_dots - target_gs)
+    loc_rate = (loc_err - float(_AP.get("last_loc_err", loc_err))) / dt
+    gs_rate = (gs_err - float(_AP.get("last_gs_err", gs_err))) / dt
+    _AP["last_loc_err"] = loc_err
+    _AP["last_gs_err"] = gs_err
+
+    # Vertical target on glide: use provided target_vs_fpm if present, otherwise GS*5 rule of thumb.
+    gs_kt = float(_read(state, "groundspeed_kt", ias_kt)) if _is_num(_read(state, "groundspeed_kt", ias_kt)) else ias_kt
+    tgt_vs = float(_read(state, "target_vs_fpm", -(gs_kt * 5.0))) if _is_num(_read(state, "target_vs_fpm", -(gs_kt * 5.0))) else (-(gs_kt * 5.0))
+    # Correct glide deviation by nudging target VS
+    tgt_vs = float(tgt_vs - 220.0 * gs_err)
+    # Limit unreasonable sink rates
+    tgt_vs = _clamp(tgt_vs, -1800.0, -100.0)
+
+    # Go-around logic
+    if not on_ground and not wow and not _AP.get("goaround", False):
+        # Determine AGL gate for stabilized criteria
+        agl = ra_ft if ra_ft is not None else 2000.0
+
+        # Criteria (tuned to prefer safety over saving the 0.1 penalty)
+        too_off = (abs(loc_err) > (2.6 if agl > 800.0 else 1.7 if agl > 400.0 else 1.2)) or (
+            abs(gs_err) > (2.6 if agl > 800.0 else 1.7 if agl > 400.0 else 1.2)
+        )
+        too_fast = ias_kt > (vref + (30.0 if agl > 800.0 else 22.0 if agl > 400.0 else 18.0))
+        too_slow = ias_kt < (vref - (8.0 if agl > 800.0 else 6.0))
+        too_sink = vs_fpm < (-2000.0 if agl > 800.0 else -1500.0 if agl > 400.0 else -1200.0)
+
+        ils_unreliable = (loc_conf < 0.35 and agl < 1200.0) or (gs_conf < 0.35 and agl < 1200.0)
+
+        unstable = (too_off or too_fast or too_slow or too_sink or ils_unreliable)
+        # Require persistence to avoid oscillatory go-arounds on momentary bumps.
+        if unstable:
+            _AP["unstable_t"] = float(_AP.get("unstable_t", 0.0)) + dt
+        else:
+            _AP["unstable_t"] = max(0.0, float(_AP.get("unstable_t", 0.0)) - 2.0 * dt)
+
+        # Do not attempt go-around with no thrust.
+        if (not dual_engine_out) and float(_AP["unstable_t"]) > (1.2 if agl > 600.0 else 0.6):
+            _AP["goaround"] = True
+            _AP["unstable_t"] = 0.0
+
+    # Control laws
+    # ---------------- Lateral ----------------
+    bank_limit = 25.0
+    if ra_ft is not None:
+        if ra_ft < 200.0:
+            bank_limit = 10.0
+        if ra_ft < 80.0:
+            bank_limit = 6.0
+    # Track damping toward runway heading
+    track_err = _wrap_deg(trk_deg - target_hdg)
+
+    # Engine-out bias (bank a touch into good engine to reduce rudder demand)
+    eng_bank_bias = 0.0
+    if eng1_ok != eng2_ok and (ra_ft is None or ra_ft > 60.0):
+        eng_bank_bias = 3.0 if eng2_ok else -3.0
+
+    desired_bank = _clamp((-12.0 * loc_err) + (-4.0 * loc_rate) + (-0.04 * track_err) + eng_bank_bias, -bank_limit, bank_limit)
+    roll_err = desired_bank - roll_deg
+
+    # Aileron to track desired bank
+    aileron = 0.08 * roll_err - 0.015 * roll_rate + float(_AP.get("ail_bias", 0.0))
+    aileron = _clamp(aileron, -1.0, 1.0)
+
+    # Slowly adapt aileron bias to fight stuck aileron / asymmetric flaps
+    if mode in ("approach", "flare") and (ra_ft is None or ra_ft > 80.0):
+        _AP["ail_bias"] = _clamp(float(_AP.get("ail_bias", 0.0)) + 0.0025 * roll_err * dt, -0.25, 0.25)
+
+    # Rudder: mostly used for engine-out and rollout centerline tracking
+    rudder = 0.0
+    if mode == "rollout":
+        hdg_err = _wrap_deg(hdg_deg - target_hdg)
+        rudder = _clamp(-0.03 * hdg_err - 0.20 * loc_err - 0.01 * (roll_deg), -1.0, 1.0)
+    else:
+        if eng1_ok != eng2_ok:
+            # Rudder toward the good engine
+            rudder = 0.45 if eng2_ok else -0.45
+        # Tiny damping to reduce rapid yaw oscillations if present (use heading-track difference proxy)
+        crab = _wrap_deg(hdg_deg - trk_deg)
+        rudder = _clamp(rudder - 0.01 * crab, -1.0, 1.0)
+
+    # ---------------- Longitudinal ----------------
+    elevator_trim = float(_AP.get("trim", 0.0))
+
+    # Speedbrake in flight: use for energy management; in dual-engine-out, also for glidepath.
+    speedbrake = 0.0
+    if mode == "approach":
+        if dual_engine_out:
+            # Use speedbrake to adjust glidepath without trading speed.
+            # Above glidepath -> add drag to steepen; below -> retract.
+            speedbrake = _clamp(0.25 + 0.18 * gs_err, 0.0, 1.0)
+        else:
+            # If fast, add a little speedbrake (not close to ground).
+            if (ias_kt - target_ias) > 12.0 and (ra_ft is None or ra_ft > 500.0):
+                speedbrake = _clamp((ias_kt - target_ias - 10.0) / 25.0, 0.0, 0.7)
+
+    if mode in ("flare", "go_around"):
+        speedbrake = 0.0
+
+    # Elevator command
+    elevator = 0.0
+    if mode == "go_around":
+        # Go-around: TOGA, pitch to ~12 deg.
+        target_pitch = 12.0
+        pitch_err = target_pitch - pitch_deg
+        elevator = _clamp(0.06 * pitch_err - 0.02 * pitch_rate, -1.0, 1.0)
+        # Trim toward commanded elevator to avoid saturating
+        _AP["trim"] = _clamp(elevator_trim + 0.15 * elevator * dt, -1.0, 1.0)
+    elif mode == "flare":
+        # Flare: progressively reduce descent rate. Use RA or DME-estimated AGL.
+        agl = ra_ft if ra_ft is not None else 30.0
+        # Target VS ramps from glide (-700..-900) to -80 fpm near touchdown.
+        flare_w = _clamp((agl - 5.0) / 45.0, 0.0, 1.0)  # 1 at ~50ft, 0 near 5ft
+        flare_tgt_vs = flare_w * tgt_vs + (1.0 - flare_w) * (-80.0)
+        vs_err = vs_fpm - flare_tgt_vs
+        elevator = _clamp((-0.0022 * vs_err) + (-0.11 * gs_err) + (-0.02 * gs_rate), -1.0, 1.0)
+        # Gentle pitch-up bias to avoid hard touchdowns
+        elevator = _clamp(elevator + 0.02 * (2.5 - pitch_deg), -1.0, 1.0)
+        _AP["trim"] = _clamp(elevator_trim + 0.08 * elevator * dt, -1.0, 1.0)
+    elif mode == "rollout":
+        elevator = _clamp(-0.04 * pitch_deg - 0.03 * pitch_rate, -0.5, 0.5)
+        _AP["trim"] = _clamp(elevator_trim + 0.05 * elevator * dt, -1.0, 1.0)
+    else:
+        # Approach
+        if dual_engine_out:
+            # Pitch for speed when no thrust; glidepath handled mainly by speedbrake.
+            spd_err = ias_kt - target_ias
+            elevator = _clamp(0.02 * spd_err - 0.01 * pitch_rate - 0.03 * (pitch_deg - 2.5), -1.0, 1.0)
+        else:
+            vs_err = vs_fpm - tgt_vs
+            elevator = _clamp((-0.0020 * vs_err) + (-0.14 * gs_err) + (-0.03 * gs_rate), -1.0, 1.0)
+        _AP["trim"] = _clamp(elevator_trim + 0.06 * elevator * dt, -1.0, 1.0)
+
+    elevator_trim = float(_AP.get("trim", 0.0))
+
+    # ---------------- Throttle ----------------
+    throttle_cmd = 0.0
+    if dual_engine_out:
+        throttle_cmd = 0.0
+    else:
+        if mode == "go_around":
+            throttle_cmd = 1.0
+        elif mode == "rollout":
+            throttle_cmd = 0.0
+        elif mode == "flare":
+            # Idle-ish, but add power if sink rate becomes excessive.
+            throttle_cmd = 0.02
+            if vs_fpm < -900.0 and (ra_ft is None or ra_ft < 30.0):
+                throttle_cmd = _clamp(0.15 + (-(vs_fpm + 900.0)) / 2500.0, 0.02, 0.65)
+        else:
+            spd_err = target_ias - ias_kt
+            _AP["speed_int"] = _clamp(float(_AP.get("speed_int", 0.0)) + spd_err * dt, -120.0, 120.0)
+            spd_der = (spd_err - float(_AP.get("last_speed_err", 0.0))) / dt
+            _AP["last_speed_err"] = spd_err
+
+            # Simple PID
+            throttle_cmd = 0.35 + 0.012 * spd_err + 0.0006 * float(_AP["speed_int"]) + 0.004 * spd_der
+            throttle_cmd = _clamp(throttle_cmd, 0.0, 1.0)
+
+            # Windshear/energy protection: if speed is rapidly bleeding near ground, add power immediately.
+            if (ra_ft is not None and ra_ft < 800.0) and (ias_rate < -6.0 or (ias_kt < vref - 5.0)):
+                throttle_cmd = max(throttle_cmd, 0.85)
+
+    # Split throttle across engines with failures
+    throttle_1 = throttle_cmd if eng1_ok else 0.0
+    throttle_2 = throttle_cmd if eng2_ok else 0.0
+    if eng1_ok != eng2_ok and mode not in ("rollout",):
+        # Allow more on the good engine for speed control
+        if eng1_ok:
+            throttle_1 = throttle_cmd
+            throttle_2 = 0.0
+        else:
+            throttle_2 = throttle_cmd
+            throttle_1 = 0.0
+
+    # Touchdown / braking
+    spoiler = 0.0
+    autobrake = 0.0
+    reverse_1 = 0.0
+    reverse_2 = 0.0
+    if mode == "rollout":
+        spoiler = 1.0
+        autobrake = 1.0
+        speedbrake = 1.0
+        # Deploy reverse on any running engines, then ease out below ~60kt.
+        gs = float(_read(state, "groundspeed_kt", 0.0)) if _is_num(_read(state, "groundspeed_kt", 0.0)) else 0.0
+        rev = 1.0 if gs > 60.0 else _clamp((gs - 20.0) / 40.0, 0.0, 1.0)
+        reverse_1 = rev if eng1_ok else 0.0
+        reverse_2 = rev if eng2_ok else 0.0
+        # Hold throttles at idle
+        throttle_1 = 0.0
+        throttle_2 = 0.0
+
+    # Complete go-around when climbing through 1500 ft AGL, then hold (sim will reset).
+    if mode == "go_around":
+        agl = ra_ft if ra_ft is not None else (50.0 + 318.0 * float(dme_nm) if dme_nm is not None else 2000.0)
+        if agl >= 1500.0:
+            # Stop commanding extreme pitch; maintain wings level and modest climb.
+            target_pitch = 8.0
+            pitch_err = target_pitch - pitch_deg
+            elevator = _clamp(0.05 * pitch_err - 0.02 * pitch_rate, -1.0, 1.0)
+            aileron = _clamp(-0.07 * roll_deg - 0.02 * roll_rate, -1.0, 1.0)
+            rudder = _clamp(-0.01 * _wrap_deg(hdg_deg - target_hdg), -1.0, 1.0)
+
+        # Basic clean-up for climb performance.
+        speedbrake = 0.0
+        reverse_1 = 0.0
+        reverse_2 = 0.0
+        autobrake = 0.0
+        spoiler = 0.0
+        # Reduce from landing flaps toward a go-around setting.
+        if flaps_deg > 20.0:
+            flaps_deg = 20.0
+        # Keep gear down until a positive climb is clearly established.
+        if vs_fpm > 200.0 and (ra_ft is None or ra_ft > 80.0):
+            gear = 0.0
+        else:
+            gear = 1.0
+
+    # Output commands
+    return {
+        "elevator": float(_clamp(elevator, -1.0, 1.0)),
+        "aileron": float(_clamp(aileron, -1.0, 1.0)),
+        "rudder": float(_clamp(rudder, -1.0, 1.0)),
+        "throttle_1": float(_clamp(throttle_1, 0.0, 1.0)),
+        "throttle_2": float(_clamp(throttle_2, 0.0, 1.0)),
+        "elevator_trim": float(_clamp(elevator_trim, -1.0, 1.0)),
+        "flaps": float(_clamp(flaps_deg, 0.0, 40.0)),
+        "gear": float(1.0 if gear >= 0.5 else 0.0),
+        "speedbrake": float(_clamp(speedbrake, 0.0, 1.0)),
+        "spoiler": float(1.0 if spoiler >= 0.5 else 0.0),
+        "autobrake": float(_clamp(autobrake, 0.0, 1.0)),
+        "reverse_1": float(_clamp(reverse_1, 0.0, 1.0)),
+        "reverse_2": float(_clamp(reverse_2, 0.0, 1.0)),
+    }

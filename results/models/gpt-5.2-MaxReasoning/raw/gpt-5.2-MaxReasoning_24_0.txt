@@ -1,0 +1,411 @@
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <mutex>
+#include <string>
+#include <thread>
+
+namespace {
+
+constexpr double kPi = 3.141592653589793238462643383279502884;
+constexpr double kTwoPi = 2.0 * kPi;
+
+double wrapPi(double a) {
+  if (!std::isfinite(a)) return 0.0;
+  a = std::fmod(a + kPi, kTwoPi);
+  if (a < 0.0) a += kTwoPi;
+  return a - kPi;
+}
+
+template <class T>
+T clamp(T v, T lo, T hi) {
+  return std::min(hi, std::max(lo, v));
+}
+
+struct Vec2 {
+  double x = 0.0;
+  double y = 0.0;
+};
+
+struct Vec3 {
+  double x = 0.0;
+  double y = 0.0;
+  double z = 0.0;
+
+  Vec3() = default;
+  Vec3(double x_, double y_, double z_) : x(x_), y(y_), z(z_) {}
+
+  Vec3 operator+(const Vec3& o) const { return {x + o.x, y + o.y, z + o.z}; }
+  Vec3 operator-(const Vec3& o) const { return {x - o.x, y - o.y, z - o.z}; }
+  Vec3 operator*(double s) const { return {x * s, y * s, z * s}; }
+  Vec3 operator/(double s) const { return {x / s, y / s, z / s}; }
+};
+
+Vec3 operator*(double s, const Vec3& v) { return v * s; }
+
+double dot(const Vec3& a, const Vec3& b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+double norm(const Vec3& v) { return std::sqrt(dot(v, v)); }
+
+double norm2(const Vec2& v) { return std::sqrt(v.x * v.x + v.y * v.y); }
+
+struct Params {
+  std::int64_t width = 0;
+  std::int64_t depth = 0;
+  std::int64_t height = 0;
+  double gravity = 1.62;
+  double max_thrust = 10.0;
+  double target_x = 0.0;
+  double target_y = 0.0;
+  double target_z = 0.0;
+  double landing_radius = 5.0;
+};
+
+struct State {
+  double x = 0.0, y = 0.0, z = 0.0;
+  double vx = 0.0, vy = 0.0, vz = 0.0;
+  double pitch = 0.0, yaw = 0.0, roll = 0.0;
+  double pitch_rate = 0.0, yaw_rate = 0.0, roll_rate = 0.0;
+  double fuel_remaining = 0.0;
+};
+
+struct SharedState {
+  State s{};
+  bool valid = false;
+  std::chrono::steady_clock::time_point last_update{};
+};
+
+struct TerrainCell {
+  std::uint16_t a = 0;
+  std::uint16_t b = 0;
+  std::uint16_t c = 0;
+};
+
+bool readTerrainCell(std::ifstream& f, const Params& p, int cx, int cy, TerrainCell& out) {
+  if (cx < 0 || cy < 0 || cx >= static_cast<int>(p.width) || cy >= static_cast<int>(p.depth)) return false;
+  const std::uint64_t idx = static_cast<std::uint64_t>(cx) * static_cast<std::uint64_t>(p.depth) +
+                            static_cast<std::uint64_t>(cy);
+  const std::uint64_t offset = idx * 6ULL;
+  f.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+  if (!f) return false;
+  unsigned char buf[6];
+  f.read(reinterpret_cast<char*>(buf), 6);
+  if (!f) return false;
+  auto u16le = [](const unsigned char* b) -> std::uint16_t {
+    return static_cast<std::uint16_t>(static_cast<std::uint16_t>(b[0]) |
+                                      (static_cast<std::uint16_t>(b[1]) << 8));
+  };
+  out.a = u16le(buf + 0);
+  out.b = u16le(buf + 2);
+  out.c = u16le(buf + 4);
+  return true;
+}
+
+int cellFromCoord(double v, std::int64_t maxv) {
+  if (!std::isfinite(v)) return 0;
+  long long i = static_cast<long long>(std::floor(v));
+  if (i < 0) i = 0;
+  if (i > maxv - 1) i = maxv - 1;
+  return static_cast<int>(i);
+}
+
+double smoothstep01(double x) {
+  x = clamp(x, 0.0, 1.0);
+  return x * x * (3.0 - 2.0 * x);
+}
+
+struct Command {
+  double thrust = 0.0;
+  double pitch_cmd = 0.0;
+  double yaw_cmd = 0.0;
+  double roll_cmd = 0.0;
+};
+
+Command computeCommand(const Params& p, const State& s, double terrain_ceiling_z, Command prev) {
+  const Vec3 pos{s.x, s.y, s.z};
+  const Vec3 vel{s.vx, s.vy, s.vz};
+  const Vec2 err_xy{p.target_x - pos.x, p.target_y - pos.y};
+  const double dist_xy = norm2(err_xy);
+  const double alt = pos.z - p.target_z;
+
+  const double a_up_max = std::max(0.05, p.max_thrust - p.gravity);
+
+  // Desired altitude profile: high when far, descending smoothly near the pad.
+  const double base_clear = 20.0;
+  const double extra_clear = 0.05 * dist_xy;
+  double z_des = p.target_z + base_clear + extra_clear;
+
+  const double descend_band = std::max(20.0, 2.0 * p.landing_radius);
+  if (dist_xy < descend_band) {
+    const double t = smoothstep01(dist_xy / descend_band); // 0 near pad, 1 at band edge
+    z_des = p.target_z + (base_clear * t);
+  }
+
+  if (terrain_ceiling_z >= 0.0) {
+    z_des = std::max(z_des, terrain_ceiling_z + 8.0);
+  }
+  z_des = clamp(z_des, p.target_z, static_cast<double>(p.height) - 2.0);
+
+  // Horizontal velocity target: fast when far, slow when low.
+  const double alt_factor = clamp(alt / 50.0, 0.2, 1.0);
+  const double a_brake = std::max(0.05, 0.6 * a_up_max);
+  double speed_des = std::sqrt(std::max(0.0, 2.0 * a_brake * dist_xy));
+  const double speed_cap = 600.0;
+  speed_des = std::min(speed_des, speed_cap);
+  speed_des *= alt_factor;
+
+  Vec2 dir_xy{0.0, 0.0};
+  if (dist_xy > 1e-6) {
+    dir_xy.x = err_xy.x / dist_xy;
+    dir_xy.y = err_xy.y / dist_xy;
+  }
+  const Vec2 v_xy_des{dir_xy.x * speed_des, dir_xy.y * speed_des};
+
+  const double tau_v_xy = clamp(0.8 + dist_xy / 250.0, 0.8, 6.0);
+  const Vec2 a_xy{(v_xy_des.x - vel.x) / tau_v_xy, (v_xy_des.y - vel.y) / tau_v_xy};
+
+  // Vertical velocity target from altitude error.
+  const double tau_z_pos = 2.0;
+  double vz_des = (z_des - pos.z) / tau_z_pos;
+  const double vz_down_limit = (dist_xy < descend_band) ? (3.5 + 0.15 * std::max(0.0, alt)) : (10.0 + 0.3 * std::max(0.0, alt));
+  vz_des = clamp(vz_des, -clamp(vz_down_limit, 2.0, 60.0), 25.0);
+  const double tau_vz = 0.8;
+  double a_z = (vz_des - vel.z) / tau_vz;
+  a_z = std::max(a_z, -p.gravity + 0.01); // don't ask for "more than freefall" downward accel
+
+  Vec3 a_cmd{a_xy.x, a_xy.y, a_z};
+
+  // Tilt limits: aggressive when high, conservative near landing.
+  double max_tilt = 45.0 * (kPi / 180.0);
+  if (alt < 60.0) max_tilt = 25.0 * (kPi / 180.0);
+  if (alt < 25.0) max_tilt = 12.0 * (kPi / 180.0);
+
+  // Convert desired net acceleration to required thrust vector.
+  Vec3 u = a_cmd + Vec3{0.0, 0.0, p.gravity};
+  u.z = std::max(u.z, 0.0);
+
+  // Enforce tilt constraint: |u_xy| <= u_z * tan(max_tilt)
+  const double u_xy = std::sqrt(u.x * u.x + u.y * u.y);
+  const double u_xy_max = u.z * std::tan(max_tilt);
+  if (u_xy > 1e-12 && u_xy > u_xy_max) {
+    const double sxy = u_xy_max / u_xy;
+    u.x *= sxy;
+    u.y *= sxy;
+  }
+
+  // Enforce max thrust magnitude.
+  double u_mag = norm(u);
+  if (u_mag > p.max_thrust && u_mag > 1e-12) {
+    u = (p.max_thrust / u_mag) * u;
+    u_mag = p.max_thrust;
+  }
+
+  // Emergency vertical braking if we're low and can't stop in time.
+  if (alt > 0.0 && vel.z < -0.5) {
+    const double stop_dist = (vel.z * vel.z) / (2.0 * a_up_max);
+    if (stop_dist > std::max(0.0, alt - 2.0)) {
+      u = Vec3{0.0, 0.0, p.max_thrust};
+      u_mag = p.max_thrust;
+    }
+  }
+
+  Command cmd{};
+
+  if (s.fuel_remaining <= 1e-6 || p.max_thrust <= 1e-9) {
+    cmd.thrust = 0.0;
+    cmd.pitch_cmd = 0.0;
+    cmd.yaw_cmd = 0.0;
+    cmd.roll_cmd = clamp(-0.8 * wrapPi(s.roll) - 0.3 * s.roll_rate, -1.0, 1.0);
+    return cmd;
+  }
+
+  cmd.thrust = clamp(u_mag / p.max_thrust, 0.0, 1.0);
+
+  // Low-pass thrust slightly to avoid chatter.
+  const double alpha_thrust = 0.35;
+  cmd.thrust = clamp(alpha_thrust * cmd.thrust + (1.0 - alpha_thrust) * prev.thrust, 0.0, 1.0);
+
+  double yaw_des = s.yaw;
+  double pitch_des = 0.0;
+  if (u_mag > 1e-9) {
+    const Vec3 d = u / u_mag;
+    yaw_des = std::atan2(d.y, d.x);
+    const double horiz = std::sqrt(d.x * d.x + d.y * d.y);
+    pitch_des = -std::atan2(horiz, clamp(d.z, 1e-9, 1.0));
+    pitch_des = clamp(pitch_des, -kPi / 2.0, kPi / 2.0);
+  }
+
+  const double yaw_err = wrapPi(yaw_des - s.yaw);
+  const double pitch_err = clamp(pitch_des - s.pitch, -kPi, kPi);
+
+  // PD attitude control -> angular-acceleration commands in [-1,1]
+  const double kp = 1.8;
+  const double kd = 0.65;
+  cmd.yaw_cmd = clamp(kp * yaw_err - kd * s.yaw_rate, -1.0, 1.0);
+  cmd.pitch_cmd = clamp(kp * pitch_err - kd * s.pitch_rate, -1.0, 1.0);
+
+  // Roll is cosmetic; just damp it out.
+  const double roll_err = wrapPi(0.0 - s.roll);
+  cmd.roll_cmd = clamp(1.0 * roll_err - 0.35 * s.roll_rate, -1.0, 1.0);
+
+  // Final clamps + NaN safety.
+  auto nz = [](double v) { return std::isfinite(v) ? v : 0.0; };
+  cmd.thrust = clamp(nz(cmd.thrust), 0.0, 1.0);
+  cmd.pitch_cmd = clamp(nz(cmd.pitch_cmd), -1.0, 1.0);
+  cmd.yaw_cmd = clamp(nz(cmd.yaw_cmd), -1.0, 1.0);
+  cmd.roll_cmd = clamp(nz(cmd.roll_cmd), -1.0, 1.0);
+  return cmd;
+}
+
+} // namespace
+
+int main() {
+  std::ios::sync_with_stdio(false);
+  std::cin.tie(nullptr);
+
+  double width_d = 0.0, depth_d = 0.0, height_d = 0.0;
+  Params p{};
+  double fuel_init = 0.0;
+  if (!(std::cin >> width_d >> depth_d >> height_d >> p.gravity >> p.max_thrust >> fuel_init)) {
+    return 0;
+  }
+  p.width = static_cast<std::int64_t>(std::llround(width_d));
+  p.depth = static_cast<std::int64_t>(std::llround(depth_d));
+  p.height = static_cast<std::int64_t>(std::llround(height_d));
+
+  double start_x = 0.0, start_y = 0.0, start_z = 0.0;
+  if (!(std::cin >> start_x >> start_y >> start_z >> p.target_x >> p.target_y >> p.target_z)) {
+    return 0;
+  }
+
+  std::string line;
+  std::getline(std::cin, line); // consume endline
+  std::string terrain_path;
+  std::getline(std::cin, terrain_path);
+  if (!terrain_path.empty() && terrain_path.front() == '"' && terrain_path.back() == '"' && terrain_path.size() >= 2) {
+    terrain_path = terrain_path.substr(1, terrain_path.size() - 2);
+  }
+
+  std::string token;
+  std::cin >> token; // expected "STATE"
+
+  p.landing_radius = std::max(5.0, std::min<double>(static_cast<double>(p.width), static_cast<double>(p.depth)) * 0.02);
+
+  std::atomic<bool> done{false};
+  std::atomic<double> terrain_ceiling_z{-1.0};
+
+  // Terrain sampling worker (coarse safety ceiling along start->target).
+  std::thread terrain_worker([&]() {
+    std::ifstream f(terrain_path, std::ios::binary);
+    if (!f) return;
+
+    const double dx = p.target_x - start_x;
+    const double dy = p.target_y - start_y;
+    const double dist = std::hypot(dx, dy);
+    const int samples = clamp(static_cast<int>(dist / 50.0), 32, 256);
+
+    double max_top = -1.0;
+    TerrainCell cell{};
+    for (int i = 0; i <= samples; i++) {
+      const double t = (samples == 0) ? 1.0 : (static_cast<double>(i) / static_cast<double>(samples));
+      const double sx = start_x + dx * t;
+      const double sy = start_y + dy * t;
+      const int cx = cellFromCoord(sx, p.width);
+      const int cy = cellFromCoord(sy, p.depth);
+      if (readTerrainCell(f, p, cx, cy, cell)) {
+        const double top = static_cast<double>(std::max(cell.a, cell.c));
+        if (top > max_top) {
+          max_top = top;
+          terrain_ceiling_z.store(max_top, std::memory_order_relaxed);
+        }
+      }
+    }
+
+    // Also sample a small neighborhood around the target.
+    const int tx = cellFromCoord(p.target_x, p.width);
+    const int ty = cellFromCoord(p.target_y, p.depth);
+    for (int ox = -3; ox <= 3; ox++) {
+      for (int oy = -3; oy <= 3; oy++) {
+        if (readTerrainCell(f, p, tx + ox, ty + oy, cell)) {
+          const double top = static_cast<double>(std::max(cell.a, cell.c));
+          max_top = std::max(max_top, top);
+          terrain_ceiling_z.store(max_top, std::memory_order_relaxed);
+        }
+      }
+    }
+  });
+
+  SharedState shared{};
+  std::mutex shared_mu;
+
+  // Reader thread: consume streamed state updates.
+  std::thread reader([&]() {
+    State s{};
+    while (std::cin >> s.x >> s.y >> s.z >> s.vx >> s.vy >> s.vz >> s.pitch >> s.yaw >> s.roll >> s.pitch_rate >>
+                  s.yaw_rate >> s.roll_rate >> s.fuel_remaining) {
+      const auto now = std::chrono::steady_clock::now();
+      {
+        std::lock_guard<std::mutex> lock(shared_mu);
+        shared.s = s;
+        shared.valid = true;
+        shared.last_update = now;
+      }
+    }
+    done.store(true, std::memory_order_relaxed);
+  });
+
+  std::cout.setf(std::ios::fixed);
+  std::cout << std::setprecision(6);
+
+  Command prev{};
+
+  using clock = std::chrono::steady_clock;
+  const auto period = std::chrono::milliseconds(50); // 20Hz
+  auto next = clock::now();
+
+  while (!done.load(std::memory_order_relaxed)) {
+    next += period;
+
+    State s{};
+    bool ok = false;
+    clock::time_point last{};
+    {
+      std::lock_guard<std::mutex> lock(shared_mu);
+      ok = shared.valid;
+      if (ok) {
+        s = shared.s;
+        last = shared.last_update;
+      }
+    }
+
+    if (!ok) {
+      std::cout << "0 0 0 0\n" << std::flush;
+      std::this_thread::sleep_until(next);
+      continue;
+    }
+
+    // If input stalls for a while, keep outputting something safe.
+    const auto now = clock::now();
+    if (now - last > std::chrono::seconds(2)) {
+      std::cout << "0 0 0 0\n" << std::flush;
+      std::this_thread::sleep_until(next);
+      continue;
+    }
+
+    const double ceiling = terrain_ceiling_z.load(std::memory_order_relaxed);
+    const Command cmd = computeCommand(p, s, ceiling, prev);
+    prev = cmd;
+
+    std::cout << cmd.thrust << ' ' << cmd.pitch_cmd << ' ' << cmd.yaw_cmd << ' ' << cmd.roll_cmd << "\n" << std::flush;
+    std::this_thread::sleep_until(next);
+  }
+
+  if (reader.joinable()) reader.join();
+  if (terrain_worker.joinable()) terrain_worker.join();
+
+  return 0;
+}

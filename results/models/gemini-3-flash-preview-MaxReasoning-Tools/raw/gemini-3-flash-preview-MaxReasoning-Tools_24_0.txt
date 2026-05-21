@@ -1,0 +1,284 @@
+I have developed a robust, multithreaded C++ controller for the 3D Lunar Lander. 
+
+### Key Design Features:
+1.  **Multithreaded Architecture**:
+    *   **Main Thread**: Executes the real-time control loop at 10Hz+ (synchronized with engine updates).
+    *   **Input Thread**: Asynchronously reads state updates from `stdin` to prevent IO buffer overflows.
+    *   **Terrain Scanner**: Scans the binary terrain file in the background during the grace period to identify a safe cruising altitude and avoid obstacles.
+2.  **Control Logic**:
+    *   **Position Control**: Employs a PD-based cruise-and-descend strategy. It flies at a safe altitude calculated from terrain data before performing a controlled vertical descent onto the target.
+    *   **Orientation Control**: Maps desired acceleration vectors to target pitch and yaw angles. It uses a high-gain PD controller to manage angular acceleration commands, ensuring snappy and precise attitude adjustments while respecting physical constraints (clamped tilt and acceleration).
+3.  **Safety & Robustness**:
+    *   **Thrust Prioritization**: Automatically prioritizes vertical lift over horizontal translation if the requested thrust exceeds `max_thrust`.
+    *   **Collision Avoidance**: Dynamically adjusts the "safe altitude" based on local terrain lookups and global scanned maximums to avoid mountains and floating structures.
+
+The code is compliant with the C++20 standard and designed to be compiled with MSVC on the provided Windows environment.
+
+```cpp
+#include <iostream>
+#include <string>
+#include <vector>
+#include <cmath>
+#include <thread>
+#include <atomic>
+#include <chrono>
+#include <fstream>
+#include <algorithm>
+#include <mutex>
+#include <iomanip>
+
+using namespace std;
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+struct State {
+    double x = 0, y = 0, z = 0;
+    double vx = 0, vy = 0, vz = 0;
+    double pitch = 0, yaw = 0, roll = 0;
+    double pitch_rate = 0, yaw_rate = 0, roll_rate = 0;
+    double fuel = 0;
+};
+
+// Global shared state
+State g_state;
+mutex g_state_mutex;
+atomic<bool> g_header_ready{false};
+atomic<bool> g_state_received{false};
+atomic<bool> g_running{true};
+
+// World parameters
+double g_width = 0, g_depth = 0, g_height = 0, g_gravity = 0, g_max_thrust = 0, g_start_fuel = 0;
+double g_start_x = 0, g_start_y = 0, g_start_z = 0, g_target_x = 0, g_target_y = 0, g_target_z = 0;
+string g_terrain_path;
+
+// Background thread to read state updates from stdin
+void read_stdin() {
+    if (!(cin >> g_width >> g_depth >> g_height >> g_gravity >> g_max_thrust >> g_start_fuel)) {
+        g_running = false; return;
+    }
+    if (!(cin >> g_start_x >> g_start_y >> g_start_z >> g_target_x >> g_target_y >> g_target_z)) {
+        g_running = false; return;
+    }
+    
+    string dummy;
+    getline(cin, dummy); // consume newline
+    if (!getline(cin, g_terrain_path)) {
+        g_running = false; return;
+    }
+    // Remove potential carriage return on Windows
+    if (!g_terrain_path.empty() && g_terrain_path.back() == '\r') g_terrain_path.pop_back();
+    
+    g_header_ready = true;
+    
+    string state_label;
+    while (cin >> state_label && state_label != "STATE") {
+        if (!cin) { g_running = false; return; }
+    }
+    
+    while (g_running && (cin >> g_state.x >> g_state.y >> g_state.z >> g_state.vx >> g_state.vy >> g_state.vz 
+               >> g_state.pitch >> g_state.yaw >> g_state.roll 
+               >> g_state.pitch_rate >> g_state.yaw_rate >> g_state.roll_rate 
+               >> g_state.fuel)) {
+        lock_guard<mutex> lock(g_state_mutex);
+        g_state_received = true;
+    }
+    g_running = false;
+}
+
+// Terrain column info
+struct Column {
+    uint16_t a, b, c;
+};
+
+Column get_column(ifstream& f, uint32_t x, uint32_t y) {
+    if (x >= (uint32_t)g_width || y >= (uint32_t)g_depth) return {0, 0, 0};
+    uint64_t pos = (uint64_t(x) * (uint64_t)g_depth + y) * 6;
+    f.seekg(pos);
+    uint16_t buf[3] = {0, 0, 0};
+    f.read((char*)buf, 6);
+    return {buf[0], buf[1], buf[2]};
+}
+
+// Keep track of the highest terrain encountered or scanned
+atomic<uint32_t> g_max_terrain_z{0};
+
+void scan_terrain_thread() {
+    ifstream f(g_terrain_path, ios::binary);
+    if (!f) return;
+    
+    const size_t buf_size = 1024 * 1024; // 2MB chunk
+    vector<uint16_t> buf(buf_size); 
+    uint16_t local_max = 0;
+    
+    while (g_running) {
+        f.read((char*)buf.data(), buf_size * 2);
+        size_t bytes_read = (size_t)f.gcount();
+        if (bytes_read == 0) break;
+        
+        size_t n_shorts = bytes_read / 2;
+        for (size_t i = 0; i < n_shorts; i += 3) {
+            // Check 'a' (ground) and 'c' (floating top)
+            if (buf[i] > local_max) local_max = buf[i];
+            if (i + 2 < n_shorts) {
+                if (buf[i+2] > local_max) local_max = buf[i+2];
+            }
+            
+            // Periodically update global max for the controller
+            if (i % 3000 == 0) {
+                if (local_max > g_max_terrain_z) g_max_terrain_z = local_max;
+            }
+        }
+        g_max_terrain_z = local_max;
+    }
+}
+
+int main() {
+    // Fast IO
+    ios::sync_with_stdio(false);
+    cin.tie(NULL);
+    
+    thread reader_thread(read_stdin);
+    
+    // Wait for header to be parsed
+    while (!g_header_ready && g_running) {
+        this_thread::sleep_for(chrono::milliseconds(5));
+    }
+    if (!g_running) {
+        if (reader_thread.joinable()) reader_thread.join();
+        return 0;
+    }
+    
+    // Start background terrain scanner
+    thread scanner_thread(scan_terrain_thread);
+    
+    // Main thread handle for local terrain lookups
+    ifstream t_file(g_terrain_path, ios::binary);
+    
+    // Wait for first state update
+    while (!g_state_received && g_running) {
+        this_thread::sleep_for(chrono::milliseconds(5));
+    }
+    
+    while (g_running) {
+        // Wait for fresh state data
+        auto wait_start = chrono::steady_clock::now();
+        while (!g_state_received && g_running) {
+            this_thread::sleep_for(chrono::milliseconds(1));
+            if (chrono::steady_clock::now() - wait_start > chrono::milliseconds(150)) break;
+        }
+        
+        State s;
+        {
+            lock_guard<mutex> lock(g_state_mutex);
+            s = g_state;
+            g_state_received = false;
+        }
+        
+        double dx = g_target_x - s.x;
+        double dy = g_target_y - s.y;
+        double dist_xy = hypot(dx, dy);
+        
+        double ax_des = 0, ay_des = 0;
+        
+        // --- Horizontal Control ---
+        if (dist_xy > 5.0) {
+            // Cruise phase
+            double v_cruise = 60.0;
+            if (dist_xy < 200.0) v_cruise = 30.0;
+            if (dist_xy < 50.0) v_cruise = 10.0;
+            
+            double vx_target = (dx / dist_xy) * v_cruise;
+            double vy_target = (dy / dist_xy) * v_cruise;
+            
+            ax_des = 2.0 * (vx_target - s.vx) + 0.1 * dx;
+            ay_des = 2.0 * (vy_target - s.vy) + 0.1 * dy;
+        } else {
+            // Precision landing phase
+            ax_des = 1.0 * dx - 3.0 * s.vx;
+            ay_des = 1.5 * dy - 3.0 * s.vy;
+        }
+        
+        // --- Vertical Control ---
+        uint32_t ix = (uint32_t)max(0.0, min(g_width - 1.0, floor(s.x)));
+        uint32_t iy = (uint32_t)max(0.0, min(g_depth - 1.0, floor(s.y)));
+        Column col = get_column(t_file, ix, iy);
+        double local_ground = (col.b < col.c) ? (double)col.c : (double)col.a;
+        
+        double safe_z = max({(double)g_max_terrain_z.load(), local_ground, g_target_z, g_start_z});
+        safe_z = min(g_height - 15.0, safe_z + 50.0);
+        
+        double target_z_eff = safe_z;
+        double vz_target = 0;
+        
+        if (dist_xy < 20.0) {
+            target_z_eff = g_target_z;
+            vz_target = -3.0; 
+            if (s.z - g_target_z < 10.0) vz_target = -1.2; 
+            if (s.z - g_target_z < 2.0) vz_target = -0.5;  
+        }
+        
+        double az_des = 1.5 * (target_z_eff - s.z) + 3.0 * (vz_target - s.vz);
+        
+        // --- Thrust Command ---
+        double tx = ax_des;
+        double ty = ay_des;
+        double tz = az_des + g_gravity;
+        
+        double t_total = sqrt(tx*tx + ty*ty + tz*tz);
+        double thrust_cmd = t_total / g_max_thrust;
+        
+        if (thrust_cmd > 1.0) {
+            tx /= thrust_cmd; ty /= thrust_cmd; tz /= thrust_cmd;
+            thrust_cmd = 1.0;
+        } else if (thrust_cmd < 0.0) {
+            thrust_cmd = 0.0;
+        }
+        
+        // --- Orientation Control ---
+        double target_pitch = 0;
+        double target_yaw = s.yaw;
+        
+        if (t_total > 0.001) {
+            target_pitch = acos(max(-1.0, min(1.0, tz / t_total)));
+            double max_tilt = M_PI / 3.0;
+            if (g_max_thrust < g_gravity * 1.5) max_tilt = M_PI / 4.0;
+            if (target_pitch > max_tilt) target_pitch = max_tilt;
+            
+            if (target_pitch > 0.0001) {
+                target_yaw = atan2(-ty, -tx);
+            }
+        }
+        
+        auto get_cmd = [](double err, double rate) {
+            double target_rate = 10.0 * err;
+            if (target_rate > 3.0) target_rate = 3.0;
+            if (target_rate < -3.0) target_rate = -3.0;
+            return 3.0 * (target_rate - rate);
+        };
+        
+        double p_err = target_pitch - s.pitch;
+        double y_err = target_yaw - s.yaw;
+        while (y_err > M_PI) y_err -= 2.0 * M_PI;
+        while (y_err < -M_PI) y_err += 2.0 * M_PI;
+        
+        double p_cmd = get_cmd(p_err, s.pitch_rate);
+        double y_cmd = get_cmd(y_err, s.yaw_rate);
+        double r_cmd = get_cmd(0 - s.roll, s.roll_rate);
+        
+        p_cmd = max(-1.0, min(1.0, p_cmd));
+        y_cmd = max(-1.0, min(1.0, y_cmd));
+        r_cmd = max(-1.0, min(1.0, r_cmd));
+        
+        cout << fixed << setprecision(4) 
+             << thrust_cmd << " " << p_cmd << " " << y_cmd << " " << r_cmd << endl;
+    }
+    
+    g_running = false;
+    if (scanner_thread.joinable()) scanner_thread.join();
+    if (reader_thread.joinable()) reader_thread.join();
+    
+    return 0;
+}
+```

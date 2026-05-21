@@ -1,0 +1,1136 @@
+// N-Dimensional Snake Game Solver
+// Reads full game state from stdin and outputs up to max_turns moves (axis, direction).
+// Strategy:
+//   - Prefer shortest-path BFS to a selected food (recomputed as needed, with caps).
+//   - If no food path found, chase tail.
+//   - Otherwise pick a safe greedy move, biased by space (limited flood fill) and food distance.
+//
+// Designed to handle dimensions up to 20+ efficiently by using 64-bit mixed-radix indexing when
+// the total cell count fits in uint64_t, falling back to hashed coordinates otherwise.
+
+#include <algorithm>
+#include <array>
+#include <cstdint>
+#include <cstdlib>
+#include <deque>
+#include <iostream>
+#include <limits>
+#include <queue>
+#include <random>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
+#include <vector>
+
+using std::int32_t;
+using std::int64_t;
+using std::uint32_t;
+using std::uint64_t;
+
+namespace {
+
+constexpr int kMaxD = 32;
+
+struct Move {
+  int axis = 0;
+  int dir = 1; // -1 or +1
+};
+
+inline uint64_t splitmix64(uint64_t x) noexcept {
+  x += 0x9e3779b97f4a7c15ULL;
+  x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+  x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+  return x ^ (x >> 31);
+}
+
+struct Coord {
+  std::array<int32_t, kMaxD> v{};
+};
+
+struct CoordEq {
+  int d = 0;
+  bool operator()(Coord const& a, Coord const& b) const noexcept {
+    for (int i = 0; i < d; ++i) {
+      if (a.v[i] != b.v[i]) return false;
+    }
+    return true;
+  }
+};
+
+struct CoordHash {
+  int d = 0;
+  size_t operator()(Coord const& c) const noexcept {
+    uint64_t h = 0x243f6a8885a308d3ULL;
+    for (int i = 0; i < d; ++i) {
+      uint64_t x = static_cast<uint32_t>(c.v[i]);
+      x ^= 0x9e3779b97f4a7c15ULL * static_cast<uint64_t>(i + 1);
+      h = splitmix64(h ^ x);
+    }
+    return static_cast<size_t>(h);
+  }
+};
+
+struct Encoder64 {
+  int d = 0;
+  std::vector<uint64_t> bounds;
+  std::vector<uint64_t> stride; // stride[i] = product(bounds[0..i-1])
+  uint64_t total_cells = 0;
+  bool exact = false;
+
+  bool init(int dim, const std::vector<int64_t>& b) {
+    d = dim;
+    bounds.assign(d, 0);
+    stride.assign(d, 0);
+    exact = true;
+
+    for (int i = 0; i < d; ++i) {
+      if (b[i] <= 0) return false;
+      bounds[i] = static_cast<uint64_t>(b[i]);
+    }
+
+    stride[0] = 1;
+    for (int i = 1; i < d; ++i) {
+      if (stride[i - 1] != 0 && bounds[i - 1] != 0 &&
+          stride[i - 1] > std::numeric_limits<uint64_t>::max() / bounds[i - 1]) {
+        exact = false;
+        return true;
+      }
+      stride[i] = stride[i - 1] * static_cast<uint64_t>(bounds[i - 1]);
+    }
+
+    // total_cells = stride[d-1] * bounds[d-1]
+    if (stride[d - 1] != 0 && bounds[d - 1] != 0 &&
+        stride[d - 1] > std::numeric_limits<uint64_t>::max() / bounds[d - 1]) {
+      exact = false;
+      return true;
+    }
+    total_cells = stride[d - 1] * static_cast<uint64_t>(bounds[d - 1]);
+    return true;
+  }
+
+  uint64_t encode(const std::vector<int32_t>& c) const noexcept {
+    uint64_t id = 0;
+    for (int i = 0; i < d; ++i) {
+      id += static_cast<uint64_t>(static_cast<uint32_t>(c[i])) * stride[i];
+    }
+    return id;
+  }
+
+  uint64_t encode(const Coord& c) const noexcept {
+    uint64_t id = 0;
+    for (int i = 0; i < d; ++i) {
+      id += static_cast<uint64_t>(static_cast<uint32_t>(c.v[i])) * stride[i];
+    }
+    return id;
+  }
+
+  void decode(uint64_t id, std::vector<int32_t>& out) const {
+    out.assign(d, 0);
+    for (int i = 0; i < d; ++i) {
+      uint64_t bi = bounds[i];
+      out[i] = static_cast<int32_t>(id % bi);
+      id /= bi;
+    }
+  }
+
+  int64_t manhattan(const std::vector<int32_t>& a, const std::vector<int32_t>& b) const noexcept {
+    int64_t s = 0;
+    for (int i = 0; i < d; ++i) s += std::llabs(static_cast<int64_t>(a[i]) - b[i]);
+    return s;
+  }
+};
+
+struct DenseBfsWorkspace {
+  std::vector<uint32_t> seen_stamp;
+  std::vector<uint64_t> parent;
+  std::vector<int16_t> parent_move; // move encoded as (axis*2 + (dir==+1))
+  uint32_t stamp = 1;
+
+  void ensure_size(uint64_t n) {
+    if (seen_stamp.size() == n) return;
+    seen_stamp.assign(static_cast<size_t>(n), 0);
+    parent.assign(static_cast<size_t>(n), 0);
+    parent_move.assign(static_cast<size_t>(n), -1);
+    stamp = 1;
+  }
+
+  uint32_t next_stamp() {
+    ++stamp;
+    if (stamp == 0) {
+      std::fill(seen_stamp.begin(), seen_stamp.end(), 0);
+      stamp = 1;
+    }
+    return stamp;
+  }
+};
+
+struct Game {
+  int d = 0;
+  int64_t max_turns = 0;
+
+  // Coordinates
+  std::vector<int32_t> head_coord;
+
+  // Indexing
+  Encoder64 enc;
+  bool use_id = false; // enc.exact
+  bool dense = false;  // enc.total_cells <= dense_limit
+
+  // Dense storage (only if dense)
+  std::vector<uint8_t> obstacle_dense;
+  std::vector<uint8_t> food_dense;
+  uint64_t food_remaining = 0;
+  std::vector<uint32_t> occ_dense; // counts
+
+  // Sparse storage (if use_id && !dense)
+  std::unordered_set<uint64_t> obstacles_id;
+  std::unordered_set<uint64_t> foods_id;
+  std::unordered_map<uint64_t, uint32_t> occ_id;
+  uint64_t food_remaining_sparse = 0;
+
+  // Coord-hash storage (if !use_id)
+  Coord head_c{};
+  std::unordered_set<Coord, CoordHash, CoordEq> obstacles_c;
+  std::unordered_set<Coord, CoordHash, CoordEq> foods_c;
+  std::unordered_map<Coord, uint32_t, CoordHash, CoordEq> occ_c;
+  uint64_t food_remaining_c = 0;
+
+  // Snake body
+  std::deque<uint64_t> body_id; // head at front
+  std::deque<Coord> body_c;
+
+  DenseBfsWorkspace dense_ws;
+
+  // Target
+  bool have_target = false;
+  uint64_t target_id = 0;
+  Coord target_c{};
+
+  std::mt19937_64 rng{1234567ULL};
+
+  static constexpr uint64_t kDenseLimit = 5'000'000ULL;
+
+  bool init_from_stdin() {
+    std::ios::sync_with_stdio(false);
+    std::cin.tie(nullptr);
+
+    std::cin >> d >> max_turns;
+    if (!std::cin || d <= 0 || d > kMaxD) return false;
+
+    std::vector<int64_t> bounds_ll(d);
+    for (int i = 0; i < d; ++i) std::cin >> bounds_ll[i];
+
+    int64_t start_len_ll = 1;
+    head_coord.assign(d, 0);
+    std::cin >> start_len_ll;
+    for (int i = 0; i < d; ++i) {
+      int64_t x;
+      std::cin >> x;
+      head_coord[i] = static_cast<int32_t>(x);
+    }
+
+    if (!enc.init(d, bounds_ll)) return false;
+    use_id = enc.exact;
+    dense = use_id && (enc.total_cells > 0) && (enc.total_cells <= kDenseLimit);
+
+    int64_t Fll = 0;
+    std::cin >> Fll;
+    if (Fll < 0) Fll = 0;
+
+    int64_t Oll = 0;
+
+    if (use_id) {
+      uint64_t head_id = enc.encode(head_coord);
+
+      if (dense) {
+        obstacle_dense.assign(static_cast<size_t>(enc.total_cells), 0);
+        food_dense.assign(static_cast<size_t>(enc.total_cells), 0);
+        occ_dense.assign(static_cast<size_t>(enc.total_cells), 0);
+        dense_ws.ensure_size(enc.total_cells);
+
+        for (int64_t i = 0; i < Fll; ++i) {
+          std::vector<int32_t> fc(d);
+          for (int j = 0; j < d; ++j) {
+            int64_t x;
+            std::cin >> x;
+            fc[j] = static_cast<int32_t>(x);
+          }
+          if (!in_bounds(fc)) continue;
+          uint64_t fid = enc.encode(fc);
+          if (food_dense[fid] == 0) {
+            food_dense[fid] = 1;
+            ++food_remaining;
+          }
+        }
+
+        std::cin >> Oll;
+        if (Oll < 0) Oll = 0;
+        for (int64_t i = 0; i < Oll; ++i) {
+          std::vector<int32_t> oc(d);
+          for (int j = 0; j < d; ++j) {
+            int64_t x;
+            std::cin >> x;
+            oc[j] = static_cast<int32_t>(x);
+          }
+          if (!in_bounds(oc)) continue;
+          uint64_t oid = enc.encode(oc);
+          obstacle_dense[oid] = 1;
+        }
+
+        // Initialize snake body: collapsed at head position.
+        uint32_t start_len = (start_len_ll <= 0) ? 1u
+                                                 : (start_len_ll > std::numeric_limits<uint32_t>::max()
+                                                        ? std::numeric_limits<uint32_t>::max()
+                                                        : static_cast<uint32_t>(start_len_ll));
+        body_id.clear();
+        body_id.resize(start_len, head_id);
+        occ_dense[head_id] = start_len;
+      } else {
+        obstacles_id.clear();
+        foods_id.clear();
+        occ_id.clear();
+
+        foods_id.reserve(static_cast<size_t>(std::min<int64_t>(Fll, 2'000'000)));
+        for (int64_t i = 0; i < Fll; ++i) {
+          std::vector<int32_t> fc(d);
+          for (int j = 0; j < d; ++j) {
+            int64_t x;
+            std::cin >> x;
+            fc[j] = static_cast<int32_t>(x);
+          }
+          if (!in_bounds(fc)) continue;
+          uint64_t fid = enc.encode(fc);
+          if (foods_id.insert(fid).second) ++food_remaining_sparse;
+        }
+
+        std::cin >> Oll;
+        if (Oll < 0) Oll = 0;
+        obstacles_id.reserve(static_cast<size_t>(std::min<int64_t>(Oll, 2'000'000)));
+        for (int64_t i = 0; i < Oll; ++i) {
+          std::vector<int32_t> oc(d);
+          for (int j = 0; j < d; ++j) {
+            int64_t x;
+            std::cin >> x;
+            oc[j] = static_cast<int32_t>(x);
+          }
+          if (!in_bounds(oc)) continue;
+          obstacles_id.insert(enc.encode(oc));
+        }
+
+        uint32_t start_len = (start_len_ll <= 0) ? 1u
+                                                 : (start_len_ll > std::numeric_limits<uint32_t>::max()
+                                                        ? std::numeric_limits<uint32_t>::max()
+                                                        : static_cast<uint32_t>(start_len_ll));
+        body_id.clear();
+        body_id.resize(start_len, head_id);
+        occ_id[head_id] = start_len;
+      }
+    } else {
+      // Coord-hash mode
+      head_c = Coord{};
+      for (int i = 0; i < d; ++i) head_c.v[i] = head_coord[i];
+      CoordHash ch{d};
+      CoordEq ce{d};
+      obstacles_c = std::unordered_set<Coord, CoordHash, CoordEq>(0, ch, ce);
+      foods_c = std::unordered_set<Coord, CoordHash, CoordEq>(0, ch, ce);
+      occ_c = std::unordered_map<Coord, uint32_t, CoordHash, CoordEq>(0, ch, ce);
+
+      for (int64_t i = 0; i < Fll; ++i) {
+        Coord f{};
+        for (int j = 0; j < d; ++j) {
+          int64_t x;
+          std::cin >> x;
+          f.v[j] = static_cast<int32_t>(x);
+        }
+        if (!in_bounds(f)) continue;
+        if (foods_c.insert(f).second) ++food_remaining_c;
+      }
+
+      std::cin >> Oll;
+      if (Oll < 0) Oll = 0;
+      for (int64_t i = 0; i < Oll; ++i) {
+        Coord o{};
+        for (int j = 0; j < d; ++j) {
+          int64_t x;
+          std::cin >> x;
+          o.v[j] = static_cast<int32_t>(x);
+        }
+        if (!in_bounds(o)) continue;
+        obstacles_c.insert(o);
+      }
+
+      uint32_t start_len = (start_len_ll <= 0) ? 1u
+                                               : (start_len_ll > std::numeric_limits<uint32_t>::max()
+                                                      ? std::numeric_limits<uint32_t>::max()
+                                                      : static_cast<uint32_t>(start_len_ll));
+      body_c.clear();
+      body_c.resize(start_len, head_c);
+      occ_c[head_c] = start_len;
+    }
+
+    // Ensure head is not on an obstacle; if it is, we can still output moves, but we're "dead".
+    have_target = false;
+    return true;
+  }
+
+  bool in_bounds(const std::vector<int32_t>& c) const noexcept {
+    for (int i = 0; i < d; ++i) {
+      if (c[i] < 0) return false;
+      if (use_id && i < static_cast<int>(enc.bounds.size())) {
+        if (static_cast<uint64_t>(c[i]) >= enc.bounds[i]) return false;
+      }
+    }
+    return true;
+  }
+
+  bool in_bounds(const Coord& c) const noexcept {
+    for (int i = 0; i < d; ++i) {
+      if (c.v[i] < 0) return false;
+      // For coord mode we still have enc.bounds populated (may not be exact, but bounds fit uint32_t if init succeeded).
+      if (i < static_cast<int>(enc.bounds.size())) {
+        if (static_cast<uint64_t>(c.v[i]) >= enc.bounds[i]) return false;
+      }
+    }
+    return true;
+  }
+
+  bool any_food_remaining() const noexcept {
+    if (use_id) return dense ? (food_remaining > 0) : (food_remaining_sparse > 0);
+    return food_remaining_c > 0;
+  }
+
+  bool is_obstacle(uint64_t id) const noexcept {
+    if (dense) return obstacle_dense[id] != 0;
+    return obstacles_id.contains(id);
+  }
+
+  bool is_food(uint64_t id) const noexcept {
+    if (dense) return food_dense[id] != 0;
+    return foods_id.contains(id);
+  }
+
+  uint32_t occ_count(uint64_t id) const noexcept {
+    if (dense) return occ_dense[id];
+    auto it = occ_id.find(id);
+    return it == occ_id.end() ? 0u : it->second;
+  }
+
+  uint32_t occ_count(const Coord& c) const noexcept {
+    auto it = occ_c.find(c);
+    return it == occ_c.end() ? 0u : it->second;
+  }
+
+  void occ_inc(uint64_t id) {
+    if (dense) {
+      ++occ_dense[id];
+    } else {
+      ++occ_id[id];
+    }
+  }
+
+  void occ_dec(uint64_t id) {
+    if (dense) {
+      if (occ_dense[id] > 0) --occ_dense[id];
+    } else {
+      auto it = occ_id.find(id);
+      if (it == occ_id.end()) return;
+      if (it->second <= 1) {
+        occ_id.erase(it);
+      } else {
+        --it->second;
+      }
+    }
+  }
+
+  void occ_inc(const Coord& c) { ++occ_c[c]; }
+
+  void occ_dec(const Coord& c) {
+    auto it = occ_c.find(c);
+    if (it == occ_c.end()) return;
+    if (it->second <= 1) {
+      occ_c.erase(it);
+    } else {
+      --it->second;
+    }
+  }
+
+  void remove_food(uint64_t id) {
+    if (dense) {
+      if (food_dense[id]) {
+        food_dense[id] = 0;
+        if (food_remaining) --food_remaining;
+      }
+    } else {
+      if (foods_id.erase(id)) {
+        if (food_remaining_sparse) --food_remaining_sparse;
+      }
+    }
+  }
+
+  void remove_food(const Coord& c) {
+    if (foods_c.erase(c)) {
+      if (food_remaining_c) --food_remaining_c;
+    }
+  }
+
+  // Move legality check at current state.
+  bool legal_step_id(int axis, int dir, uint64_t head_id) const {
+    int32_t hc = head_coord[axis];
+    int64_t nc = static_cast<int64_t>(hc) + dir;
+    if (nc < 0 || static_cast<uint64_t>(nc) >= enc.bounds[axis]) return false;
+    uint64_t nid = (dir > 0) ? (head_id + enc.stride[axis]) : (head_id - enc.stride[axis]);
+    if (is_obstacle(nid)) return false;
+
+    bool would_eat = is_food(nid);
+    uint64_t tail = body_id.empty() ? head_id : body_id.back();
+    uint32_t occ = occ_count(nid);
+
+    if (!would_eat) {
+      if (occ == 0) return true;
+      if (nid == tail && occ == 1) return true;
+      return false;
+    } else {
+      return occ == 0;
+    }
+  }
+
+  bool legal_step_c(int axis, int dir) const {
+    Coord nh = head_c;
+    int64_t nc = static_cast<int64_t>(nh.v[axis]) + dir;
+    if (nc < 0 || static_cast<uint64_t>(nc) >= enc.bounds[axis]) return false;
+    nh.v[axis] = static_cast<int32_t>(nc);
+    if (obstacles_c.contains(nh)) return false;
+
+    bool would_eat = foods_c.contains(nh);
+    Coord tail = body_c.empty() ? head_c : body_c.back();
+    uint32_t occ = occ_count(nh);
+
+    if (!would_eat) {
+      if (occ == 0) return true;
+      if (ceq(nh, tail) && occ == 1) return true;
+      return false;
+    } else {
+      return occ == 0;
+    }
+  }
+
+  bool ceq(const Coord& a, const Coord& b) const noexcept {
+    for (int i = 0; i < d; ++i)
+      if (a.v[i] != b.v[i]) return false;
+    return true;
+  }
+
+  // Apply a move; returns whether snake is still alive after the move.
+  bool apply_move_id(const Move& m, uint64_t& head_id) {
+    if (!legal_step_id(m.axis, m.dir, head_id)) return false;
+
+    uint64_t nid = (m.dir > 0) ? (head_id + enc.stride[m.axis]) : (head_id - enc.stride[m.axis]);
+    bool would_eat = is_food(nid);
+
+    if (!would_eat) {
+      // Pop tail first.
+      if (!body_id.empty()) {
+        uint64_t tail = body_id.back();
+        body_id.pop_back();
+        occ_dec(tail);
+      }
+    } else {
+      remove_food(nid);
+    }
+
+    // Collision check against updated occupancy.
+    if (occ_count(nid) != 0) return false;
+
+    body_id.push_front(nid);
+    occ_inc(nid);
+
+    // Update head coord/id
+    head_coord[m.axis] += static_cast<int32_t>(m.dir);
+    head_id = nid;
+    return true;
+  }
+
+  bool apply_move_c(const Move& m) {
+    if (!legal_step_c(m.axis, m.dir)) return false;
+
+    Coord nid = head_c;
+    nid.v[m.axis] += static_cast<int32_t>(m.dir);
+    bool would_eat = foods_c.contains(nid);
+
+    if (!would_eat) {
+      if (!body_c.empty()) {
+        Coord tail = body_c.back();
+        body_c.pop_back();
+        occ_dec(tail);
+      }
+    } else {
+      remove_food(nid);
+    }
+
+    if (occ_count(nid) != 0) return false;
+    body_c.push_front(nid);
+    occ_inc(nid);
+
+    head_c = nid;
+    for (int i = 0; i < d; ++i) head_coord[i] = head_c.v[i];
+    return true;
+  }
+
+  // Pick (or keep) a target food.
+  void ensure_target_id(uint64_t head_id) {
+    if (!any_food_remaining()) {
+      have_target = false;
+      return;
+    }
+    if (have_target && is_food(target_id)) return;
+
+    // Choose closest by Manhattan distance (using decoded coords).
+    have_target = false;
+    int64_t best = std::numeric_limits<int64_t>::max();
+    std::vector<int32_t> fc;
+
+    auto consider = [&](uint64_t fid) {
+      enc.decode(fid, fc);
+      int64_t dist = enc.manhattan(head_coord, fc);
+      if (dist < best) {
+        best = dist;
+        target_id = fid;
+        have_target = true;
+      }
+    };
+
+    if (dense) {
+      // Scan dense food array only if it's reasonably small; otherwise sample randomly.
+      if (enc.total_cells <= 200'000) {
+        for (uint64_t i = 0; i < enc.total_cells; ++i) {
+          if (food_dense[i]) consider(i);
+        }
+      } else {
+        // Sample a few random cells to find a target quickly.
+        std::uniform_int_distribution<uint64_t> dist(0, enc.total_cells - 1);
+        for (int i = 0; i < 256; ++i) {
+          uint64_t cand = dist(rng);
+          if (food_dense[cand]) consider(cand);
+        }
+        if (!have_target) {
+          // Fallback to full scan (still bounded by dense limit).
+          for (uint64_t i = 0; i < enc.total_cells; ++i) {
+            if (food_dense[i]) consider(i);
+          }
+        }
+      }
+    } else {
+      for (uint64_t fid : foods_id) consider(fid);
+    }
+  }
+
+  void ensure_target_c() {
+    if (!any_food_remaining()) {
+      have_target = false;
+      return;
+    }
+    if (have_target && foods_c.contains(target_c)) return;
+
+    have_target = false;
+    int64_t best = std::numeric_limits<int64_t>::max();
+    for (const Coord& f : foods_c) {
+      int64_t dist = 0;
+      for (int i = 0; i < d; ++i) dist += std::llabs(static_cast<int64_t>(head_c.v[i]) - f.v[i]);
+      if (dist < best) {
+        best = dist;
+        target_c = f;
+        have_target = true;
+      }
+    }
+  }
+
+  // BFS to goal (returns a valid first move if found).
+  // allow_tail: treat tail cell as passable if it is only occupied by the tail.
+  bool bfs_first_move_dense(uint64_t start_id, uint64_t goal_id, bool allow_tail, Move& out) {
+    const uint64_t n = enc.total_cells;
+    if (n == 0) return false;
+
+    // Hard caps to keep per-turn work bounded.
+    constexpr uint64_t kHardExpansionCap = 200'000;
+    const uint64_t expansion_cap = std::min<uint64_t>(kHardExpansionCap, n);
+
+    const uint32_t stamp = dense_ws.next_stamp();
+
+    std::queue<uint64_t> q;
+    q.push(start_id);
+    dense_ws.seen_stamp[start_id] = stamp;
+    dense_ws.parent[start_id] = start_id;
+    dense_ws.parent_move[start_id] = -1;
+
+    uint64_t expanded = 0;
+    std::vector<int32_t> cur;
+    while (!q.empty() && expanded < expansion_cap) {
+      uint64_t cur_id = q.front();
+      q.pop();
+      ++expanded;
+      if (cur_id == goal_id) break;
+
+      enc.decode(cur_id, cur);
+      for (int axis = 0; axis < d; ++axis) {
+        // -1
+        if (cur[axis] > 0) {
+          uint64_t nid = cur_id - enc.stride[axis];
+          if (dense_ws.seen_stamp[nid] != stamp && !blocked_id_dense(nid, allow_tail, start_id)) {
+            dense_ws.seen_stamp[nid] = stamp;
+            dense_ws.parent[nid] = cur_id;
+            dense_ws.parent_move[nid] = static_cast<int16_t>(axis * 2 + 0);
+            q.push(nid);
+          }
+        }
+        // +1
+        if (static_cast<uint64_t>(cur[axis] + 1) < enc.bounds[axis]) {
+          uint64_t nid = cur_id + enc.stride[axis];
+          if (dense_ws.seen_stamp[nid] != stamp && !blocked_id_dense(nid, allow_tail, start_id)) {
+            dense_ws.seen_stamp[nid] = stamp;
+            dense_ws.parent[nid] = cur_id;
+            dense_ws.parent_move[nid] = static_cast<int16_t>(axis * 2 + 1);
+            q.push(nid);
+          }
+        }
+      }
+    }
+
+    if (dense_ws.seen_stamp[goal_id] != stamp) return false;
+
+    // Reconstruct first move by walking parents back to start.
+    uint64_t cur_id = goal_id;
+    while (dense_ws.parent[cur_id] != start_id && dense_ws.parent[cur_id] != cur_id) {
+      cur_id = dense_ws.parent[cur_id];
+    }
+    int16_t mv = dense_ws.parent_move[cur_id];
+    if (mv < 0) return false;
+    out.axis = mv / 2;
+    out.dir = (mv % 2) ? +1 : -1;
+    return true;
+  }
+
+  bool blocked_id_dense(uint64_t id, bool allow_tail, uint64_t start_id) const noexcept {
+    if (obstacle_dense[id]) return true;
+    uint32_t occ = occ_dense[id];
+    if (occ == 0) return false;
+    if (!allow_tail) return true;
+    // Tail exception: only if this is exactly the tail cell and only occupied by tail.
+    uint64_t tail = body_id.empty() ? start_id : body_id.back();
+    return !(id == tail && occ == 1);
+  }
+
+  bool bfs_first_move_sparse_id(uint64_t start_id, uint64_t goal_id, bool allow_tail, Move& out) {
+    constexpr size_t kHardExpansionCap = 120'000;
+
+    struct ParentInfo {
+      uint64_t parent = 0;
+      int16_t move = -1;
+    };
+
+    std::unordered_map<uint64_t, ParentInfo> parent;
+    parent.reserve(kHardExpansionCap * 2);
+
+    std::queue<uint64_t> q;
+    q.push(start_id);
+    parent.emplace(start_id, ParentInfo{start_id, -1});
+
+    size_t expanded = 0;
+    std::vector<int32_t> cur;
+    while (!q.empty() && expanded < kHardExpansionCap) {
+      uint64_t cur_id = q.front();
+      q.pop();
+      ++expanded;
+      if (cur_id == goal_id) break;
+
+      enc.decode(cur_id, cur);
+      for (int axis = 0; axis < d; ++axis) {
+        // -1
+        if (cur[axis] > 0) {
+          uint64_t nid = cur_id - enc.stride[axis];
+          if (!parent.contains(nid) && !blocked_id_sparse(nid, allow_tail, start_id)) {
+            parent.emplace(nid, ParentInfo{cur_id, static_cast<int16_t>(axis * 2 + 0)});
+            q.push(nid);
+          }
+        }
+        // +1
+        if (static_cast<uint64_t>(cur[axis] + 1) < enc.bounds[axis]) {
+          uint64_t nid = cur_id + enc.stride[axis];
+          if (!parent.contains(nid) && !blocked_id_sparse(nid, allow_tail, start_id)) {
+            parent.emplace(nid, ParentInfo{cur_id, static_cast<int16_t>(axis * 2 + 1)});
+            q.push(nid);
+          }
+        }
+      }
+    }
+
+    if (!parent.contains(goal_id)) return false;
+    uint64_t cur_id = goal_id;
+    while (parent[cur_id].parent != start_id && parent[cur_id].parent != cur_id) {
+      cur_id = parent[cur_id].parent;
+    }
+    int16_t mv = parent[cur_id].move;
+    if (mv < 0) return false;
+    out.axis = mv / 2;
+    out.dir = (mv % 2) ? +1 : -1;
+    return true;
+  }
+
+  bool blocked_id_sparse(uint64_t id, bool allow_tail, uint64_t start_id) const noexcept {
+    if (obstacles_id.contains(id)) return true;
+    auto it = occ_id.find(id);
+    if (it == occ_id.end() || it->second == 0) return false;
+    if (!allow_tail) return true;
+    uint64_t tail = body_id.empty() ? start_id : body_id.back();
+    return !(id == tail && it->second == 1);
+  }
+
+  bool bfs_first_move_coord(const Coord& start, const Coord& goal, bool allow_tail, Move& out) {
+    constexpr size_t kHardExpansionCap = 60'000;
+
+    struct ParentInfo {
+      Coord parent{};
+      int16_t move = -1;
+    };
+
+    std::queue<Coord> q;
+    std::unordered_map<Coord, ParentInfo, CoordHash, CoordEq> parent(
+        0, CoordHash{d}, CoordEq{d});
+    parent.reserve(kHardExpansionCap * 2);
+
+    q.push(start);
+    parent.emplace(start, ParentInfo{start, -1});
+
+    size_t expanded = 0;
+    while (!q.empty() && expanded < kHardExpansionCap) {
+      Coord cur = q.front();
+      q.pop();
+      ++expanded;
+      if (ceq(cur, goal)) break;
+
+      for (int axis = 0; axis < d; ++axis) {
+        for (int s = 0; s < 2; ++s) {
+          int dir = s ? +1 : -1;
+          int64_t nc = static_cast<int64_t>(cur.v[axis]) + dir;
+          if (nc < 0 || static_cast<uint64_t>(nc) >= enc.bounds[axis]) continue;
+          Coord nxt = cur;
+          nxt.v[axis] = static_cast<int32_t>(nc);
+          if (parent.contains(nxt)) continue;
+          if (blocked_coord(nxt, allow_tail, start)) continue;
+          parent.emplace(nxt, ParentInfo{cur, static_cast<int16_t>(axis * 2 + (dir == +1))});
+          q.push(nxt);
+        }
+      }
+    }
+
+    if (!parent.contains(goal)) return false;
+    Coord cur = goal;
+    while (!ceq(parent[cur].parent, start) && !ceq(parent[cur].parent, cur)) {
+      cur = parent[cur].parent;
+    }
+    int16_t mv = parent[cur].move;
+    if (mv < 0) return false;
+    out.axis = mv / 2;
+    out.dir = (mv % 2) ? +1 : -1;
+    return true;
+  }
+
+  bool blocked_coord(const Coord& c, bool allow_tail, const Coord& start) const noexcept {
+    if (obstacles_c.contains(c)) return true;
+    auto it = occ_c.find(c);
+    if (it == occ_c.end() || it->second == 0) return false;
+    if (!allow_tail) return true;
+    Coord tail = body_c.empty() ? start : body_c.back();
+    return !(ceq(c, tail) && it->second == 1);
+  }
+
+  // Limited flood fill count for "space" heuristic (does not need to be exact).
+  uint32_t space_score_id(uint64_t start_id, bool allow_tail) {
+    constexpr uint32_t kLimit = 5000;
+    if (dense) return space_score_id_dense(start_id, allow_tail, kLimit);
+    return space_score_id_sparse(start_id, allow_tail, kLimit);
+  }
+
+  uint32_t space_score_id_dense(uint64_t start_id, bool allow_tail, uint32_t limit) {
+    const uint32_t stamp = dense_ws.next_stamp();
+    std::queue<uint64_t> q;
+    q.push(start_id);
+    dense_ws.seen_stamp[start_id] = stamp;
+
+    uint32_t count = 0;
+    std::vector<int32_t> cur;
+    while (!q.empty() && count < limit) {
+      uint64_t cur_id = q.front();
+      q.pop();
+      ++count;
+
+      enc.decode(cur_id, cur);
+      for (int axis = 0; axis < d; ++axis) {
+        if (cur[axis] > 0) {
+          uint64_t nid = cur_id - enc.stride[axis];
+          if (dense_ws.seen_stamp[nid] != stamp && !blocked_id_dense(nid, allow_tail, start_id)) {
+            dense_ws.seen_stamp[nid] = stamp;
+            q.push(nid);
+          }
+        }
+        if (static_cast<uint64_t>(cur[axis] + 1) < enc.bounds[axis]) {
+          uint64_t nid = cur_id + enc.stride[axis];
+          if (dense_ws.seen_stamp[nid] != stamp && !blocked_id_dense(nid, allow_tail, start_id)) {
+            dense_ws.seen_stamp[nid] = stamp;
+            q.push(nid);
+          }
+        }
+      }
+    }
+    return count;
+  }
+
+  uint32_t space_score_id_sparse(uint64_t start_id, bool allow_tail, uint32_t limit) {
+    std::unordered_set<uint64_t> seen;
+    seen.reserve(limit * 2);
+    std::queue<uint64_t> q;
+    q.push(start_id);
+    seen.insert(start_id);
+    uint32_t count = 0;
+    std::vector<int32_t> cur;
+    while (!q.empty() && count < limit) {
+      uint64_t cur_id = q.front();
+      q.pop();
+      ++count;
+
+      enc.decode(cur_id, cur);
+      for (int axis = 0; axis < d; ++axis) {
+        if (cur[axis] > 0) {
+          uint64_t nid = cur_id - enc.stride[axis];
+          if (!seen.contains(nid) && !blocked_id_sparse(nid, allow_tail, start_id)) {
+            seen.insert(nid);
+            q.push(nid);
+          }
+        }
+        if (static_cast<uint64_t>(cur[axis] + 1) < enc.bounds[axis]) {
+          uint64_t nid = cur_id + enc.stride[axis];
+          if (!seen.contains(nid) && !blocked_id_sparse(nid, allow_tail, start_id)) {
+            seen.insert(nid);
+            q.push(nid);
+          }
+        }
+      }
+    }
+    return count;
+  }
+
+  uint32_t space_score_coord(const Coord& start, bool allow_tail) {
+    constexpr uint32_t kLimit = 3000;
+    std::unordered_set<Coord, CoordHash, CoordEq> seen(0, CoordHash{d}, CoordEq{d});
+    seen.reserve(kLimit * 2);
+    std::queue<Coord> q;
+    q.push(start);
+    seen.insert(start);
+    uint32_t count = 0;
+    while (!q.empty() && count < kLimit) {
+      Coord cur = q.front();
+      q.pop();
+      ++count;
+      for (int axis = 0; axis < d; ++axis) {
+        for (int s = 0; s < 2; ++s) {
+          int dir = s ? +1 : -1;
+          int64_t nc = static_cast<int64_t>(cur.v[axis]) + dir;
+          if (nc < 0 || static_cast<uint64_t>(nc) >= enc.bounds[axis]) continue;
+          Coord nxt = cur;
+          nxt.v[axis] = static_cast<int32_t>(nc);
+          if (seen.contains(nxt)) continue;
+          if (blocked_coord(nxt, allow_tail, start)) continue;
+          seen.insert(nxt);
+          q.push(nxt);
+        }
+      }
+    }
+    return count;
+  }
+
+  Move pick_greedy_id(uint64_t head_id) {
+    ensure_target_id(head_id);
+    std::vector<int32_t> tgt;
+    bool have = have_target && is_food(target_id);
+    if (have) enc.decode(target_id, tgt);
+
+    Move best{0, 1};
+    int64_t best_score = std::numeric_limits<int64_t>::min();
+
+    for (int axis = 0; axis < d; ++axis) {
+      for (int s = 0; s < 2; ++s) {
+        int dir = s ? +1 : -1;
+        if (!legal_step_id(axis, dir, head_id)) continue;
+        uint64_t nid = (dir > 0) ? (head_id + enc.stride[axis]) : (head_id - enc.stride[axis]);
+        bool would_eat = is_food(nid);
+
+        // Distance heuristic
+        int64_t dist_score = 0;
+        if (have) {
+          std::vector<int32_t> nh = head_coord;
+          nh[axis] += static_cast<int32_t>(dir);
+          dist_score = -enc.manhattan(nh, tgt);
+        }
+
+        // Space heuristic (limit flood fill)
+        bool allow_tail = !would_eat;
+        uint32_t space = space_score_id(nid, allow_tail);
+
+        // Mild wall-avoidance (prefer central-ish positions)
+        int64_t wall = 0;
+        for (int i = 0; i < d; ++i) {
+          int32_t x = head_coord[i];
+          if (i == axis) x += static_cast<int32_t>(dir);
+          int64_t b = static_cast<int64_t>(enc.bounds[i]);
+          int64_t a = static_cast<int64_t>(x);
+          int64_t z = (b - 1) - static_cast<int64_t>(x);
+          wall += std::min<int64_t>(a, z);
+        }
+
+        int64_t score = dist_score + static_cast<int64_t>(space) * 3 + wall;
+        if (would_eat) score += 500000;
+        if (score > best_score) {
+          best_score = score;
+          best = Move{axis, dir};
+        }
+      }
+    }
+
+    // If nothing legal found (should be rare), output something.
+    return best;
+  }
+
+  Move pick_greedy_coord() {
+    ensure_target_c();
+    bool have = have_target && foods_c.contains(target_c);
+
+    Move best{0, 1};
+    int64_t best_score = std::numeric_limits<int64_t>::min();
+
+    for (int axis = 0; axis < d; ++axis) {
+      for (int s = 0; s < 2; ++s) {
+        int dir = s ? +1 : -1;
+        if (!legal_step_c(axis, dir)) continue;
+        Coord nid = head_c;
+        nid.v[axis] += static_cast<int32_t>(dir);
+        bool would_eat = foods_c.contains(nid);
+
+        int64_t dist_score = 0;
+        if (have) {
+          int64_t dist = 0;
+          for (int i = 0; i < d; ++i) {
+            int32_t x = head_c.v[i];
+            if (i == axis) x += static_cast<int32_t>(dir);
+            dist += std::llabs(static_cast<int64_t>(x) - target_c.v[i]);
+          }
+          dist_score = -dist;
+        }
+
+        bool allow_tail = !would_eat;
+        uint32_t space = space_score_coord(nid, allow_tail);
+
+        int64_t wall = 0;
+        for (int i = 0; i < d; ++i) {
+          int32_t x = head_c.v[i];
+          if (i == axis) x += static_cast<int32_t>(dir);
+          int64_t b = static_cast<int64_t>(enc.bounds[i]);
+          wall += std::min<int64_t>(static_cast<int64_t>(x), (b - 1) - static_cast<int64_t>(x));
+        }
+
+        int64_t score = dist_score + static_cast<int64_t>(space) * 3 + wall;
+        if (would_eat) score += 500000;
+        if (score > best_score) {
+          best_score = score;
+          best = Move{axis, dir};
+        }
+      }
+    }
+    return best;
+  }
+
+  Move choose_next_move(uint64_t head_id) {
+    ensure_target_id(head_id);
+
+    Move mv;
+    bool found = false;
+
+    if (have_target && is_food(target_id)) {
+      // Path to food.
+      if (dense) {
+        found = bfs_first_move_dense(head_id, target_id, /*allow_tail=*/true, mv);
+      } else {
+        found = bfs_first_move_sparse_id(head_id, target_id, /*allow_tail=*/true, mv);
+      }
+      if (found && legal_step_id(mv.axis, mv.dir, head_id)) return mv;
+    }
+
+    // Chase tail if possible.
+    if (!body_id.empty()) {
+      uint64_t tail = body_id.back();
+      if (dense) {
+        found = bfs_first_move_dense(head_id, tail, /*allow_tail=*/true, mv);
+      } else {
+        found = bfs_first_move_sparse_id(head_id, tail, /*allow_tail=*/true, mv);
+      }
+      if (found && legal_step_id(mv.axis, mv.dir, head_id)) return mv;
+    }
+
+    // Fallback greedy.
+    return pick_greedy_id(head_id);
+  }
+
+  Move choose_next_move_coord() {
+    ensure_target_c();
+
+    Move mv;
+    bool found = false;
+
+    if (have_target && foods_c.contains(target_c)) {
+      found = bfs_first_move_coord(head_c, target_c, /*allow_tail=*/true, mv);
+      if (found && legal_step_c(mv.axis, mv.dir)) return mv;
+    }
+
+    if (!body_c.empty()) {
+      Coord tail = body_c.back();
+      found = bfs_first_move_coord(head_c, tail, /*allow_tail=*/true, mv);
+      if (found && legal_step_c(mv.axis, mv.dir)) return mv;
+    }
+
+    return pick_greedy_coord();
+  }
+
+  void run_and_output() {
+    bool alive = true;
+    bool won = false;
+
+    uint64_t head_id = 0;
+    if (use_id) head_id = enc.encode(head_coord);
+
+    for (int64_t t = 0; t < max_turns; ++t) {
+      Move mv{0, 1};
+
+      if (alive && !won) {
+        if (use_id) {
+          mv = choose_next_move(head_id);
+          alive = apply_move_id(mv, head_id);
+          won = !any_food_remaining();
+        } else {
+          mv = choose_next_move_coord();
+          alive = apply_move_c(mv);
+          won = !any_food_remaining();
+        }
+      }
+
+      // If dead/won, just emit a harmless default (still within required format).
+      std::cout << mv.axis << ' ' << (mv.dir >= 0 ? 1 : -1) << '\n';
+    }
+  }
+};
+
+} // namespace
+
+int main() {
+  Game g;
+  if (!g.init_from_stdin()) return 0;
+  g.run_and_output();
+  return 0;
+}

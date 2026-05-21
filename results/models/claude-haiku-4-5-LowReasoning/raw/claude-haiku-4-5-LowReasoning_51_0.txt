@@ -1,0 +1,451 @@
+import math
+
+# Module-level state for control loops and sensor history
+_pitch_integral = 0.0
+_roll_integral = 0.0
+_speed_integral = 0.0
+_yaw_integral = 0.0
+_trim_integral = 0.0
+_prev_alt = None
+_prev_heading = None
+_last_valid_alt = 5000.0
+_last_valid_heading = 0.0
+_last_valid_speed = 250.0
+_failure_flags = {}
+
+def autopilot_step(state: dict, dt: float) -> dict:
+    global _pitch_integral, _roll_integral, _speed_integral, _yaw_integral, _trim_integral
+    global _prev_alt, _prev_heading, _last_valid_alt, _last_valid_heading, _last_valid_speed
+    global _failure_flags
+
+    # Sensor fusion: vote and cross-check redundant sensors
+    altitude = _fuse_altitude(state)
+    heading = _fuse_heading(state)
+    airspeed = _fuse_airspeed(state)
+    pitch = _fuse_pitch(state)
+    roll = _fuse_roll(state)
+    vertical_speed = _fuse_vertical_speed(state)
+    yaw_rate = _fuse_yaw_rate(state)
+
+    # Detect anomalies and potential failures
+    _detect_failures(state, altitude, airspeed)
+
+    # Update last valid values for fallback
+    if altitude is not None:
+        _last_valid_alt = altitude
+    if heading is not None:
+        _last_valid_heading = heading
+    if airspeed is not None:
+        _last_valid_speed = airspeed
+
+    altitude = altitude if altitude is not None else _last_valid_alt
+    heading = heading if heading is not None else _last_valid_heading
+    airspeed = airspeed if airspeed is not None else _last_valid_speed
+    pitch = pitch if pitch is not None else 0.0
+    roll = roll if roll is not None else 0.0
+    vertical_speed = vertical_speed if vertical_speed is not None else 0.0
+    yaw_rate = yaw_rate if yaw_rate is not None else 0.0
+
+    # Get autopilot targets
+    target_alt = state.get('target_alt_ft', altitude)
+    target_hdg = state.get('target_hdg_deg', heading)
+    target_spd = state.get('target_ias_kt', airspeed)
+    target_vs = state.get('target_vs_fpm', 0.0)
+    ap_engaged = state.get('ap_engaged', True)
+
+    output = {}
+
+    if not ap_engaged:
+        return output
+
+    # Calculate errors
+    alt_error = target_alt - altitude
+    hdg_error = _normalize_angle(target_hdg - heading)
+    spd_error = target_spd - airspeed
+    vs_error = target_vs - vertical_speed
+    pitch_error = pitch
+    roll_error = roll
+    yaw_error = yaw_rate
+
+    # Pitch control: altitude and speed hold
+    pitch_cmd = _pitch_controller(alt_error, spd_error, pitch, vertical_speed, dt)
+
+    # Roll control: heading hold
+    roll_cmd = _roll_controller(hdg_error, roll, dt)
+
+    # Rudder: yaw damping and coordination
+    rudder_cmd = _yaw_controller(yaw_rate, roll, dt)
+
+    # Throttle: speed and altitude hold
+    throttle_cmd = _throttle_controller(spd_error, alt_error, altitude, airspeed, dt)
+
+    # Elevator trim adjustment
+    trim_cmd = _trim_controller(pitch_error, alt_error, dt)
+
+    # Flaps and gear management
+    flaps_cmd = _flap_controller(airspeed, altitude)
+    gear_cmd = _gear_controller(altitude)
+    speedbrake_cmd = _speedbrake_controller(spd_error, alt_error)
+
+    # Build output with all control commands
+    output['elevator'] = pitch_cmd
+    output['aileron'] = roll_cmd
+    output['rudder'] = rudder_cmd
+    output['throttle_1'] = throttle_cmd
+    output['throttle_2'] = throttle_cmd
+    output['elevator_trim'] = trim_cmd
+    output['flaps'] = flaps_cmd
+    output['gear'] = gear_cmd
+    output['speedbrake'] = speedbrake_cmd
+
+    return output
+
+def _fuse_altitude(state):
+    altitudes = []
+
+    # Barometric altimeters (primary)
+    for i in range(1, 4):
+        if state.get(f'baro_alt_{i}_valid', False):
+            alt = state.get(f'baro_alt_{i}_ft')
+            if alt is not None:
+                altitudes.append(alt)
+
+    # Radar altimeter for low altitude (more reliable below 2500 ft)
+    current_baro = _median(altitudes) if altitudes else None
+    if current_baro is not None and current_baro < 2500:
+        for i in range(1, 4):
+            if state.get(f'radar_alt_{i}_valid', False):
+                alt = state.get(f'radar_alt_{i}_ft')
+                if alt is not None and abs(alt - current_baro) < 500:
+                    altitudes.append(alt)
+
+    # GPS altitude as cross-check
+    gps_alts = []
+    for i in range(1, 4):
+        if state.get(f'gps_{i}_valid', False):
+            alt = state.get(f'gps_{i}_alt_ft')
+            if alt is not None:
+                gps_alts.append(alt)
+
+    if altitudes:
+        result = _median(altitudes)
+
+        # Cross-check with GPS if available
+        if gps_alts:
+            gps_alt = _median(gps_alts)
+            if abs(result - gps_alt) > 500 and len(altitudes) <= 2:
+                # Possible sensor failure, trust GPS if available
+                return gps_alt
+
+        return result
+
+    return None
+
+def _fuse_heading(state):
+    headings = []
+
+    # IRS heading (primary)
+    for i in range(1, 4):
+        if state.get(f'irs_{i}_valid', False):
+            hdg = state.get(f'irs_{i}_heading_deg')
+            if hdg is not None:
+                headings.append(hdg)
+
+    # GPS track as cross-check
+    for i in range(1, 4):
+        if state.get(f'gps_{i}_valid', False):
+            track = state.get(f'gps_{i}_track_deg')
+            if track is not None:
+                headings.append(track)
+
+    if headings:
+        return _circular_median(headings)
+
+    return None
+
+def _fuse_airspeed(state):
+    speeds = []
+
+    # Vote on three ADC airspeed measurements
+    for i in range(1, 4):
+        if state.get(f'ias_{i}_valid', False):
+            spd = state.get(f'ias_{i}_kt')
+            if spd is not None:
+                speeds.append(spd)
+
+    if speeds:
+        return _median(speeds)
+
+    return None
+
+def _fuse_pitch(state):
+    pitches = []
+
+    # IRS pitch
+    for i in range(1, 4):
+        if state.get(f'irs_{i}_valid', False):
+            pitch = state.get(f'irs_{i}_pitch_deg')
+            if pitch is not None:
+                pitches.append(pitch)
+
+    if pitches:
+        return _median(pitches)
+
+    return None
+
+def _fuse_roll(state):
+    rolls = []
+
+    # IRS roll
+    for i in range(1, 4):
+        if state.get(f'irs_{i}_valid', False):
+            roll = state.get(f'irs_{i}_roll_deg')
+            if roll is not None:
+                rolls.append(roll)
+
+    if rolls:
+        return _median(rolls)
+
+    return None
+
+def _fuse_vertical_speed(state):
+    vs_values = []
+
+    # IRS vertical speed
+    for i in range(1, 4):
+        if state.get(f'irs_{i}_valid', False):
+            vs = state.get(f'irs_{i}_vs_fpm')
+            if vs is not None:
+                vs_values.append(vs)
+
+    if vs_values:
+        return _median(vs_values)
+
+    return None
+
+def _fuse_yaw_rate(state):
+    yaw_rates = []
+
+    # Gyroscope yaw rate
+    for i in range(1, 4):
+        if state.get(f'gyro_{i}_valid', False):
+            yaw = state.get(f'gyro_{i}_yaw_rate_dps')
+            if yaw is not None:
+                yaw_rates.append(yaw)
+
+    if yaw_rates:
+        return _median(yaw_rates)
+
+    return None
+
+def _detect_failures(state, altitude, airspeed):
+    global _failure_flags
+
+    # Check for altitude divergence
+    baro_alts = [state.get(f'baro_alt_{i}_ft') for i in range(1, 4)
+                 if state.get(f'baro_alt_{i}_valid', False) and state.get(f'baro_alt_{i}_ft') is not None]
+
+    if baro_alts and len(baro_alts) >= 2:
+        max_alt = max(baro_alts)
+        min_alt = min(baro_alts)
+        if max_alt - min_alt > 1000:
+            # Multiple altimeter divergence - potential failures
+            _failure_flags['alt_disagreement'] = True
+
+    # Check for speed anomaly
+    if airspeed is not None:
+        if airspeed < 50 or airspeed > 500:
+            _failure_flags['speed_anomaly'] = True
+
+    # Check engine status
+    eng1_running = state.get('engine_1_running', False)
+    eng2_running = state.get('engine_2_running', False)
+    if not eng1_running or not eng2_running:
+        _failure_flags['engine_failure'] = True
+
+def _pitch_controller(alt_error, spd_error, pitch, vertical_speed, dt):
+    global _pitch_integral
+
+    # Pitch control law for altitude and speed hold
+    # Proportional-Integral control
+
+    # Error priority: altitude > speed (altitude prevents level-off)
+    kp_alt = 0.005  # ~1 degree pitch per 200 ft error
+    kp_spd = -0.004  # Inverse: high speed = pitch up (increase drag)
+    ki = 0.0001
+
+    # Combined error signal
+    error = alt_error * kp_alt + spd_error * kp_spd
+    _pitch_integral += error * dt
+    _pitch_integral = _clamp(_pitch_integral, -0.3, 0.3)
+
+    pitch_cmd = error + _pitch_integral * ki
+
+    # Limit pitch command
+    pitch_cmd = _clamp(pitch_cmd, -1.0, 1.0)
+
+    return pitch_cmd
+
+def _roll_controller(hdg_error, roll, dt):
+    global _roll_integral
+
+    # Roll control for heading hold
+    # Command bank angle based on heading error
+    max_bank = 20.0  # Max 20 degree bank
+
+    # Proportional heading error to bank command
+    bank_cmd = _clamp(hdg_error / 8.0, -max_bank, max_bank)
+
+    # Roll control to achieve desired bank angle
+    roll_error = bank_cmd - roll
+
+    kp = 0.02
+    ki = 0.001
+
+    _roll_integral += roll_error * dt
+    _roll_integral = _clamp(_roll_integral, -0.2, 0.2)
+
+    roll_cmd = roll_error * kp + _roll_integral * ki
+    roll_cmd = _clamp(roll_cmd, -1.0, 1.0)
+
+    return roll_cmd
+
+def _yaw_controller(yaw_rate, roll, dt):
+    global _yaw_integral
+
+    # Yaw damping and turn coordination
+    # Primary: dampen yaw rate
+    # Secondary: coordinate with roll
+
+    kp_yaw = -0.01  # Damping gain
+    kp_coord = 0.002 * abs(roll) / 20.0  # Coordination gain
+
+    # Yaw damping
+    yaw_cmd = yaw_rate * kp_yaw
+
+    # Turn coordination (apply rudder in turns)
+    yaw_cmd += roll * kp_coord
+
+    yaw_cmd = _clamp(yaw_cmd, -1.0, 1.0)
+
+    return yaw_cmd
+
+def _throttle_controller(spd_error, alt_error, altitude, airspeed, dt):
+    global _speed_integral
+
+    # Throttle control for speed hold with altitude consideration
+
+    # Base throttle for cruise
+    base_throttle = 0.6
+
+    # Speed error to throttle (higher error = more throttle)
+    kp_spd = 0.002  # 1% throttle per 50 kt error
+
+    # Altitude consideration: need more throttle at altitude
+    alt_factor = 1.0 + (altitude / 40000.0) * 0.4
+
+    # Stall protection: maintain minimum speed
+    min_speed = 150.0  # Minimum safe speed in knots
+    if airspeed < min_speed + 20:
+        # Near stall: increase throttle
+        kp_spd = 0.005
+
+    _speed_integral += spd_error * dt
+    _speed_integral = _clamp(_speed_integral, -0.2, 0.2)
+
+    throttle = base_throttle + spd_error * kp_spd * alt_factor + _speed_integral * 0.0001
+    throttle = _clamp(throttle, 0.0, 1.0)
+
+    return throttle
+
+def _trim_controller(pitch_error, alt_error, dt):
+    global _trim_integral
+
+    # Slow elevator trim adjustment to relieve control column force
+    # Trim adjusts gradually to avoid instability
+
+    # Trim based on average pitch error
+    kp_trim = 0.001
+
+    _trim_integral += pitch_error * dt
+    _trim_integral = _clamp(_trim_integral, -1.0, 1.0)
+
+    # Very slow trim adjustment
+    trim_cmd = _trim_integral * 0.1
+    trim_cmd = _clamp(trim_cmd, -1.0, 1.0)
+
+    return trim_cmd
+
+def _flap_controller(airspeed, altitude):
+    # Automatic flap management
+    # Extend flaps as airspeed decreases
+
+    if airspeed is None:
+        return 0
+
+    if airspeed > 280:
+        return 0  # No flaps
+    elif airspeed > 230:
+        return 5  # Flaps 5
+    elif airspeed > 200:
+        return 15  # Flaps 15
+    else:
+        return 25  # Flaps 25
+
+    return 0
+
+def _gear_controller(altitude):
+    # Automatic landing gear management
+
+    if altitude is None:
+        return 0
+
+    # Lower gear below 5000 ft
+    if altitude < 5000:
+        return 1  # Down
+    else:
+        return 0  # Up
+
+def _speedbrake_controller(spd_error, alt_error):
+    # Speedbrake for descent control and overspeed prevention
+
+    # Open speedbrake if overspeeding or need to descend
+    if spd_error > 20 or (alt_error < -500):
+        return 0.5
+    elif spd_error > 50 or (alt_error < -1500):
+        return 1.0
+    else:
+        return 0.0
+
+def _median(values):
+    if not values:
+        return None
+    sorted_vals = sorted(values)
+    n = len(sorted_vals)
+    if n % 2 == 1:
+        return sorted_vals[n // 2]
+    return (sorted_vals[n // 2 - 1] + sorted_vals[n // 2]) / 2.0
+
+def _circular_median(angles):
+    if not angles:
+        return None
+
+    # Circular median for 0-360 degree values
+    sin_sum = sum(math.sin(math.radians(a)) for a in angles)
+    cos_sum = sum(math.cos(math.radians(a)) for a in angles)
+
+    result = math.degrees(math.atan2(sin_sum, cos_sum))
+    if result < 0:
+        result += 360
+    return result
+
+def _normalize_angle(angle):
+    # Normalize angle to -180 to 180 range for shortest turn
+    while angle > 180:
+        angle -= 360
+    while angle < -180:
+        angle += 360
+    return angle
+
+def _clamp(value, min_val, max_val):
+    return max(min_val, min(max_val, value))

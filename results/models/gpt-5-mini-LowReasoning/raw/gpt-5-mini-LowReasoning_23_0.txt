@@ -1,1 +1,353 @@
-{'__exception__': "Can't run here - we're trying to get this working in codex."}
+Here's a single-file Rust program that implements a non-blocking, multithreaded controller for the streaming Lunar Lander problem. It spawns a reader thread to parse stdin as it arrives, stores the latest state in a shared structure, and runs a controller loop at ~25 Hz that prints thrust/turn outputs to stdout. The control law is simple and conservative: it tries to keep the craft roughly vertical while cancelling horizontal velocity and providing just enough thrust to counter gravity and slow descent. This gives a baseline real-time controller that is safe and responsive to streaming input.
+
+Copy this into a file (e.g., main.rs) and compile with stable Rust (edition 2024 is used here via annotations but no special crates are needed).
+
+Note: The environment doesn't provide exact engine rotation limits. The controller uses a proportional law for rotation and thrust and clamps outputs into the required ranges. Adjust the gains if you want more aggressive behavior.
+
+```rust
+use std::io::{self, BufRead, Write};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
+
+#[derive(Clone, Debug)]
+struct MapInfo {
+    width: usize,
+    height: usize,
+    gravity: f64,
+    max_thrust: f64,
+    fuel_init: f64,
+    start_x: f64,
+    start_y: f64,
+    target_x: f64,
+    target_y: f64,
+    // We don't store the full map beyond reading to skip memory blowups for huge maps.
+}
+
+#[derive(Clone, Debug)]
+struct State {
+    x: f64,
+    y: f64,
+    vx: f64,
+    vy: f64,
+    angle: f64,
+    angular_vel: f64,
+    fuel: f64,
+    timestamp: Instant,
+}
+
+fn clamp(v: f64, lo: f64, hi: f64) -> f64 {
+    if v.is_nan() {
+        lo
+    } else if v < lo {
+        lo
+    } else if v > hi {
+        hi
+    } else {
+        v
+    }
+}
+
+fn main() {
+    // Shared parsed data
+    let map_info: Arc<Mutex<Option<MapInfo>>> = Arc::new(Mutex::new(None));
+    let latest_state: Arc<Mutex<Option<State>>> = Arc::new(Mutex::new(None));
+    let reader_map = Arc::clone(&map_info);
+    let reader_state = Arc::clone(&latest_state);
+
+    // Reader thread: parse the initial map, then stream states.
+    let reader = thread::spawn(move || {
+        let stdin = io::stdin();
+        let mut stdin_lock = stdin.lock().lines();
+
+        // Helper to get next non-empty line
+        let mut next_line = || -> Option<String> {
+            while let Some(ln) = stdin_lock.next() {
+                match ln {
+                    Ok(s) => {
+                        if !s.trim().is_empty() {
+                            return Some(s);
+                        } else {
+                            // empty line, keep reading
+                            continue;
+                        }
+                    }
+                    Err(_) => return None,
+                }
+            }
+            None
+        };
+
+        // Read initial numeric header line (width height gravity max_thrust fuel)
+        let header_line = match next_line() {
+            Some(l) => l,
+            None => return,
+        };
+        let mut header_parts = header_line.split_whitespace();
+        let width: usize = match header_parts.next().and_then(|s| s.parse().ok()) {
+            Some(v) => v,
+            None => {
+                // maybe all numbers on multiple lines; try reading additional tokens
+                let mut tokens = header_line.split_whitespace().map(|s| s.to_string()).collect::<Vec<_>>();
+                while tokens.len() < 5 {
+                    if let Some(l) = next_line() {
+                        tokens.extend(l.split_whitespace().map(|s| s.to_string()));
+                    } else {
+                        return;
+                    }
+                }
+                let mut it = tokens.into_iter();
+                it.next().unwrap().parse().unwrap_or(0usize)
+            }
+        };
+        // For safety parse the rest robustly
+        let mut tokens: Vec<String> = header_line.split_whitespace().map(|s| s.to_string()).collect();
+        while tokens.len() < 5 {
+            if let Some(l) = next_line() {
+                tokens.extend(l.split_whitespace().map(|s| s.to_string()));
+            } else {
+                return;
+            }
+        }
+        let width: usize = tokens[0].parse().unwrap_or(0);
+        let height: usize = tokens[1].parse().unwrap_or(0);
+        let gravity: f64 = tokens[2].parse().unwrap_or(9.81);
+        let max_thrust: f64 = tokens[3].parse().unwrap_or(10.0);
+        let fuel_init: f64 = tokens[4].parse().unwrap_or(100.0);
+
+        // Next line: start_x start_y target_x target_y
+        let mut coords_tokens: Vec<String> = Vec::new();
+        while coords_tokens.len() < 4 {
+            if let Some(l) = next_line() {
+                coords_tokens.extend(l.split_whitespace().map(|s| s.to_string()));
+            } else {
+                return;
+            }
+        }
+        let start_x: f64 = coords_tokens[0].parse().unwrap_or(0.0);
+        let start_y: f64 = coords_tokens[1].parse().unwrap_or(0.0);
+        let target_x: f64 = coords_tokens[2].parse().unwrap_or(start_x);
+        let target_y: f64 = coords_tokens[3].parse().unwrap_or(start_y);
+
+        // Read 'height' map rows. We discard them (to avoid huge memory usage),
+        // but we must consume exactly 'height' non-empty lines.
+        let mut rows_read = 0usize;
+        while rows_read < height {
+            if let Some(line) = next_line() {
+                // Accept empty rows as valid map rows if they exist; count them anyway.
+                rows_read += 1;
+                // We purposely don't store large maps to keep memory bounded.
+            } else {
+                // EOF early
+                break;
+            }
+        }
+
+        // Store map info
+        {
+            let mut mg = reader_map.lock().unwrap();
+            *mg = Some(MapInfo {
+                width,
+                height,
+                gravity,
+                max_thrust,
+                fuel_init,
+                start_x,
+                start_y,
+                target_x,
+                target_y,
+            });
+        }
+
+        // Now read continuous updates. Each update should be a line with 7 numbers:
+        // x y vx vy angle angular_vel fuel_remaining
+        // But we parse tokens flexibly: collect tokens until 7 are available, then form a state.
+        let mut pending_tokens: Vec<String> = Vec::new();
+        loop {
+            // Pull next raw line (blocks until available)
+            match stdin_lock.next() {
+                Some(Ok(line)) => {
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    pending_tokens.extend(line.split_whitespace().map(|s| s.to_string()));
+                    while pending_tokens.len() >= 7 {
+                        // Parse a state from the first 7 tokens
+                        let mut nums = [0f64; 7];
+                        let mut ok = true;
+                        for i in 0..7 {
+                            match pending_tokens[i].parse::<f64>() {
+                                Ok(v) => nums[i] = v,
+                                Err(_) => {
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if !ok {
+                            // discard one token and retry to resync
+                            pending_tokens.remove(0);
+                            continue;
+                        }
+                        // Remove the first 7 tokens
+                        for _ in 0..7 {
+                            pending_tokens.remove(0);
+                        }
+                        let state = State {
+                            x: nums[0],
+                            y: nums[1],
+                            vx: nums[2],
+                            vy: nums[3],
+                            angle: nums[4],
+                            angular_vel: nums[5],
+                            fuel: nums[6],
+                            timestamp: Instant::now(),
+                        };
+                        // store state
+                        {
+                            let mut gs = reader_state.lock().unwrap();
+                            *gs = Some(state);
+                        }
+                    }
+                }
+                Some(Err(_)) => {
+                    // Unexpected error reading stdin, exit reader
+                    break;
+                }
+                None => {
+                    // EOF
+                    break;
+                }
+            }
+        }
+    });
+
+    // Controller loop: produce outputs at >=20Hz (we choose 25Hz -> 40ms period)
+    // Use stdout lock to write outputs quickly and flush.
+    let mut stdout = io::stdout();
+    let mut out = stdout.lock();
+
+    // We'll wait until map_info is available
+    loop {
+        if map_info.lock().unwrap().is_some() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+
+    // Gains and constants (conservative)
+    let kp_angle = 1.5; // how strongly to rotate toward desired angle (rad error -> rad/s)
+    let kp_vx = 0.6; // desired angle contribution from horizontal velocity
+    let target_horizontal_deadzone = 0.5; // m/s tolerance
+    let kp_vy = 0.6; // vertical velocity damping into thrust
+    let hover_margin = 0.20; // extra thrust margin (fraction of max thrust)
+
+    let period = Duration::from_millis(40); // 25 Hz
+    let mut last_output = Instant::now();
+
+    loop {
+        let loop_start = Instant::now();
+
+        // Get latest state copy
+        let s_opt = { latest_state.lock().unwrap().clone() };
+        let map = { map_info.lock().unwrap().clone() };
+
+        if let (Some(state), Some(mapinfo)) = (s_opt, map) {
+            // Compute desired angle:
+            // We want to cancel horizontal velocity by tilting toward direction opposite vx.
+            // Positive vx => moving right, so tilt right (positive angle) to push left (thrust vector points along angle upwards).
+            // angle = 0 means facing up (thrust upwards). Positive is clockwise per spec.
+            // We'll set desired_angle proportional to -vx (so negative vx -> tilt left).
+            // Use sign convention carefully: if vx > 0 (moving right), we want thrust to have a leftward component,
+            // that corresponds to angle > 0? If 0 is up, positive angle rotates clockwise -> right side down -> thrust vector points to the right relative to vertical.
+            // To produce leftward thrust we need a negative angle. So desired_angle = -kp_vx * vx.
+            let desired_angle = -kp_vx * state.vx;
+
+            // Angle error
+            let angle_error = desired_angle - state.angle;
+            // Compute turn command: proportional to angle error
+            // We do not know the mapping from turn command to rad/s, but the spec says turn is radians/sec in command range -1..1,
+            // so we'll scale by a factor to try to get responsive rotation.
+            let turn_cmd = clamp(angle_error * kp_angle, -1.0, 1.0);
+
+            // Thrust: we aim to counter gravity and slow downward speed.
+            // Required upward acceleration to counter gravity is gravity.
+            // Use additional acceleration to reduce downward velocity: a_extra = -kp_vy * vy (vy positive downward),
+            // so if vy positive we want upward acceleration (negative vy * -kp_vy -> negative? careful) We'll set desired_accel_up = -kp_vy * vy
+            // Desired upward acceleration (positive upwards) to reduce downward speed: desired_up = -kp_vy * state.vy
+            // Net acceleration we need from engines upwards = gravity + desired_up (since gravity is downward positive).
+            // Then thrust fraction = needed_accel / max_thrust, but clamp to [0,1].
+            let desired_up_accel = -kp_vy * state.vy;
+            let needed_accel = mapinfo.gravity + desired_up_accel;
+            let mut thrust_frac = needed_accel / mapinfo.max_thrust;
+
+            // If we are tilted, vertical component of thrust reduces: multiply by cos(angle)
+            // To approximately account, increase thrust_fraction by 1/cos(angle) factor (safely).
+            let cos_a = state.angle.cos().abs().max(0.2); // avoid divide by zero; keep conservative
+            thrust_frac /= cos_a;
+
+            // Add small margin and safety
+            thrust_frac += hover_margin * thrust_frac.max(0.0);
+
+            // If horizontal velocity large, ask a bit more thrust to enable maneuvering
+            let extra_for_horizontal = (state.vx.abs() * 0.05).min(0.3);
+            thrust_frac += extra_for_horizontal;
+
+            // If close to target horizontally and vertically, reduce thrust to land softly
+            let dx = state.x - mapinfo.target_x;
+            let dy = state.y - mapinfo.target_y;
+            let close_xy = dx.abs() < 5.0 && dy.abs() < 6.0;
+            if close_xy {
+                // prioritize soft landing: reduce thrust if descending too fast but also ensure not to crash
+                if state.vy > 1.5 {
+                    // descending fast: add thrust
+                    thrust_frac += 0.3;
+                } else {
+                    // gentle slow down
+                    thrust_frac *= 0.8;
+                }
+            }
+
+            // If fuel is very low, reduce thrust conservatively
+            if state.fuel < 1.0 {
+                thrust_frac = thrust_frac.min(0.6);
+            }
+
+            // Limit thrust and turn to valid ranges
+            let thrust_cmd = clamp(thrust_frac, 0.0, 1.0);
+            let turn_cmd = clamp(turn_cmd, -1.0, 1.0);
+
+            // Print outputs: two decimals are fine but keep full precision to be safe
+            // Format: "thrust turn\n"
+            let _ = writeln!(out, "{:.6} {:.6}", thrust_cmd, turn_cmd);
+            let _ = out.flush();
+            last_output = Instant::now();
+        } else {
+            // We don't have a state yet: output zero commands to avoid timeouts
+            let _ = writeln!(out, "{:.6} {:.6}", 0.0f64, 0.0f64);
+            let _ = out.flush();
+            last_output = Instant::now();
+        }
+
+        // Sleep to maintain loop period (non-busy)
+        let elapsed = loop_start.elapsed();
+        if elapsed < period {
+            thread::sleep(period - elapsed);
+        } else {
+            // If we're late, just yield briefly to avoid hogging CPU
+            thread::yield_now();
+        }
+    }
+
+    // Wait for reader thread to finish (unreachable in this infinite loop example)
+    let _ = reader.join();
+}
+```
+
+Key characteristics:
+- Reader thread parses initial map header and then streams state updates, storing only the latest state to minimize memory usage.
+- Controller runs at ~25 Hz, writing thrust and turn commands every cycle and flushing stdout immediately to avoid IO buffering delays that could cause simulated freezes.
+- Controller uses conservative proportional gains and safety clamping to avoid extreme commands.
+- The map rows are consumed from stdin but not stored (to handle enormous maps without blowing memory).
+
+You can tune the PID-like gains (kp_angle, kp_vx, kp_vy, hover_margin, etc.) for better performance on particular maps or tougher scenarios.

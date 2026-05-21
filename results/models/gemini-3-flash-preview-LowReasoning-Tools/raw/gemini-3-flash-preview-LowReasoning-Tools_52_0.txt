@@ -1,0 +1,196 @@
+import math
+
+# Persistent state for filtering and PID
+class AutopilotState:
+    def __init__(self):
+        self.prev_speed_error = 0.0
+        self.speed_integral = 0.0
+        self.prev_lane_error = 0.0
+        self.lane_integral = 0.0
+        self.initialized = False
+        self.last_steering = 0.0
+        self.last_throttle = 0.0
+        self.last_brake = 0.0
+
+state_persist = AutopilotState()
+
+def get_median(values):
+    if not values:
+        return None
+    sorted_vals = sorted(values)
+    n = len(sorted_vals)
+    if n % 2 == 1:
+        return sorted_vals[n // 2]
+    else:
+        return (sorted_vals[n // 2 - 1] + sorted_vals[n // 2]) / 2.0
+
+def fuse_speed(state):
+    speeds = []
+    # Wheel speeds
+    for s in ['fl', 'fr', 'rl', 'rr']:
+        if state.get(f'wheel_speed_{s}_valid') and state.get(f'wheel_speed_{s}_kmh') is not None:
+            speeds.append(state[f'wheel_speed_{s}_kmh'])
+    
+    # GPS speeds
+    for i in [1, 2]:
+        if state.get(f'gps_{i}_valid') and state.get(f'gps_{i}_speed_kmh') is not None:
+            speeds.append(state[f'gps_{i}_speed_kmh'])
+            
+    # Vehicle speeds
+    for i in [1, 2]:
+        v_speed = state.get(f'vehicle_speed_{i}_kmh')
+        if v_speed is not None:
+            speeds.append(v_speed)
+            
+    res = get_median(speeds)
+    return res if res is not None else 0.0
+
+def fuse_vision_value(state, key_suffix, valid_suffix=None):
+    values = []
+    for i in [1, 2, 3]:
+        valid_key = f'vision_{i}_{valid_suffix}' if valid_suffix else f'vision_{i}_{key_suffix}_valid'
+        if state.get(valid_key) or valid_suffix is None:
+            val = state.get(f'vision_{i}_{key_suffix}')
+            if val is not None:
+                values.append(val)
+    return get_median(values)
+
+def autopilot_step(state: dict, dt: float) -> dict:
+    global state_persist
+    if not state_persist.initialized:
+        state_persist.initialized = True
+        
+    if dt <= 0:
+        dt = 0.01 # Prevent division by zero
+
+    # 1. Sensor Fusion
+    current_speed_kmh = fuse_speed(state)
+    mu = state.get('estimated_mu', 1.0)
+    target_speed_kmh = state.get('target_speed_kmh', 100.0)
+    
+    # Vision Fusion
+    lane_offset = fuse_vision_value(state, 'lane_offset_m')
+    road_curvature = fuse_vision_value(state, 'road_curvature_1pm')
+    if road_curvature is None: road_curvature = 0.0
+    
+    speed_limit = fuse_vision_value(state, 'speed_limit_kmh', 'speed_limit_valid')
+    if speed_limit:
+        target_speed_kmh = min(target_speed_kmh, speed_limit)
+
+    # Obstacle avoidance
+    min_obstacle_dist = 1000.0
+    obstacle_rel_speed = 0.0
+    
+    for i in [1, 2, 3]:
+        if state.get(f'vision_{i}_obstacle_detected') and state.get(f'vision_{i}_obstacle_valid'):
+            dist = state.get(f'vision_{i}_obstacle_dist_m', 1000.0)
+            if dist < min_obstacle_dist:
+                min_obstacle_dist = dist
+                obstacle_rel_speed = state.get(f'vision_{i}_obstacle_rel_speed_kmh', 0.0)
+
+    # Lidar check for obstacles
+    lidar_angles = ['+005', '+015', '-005', '-015']
+    for ang in lidar_angles:
+        if state.get(f'lidar_{ang}_deg_valid'):
+            dist = state.get(f'lidar_{ang}_deg_range_m', 1000.0)
+            # Only consider lidar obstacles if they are closer than vision
+            if dist < min_obstacle_dist:
+                min_obstacle_dist = dist
+                # Assume static or same speed if only lidar sees it
+                if dist < 20: obstacle_rel_speed = min(obstacle_rel_speed, 0.0)
+
+    # 2. Speed Control (PID)
+    # Adjust target speed for traction
+    safe_speed = target_speed_kmh
+    if mu < 0.6: safe_speed *= (0.5 + 0.8 * mu) # Scaled reduction
+    if mu < 0.2: safe_speed = min(safe_speed, 30.0) # Very slow on ice
+
+    # Safety Buffer (Time To Collision)
+    target_ttc = 3.0 # seconds
+    stop_dist = 5.0 # meters
+    
+    if min_obstacle_dist < 100.0:
+        # Simple ACC logic
+        v_rel_ms = obstacle_rel_speed / 3.6
+        v_target_ms = (min_obstacle_dist - stop_dist) / target_ttc + v_rel_ms
+        safe_speed = min(safe_speed, max(0.0, v_target_ms * 3.6))
+
+    speed_error = (safe_speed - current_speed_kmh) / 3.6 # m/s
+    
+    # Integral anti-windup
+    if abs(speed_error) < 10.0:
+        state_persist.speed_integral += speed_error * dt
+    state_persist.speed_integral = max(-50.0, min(50.0, state_persist.speed_integral))
+    
+    speed_derivative = (speed_error - state_persist.prev_speed_error) / dt
+    state_persist.prev_speed_error = speed_error
+    
+    kp_v, ki_v, kd_v = (0.6, 0.05, 0.1)
+    accel_cmd = kp_v * speed_error + ki_v * state_persist.speed_integral + kd_v * speed_derivative
+    
+    throttle = 0.0
+    brake = 0.0
+    if accel_cmd > 0.05:
+        throttle = min(1.0, accel_cmd)
+        brake = 0.0
+    elif accel_cmd < -0.05:
+        brake = min(1.0, -accel_cmd)
+        throttle = 0.0
+        
+    # Emergency braking
+    if min_obstacle_dist < 10.0 and current_speed_kmh > 5.0:
+        brake = 1.0
+        throttle = 0.0
+
+    # Traction management for throttle/brake
+    if mu < 0.5:
+        throttle = min(throttle, mu * 1.5)
+        brake = min(brake, mu * 2.0)
+
+    # 3. Steering Control (Lane Keeping)
+    target_lane = state.get('target_lane', 1)
+    current_lane = state.get('current_lane', 1)
+    
+    if lane_offset is None: lane_offset = 0.0
+        
+    lane_width = 3.7 # Standard highway lane
+    lane_diff = target_lane - current_lane
+    effective_offset = lane_offset - (lane_diff * lane_width)
+    
+    # PID for steering
+    # Adjust gains based on speed
+    speed_factor = max(10.0, current_speed_kmh) / 50.0
+    kp_s = 0.15 / speed_factor
+    ki_s = 0.001
+    kd_s = 0.05 / speed_factor
+    
+    lane_error = -effective_offset
+    state_persist.lane_integral += lane_error * dt
+    state_persist.lane_integral = max(-1.0, min(1.0, state_persist.lane_integral))
+    
+    lane_derivative = (lane_error - state_persist.prev_lane_error) / dt
+    state_persist.prev_lane_error = lane_error
+    
+    steering = kp_s * lane_error + ki_s * state_persist.lane_integral + kd_s * lane_derivative
+    
+    # Curvature feedforward
+    if road_curvature != 0:
+        # steering angle approx proportional to curvature * wheelbase / speed^2 ?
+        # simpler: heuristic
+        steering += road_curvature * 15.0 
+        
+    # Reduce steering sensitivity on low mu
+    if mu < 0.4:
+        steering = max(-0.5, min(0.5, steering))
+        
+    steering = max(-1.0, min(1.0, steering))
+
+    state_persist.last_steering = steering
+    state_persist.last_throttle = throttle
+    state_persist.last_brake = brake
+
+    return {
+        "steering": steering,
+        "throttle": throttle,
+        "brake": brake
+    }

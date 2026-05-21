@@ -1,0 +1,391 @@
+use std::f64::consts::PI;
+use std::io::{self, BufRead, BufReader, Write};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
+
+#[derive(Clone, Copy, Debug, Default)]
+struct State {
+    x: f64,
+    y: f64,
+    vx: f64,
+    vy: f64,
+    angle: f64,
+    angular_vel: f64,
+    fuel: f64,
+}
+
+#[derive(Debug)]
+struct Shared {
+    latest: Option<State>,
+    closed: bool,
+}
+
+#[derive(Debug)]
+struct TerrainProfile {
+    top_solid_y: Vec<i32>,
+}
+
+#[derive(Debug)]
+struct MapInfo {
+    gravity: f64,
+    max_thrust: f64,
+    start_x: f64,
+    start_y: f64,
+    target_y: f64,
+    landing_left: i32,
+    landing_right: i32,
+    profile: Option<TerrainProfile>,
+}
+
+struct Scanner<R> {
+    reader: R,
+    buf: Vec<u8>,
+    pos: usize,
+    cap: usize,
+}
+
+impl<R: BufRead> Scanner<R> {
+    fn new(reader: R) -> Self {
+        Self {
+            reader,
+            buf: vec![0; 1 << 16],
+            pos: 0,
+            cap: 0,
+        }
+    }
+
+    fn refill(&mut self) -> bool {
+        match self.reader.read(&mut self.buf) {
+            Ok(0) | Err(_) => false,
+            Ok(n) => {
+                self.pos = 0;
+                self.cap = n;
+                true
+            }
+        }
+    }
+
+    fn next_token(&mut self) -> Option<String> {
+        let mut out = Vec::with_capacity(32);
+        loop {
+            if self.pos >= self.cap && !self.refill() {
+                break;
+            }
+            while self.pos < self.cap && self.buf[self.pos].is_ascii_whitespace() {
+                self.pos += 1;
+                if self.pos >= self.cap && !self.refill() {
+                    return None;
+                }
+            }
+            while self.pos < self.cap && !self.buf[self.pos].is_ascii_whitespace() {
+                out.push(self.buf[self.pos]);
+                self.pos += 1;
+            }
+            if !out.is_empty() {
+                break;
+            }
+        }
+        if out.is_empty() {
+            None
+        } else {
+            String::from_utf8(out).ok()
+        }
+    }
+
+    fn next_usize(&mut self) -> Option<usize> {
+        self.next_token()?.parse().ok()
+    }
+
+    fn next_f64(&mut self) -> Option<f64> {
+        self.next_token()?.parse().ok()
+    }
+}
+
+fn clamp(v: f64, lo: f64, hi: f64) -> f64 {
+    v.max(lo).min(hi)
+}
+
+fn normalize_angle(mut a: f64) -> f64 {
+    while a > PI {
+        a -= 2.0 * PI;
+    }
+    while a < -PI {
+        a += 2.0 * PI;
+    }
+    a
+}
+
+fn estimate_barrier_y(profile: &TerrainProfile, x0: f64, x1: f64) -> Option<i32> {
+    let mut lo = x0.floor() as isize;
+    let mut hi = x1.ceil() as isize;
+    if lo > hi {
+        std::mem::swap(&mut lo, &mut hi);
+    }
+    lo = lo.max(0);
+    hi = hi.min(profile.top_solid_y.len() as isize - 1);
+    if lo > hi {
+        return None;
+    }
+    let mut best = i32::MAX;
+    for idx in lo..=hi {
+        let y = profile.top_solid_y[idx as usize];
+        if y >= 0 && y < best {
+            best = y;
+        }
+    }
+    if best == i32::MAX { None } else { Some(best) }
+}
+
+fn control(state: State, map: &MapInfo) -> (f64, f64) {
+    let pad_center_x = (map.landing_left + map.landing_right) as f64 * 0.5;
+    let pad_half_width = ((map.landing_right - map.landing_left).abs() as f64 * 0.5).max(1.0);
+    let dx = pad_center_x - state.x;
+    let dy = map.target_y - state.y;
+    let horizontal_error = dx.abs();
+
+    let mut desired_y = map.target_y - 12.0;
+    let (desired_x, mut desired_vx, mut desired_vy);
+
+    if let Some(profile) = &map.profile {
+        if horizontal_error > pad_half_width + 6.0 {
+            if let Some(barrier_y) = estimate_barrier_y(profile, state.x, pad_center_x) {
+                let clearance = if horizontal_error > 80.0 { 14.0 } else { 10.0 };
+                let transit_y = (barrier_y as f64 - clearance).min(map.target_y - 6.0);
+                desired_y = desired_y.min(transit_y);
+            }
+        }
+    }
+
+    let above_transit_line = state.y <= desired_y + 1.5;
+    if horizontal_error > pad_half_width + 4.0 {
+        desired_x = pad_center_x;
+        desired_vx = clamp(dx * 0.08, -8.0, 8.0);
+        desired_vy = if above_transit_line {
+            clamp((desired_y - state.y) * 0.18, -2.0, 2.0)
+        } else {
+            -3.0
+        };
+        if state.y > desired_y + 6.0 {
+            desired_vx *= 0.4;
+        }
+    } else {
+        desired_x = pad_center_x;
+        let altitude = map.target_y - state.y;
+        desired_vx = clamp(dx * 0.25, -2.0, 2.0);
+        desired_vy = if altitude < 4.0 {
+            0.0
+        } else if altitude < 10.0 {
+            0.8
+        } else if altitude < 24.0 {
+            1.5
+        } else {
+            2.2
+        };
+    }
+
+    if dy > -1.0 && horizontal_error < pad_half_width && state.vy.abs() < 1.5 && state.vx.abs() < 1.0 {
+        desired_vy = 0.0;
+    }
+
+    let ax_cmd = clamp((desired_x - state.x) * 0.05 + (desired_vx - state.vx) * 0.45, -8.0, 8.0);
+    let ay_cmd = clamp((desired_y - state.y) * 0.03 + (desired_vy - state.vy) * 0.65, -8.0, 8.0);
+
+    let thrust_x = ax_cmd;
+    let thrust_up = map.gravity - ay_cmd;
+    let mut desired_angle = thrust_x.atan2(thrust_up.max(0.2));
+    desired_angle = clamp(desired_angle, -1.35, 1.35);
+
+    if state.fuel < 0.5 {
+        desired_angle *= 0.5;
+    }
+
+    let required_accel = (thrust_x * thrust_x + thrust_up * thrust_up).sqrt();
+    let mut thrust = clamp(required_accel / map.max_thrust.max(0.1), 0.0, 1.0);
+
+    if horizontal_error < pad_half_width + 2.0 && map.target_y - state.y < 8.0 {
+        thrust = thrust.max(if state.vy > 1.2 { 0.55 } else { 0.25 });
+    }
+    if state.vy > 5.0 {
+        thrust = thrust.max(0.85);
+    }
+
+    let angle_error = normalize_angle(desired_angle - state.angle);
+    let turn = clamp(angle_error * 2.4 - state.angular_vel * 0.9, -1.0, 1.0);
+
+    (thrust, turn)
+}
+
+fn main() {
+    let stdin = io::stdin();
+    let reader = BufReader::new(stdin.lock());
+    let mut scan = Scanner::new(reader);
+
+    let width = match scan.next_usize() {
+        Some(v) => v,
+        None => return,
+    };
+    let height = match scan.next_usize() {
+        Some(v) => v,
+        None => return,
+    };
+    let gravity = match scan.next_f64() {
+        Some(v) => v,
+        None => return,
+    };
+    let max_thrust = match scan.next_f64() {
+        Some(v) => v,
+        None => return,
+    };
+    let _initial_fuel = match scan.next_f64() {
+        Some(v) => v,
+        None => return,
+    };
+
+    let start_x = match scan.next_f64() {
+        Some(v) => v,
+        None => return,
+    };
+    let start_y = match scan.next_f64() {
+        Some(v) => v,
+        None => return,
+    };
+    let target_x = match scan.next_f64() {
+        Some(v) => v,
+        None => return,
+    };
+    let target_y = match scan.next_f64() {
+        Some(v) => v,
+        None => return,
+    };
+
+    let store_profile = width <= 2_000_000;
+    let mut top_solid_y = if store_profile {
+        vec![-1; width]
+    } else {
+        Vec::new()
+    };
+
+    let mut landing_left = target_x.floor() as i32;
+    let mut landing_right = target_x.ceil() as i32;
+
+    for y in 0..height {
+        let row = match scan.next_token() {
+            Some(s) => s,
+            None => return,
+        };
+        let bytes = row.as_bytes();
+        if bytes.len() != width {
+            return;
+        }
+
+        if store_profile {
+            for (x, &b) in bytes.iter().enumerate() {
+                if top_solid_y[x] < 0 && matches!(b, b'#' | b'L' | b'T') {
+                    top_solid_y[x] = y as i32;
+                }
+            }
+        }
+
+        if (y as f64 - target_y).abs() <= 1.0 {
+            let tx = clamp(target_x.floor(), 0.0, (width.saturating_sub(1)) as f64) as usize;
+            if tx < bytes.len() && matches!(bytes[tx], b'L' | b'T') {
+                let mut l = tx;
+                while l > 0 && matches!(bytes[l - 1], b'L' | b'T') {
+                    l -= 1;
+                }
+                let mut r = tx;
+                while r + 1 < bytes.len() && matches!(bytes[r + 1], b'L' | b'T') {
+                    r += 1;
+                }
+                landing_left = l as i32;
+                landing_right = r as i32;
+            }
+        }
+    }
+
+    let map = Arc::new(MapInfo {
+        gravity,
+        max_thrust,
+        start_x,
+        start_y,
+        target_y,
+        landing_left,
+        landing_right,
+        profile: if store_profile {
+            Some(TerrainProfile { top_solid_y })
+        } else {
+            None
+        },
+    });
+
+    let shared = Arc::new(Mutex::new(Shared {
+        latest: Some(State {
+            x: map.start_x,
+            y: map.start_y,
+            ..State::default()
+        }),
+        closed: false,
+    }));
+
+    {
+        let shared = Arc::clone(&shared);
+        let map = Arc::clone(&map);
+        thread::spawn(move || {
+            let mut out = io::BufWriter::new(io::stdout().lock());
+            let tick = Duration::from_millis(50);
+            loop {
+                let start = Instant::now();
+                let (state, closed) = {
+                    let guard = shared.lock().unwrap();
+                    (guard.latest, guard.closed)
+                };
+
+                if let Some(state) = state {
+                    let (thrust, turn) = control(state, &map);
+                    let _ = writeln!(out, "{:.3} {:.3}", thrust, turn);
+                    let _ = out.flush();
+                }
+
+                if closed {
+                    break;
+                }
+
+                let elapsed = start.elapsed();
+                if elapsed < tick {
+                    thread::sleep(tick - elapsed);
+                }
+            }
+        });
+    }
+
+    loop {
+        let next = (
+            scan.next_f64(),
+            scan.next_f64(),
+            scan.next_f64(),
+            scan.next_f64(),
+            scan.next_f64(),
+            scan.next_f64(),
+            scan.next_f64(),
+        );
+        let state = match next {
+            (Some(x), Some(y), Some(vx), Some(vy), Some(angle), Some(angular_vel), Some(fuel)) => State {
+                x,
+                y,
+                vx,
+                vy,
+                angle,
+                angular_vel,
+                fuel,
+            },
+            _ => {
+                let mut guard = shared.lock().unwrap();
+                guard.closed = true;
+                break;
+            }
+        };
+        let mut guard = shared.lock().unwrap();
+        guard.latest = Some(state);
+    }
+}

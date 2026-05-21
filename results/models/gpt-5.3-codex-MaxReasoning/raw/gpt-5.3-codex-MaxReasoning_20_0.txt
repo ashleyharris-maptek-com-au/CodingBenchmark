@@ -1,0 +1,740 @@
+use std::collections::HashMap;
+use std::io::{self, Read};
+
+#[derive(Clone, Copy, Debug, Default)]
+struct RobustStats {
+    median: f64,
+    mad: f64,
+    mean: f64,
+    std: f64,
+    scale: f64,
+    count: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Suspect {
+    sample: usize,
+    prop: usize,
+    score: f64,
+    confidence: f64,
+}
+
+#[derive(Debug)]
+struct ParsedData {
+    num_props: usize,
+    prop_names: Vec<String>,
+    hole_ids: Vec<String>,
+    sample_hole: Vec<usize>,
+    sample_idx: Vec<usize>,
+    coords: Vec<[f32; 3]>,
+    values: Vec<Vec<f32>>, // property-major: values[prop][sample]
+}
+
+#[derive(Debug)]
+struct GridIndex {
+    min: [f32; 3],
+    cell: f32,
+    sample_cell: Vec<(i32, i32, i32)>,
+    buckets: HashMap<(i32, i32, i32), Vec<usize>>,
+}
+
+#[derive(Debug)]
+struct VoxelModel {
+    sample_cell: Vec<(i32, i32, i32)>,
+    sample_voxel: Vec<usize>,
+    map: HashMap<(i32, i32, i32), usize>,
+    counts: Vec<u32>,
+    sums: Vec<f64>,
+    sums_sq: Vec<f64>,
+    props: usize,
+}
+
+fn main() {
+    let mut input = String::new();
+    if io::stdin().read_to_string(&mut input).is_err() {
+        println!("0");
+        return;
+    }
+
+    let data = parse_input(&input);
+    let n_samples = data.coords.len();
+    if n_samples == 0 || data.num_props == 0 {
+        println!("0");
+        return;
+    }
+
+    let max_sample_for_global = if n_samples <= 300_000 { n_samples } else { 300_000 };
+    let global_stats = compute_global_stats(&data.values, max_sample_for_global);
+
+    let mut suspects = if n_samples <= 80_000 {
+        detect_with_knn(&data, &global_stats)
+    } else {
+        detect_with_voxels(&data, &global_stats)
+    };
+
+    suspects.sort_by(|a, b| {
+        b.confidence
+            .total_cmp(&a.confidence)
+            .then_with(|| b.score.total_cmp(&a.score))
+            .then_with(|| a.sample.cmp(&b.sample))
+            .then_with(|| a.prop.cmp(&b.prop))
+    });
+
+    let mut out = String::new();
+    out.push_str(&format!("{}\n", suspects.len()));
+    for s in suspects {
+        let hole_idx = data.sample_hole[s.sample];
+        let hole_id = &data.hole_ids[hole_idx];
+        let sample_idx = data.sample_idx[s.sample];
+        let prop_name = &data.prop_names[s.prop];
+        out.push_str(&format!(
+            "{} {} {} {:.6}\n",
+            hole_id, sample_idx, prop_name, s.confidence
+        ));
+    }
+    print!("{out}");
+}
+
+fn detect_with_knn(data: &ParsedData, global_stats: &[RobustStats]) -> Vec<Suspect> {
+    let n = data.coords.len();
+    let pcount = data.num_props;
+    let mut suspects = Vec::new();
+
+    let grid = GridIndex::build(&data.coords, 8.0);
+    let k_target = if n <= 5_000 { 24 } else { 32 };
+    let max_radius = if n <= 20_000 { 4 } else { 3 };
+    let min_local = 8usize;
+    let score_threshold = 3.2;
+    let max_keep = if n <= 120_000 { 40_000 } else { 60_000 };
+
+    let mut local_vals = Vec::<f32>::with_capacity(k_target);
+    let mut deviations = Vec::<f32>::with_capacity(k_target);
+
+    for i in 0..n {
+        let neighbors = grid.neighbors(&data.coords, i, k_target, max_radius);
+        for p in 0..pcount {
+            let x_f = data.values[p][i];
+            if !x_f.is_finite() {
+                continue;
+            }
+            let x = x_f as f64;
+
+            local_vals.clear();
+            for &j in &neighbors {
+                let v = data.values[p][j];
+                if v.is_finite() {
+                    local_vals.push(v);
+                }
+            }
+
+            let (local_z, support) = if local_vals.len() >= min_local {
+                local_vals.sort_by(|a, b| a.total_cmp(b));
+                let med = median_sorted_f32(&local_vals);
+
+                deviations.clear();
+                for &v in &local_vals {
+                    deviations.push((v as f64 - med).abs() as f32);
+                }
+                deviations.sort_by(|a, b| a.total_cmp(b));
+                let mad = median_sorted_f32(&deviations);
+
+                let denom = (1.4826 * mad).max(global_stats[p].scale * 0.15).max(1e-6);
+                let z = ((x - med).abs() / denom).min(1_000.0);
+                let support = (local_vals.len() as f64 / k_target as f64).min(1.0);
+                (z, support)
+            } else {
+                (0.0, 0.0)
+            };
+
+            let global_z = robust_global_z(x, &global_stats[p]);
+            let mut score = if support > 0.0 {
+                0.72 * local_z + 0.28 * global_z
+            } else {
+                0.88 * global_z
+            };
+            score *= 0.65 + 0.35 * support;
+
+            if score >= score_threshold {
+                let confidence = confidence_from_score(score, support);
+                suspects.push(Suspect {
+                    sample: i,
+                    prop: p,
+                    score,
+                    confidence,
+                });
+            }
+        }
+
+        if suspects.len() > max_keep * 4 {
+            suspects.sort_by(|a, b| b.confidence.total_cmp(&a.confidence));
+            suspects.truncate(max_keep * 2);
+        }
+    }
+
+    suspects.sort_by(|a, b| b.confidence.total_cmp(&a.confidence));
+    suspects.truncate(max_keep.min(suspects.len()));
+    suspects
+}
+
+fn detect_with_voxels(data: &ParsedData, global_stats: &[RobustStats]) -> Vec<Suspect> {
+    let n = data.coords.len();
+    let pcount = data.num_props;
+    let mut suspects = Vec::new();
+
+    let target_samples_per_voxel = if n > 1_500_000 {
+        36.0
+    } else if n > 600_000 {
+        28.0
+    } else {
+        20.0
+    };
+    let model = VoxelModel::build(data, target_samples_per_voxel);
+
+    let radius = if n > 1_000_000 { 1 } else { 2 };
+    let min_local = if n > 1_000_000 { 8u32 } else { 10u32 };
+    let score_threshold = if n > 1_000_000 { 3.5 } else { 3.3 };
+    let max_keep = if n > 1_000_000 { 80_000 } else { 60_000 };
+
+    let mut n_acc = vec![0u32; pcount];
+    let mut s_acc = vec![0.0f64; pcount];
+    let mut q_acc = vec![0.0f64; pcount];
+
+    for i in 0..n {
+        n_acc.fill(0);
+        s_acc.fill(0.0);
+        q_acc.fill(0.0);
+
+        let (cx, cy, cz) = model.sample_cell[i];
+        for dx in -radius..=radius {
+            for dy in -radius..=radius {
+                for dz in -radius..=radius {
+                    let key = (cx + dx, cy + dy, cz + dz);
+                    if let Some(&vidx) = model.map.get(&key) {
+                        let base = vidx * pcount;
+                        for p in 0..pcount {
+                            let c = model.counts[base + p];
+                            if c > 0 {
+                                n_acc[p] = n_acc[p].saturating_add(c);
+                                s_acc[p] += model.sums[base + p];
+                                q_acc[p] += model.sums_sq[base + p];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let self_voxel = model.sample_voxel[i];
+        let self_base = self_voxel * pcount;
+
+        for p in 0..pcount {
+            let x_f = data.values[p][i];
+            if !x_f.is_finite() {
+                continue;
+            }
+            let x = x_f as f64;
+
+            let mut n_local = n_acc[p];
+            let mut s_local = s_acc[p];
+            let mut q_local = q_acc[p];
+
+            if n_local > 0 {
+                let self_count = model.counts[self_base + p];
+                if self_count > 0 {
+                    n_local = n_local.saturating_sub(1);
+                    s_local -= x;
+                    q_local -= x * x;
+                }
+            }
+
+            let support = if n_local >= min_local {
+                (n_local as f64 / (min_local as f64 * 3.0)).min(1.0)
+            } else {
+                0.0
+            };
+
+            let local_z = if n_local >= min_local {
+                let mean = s_local / n_local as f64;
+                let var = (q_local / n_local as f64 - mean * mean).max(0.0);
+                let denom = var.sqrt().max(global_stats[p].scale * 0.2).max(1e-6);
+                ((x - mean).abs() / denom).min(1_000.0)
+            } else {
+                0.0
+            };
+
+            let global_z = robust_global_z(x, &global_stats[p]);
+            let mut score = if support > 0.0 {
+                0.76 * local_z + 0.24 * global_z
+            } else {
+                0.90 * global_z
+            };
+            score *= 0.60 + 0.40 * support;
+
+            if score >= score_threshold {
+                let confidence = confidence_from_score(score, support);
+                suspects.push(Suspect {
+                    sample: i,
+                    prop: p,
+                    score,
+                    confidence,
+                });
+            }
+        }
+
+        if suspects.len() > max_keep * 4 {
+            suspects.sort_by(|a, b| b.confidence.total_cmp(&a.confidence));
+            suspects.truncate(max_keep * 2);
+        }
+    }
+
+    suspects.sort_by(|a, b| b.confidence.total_cmp(&a.confidence));
+    suspects.truncate(max_keep.min(suspects.len()));
+    suspects
+}
+
+impl GridIndex {
+    fn build(coords: &[[f32; 3]], target_points_per_cell: f32) -> Self {
+        let (min, max) = bounding_box(coords);
+        let ex = (max[0] - min[0]).abs().max(1e-3);
+        let ey = (max[1] - min[1]).abs().max(1e-3);
+        let ez = (max[2] - min[2]).abs().max(1e-3);
+        let n = coords.len() as f32;
+        let volume = ex * ey * ez;
+
+        let mut cell = ((volume * target_points_per_cell) / n.max(1.0)).cbrt();
+        if !cell.is_finite() || cell <= 1e-6 {
+            let emax = ex.max(ey).max(ez).max(1.0);
+            let denom = (n / target_points_per_cell.max(1.0)).cbrt().max(1.0);
+            cell = emax / denom;
+        }
+        if !cell.is_finite() || cell <= 1e-6 {
+            cell = 1.0;
+        }
+
+        let mut sample_cell = Vec::with_capacity(coords.len());
+        let mut buckets: HashMap<(i32, i32, i32), Vec<usize>> = HashMap::new();
+        for (i, &p) in coords.iter().enumerate() {
+            let key = cell_key(p, min, cell);
+            sample_cell.push(key);
+            buckets.entry(key).or_default().push(i);
+        }
+
+        Self {
+            min,
+            cell,
+            sample_cell,
+            buckets,
+        }
+    }
+
+    fn neighbors(
+        &self,
+        coords: &[[f32; 3]],
+        idx: usize,
+        k_target: usize,
+        max_radius: i32,
+    ) -> Vec<usize> {
+        let (cx, cy, cz) = self.sample_cell[idx];
+        let mut candidates = Vec::<usize>::with_capacity(k_target * 8);
+
+        for r in 0..=max_radius {
+            for dx in -r..=r {
+                for dy in -r..=r {
+                    for dz in -r..=r {
+                        if r > 0 && max3(dx.abs(), dy.abs(), dz.abs()) != r {
+                            continue;
+                        }
+                        let key = (cx + dx, cy + dy, cz + dz);
+                        if let Some(v) = self.buckets.get(&key) {
+                            candidates.extend(v.iter().copied());
+                        }
+                    }
+                }
+            }
+            if candidates.len() > k_target * 6 {
+                break;
+            }
+        }
+
+        if candidates.is_empty() {
+            return Vec::new();
+        }
+
+        let p = coords[idx];
+        let mut dist_idx = Vec::<(f32, usize)>::with_capacity(candidates.len());
+        for j in candidates {
+            if j == idx {
+                continue;
+            }
+            let q = coords[j];
+            let dx = p[0] - q[0];
+            let dy = p[1] - q[1];
+            let dz = p[2] - q[2];
+            let d2 = dx * dx + dy * dy + dz * dz;
+            dist_idx.push((d2, j));
+        }
+
+        dist_idx.sort_by(|a, b| a.0.total_cmp(&b.0));
+        if dist_idx.len() > k_target {
+            dist_idx.truncate(k_target);
+        }
+        dist_idx.into_iter().map(|(_, j)| j).collect()
+    }
+}
+
+impl VoxelModel {
+    fn build(data: &ParsedData, target_samples_per_voxel: f32) -> Self {
+        let coords = &data.coords;
+        let pcount = data.num_props;
+        let n = coords.len().max(1) as f32;
+
+        let (min, max) = bounding_box(coords);
+        let ex = (max[0] - min[0]).abs().max(1e-3);
+        let ey = (max[1] - min[1]).abs().max(1e-3);
+        let ez = (max[2] - min[2]).abs().max(1e-3);
+        let volume = ex * ey * ez;
+
+        let target_voxels = (n / target_samples_per_voxel.max(1.0)).max(1.0);
+        let mut cell = (volume / target_voxels).cbrt();
+        if !cell.is_finite() || cell <= 1e-6 {
+            let emax = ex.max(ey).max(ez).max(1.0);
+            let denom = target_voxels.cbrt().max(1.0);
+            cell = emax / denom;
+        }
+        if !cell.is_finite() || cell <= 1e-6 {
+            cell = 1.0;
+        }
+
+        let mut sample_cell = Vec::with_capacity(coords.len());
+        let mut sample_voxel = Vec::with_capacity(coords.len());
+        let mut map: HashMap<(i32, i32, i32), usize> = HashMap::new();
+        let mut counts = Vec::<u32>::new();
+        let mut sums = Vec::<f64>::new();
+        let mut sums_sq = Vec::<f64>::new();
+
+        for (i, &pt) in coords.iter().enumerate() {
+            let key = cell_key(pt, min, cell);
+            let vidx = if let Some(&v) = map.get(&key) {
+                v
+            } else {
+                let v = map.len();
+                map.insert(key, v);
+                counts.extend(std::iter::repeat_n(0u32, pcount));
+                sums.extend(std::iter::repeat_n(0.0f64, pcount));
+                sums_sq.extend(std::iter::repeat_n(0.0f64, pcount));
+                v
+            };
+
+            sample_cell.push(key);
+            sample_voxel.push(vidx);
+
+            let base = vidx * pcount;
+            for p in 0..pcount {
+                let x = data.values[p][i];
+                if x.is_finite() {
+                    let xv = x as f64;
+                    counts[base + p] = counts[base + p].saturating_add(1);
+                    sums[base + p] += xv;
+                    sums_sq[base + p] += xv * xv;
+                }
+            }
+        }
+
+        Self {
+            sample_cell,
+            sample_voxel,
+            map,
+            counts,
+            sums,
+            sums_sq,
+            props: pcount,
+        }
+    }
+}
+
+fn parse_input(input: &str) -> ParsedData {
+    let mut lines = input.lines();
+
+    let header = next_nonempty_line(&mut lines).unwrap_or_default();
+    let header_tokens: Vec<&str> = header.split_whitespace().collect();
+    let num_holes = parse_usize(header_tokens.first().copied()).unwrap_or(0);
+    let num_props = parse_usize(header_tokens.get(1).copied()).unwrap_or(0);
+
+    let mut prop_names = if num_props > 0 {
+        let props_line = next_nonempty_line(&mut lines).unwrap_or_default();
+        let mut names: Vec<String> = props_line
+            .split_whitespace()
+            .take(num_props)
+            .map(|s| s.to_string())
+            .collect();
+        if names.len() < num_props {
+            for i in names.len()..num_props {
+                names.push(format!("prop{}", i + 1));
+            }
+        }
+        names
+    } else {
+        Vec::new()
+    };
+
+    if prop_names.len() > num_props {
+        prop_names.truncate(num_props);
+    }
+
+    let mut hole_ids = Vec::<String>::new();
+    let mut sample_hole = Vec::<usize>::new();
+    let mut sample_idx = Vec::<usize>::new();
+    let mut coords = Vec::<[f32; 3]>::new();
+    let mut values = vec![Vec::<f32>::new(); num_props];
+
+    for _ in 0..num_holes {
+        let Some(hole_line) = next_nonempty_line(&mut lines) else {
+            break;
+        };
+        let tokens: Vec<&str> = hole_line.split_whitespace().collect();
+        if tokens.len() < 9 {
+            continue;
+        }
+
+        let hole_id = tokens[0].to_string();
+        let sx = parse_f64(tokens.get(1).copied()).unwrap_or(0.0) as f32;
+        let sy = parse_f64(tokens.get(2).copied()).unwrap_or(0.0) as f32;
+        let sz = parse_f64(tokens.get(3).copied()).unwrap_or(0.0) as f32;
+        let dx = parse_f64(tokens.get(4).copied()).unwrap_or(0.0);
+        let dy = parse_f64(tokens.get(5).copied()).unwrap_or(0.0);
+        let dz = parse_f64(tokens.get(6).copied()).unwrap_or(1.0);
+        let length = parse_f64(tokens.get(7).copied()).unwrap_or(0.0);
+        let num_samples = parse_usize(tokens.get(8).copied()).unwrap_or(0);
+        let dir = normalize_dir(dx, dy, dz);
+
+        let hole_index = hole_ids.len();
+        hole_ids.push(hole_id);
+
+        for s_idx in 0..num_samples {
+            let Some(sample_line) = next_nonempty_line(&mut lines) else {
+                break;
+            };
+            let stoks: Vec<&str> = sample_line.split_whitespace().collect();
+            if stoks.is_empty() {
+                continue;
+            }
+
+            let raw_depth = parse_f64(stoks.first().copied()).unwrap_or(f64::NAN);
+            let depth = canonical_depth(raw_depth, length) as f32;
+            let px = sx + dir.0 * depth;
+            let py = sy + dir.1 * depth;
+            let pz = sz + dir.2 * depth;
+
+            sample_hole.push(hole_index);
+            sample_idx.push(s_idx);
+            coords.push([px, py, pz]);
+
+            for p in 0..num_props {
+                let v = parse_f64(stoks.get(p + 1).copied()).unwrap_or(f64::NAN);
+                values[p].push(v as f32);
+            }
+        }
+    }
+
+    ParsedData {
+        num_props,
+        prop_names,
+        hole_ids,
+        sample_hole,
+        sample_idx,
+        coords,
+        values,
+    }
+}
+
+fn compute_global_stats(values: &[Vec<f32>], max_sample: usize) -> Vec<RobustStats> {
+    values
+        .iter()
+        .map(|v| robust_stats(v, max_sample))
+        .collect::<Vec<_>>()
+}
+
+fn robust_stats(values: &[f32], max_sample: usize) -> RobustStats {
+    let mut count = 0usize;
+    let mut mean = 0.0f64;
+    let mut m2 = 0.0f64;
+
+    for &v in values {
+        if !v.is_finite() {
+            continue;
+        }
+        let x = v as f64;
+        count += 1;
+        let delta = x - mean;
+        mean += delta / count as f64;
+        let delta2 = x - mean;
+        m2 += delta * delta2;
+    }
+
+    if count == 0 {
+        return RobustStats::default();
+    }
+
+    let std = if count > 1 {
+        (m2 / (count as f64 - 1.0)).sqrt()
+    } else {
+        0.0
+    };
+
+    let mut sample = Vec::<f32>::new();
+    if count <= max_sample.max(1) {
+        sample.reserve(count);
+        for &v in values {
+            if v.is_finite() {
+                sample.push(v);
+            }
+        }
+    } else {
+        let len = values.len().max(1);
+        let step = (len / max_sample.max(1)).max(1);
+        let mut i = 0usize;
+        while i < len {
+            let v = values[i];
+            if v.is_finite() {
+                sample.push(v);
+            }
+            i += step;
+        }
+        if sample.is_empty() {
+            for &v in values {
+                if v.is_finite() {
+                    sample.push(v);
+                    if sample.len() >= max_sample {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    if sample.is_empty() {
+        let scale = (std * 0.5).max((mean.abs() + 1.0) * 1e-6).max(1e-6);
+        return RobustStats {
+            median: mean,
+            mad: 0.0,
+            mean,
+            std,
+            scale,
+            count,
+        };
+    }
+
+    sample.sort_by(|a, b| a.total_cmp(b));
+    let median = median_sorted_f32(&sample);
+
+    let mut deviations = Vec::<f32>::with_capacity(sample.len());
+    for &x in &sample {
+        deviations.push((x as f64 - median).abs() as f32);
+    }
+    deviations.sort_by(|a, b| a.total_cmp(b));
+    let mad = median_sorted_f32(&deviations);
+
+    let scale = (1.4826 * mad)
+        .max(std * 0.5)
+        .max((median.abs() + 1.0) * 1e-6)
+        .max(1e-6);
+
+    RobustStats {
+        median,
+        mad,
+        mean,
+        std,
+        scale,
+        count,
+    }
+}
+
+fn robust_global_z(x: f64, stats: &RobustStats) -> f64 {
+    if !x.is_finite() || stats.count == 0 {
+        return 0.0;
+    }
+    ((x - stats.median).abs() / stats.scale.max(1e-6)).min(1_000.0)
+}
+
+fn confidence_from_score(score: f64, support: f64) -> f64 {
+    let base = 1.0 - (-score / 4.2).exp();
+    (base * (0.85 + 0.15 * support)).clamp(0.0, 0.999_999)
+}
+
+fn median_sorted_f32(sorted: &[f32]) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    let n = sorted.len();
+    if n % 2 == 1 {
+        sorted[n / 2] as f64
+    } else {
+        (sorted[n / 2 - 1] as f64 + sorted[n / 2] as f64) * 0.5
+    }
+}
+
+fn normalize_dir(dx: f64, dy: f64, dz: f64) -> (f32, f32, f32) {
+    let n2 = dx * dx + dy * dy + dz * dz;
+    if !n2.is_finite() || n2 <= 1e-20 {
+        return (0.0, 0.0, 1.0);
+    }
+    let inv = 1.0 / n2.sqrt();
+    ((dx * inv) as f32, (dy * inv) as f32, (dz * inv) as f32)
+}
+
+fn canonical_depth(raw_depth: f64, hole_length: f64) -> f64 {
+    if !raw_depth.is_finite() {
+        return 0.0;
+    }
+    if hole_length.is_finite() && hole_length > 0.0 {
+        raw_depth.clamp(0.0, hole_length)
+    } else {
+        raw_depth.max(0.0)
+    }
+}
+
+fn bounding_box(coords: &[[f32; 3]]) -> ([f32; 3], [f32; 3]) {
+    if coords.is_empty() {
+        return ([0.0, 0.0, 0.0], [1.0, 1.0, 1.0]);
+    }
+    let mut min = coords[0];
+    let mut max = coords[0];
+    for &p in coords {
+        min[0] = min[0].min(p[0]);
+        min[1] = min[1].min(p[1]);
+        min[2] = min[2].min(p[2]);
+        max[0] = max[0].max(p[0]);
+        max[1] = max[1].max(p[1]);
+        max[2] = max[2].max(p[2]);
+    }
+    (min, max)
+}
+
+fn cell_key(p: [f32; 3], min: [f32; 3], cell: f32) -> (i32, i32, i32) {
+    let inv = 1.0f32 / cell.max(1e-6);
+    let ix = ((p[0] - min[0]) * inv).floor() as i32;
+    let iy = ((p[1] - min[1]) * inv).floor() as i32;
+    let iz = ((p[2] - min[2]) * inv).floor() as i32;
+    (ix, iy, iz)
+}
+
+fn max3(a: i32, b: i32, c: i32) -> i32 {
+    a.max(b).max(c)
+}
+
+fn parse_usize(tok: Option<&str>) -> Option<usize> {
+    tok.and_then(|t| t.parse::<usize>().ok())
+}
+
+fn parse_f64(tok: Option<&str>) -> Option<f64> {
+    tok.and_then(|t| t.parse::<f64>().ok())
+}
+
+fn next_nonempty_line<'a, I: Iterator<Item = &'a str>>(lines: &mut I) -> Option<&'a str> {
+    for line in lines {
+        if !line.trim().is_empty() {
+            return Some(line);
+        }
+    }
+    None
+}

@@ -1,0 +1,432 @@
+// 3D Lunar Lander controller (C++20, MSVC-compatible)
+// Reads initial header + continuous STATE updates on stdin and outputs thrust/rotation commands on stdout.
+// Uses a lightweight background thread to asynchronously sample the terrain file (non-blocking for the main loop).
+
+#include <algorithm>
+#include <atomic>
+#include <cassert>
+#include <cmath>
+#include <cstdint>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <limits>
+#include <numbers>
+#include <string>
+#include <thread>
+
+namespace {
+
+constexpr double kDt = 0.1; // Simulation tick per prompt.
+
+double clamp(double v, double lo, double hi) {
+  if (v < lo) return lo;
+  if (v > hi) return hi;
+  return v;
+}
+
+double wrap_pi(double a) {
+  constexpr double two_pi = 2.0 * std::numbers::pi;
+  a = std::fmod(a + std::numbers::pi, two_pi);
+  if (a < 0) a += two_pi;
+  return a - std::numbers::pi;
+}
+
+struct Vec2 {
+  double x = 0.0;
+  double y = 0.0;
+
+  Vec2() = default;
+  Vec2(double x_, double y_) : x(x_), y(y_) {}
+
+  Vec2 operator+(const Vec2& o) const { return {x + o.x, y + o.y}; }
+  Vec2 operator-(const Vec2& o) const { return {x - o.x, y - o.y}; }
+  Vec2 operator*(double s) const { return {x * s, y * s}; }
+  Vec2 operator/(double s) const { return {x / s, y / s}; }
+};
+
+double norm(const Vec2& v) { return std::hypot(v.x, v.y); }
+
+Vec2 clamp_mag(const Vec2& v, double max_n) {
+  const double n = norm(v);
+  if (n <= max_n || n <= 1e-12) return v;
+  return v * (max_n / n);
+}
+
+struct Vec3 {
+  double x = 0.0;
+  double y = 0.0;
+  double z = 0.0;
+
+  Vec3() = default;
+  Vec3(double x_, double y_, double z_) : x(x_), y(y_), z(z_) {}
+
+  Vec3 operator+(const Vec3& o) const { return {x + o.x, y + o.y, z + o.z}; }
+  Vec3 operator-(const Vec3& o) const { return {x - o.x, y - o.y, z - o.z}; }
+  Vec3 operator*(double s) const { return {x * s, y * s, z * s}; }
+  Vec3 operator/(double s) const { return {x / s, y / s, z / s}; }
+};
+
+double norm(const Vec3& v) { return std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z); }
+
+struct ColumnData {
+  std::uint16_t a = 0; // ground rock top
+  std::uint16_t b = 0; // floating rock bottom
+  std::uint16_t c = 0; // floating rock top
+  bool valid = false;
+};
+
+class TerrainAsyncSampler {
+public:
+  TerrainAsyncSampler(std::uint32_t width, std::uint32_t depth, std::string path)
+      : width_(width), depth_(depth), path_(std::move(path)) {
+    worker_ = std::thread([this] { this->thread_main(); });
+  }
+
+  TerrainAsyncSampler(const TerrainAsyncSampler&) = delete;
+  TerrainAsyncSampler& operator=(const TerrainAsyncSampler&) = delete;
+
+  ~TerrainAsyncSampler() {
+    request_key_.store(kStopKey, std::memory_order_release);
+    request_key_.notify_one();
+    if (worker_.joinable()) worker_.join();
+  }
+
+  void request(std::int64_t x, std::int64_t y) {
+    if (x < 0 || y < 0) return;
+    if (x >= static_cast<std::int64_t>(width_) || y >= static_cast<std::int64_t>(depth_)) return;
+    const std::uint64_t key = pack_key(static_cast<std::uint32_t>(x), static_cast<std::uint32_t>(y));
+    request_key_.store(key, std::memory_order_release);
+    request_key_.notify_one();
+  }
+
+  bool try_get(std::int64_t x, std::int64_t y, ColumnData& out) const {
+    if (x < 0 || y < 0) return false;
+    if (x >= static_cast<std::int64_t>(width_) || y >= static_cast<std::int64_t>(depth_)) return false;
+    const std::uint64_t want = pack_key(static_cast<std::uint32_t>(x), static_cast<std::uint32_t>(y));
+    const std::uint64_t got = result_key_.load(std::memory_order_acquire);
+    if (got != want) return false;
+    const std::uint64_t data = result_data_.load(std::memory_order_acquire);
+    const bool valid = ((data >> 48) & 0x1u) != 0;
+    if (!valid) return false;
+    out.a = static_cast<std::uint16_t>(data & 0xFFFFu);
+    out.b = static_cast<std::uint16_t>((data >> 16) & 0xFFFFu);
+    out.c = static_cast<std::uint16_t>((data >> 32) & 0xFFFFu);
+    out.valid = true;
+    return true;
+  }
+
+private:
+  static constexpr std::uint64_t kStopKey = std::numeric_limits<std::uint64_t>::max();
+
+  static std::uint64_t pack_key(std::uint32_t x, std::uint32_t y) {
+    return (static_cast<std::uint64_t>(x) << 32) | static_cast<std::uint64_t>(y);
+  }
+
+  static void unpack_key(std::uint64_t key, std::uint32_t& x, std::uint32_t& y) {
+    x = static_cast<std::uint32_t>(key >> 32);
+    y = static_cast<std::uint32_t>(key & 0xFFFFFFFFu);
+  }
+
+  static std::uint16_t u16le(const unsigned char* p) {
+    return static_cast<std::uint16_t>(static_cast<std::uint16_t>(p[0]) |
+                                      (static_cast<std::uint16_t>(p[1]) << 8));
+  }
+
+  void thread_main() {
+    std::ifstream file(path_, std::ios::binary);
+    const bool file_ok = static_cast<bool>(file);
+
+    std::uint64_t last_seen = request_key_.load(std::memory_order_acquire);
+    for (;;) {
+      request_key_.wait(last_seen);
+      const std::uint64_t key = request_key_.load(std::memory_order_acquire);
+      last_seen = key;
+      if (key == kStopKey) break;
+
+      std::uint32_t x = 0, y = 0;
+      unpack_key(key, x, y);
+
+      ColumnData col;
+      if (file_ok) {
+        const std::uint64_t idx = static_cast<std::uint64_t>(x) * static_cast<std::uint64_t>(depth_) +
+                                  static_cast<std::uint64_t>(y);
+        const std::uint64_t offset = idx * 6ULL;
+
+        unsigned char buf[6]{};
+        file.clear();
+        file.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+        if (file.good()) {
+          file.read(reinterpret_cast<char*>(buf), 6);
+          if (file.gcount() == 6) {
+            col.a = u16le(&buf[0]);
+            col.b = u16le(&buf[2]);
+            col.c = u16le(&buf[4]);
+            col.valid = true;
+          }
+        }
+      }
+
+      std::uint64_t packed = 0;
+      packed |= static_cast<std::uint64_t>(col.a);
+      packed |= (static_cast<std::uint64_t>(col.b) << 16);
+      packed |= (static_cast<std::uint64_t>(col.c) << 32);
+      packed |= (static_cast<std::uint64_t>(col.valid ? 1u : 0u) << 48);
+
+      result_data_.store(packed, std::memory_order_release);
+      result_key_.store(key, std::memory_order_release);
+    }
+  }
+
+  std::uint32_t width_ = 0;
+  std::uint32_t depth_ = 0;
+  std::string path_;
+
+  std::atomic<std::uint64_t> request_key_{0};
+  std::atomic<std::uint64_t> result_key_{std::numeric_limits<std::uint64_t>::max()};
+  std::atomic<std::uint64_t> result_data_{0};
+  std::thread worker_;
+};
+
+struct Params {
+  std::uint32_t width = 0;
+  std::uint32_t depth = 0;
+  double height = 0.0;
+  double gravity = 1.62;
+  double max_thrust = 10.0;
+  double fuel = 0.0;
+
+  Vec3 start;
+  Vec3 target;
+  double landing_radius = 5.0;
+};
+
+// Convert continuous position to integer terrain grid indices.
+// Assumes 1 cell per meter (as implied by width/depth and "positions are in meters").
+bool pos_to_cell(const Params& p, const Vec3& pos, std::int64_t& ix, std::int64_t& iy) {
+  const double fx = std::floor(pos.x);
+  const double fy = std::floor(pos.y);
+  if (!std::isfinite(fx) || !std::isfinite(fy)) return false;
+  ix = static_cast<std::int64_t>(fx);
+  iy = static_cast<std::int64_t>(fy);
+  if (ix < 0 || iy < 0) return false;
+  if (ix >= static_cast<std::int64_t>(p.width) || iy >= static_cast<std::int64_t>(p.depth)) return false;
+  return true;
+}
+
+} // namespace
+
+int main() {
+  std::ios::sync_with_stdio(false);
+  std::cin.tie(nullptr);
+
+  Params params;
+  {
+    double width_d = 0.0, depth_d = 0.0, height_d = 0.0;
+    if (!(std::cin >> width_d >> depth_d >> height_d >> params.gravity >> params.max_thrust >> params.fuel)) {
+      return 0;
+    }
+    const auto to_u32 = [](double v) -> std::uint32_t {
+      if (!std::isfinite(v) || v < 0) return 0u;
+      const double r = std::llround(v);
+      if (r < 0) return 0u;
+      if (r > static_cast<double>(std::numeric_limits<std::uint32_t>::max()))
+        return std::numeric_limits<std::uint32_t>::max();
+      return static_cast<std::uint32_t>(r);
+    };
+    params.width = to_u32(width_d);
+    params.depth = to_u32(depth_d);
+    params.height = height_d;
+
+    if (!(std::cin >> params.start.x >> params.start.y >> params.start.z >> params.target.x >> params.target.y >>
+          params.target.z)) {
+      return 0;
+    }
+  }
+
+  std::string terrain_path;
+  std::getline(std::cin >> std::ws, terrain_path); // path may contain spaces
+
+  // Consume lines until we see "STATE" (robust to extra blank lines).
+  for (;;) {
+    std::string line;
+    if (!std::getline(std::cin, line)) return 0;
+    if (line.find("STATE") != std::string::npos) break;
+  }
+
+  const double min_wh = static_cast<double>(std::min(params.width, params.depth));
+  params.landing_radius = std::max(5.0, min_wh * 0.02);
+
+  TerrainAsyncSampler terrain(params.width, params.depth, terrain_path);
+
+  // Request target cell immediately (async).
+  {
+    std::int64_t tx = 0, ty = 0;
+    if (pos_to_cell(params, params.target, tx, ty)) {
+      terrain.request(tx, ty);
+    }
+  }
+
+  // Controller state.
+  ColumnData target_col;
+  target_col.valid = false;
+
+  std::cout.setf(std::ios::fixed);
+  std::cout << std::setprecision(6);
+
+  while (true) {
+    double x, y, z;
+    double vx, vy, vz;
+    double pitch, yaw, roll;
+    double pitch_rate, yaw_rate, roll_rate;
+    double fuel_remaining;
+
+    if (!(std::cin >> x >> y >> z >> vx >> vy >> vz >> pitch >> yaw >> roll >> pitch_rate >> yaw_rate >>
+          roll_rate >> fuel_remaining)) {
+      break;
+    }
+
+    Vec3 pos{x, y, z};
+    Vec3 vel{vx, vy, vz};
+
+    // Request terrain sample for current cell (async; never blocks).
+    std::int64_t ix = -1, iy = -1;
+    ColumnData cur_col;
+    cur_col.valid = false;
+    if (pos_to_cell(params, pos, ix, iy)) {
+      terrain.request(ix, iy);
+      (void)terrain.try_get(ix, iy, cur_col);
+    }
+
+    // Try to grab target cell (eventually becomes valid).
+    if (!target_col.valid) {
+      std::int64_t tx = 0, ty = 0;
+      if (pos_to_cell(params, params.target, tx, ty)) {
+        (void)terrain.try_get(tx, ty, target_col);
+      }
+    }
+
+    // --- Guidance / reference selection ---
+    const Vec2 dxy{params.target.x - pos.x, params.target.y - pos.y};
+    const double dist_xy = norm(dxy);
+    const double alt_to_target = std::max(0.0, pos.z - params.target.z);
+
+    // Base cruise altitude grows with distance but is clamped within world height.
+    double cruise_alt = params.target.z + 20.0 + 0.20 * std::min(dist_xy, 50000.0);
+
+    // If we have evidence of floating terrain nearby, ensure cruise stays above it.
+    const auto consider_ceiling = [&](const ColumnData& c) {
+      if (!c.valid) return;
+      if (c.b < c.c) cruise_alt = std::max(cruise_alt, static_cast<double>(c.c) + 15.0);
+    };
+    consider_ceiling(cur_col);
+    consider_ceiling(target_col);
+
+    cruise_alt = clamp(cruise_alt, 0.0, params.height - 2.0);
+
+    const bool close_xy = dist_xy < (params.landing_radius * 1.5);
+    const bool in_landing_column = dist_xy < (params.landing_radius * 0.8);
+
+    Vec3 ref = params.target;
+    ref.z = close_xy ? params.target.z : cruise_alt;
+
+    // --- Velocity setpoints (outer loop) ---
+    const Vec2 e_xy{ref.x - pos.x, ref.y - pos.y};
+    const Vec2 v_xy{vel.x, vel.y};
+
+    const double dist_xy_ref = norm(e_xy);
+    double v_xy_max_dist = 2.0 + 0.8 * std::sqrt(std::max(0.0, dist_xy_ref));
+    v_xy_max_dist = clamp(v_xy_max_dist, 2.0, 320.0);
+
+    double v_xy_max_alt = 2.0 + 0.6 * alt_to_target;
+    v_xy_max_alt = clamp(v_xy_max_alt, 2.0, 220.0);
+
+    double v_xy_max = std::min(v_xy_max_dist, v_xy_max_alt);
+
+    // Tighter near the landing zone.
+    if (dist_xy_ref < params.landing_radius * 2.5) v_xy_max = std::min(v_xy_max, 25.0);
+    if (dist_xy_ref < params.landing_radius * 1.2) v_xy_max = std::min(v_xy_max, 8.0);
+    if (alt_to_target < 8.0) v_xy_max = std::min(v_xy_max, 4.0);
+
+    const double kPosToVelXY = 0.20; // 1/s
+    const Vec2 v_xy_des = clamp_mag(e_xy * kPosToVelXY, v_xy_max);
+
+    const double tau_xy = 2.0;
+    Vec2 a_xy_des = (v_xy_des - v_xy) / tau_xy;
+    const double a_xy_max = std::max(0.0, params.max_thrust * 0.60);
+    a_xy_des = clamp_mag(a_xy_des, a_xy_max);
+
+    double v_z_des = 0.0;
+    if (!close_xy) {
+      // Hold cruise altitude while translating.
+      v_z_des = clamp((ref.z - pos.z) * 0.60, -30.0, 30.0);
+    } else {
+      // Descent profile that guarantees we can stop: vz >= -sqrt(2*a_stop*h).
+      const double h = std::max(0.0, pos.z - params.target.z);
+      const double a_stop = std::max(0.1, params.max_thrust - params.gravity);
+      const double vz_limit = -std::sqrt(std::max(0.0, 2.0 * a_stop * h));
+      const double vz_fast = -std::min(100.0, 2.0 + 0.60 * std::sqrt(h)); // "go faster when high"
+      v_z_des = std::max(vz_fast, vz_limit);                              // never faster than braking limit
+      if (in_landing_column) v_z_des = std::max(v_z_des, -2.0);           // soften the final approach
+    }
+
+    const double tau_z = 1.2;
+    const double a_z_des = (v_z_des - vel.z) / tau_z;
+
+    const Vec3 a_des{a_xy_des.x, a_xy_des.y, a_z_des};
+    const Vec3 g{0.0, 0.0, -params.gravity};
+
+    // Required thrust-acceleration vector (net accel minus gravity).
+    Vec3 u = a_des - g; // == a_des + (0,0,gravity)
+
+    // If impossible (would require thrust pointing downward), cut thrust and level out.
+    double thrust = 0.0;
+    double pitch_des = 0.0;
+    double yaw_des = yaw;
+
+    if (u.z > 1e-6 && params.max_thrust > 1e-6) {
+      const double um = norm(u);
+      thrust = clamp(um / params.max_thrust, 0.0, 1.0);
+
+      const Vec3 t = u / um; // desired thrust direction (unit)
+      const double hz = clamp(t.z, 0.0, 1.0);
+      pitch_des = std::atan2(std::hypot(t.x, t.y), hz);
+
+      // Limit tilt near the ground for vertical authority.
+      const double max_pitch = clamp(0.02 * alt_to_target, 0.05, 1.20);
+      pitch_des = clamp(pitch_des, 0.0, max_pitch);
+
+      if (std::hypot(t.x, t.y) > 1e-6) {
+        yaw_des = std::atan2(-t.y, -t.x);
+      } else {
+        yaw_des = yaw;
+      }
+    } else {
+      thrust = 0.0;
+      pitch_des = 0.0;
+      yaw_des = yaw;
+    }
+
+    // --- Attitude controller (inner loop) ---
+    const double kp_pitch = 1.20, kd_pitch = 0.35;
+    const double kp_yaw = 1.10, kd_yaw = 0.30;
+    const double kp_roll = 0.80, kd_roll = 0.25;
+
+    const double pitch_err = clamp(pitch_des - pitch, -1.5, 1.5);
+    const double yaw_err = clamp(wrap_pi(yaw_des - yaw), -1.5, 1.5);
+    const double roll_err = clamp(wrap_pi(0.0 - roll), -1.5, 1.5);
+
+    const double pitch_cmd = clamp(kp_pitch * pitch_err - kd_pitch * pitch_rate, -1.0, 1.0);
+    const double yaw_cmd = clamp(kp_yaw * yaw_err - kd_yaw * yaw_rate, -1.0, 1.0);
+    const double roll_cmd = clamp(kp_roll * roll_err - kd_roll * roll_rate, -1.0, 1.0);
+
+    // If we're extremely close and slow, bias to a stable upright touchdown.
+    if (in_landing_column && alt_to_target < 2.0 && norm(Vec3{vel.x, vel.y, vel.z}) < 3.5) {
+      thrust = std::min(thrust, 0.8);
+    }
+
+    std::cout << thrust << ' ' << pitch_cmd << ' ' << yaw_cmd << ' ' << roll_cmd << '\n' << std::flush;
+  }
+
+  return 0;
+}

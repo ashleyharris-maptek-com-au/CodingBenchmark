@@ -1,0 +1,371 @@
+import statistics
+
+# Persistent state for filtering and control
+_prev_speed = None
+_speed_history = []
+_lane_offset_history = []
+_speed_integral = 0.0
+_lane_integral = 0.0
+_prev_lane_offset = 0.0
+_obstacle_brake_time = 0.0
+_emergency_mode = False
+
+def autopilot_step(state: dict, dt: float) -> dict:
+    """
+    Main autopilot control function with sensor fusion, lane keeping,
+    speed control, obstacle avoidance, and graceful degradation.
+    """
+    global _prev_speed, _speed_history, _lane_offset_history
+    global _speed_integral, _lane_integral, _prev_lane_offset
+    global _obstacle_brake_time, _emergency_mode
+
+    # Initialize output
+    output = {}
+
+    # ============= SENSOR FUSION =============
+
+    # 1. Fuse vehicle speed from multiple sources
+    speed_kmh = fuse_speed(state)
+
+    # 2. Fuse yaw rate
+    yaw_rate_dps = fuse_yaw_rate(state)
+
+    # 3. Fuse lateral acceleration
+    lateral_accel = fuse_lateral_accel(state)
+
+    # 4. Fuse lane offset and line distances
+    lane_offset, left_dist, right_dist = fuse_lane_info(state)
+
+    # 5. Fuse obstacle information
+    obstacle_detected, obstacle_dist, obstacle_rel_speed = fuse_obstacle_info(state)
+
+    # 6. Get traction estimate
+    mu = state.get('estimated_mu', 1.0)
+
+    # 7. Get targets
+    target_speed_kmh = state.get('target_speed_kmh', 100.0)
+    target_lane = state.get('target_lane', 1)
+    current_lane = state.get('current_lane', 1)
+
+    # 8. Get speed limit
+    speed_limit_kmh = fuse_speed_limit(state)
+    if speed_limit_kmh is not None:
+        target_speed_kmh = min(target_speed_kmh, speed_limit_kmh)
+
+    # ============= TRACTION ADJUSTMENT =============
+    # Reduce target speed on low-mu surfaces
+    if mu < 0.5:
+        traction_factor = max(0.5, mu)
+        target_speed_kmh *= traction_factor
+
+    # ============= OBSTACLE AVOIDANCE =============
+    if obstacle_detected and obstacle_dist is not None:
+        # Calculate time-to-collision
+        if obstacle_rel_speed is not None:
+            closing_speed_ms = (speed_kmh - obstacle_rel_speed) / 3.6
+        else:
+            closing_speed_ms = speed_kmh / 3.6
+
+        if closing_speed_ms > 0.1:
+            ttc = obstacle_dist / closing_speed_ms
+        else:
+            ttc = float('inf')
+
+        # Emergency braking if TTC < 3 seconds or distance < 15m
+        if ttc < 3.0 or obstacle_dist < 15.0:
+            _emergency_mode = True
+            _obstacle_brake_time = 3.0
+
+        # Adaptive cruise control - maintain safe following distance
+        safe_distance = max(20.0, speed_kmh / 3.6 * 2.0)  # 2 second rule
+        if obstacle_dist < safe_distance:
+            # Reduce target speed proportionally
+            distance_factor = obstacle_dist / safe_distance
+            target_speed_kmh = min(target_speed_kmh, speed_kmh * distance_factor * 0.8)
+
+    # Decay emergency mode
+    if _obstacle_brake_time > 0:
+        _obstacle_brake_time -= dt
+    else:
+        _emergency_mode = False
+
+    # ============= SPEED CONTROL =============
+    if _prev_speed is None:
+        _prev_speed = speed_kmh
+
+    # Smooth speed estimate
+    _speed_history.append(speed_kmh)
+    if len(_speed_history) > 5:
+        _speed_history.pop(0)
+    smooth_speed = statistics.median(_speed_history)
+
+    # PID controller for speed
+    speed_error = target_speed_kmh - smooth_speed
+    _speed_integral += speed_error * dt
+    _speed_integral = max(-50, min(50, _speed_integral))  # Anti-windup
+
+    speed_derivative = (smooth_speed - _prev_speed) / max(dt, 0.001)
+    _prev_speed = smooth_speed
+
+    # PID gains (adjusted for traction)
+    kp_speed = 0.02 * min(1.0, mu + 0.3)
+    ki_speed = 0.005 * min(1.0, mu + 0.3)
+    kd_speed = 0.01
+
+    speed_control = (kp_speed * speed_error +
+                     ki_speed * _speed_integral -
+                     kd_speed * speed_derivative)
+
+    # Emergency braking override
+    if _emergency_mode:
+        output['brake'] = min(1.0, 0.8 * mu)  # Traction-limited braking
+        output['throttle'] = 0.0
+    elif speed_control > 0:
+        # Accelerate
+        output['throttle'] = min(1.0, speed_control)
+        output['brake'] = 0.0
+    else:
+        # Brake
+        output['throttle'] = 0.0
+        output['brake'] = min(1.0, -speed_control * 0.5)
+
+    # ============= LANE KEEPING =============
+    if lane_offset is not None:
+        # Filter lane offset
+        _lane_offset_history.append(lane_offset)
+        if len(_lane_offset_history) > 5:
+            _lane_offset_history.pop(0)
+
+        smooth_lane_offset = statistics.median(_lane_offset_history)
+
+        # PID controller for lane keeping
+        lane_error = -smooth_lane_offset  # Negative to correct offset
+        _lane_integral += lane_error * dt
+        _lane_integral = max(-2, min(2, _lane_integral))  # Anti-windup
+
+        lane_derivative = (smooth_lane_offset - _prev_lane_offset) / max(dt, 0.001)
+        _prev_lane_offset = smooth_lane_offset
+
+        # PID gains
+        kp_lane = 0.3
+        ki_lane = 0.05
+        kd_lane = 0.2
+
+        steering_cmd = (kp_lane * lane_error +
+                        ki_lane * _lane_integral -
+                        kd_lane * lane_derivative)
+
+        # Add feedforward for road curvature
+        curvature = fuse_curvature(state)
+        if curvature is not None:
+            steering_cmd += curvature * smooth_speed * 0.01
+
+        # Compensate for crosswind using lateral acceleration
+        if lateral_accel is not None:
+            steering_cmd -= lateral_accel * 0.05
+
+        # Traction-limited steering
+        max_steer = 1.0 if mu > 0.5 else 0.5
+        output['steering'] = max(-max_steer, min(max_steer, steering_cmd))
+
+    elif left_dist is not None or right_dist is not None:
+        # Fallback: use line distances to center in lane
+        if left_dist is not None and right_dist is not None:
+            lane_width = left_dist + right_dist
+            center_error = (right_dist - left_dist) / lane_width if lane_width > 0 else 0
+            output['steering'] = max(-1.0, min(1.0, center_error * 0.5))
+        elif left_dist is not None:
+            # Only left line visible - stay right of it
+            output['steering'] = max(-1.0, min(1.0, (left_dist - 1.8) * 0.3))
+        elif right_dist is not None:
+            # Only right line visible - stay left of it
+            output['steering'] = max(-1.0, min(1.0, (1.8 - right_dist) * 0.3))
+    else:
+        # No lane info - use lidar for obstacle avoidance steering
+        steering_bias = compute_lidar_steering(state)
+        output['steering'] = max(-1.0, min(1.0, steering_bias))
+
+    return output
+
+
+def fuse_speed(state):
+    """Fuse speed from wheel sensors, GPS, and vehicle speed sensors."""
+    speeds = []
+
+    # Wheel speeds
+    for wheel in ['fl', 'fr', 'rl', 'rr']:
+        if state.get(f'wheel_speed_{wheel}_valid', False):
+            speeds.append(state.get(f'wheel_speed_{wheel}_kmh', 0))
+
+    # Vehicle speed sensors
+    speeds.append(state.get('vehicle_speed_1_kmh', 0))
+    speeds.append(state.get('vehicle_speed_2_kmh', 0))
+
+    # GPS speeds
+    if state.get('gps_1_valid', False):
+        speeds.append(state.get('gps_1_speed_kmh', 0))
+    if state.get('gps_2_valid', False):
+        speeds.append(state.get('gps_2_speed_kmh', 0))
+
+    # Filter out zeros and outliers
+    speeds = [s for s in speeds if 0 < s < 250]
+
+    if len(speeds) >= 3:
+        return statistics.median(speeds)
+    elif speeds:
+        return statistics.mean(speeds)
+    else:
+        return 0.0
+
+
+def fuse_yaw_rate(state):
+    """Fuse yaw rate from multiple gyroscopes."""
+    yaw_rates = []
+
+    for i in range(1, 4):
+        if state.get(f'gyro_{i}_valid', False):
+            yaw_rates.append(state.get(f'gyro_{i}_yaw_rate_dps', 0))
+
+    if len(yaw_rates) >= 2:
+        return statistics.median(yaw_rates)
+    elif yaw_rates:
+        return yaw_rates[0]
+    else:
+        return 0.0
+
+
+def fuse_lateral_accel(state):
+    """Fuse lateral acceleration from multiple accelerometers."""
+    accels = []
+
+    for i in range(1, 4):
+        if state.get(f'accel_{i}_valid', False):
+            accels.append(state.get(f'accel_{i}_lateral_ms2', 0))
+
+    if len(accels) >= 2:
+        return statistics.median(accels)
+    elif accels:
+        return accels[0]
+    else:
+        return None
+
+
+def fuse_lane_info(state):
+    """Fuse lane offset and line distances from vision systems."""
+    offsets = []
+    left_dists = []
+    right_dists = []
+
+    for i in range(1, 4):
+        # Lane offset
+        offset = state.get(f'vision_{i}_lane_offset_m')
+        if offset is not None and abs(offset) < 5.0:
+            offsets.append(offset)
+
+        # Left line
+        if state.get(f'vision_{i}_left_line_valid', False):
+            left = state.get(f'vision_{i}_left_line_dist_m')
+            if left is not None and 0 < left < 5.0:
+                left_dists.append(left)
+
+        # Right line
+        if state.get(f'vision_{i}_right_line_valid', False):
+            right = state.get(f'vision_{i}_right_line_dist_m')
+            if right is not None and 0 < right < 5.0:
+                right_dists.append(right)
+
+    lane_offset = statistics.median(offsets) if len(offsets) >= 2 else (offsets[0] if offsets else None)
+    left_dist = statistics.median(left_dists) if len(left_dists) >= 2 else (left_dists[0] if left_dists else None)
+    right_dist = statistics.median(right_dists) if len(right_dists) >= 2 else (right_dists[0] if right_dists else None)
+
+    return lane_offset, left_dist, right_dist
+
+
+def fuse_obstacle_info(state):
+    """Fuse obstacle detection from vision systems."""
+    detections = []
+    distances = []
+    rel_speeds = []
+
+    for i in range(1, 4):
+        detected = state.get(f'vision_{i}_obstacle_detected', False)
+        if detected:
+            detections.append(True)
+
+            if state.get(f'vision_{i}_obstacle_valid', False):
+                dist = state.get(f'vision_{i}_obstacle_dist_m')
+                if dist is not None and dist > 0:
+                    distances.append(dist)
+
+                rel_speed = state.get(f'vision_{i}_obstacle_rel_speed_kmh')
+                if rel_speed is not None:
+                    rel_speeds.append(rel_speed)
+
+    obstacle_detected = len(detections) >= 1
+    obstacle_dist = min(distances) if distances else None  # Use closest
+    obstacle_rel_speed = statistics.median(rel_speeds) if len(rel_speeds) >= 2 else (rel_speeds[0] if rel_speeds else None)
+
+    return obstacle_detected, obstacle_dist, obstacle_rel_speed
+
+
+def fuse_speed_limit(state):
+    """Fuse speed limit from vision systems."""
+    limits = []
+
+    for i in range(1, 4):
+        if state.get(f'vision_{i}_speed_limit_valid', False):
+            limit = state.get(f'vision_{i}_speed_limit_kmh')
+            if limit is not None and 30 <= limit <= 150:
+                limits.append(limit)
+
+    if len(limits) >= 2:
+        return statistics.median(limits)
+    elif limits:
+        return limits[0]
+    else:
+        return None
+
+
+def fuse_curvature(state):
+    """Fuse road curvature from vision systems."""
+    curvatures = []
+
+    for i in range(1, 4):
+        curv = state.get(f'vision_{i}_road_curvature_1pm')
+        if curv is not None and abs(curv) < 0.1:
+            curvatures.append(curv)
+
+    if len(curvatures) >= 2:
+        return statistics.median(curvatures)
+    elif curvatures:
+        return curvatures[0]
+    else:
+        return None
+
+
+def compute_lidar_steering(state):
+    """Compute steering bias from lidar to avoid obstacles."""
+    left_clear = 0
+    right_clear = 0
+
+    # Check left side
+    for angle in ['+005', '+015', '+030', '+045', '+060', '+090']:
+        if state.get(f'lidar_{angle}_deg_valid', False):
+            range_m = state.get(f'lidar_{angle}_deg_range_m', 100)
+            if range_m > 10:
+                left_clear += 1
+
+    # Check right side
+    for angle in ['-005', '-015', '-030', '-045', '-060', '-090']:
+        if state.get(f'lidar_{angle}_deg_valid', False):
+            range_m = state.get(f'lidar_{angle}_deg_range_m', 100)
+            if range_m > 10:
+                right_clear += 1
+
+    # Steer towards more open side
+    if left_clear > right_clear + 1:
+        return -0.2
+    elif right_clear > left_clear + 1:
+        return 0.2
+    else:
+        return 0.0

@@ -1,0 +1,439 @@
+#include <algorithm>
+#include <charconv>
+#include <chrono>
+#include <cstdint>
+#include <iostream>
+#include <limits>
+#include <queue>
+#include <string>
+#include <vector>
+
+using std::int64_t;
+using std::uint64_t;
+
+namespace {
+
+struct SplitMix64 {
+  uint64_t state;
+  explicit SplitMix64(uint64_t seed) : state(seed) {}
+  uint64_t next() {
+    uint64_t z = (state += 0x9E3779B97F4A7C15ULL);
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+    return z ^ (z >> 31);
+  }
+};
+
+enum class RuleType : int {
+  FCFS = 0,
+  SPT = 1,
+  MWKR_SPT = 2,
+  MOPNR_SPT = 3,
+  RANDOM = 4,
+};
+
+struct Instance {
+  int J = 0;
+  int M = 0;
+  int64_t N = 0;
+  std::vector<int> jobT;          // size J
+  std::vector<int64_t> offset;    // size J+1
+  std::vector<int> opMachine;     // size N
+  std::vector<int> opDur;         // size N
+  std::vector<int64_t> remWork;   // size N (sum from this op to end of job)
+  std::vector<int> remOps;        // size N (ops remaining including this one)
+  std::vector<int64_t> jobSum;    // size J
+  std::vector<int64_t> machLoad;  // size M
+  uint64_t inputHash = 0;
+  int64_t lowerBound = 0;
+};
+
+struct FutureItem {
+  int64_t arrival = 0;
+  int job = 0;
+  uint64_t rnd = 0;
+};
+
+struct FutureComp {
+  bool operator()(const FutureItem& a, const FutureItem& b) const {
+    if (a.arrival != b.arrival) return a.arrival > b.arrival; // min-heap
+    return a.rnd > b.rnd;
+  }
+};
+
+struct ReadyItem {
+  int64_t primary = 0;
+  int64_t secondary = 0;
+  int64_t tertiary = 0;
+  int64_t arrival = 0;
+  int job = 0;
+  uint64_t rnd = 0;
+};
+
+struct ReadyComp {
+  bool operator()(const ReadyItem& a, const ReadyItem& b) const {
+    if (a.primary != b.primary) return a.primary > b.primary;
+    if (a.secondary != b.secondary) return a.secondary > b.secondary;
+    if (a.tertiary != b.tertiary) return a.tertiary > b.tertiary;
+    return a.job > b.job;
+  }
+};
+
+struct MachineEvent {
+  int64_t time = 0;
+  int machine = 0;
+  int version = 0;
+};
+
+struct EventComp {
+  bool operator()(const MachineEvent& a, const MachineEvent& b) const {
+    if (a.time != b.time) return a.time > b.time; // min-heap
+    return a.machine > b.machine;
+  }
+};
+
+struct Schedule {
+  std::vector<int64_t> startTime; // size N
+  int64_t makespan = 0;
+};
+
+static inline void fnvMix(uint64_t& h, uint64_t v) {
+  // FNV-1a 64-bit
+  h ^= v;
+  h *= 1099511628211ULL;
+}
+
+static inline void computeKeys(const Instance& inst,
+                               const std::vector<int>& nextOp,
+                               RuleType rule,
+                               int job,
+                               int64_t arrival,
+                               uint64_t rnd,
+                               int64_t& primary,
+                               int64_t& secondary,
+                               int64_t& tertiary) {
+  const int64_t opId = inst.offset[job] + nextOp[job];
+  const int dur = inst.opDur[opId];
+  const int64_t remWork = inst.remWork[opId];
+  const int remOps = inst.remOps[opId];
+
+  switch (rule) {
+    case RuleType::FCFS:
+      primary = arrival;
+      secondary = dur;
+      tertiary = static_cast<int64_t>(rnd & 0x7fffffffffffffffULL);
+      break;
+    case RuleType::SPT:
+      primary = dur;
+      secondary = -remWork; // tie: prefer more work remaining
+      tertiary = arrival;
+      break;
+    case RuleType::MWKR_SPT:
+      primary = -remWork; // prefer most work remaining
+      secondary = dur;    // then shorter op
+      tertiary = arrival;
+      break;
+    case RuleType::MOPNR_SPT:
+      primary = -static_cast<int64_t>(remOps); // prefer most ops remaining
+      secondary = dur;
+      tertiary = arrival;
+      break;
+    case RuleType::RANDOM:
+      primary = static_cast<int64_t>(rnd & 0x7fffffffffffffffULL);
+      secondary = arrival;
+      tertiary = dur;
+      break;
+  }
+}
+
+static Schedule buildSchedule(const Instance& inst, RuleType rule, uint64_t seed) {
+  const int J = inst.J;
+  const int M = inst.M;
+  const int64_t N = inst.N;
+
+  Schedule sched;
+  sched.startTime.assign(static_cast<size_t>(N), -1);
+
+  std::vector<int> nextOp(J, 0);
+  std::vector<int64_t> jobReady(J, 0);
+  std::vector<int64_t> machineFree(M, 0);
+
+  SplitMix64 rng(seed);
+
+  std::vector<std::priority_queue<FutureItem, std::vector<FutureItem>, FutureComp>> future(
+      static_cast<size_t>(M));
+  std::vector<std::priority_queue<ReadyItem, std::vector<ReadyItem>, ReadyComp>> ready(
+      static_cast<size_t>(M));
+
+  auto promoteArrived = [&](int m) {
+    auto& fq = future[m];
+    auto& rq = ready[m];
+    const int64_t threshold = machineFree[m];
+
+    while (!fq.empty() && fq.top().arrival <= threshold) {
+      FutureItem f = fq.top();
+      fq.pop();
+
+      int64_t primary = 0, secondary = 0, tertiary = 0;
+      computeKeys(inst, nextOp, rule, f.job, f.arrival, f.rnd, primary, secondary, tertiary);
+      rq.push(ReadyItem{primary, secondary, tertiary, f.arrival, f.job, f.rnd});
+    }
+  };
+
+  std::vector<int> version(M, 0);
+  std::priority_queue<MachineEvent, std::vector<MachineEvent>, EventComp> events;
+
+  auto computeNextTime = [&](int m) -> int64_t {
+    promoteArrived(m);
+    if (!ready[m].empty()) return machineFree[m];
+    if (!future[m].empty()) {
+      const int64_t a = future[m].top().arrival;
+      return (machineFree[m] > a) ? machineFree[m] : a;
+    }
+    return std::numeric_limits<int64_t>::max();
+  };
+
+  auto updateEvent = [&](int m) {
+    const int64_t t = computeNextTime(m);
+    if (t == std::numeric_limits<int64_t>::max()) return;
+    ++version[m];
+    events.push(MachineEvent{t, m, version[m]});
+  };
+
+  // Seed first operation of each job into its machine queue.
+  for (int j = 0; j < J; ++j) {
+    if (inst.jobT[j] <= 0) continue;
+    const int64_t opId = inst.offset[j];
+    const int m = inst.opMachine[opId];
+    future[m].push(FutureItem{0, j, rng.next()});
+  }
+  for (int m = 0; m < M; ++m) updateEvent(m);
+
+  int64_t done = 0;
+  while (done < N) {
+    if (events.empty()) break; // should not happen for valid inputs
+
+    MachineEvent ev = events.top();
+    events.pop();
+    const int m = ev.machine;
+    if (ev.version != version[m]) continue; // stale
+
+    // Advance machine time if it was idle.
+    if (machineFree[m] < ev.time) machineFree[m] = ev.time;
+
+    promoteArrived(m);
+    if (ready[m].empty()) {
+      // Defensive: recompute and reschedule.
+      updateEvent(m);
+      continue;
+    }
+
+    ReadyItem r = ready[m].top();
+    ready[m].pop();
+
+    const int job = r.job;
+    const int64_t opId = inst.offset[job] + nextOp[job];
+
+    const int opMachine = inst.opMachine[opId];
+    (void)opMachine;
+    const int dur = inst.opDur[opId];
+
+    int64_t start = machineFree[m];
+    if (start < r.arrival) start = r.arrival;
+    if (start < jobReady[job]) start = jobReady[job];
+
+    sched.startTime[opId] = start;
+    const int64_t end = start + static_cast<int64_t>(dur);
+
+    machineFree[m] = end;
+    jobReady[job] = end;
+    ++nextOp[job];
+    ++done;
+
+    // Enqueue the next operation of this job, if any.
+    if (nextOp[job] < inst.jobT[job]) {
+      const int64_t nextId = inst.offset[job] + nextOp[job];
+      const int nextM = inst.opMachine[nextId];
+      future[nextM].push(FutureItem{jobReady[job], job, rng.next()});
+      updateEvent(nextM);
+    }
+
+    updateEvent(m);
+  }
+
+  int64_t ms = 0;
+  for (int m = 0; m < M; ++m) ms = std::max(ms, machineFree[m]);
+  sched.makespan = ms;
+  return sched;
+}
+
+struct FastPrinter {
+  static constexpr size_t FLUSH_THRESHOLD = 1u << 20; // 1 MiB
+  std::string buf;
+
+  FastPrinter() { buf.reserve(FLUSH_THRESHOLD * 2); }
+
+  void flush() {
+    if (buf.empty()) return;
+    std::cout.write(buf.data(), static_cast<std::streamsize>(buf.size()));
+    buf.clear();
+  }
+
+  void writeChar(char c) {
+    buf.push_back(c);
+    if (buf.size() >= FLUSH_THRESHOLD) flush();
+  }
+
+  void writeInt64(int64_t v) {
+    char tmp[32];
+    auto res = std::to_chars(tmp, tmp + sizeof(tmp), v);
+    buf.append(tmp, res.ptr);
+    if (buf.size() >= FLUSH_THRESHOLD) flush();
+  }
+
+  void writeInt(int v) { writeInt64(static_cast<int64_t>(v)); }
+};
+
+static Instance readInstance() {
+  Instance inst;
+  std::ios::sync_with_stdio(false);
+  std::cin.tie(nullptr);
+
+  int J = 0, M = 0;
+  if (!(std::cin >> J >> M)) return inst;
+
+  inst.J = J;
+  inst.M = M;
+  inst.jobT.assign(J, 0);
+  inst.offset.assign(static_cast<size_t>(J) + 1, 0);
+  inst.machLoad.assign(M, 0);
+  inst.jobSum.assign(J, 0);
+
+  uint64_t h = 1469598103934665603ULL;
+  fnvMix(h, static_cast<uint64_t>(J));
+  fnvMix(h, static_cast<uint64_t>(M));
+
+  inst.offset[0] = 0;
+
+  for (int j = 0; j < J; ++j) {
+    int T = 0;
+    std::cin >> T;
+    inst.jobT[j] = T;
+    inst.offset[j] = inst.N;
+    fnvMix(h, static_cast<uint64_t>(T));
+
+    for (int k = 0; k < T; ++k) {
+      int m = 0, d = 0;
+      std::cin >> m >> d;
+      inst.opMachine.push_back(m);
+      inst.opDur.push_back(d);
+      ++inst.N;
+
+      inst.jobSum[j] += static_cast<int64_t>(d);
+      if (0 <= m && m < M) inst.machLoad[m] += static_cast<int64_t>(d);
+
+      fnvMix(h, static_cast<uint64_t>(m + 1));
+      fnvMix(h, static_cast<uint64_t>(d + 1));
+    }
+    inst.offset[j + 1] = inst.N;
+  }
+  inst.offset[J] = inst.N;
+
+  inst.remWork.assign(static_cast<size_t>(inst.N), 0);
+  inst.remOps.assign(static_cast<size_t>(inst.N), 0);
+
+  // Precompute per-operation remaining work and remaining op count.
+  for (int j = 0; j < J; ++j) {
+    const int64_t s = inst.offset[j];
+    const int64_t e = inst.offset[j + 1];
+    int64_t suffix = 0;
+    for (int64_t id = e - 1; id >= s; --id) {
+      suffix += static_cast<int64_t>(inst.opDur[id]);
+      inst.remWork[id] = suffix;
+      inst.remOps[id] = static_cast<int>(e - id);
+    }
+  }
+
+  int64_t lb = 0;
+  for (int j = 0; j < J; ++j) lb = std::max(lb, inst.jobSum[j]);
+  for (int m = 0; m < M; ++m) lb = std::max(lb, inst.machLoad[m]);
+  inst.lowerBound = lb;
+  inst.inputHash = h;
+  return inst;
+}
+
+static std::vector<RuleType> pickRules(int64_t N) {
+  if (N <= 2000) return {RuleType::MWKR_SPT, RuleType::MOPNR_SPT, RuleType::SPT, RuleType::FCFS, RuleType::RANDOM};
+  if (N <= 20000) return {RuleType::MWKR_SPT, RuleType::MOPNR_SPT, RuleType::SPT, RuleType::FCFS, RuleType::RANDOM};
+  if (N <= 200000) return {RuleType::MWKR_SPT, RuleType::SPT, RuleType::FCFS};
+  return {RuleType::MWKR_SPT, RuleType::FCFS};
+}
+
+static int pickMaxIters(int64_t N) {
+  if (N <= 2000) return 80;
+  if (N <= 20000) return 20;
+  if (N <= 200000) return 8;
+  return 3;
+}
+
+static int pickTimeBudgetMs(int64_t N) {
+  if (N <= 2000) return 1800;
+  if (N <= 20000) return 1400;
+  if (N <= 200000) return 1000;
+  return 700;
+}
+
+static void writeSchedule(const Instance& inst, const Schedule& sched) {
+  FastPrinter out;
+  for (int j = 0; j < inst.J; ++j) {
+    const int T = inst.jobT[j];
+    const int64_t base = inst.offset[j];
+    for (int k = 0; k < T; ++k) {
+      const int64_t opId = base + k;
+      const int64_t st = sched.startTime[opId];
+      out.writeInt64(st < 0 ? 0 : st);
+      out.writeChar(' ');
+      out.writeInt(inst.opMachine[opId]);
+      if (k + 1 < T) out.writeChar(' ');
+    }
+    out.writeChar('\n');
+  }
+  out.flush();
+}
+
+} // namespace
+
+int main() {
+  const Instance inst = readInstance();
+  if (inst.J <= 0 || inst.M <= 0) return 0;
+
+  const auto rules = pickRules(inst.N);
+  const int maxIters = pickMaxIters(inst.N);
+  const int budgetMs = pickTimeBudgetMs(inst.N);
+
+  const auto t0 = std::chrono::steady_clock::now();
+  const auto deadline = t0 + std::chrono::milliseconds(budgetMs);
+
+  Schedule best;
+  best.makespan = std::numeric_limits<int64_t>::max();
+
+  // Deterministic base seed from input; derive run seeds via SplitMix.
+  SplitMix64 seedGen(inst.inputHash ^ 0xD1B54A32D192ED03ULL);
+
+  for (int it = 0; it < maxIters; ++it) {
+    if (std::chrono::steady_clock::now() >= deadline) break;
+
+    const RuleType rule = rules[static_cast<size_t>(it) % rules.size()];
+    const uint64_t runSeed = seedGen.next();
+    Schedule s = buildSchedule(inst, rule, runSeed);
+
+    if (s.makespan < best.makespan) best = std::move(s);
+    if (best.makespan == inst.lowerBound) break; // provably optimal
+  }
+
+  // Always have at least one schedule.
+  if (best.startTime.empty()) best = buildSchedule(inst, RuleType::MWKR_SPT, inst.inputHash);
+
+  writeSchedule(inst, best);
+  return 0;
+}
