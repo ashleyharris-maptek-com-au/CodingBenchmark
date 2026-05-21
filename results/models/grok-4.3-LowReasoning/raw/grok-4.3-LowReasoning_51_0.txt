@@ -2,160 +2,140 @@
 import math
 from collections import deque
 
-# Module-level persistence for PID state, filters, and mode memory
-_pid_state = {
-    'alt': {'i': 0.0, 'prev_err': 0.0, 'prev_deriv': 0.0},
-    'vs': {'i': 0.0, 'prev_err': 0.0},
-    'spd': {'i': 0.0, 'prev_err': 0.0},
-    'hdg': {'i': 0.0, 'prev_err': 0.0},
-    'pitch': {'i': 0.0, 'prev_err': 0.0},
-    'roll': {'i': 0.0, 'prev_err': 0.0},
-    'last_good_alt': 0.0,
-    'last_good_ias': 250.0,
-    'last_good_hdg': 0.0,
-    'last_good_pitch': 0.0,
-    'last_good_roll': 0.0,
-    'vs_demand': 0.0,
-    'mode': 'CRUISE',
-    'trim': 0.0,
-    'flap_target': 0.0,
-    'gear_target': 0,
-    'speedbrake': 0.0,
-    'history': deque(maxlen=20),
-}
+# Module-level persistence for PIDs, filters, and state
+_prev = {}
+_integrals = {'alt': 0.0, 'vs': 0.0, 'hdg': 0.0, 'ias': 0.0}
+_filters = {}
+_last_valid = {}
+_flight_phase = 'cruise'
+_cmd_history = deque(maxlen=20)
 
-def _median(values):
-    s = sorted([v for v in values if v is not None])
+def _median(vals):
+    s = sorted([v for v in vals if v is not None])
     n = len(s)
     if n == 0:
         return None
-    return s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2
+    return s[n//2] if n % 2 else (s[n//2-1] + s[n//2]) / 2
 
 def _safe_get(state, key, default=0.0):
-    return state.get(key, default) if state.get(key) is not None else default
+    return state.get(key, default)
 
-def _fuse_triple(state, base, fallback=None):
-    v1, v2, v3 = (_safe_get(state, f"{base}_{i}") for i in (1, 2, 3))
-    vals = [v1, v2, v3]
-    m = _median(vals)
-    if m is None:
-        return fallback
-    # Simple outlier rejection
-    good = [v for v in vals if abs(v - m) < 50]
-    return _median(good) if good else m
+def _fuse_triple(state, base):
+    v1 = _safe_get(state, f"{base}_1")
+    v2 = _safe_get(state, f"{base}_2")
+    v3 = _safe_get(state, f"{base}_3")
+    valid1 = _safe_get(state, f"{base}_1_valid", True)
+    valid2 = _safe_get(state, f"{base}_2_valid", True)
+    valid3 = _safe_get(state, f"{base}_3_valid", True)
+    
+    candidates = []
+    if valid1: candidates.append(v1)
+    if valid2: candidates.append(v2)
+    if valid3: candidates.append(v3)
+    
+    if len(candidates) >= 2:
+        return _median(candidates)
+    elif candidates:
+        return candidates[0]
+    else:
+        # All invalid - use last known good or raw median
+        return _median([v1, v2, v3]) or _last_valid.get(base, 0.0)
 
 def autopilot_step(state: dict, dt: float) -> dict:
-    global _pid_state
-    p = _pid_state
-    dt = max(0.01, min(dt, 0.2))
-
-    # === Sensor Fusion ===
-    baro_alt = _fuse_triple(state, 'baro_alt', p['last_good_alt'])
-    ias = _fuse_triple(state, 'ias', p['last_good_ias'])
-    hdg = _fuse_triple(state, 'irs_1_heading_deg', _safe_get(state, 'magnetic_heading_deg'))
-    pitch = _fuse_triple(state, 'irs_1_pitch_deg', p['last_good_pitch'])
-    roll = _fuse_triple(state, 'irs_1_roll_deg', p['last_good_roll'])
-    vs = _fuse_triple(state, 'irs_1_vs_fpm', 0.0)
-    mach = _safe_get(state, 'mach_1', 0.0)
-    radar_alt = _median([_safe_get(state, f"radar_alt_{i}_ft") for i in (1, 2, 3)])
-    weight_on_wheels = any(_safe_get(state, f"weight_on_wheels_{w}") for w in ("left", "nose", "right"))
-
-    # Update last good values
-    if baro_alt is not None:
-        p['last_good_alt'] = baro_alt
-    if ias is not None and 50 < ias < 450:
-        p['last_good_ias'] = ias
-    if hdg is not None:
-        p['last_good_hdg'] = hdg
-    if pitch is not None:
-        p['last_good_pitch'] = pitch
-    if roll is not None:
-        p['last_good_roll'] = roll
-
-    # Targets
-    tgt_alt = _safe_get(state, 'target_alt_ft', baro_alt)
-    tgt_hdg = _safe_get(state, 'target_hdg_deg', hdg)
-    tgt_ias = _safe_get(state, 'target_ias_kt', 280.0)
-    tgt_vs = _safe_get(state, 'target_vs_fpm', 0.0)
-
-    # === Basic Protections ===
-    controls = {}
-    stall_margin = 1.0
-    if ias is not None and ias < 180:
-        stall_margin = max(0.3, ias / 200.0)
-
-    # === Mode Logic ===
-    if weight_on_wheels:
-        p['mode'] = 'GROUND'
-        p['flap_target'] = 20.0
-        p['gear_target'] = 1
-        p['vs_demand'] = 0.0
-    elif radar_alt is not None and radar_alt < 50:
-        p['mode'] = 'FLARE'
-        p['flap_target'] = 40.0
-        p['gear_target'] = 1
-    elif abs(baro_alt - tgt_alt) > 500:
-        p['mode'] = 'ALT_CAP'
+    global _prev, _integrals, _filters, _last_valid, _flight_phase
+    
+    # === SENSOR FUSION ===
+    alt = _fuse_triple(state, 'baro_alt') or _fuse_triple(state, 'gps_alt') or 30000.0
+    ias = _fuse_triple(state, 'ias') or 250.0
+    mach = _fuse_triple(state, 'mach') or 0.7
+    vs = _fuse_triple(state, 'irs_vs') or 0.0
+    hdg = _fuse_triple(state, 'irs_heading') or _safe_get(state, 'magnetic_heading_deg', 0.0)
+    pitch = _fuse_triple(state, 'irs_pitch') or 0.0
+    roll = _fuse_triple(state, 'irs_roll') or 0.0
+    aoa = _fuse_triple(state, 'aoa') or 4.0
+    
+    target_alt = _safe_get(state, 'target_alt_ft', alt)
+    target_hdg = _safe_get(state, 'target_hdg_deg', hdg)
+    target_ias = _safe_get(state, 'target_ias_kt', ias)
+    
+    # Update last valid
+    _last_valid['alt'] = alt
+    _last_valid['ias'] = ias
+    
+    # === BASIC PROTECTIONS ===
+    cmds = {}
+    
+    # Speed protection (Vne ~365 KIAS / M0.82)
+    if ias > 355 or mach > 0.80:
+        cmds['speedbrake'] = min(1.0, (ias - 355) / 30)
+        cmds['throttle_1'] = 0.3
+        cmds['throttle_2'] = 0.3
     else:
-        p['mode'] = 'CRUISE'
-
-    # === Pitch / Altitude Control ===
-    alt_err = tgt_alt - baro_alt if baro_alt else 0.0
-    vs_demand = max(-2000, min(2000, alt_err * 1.2))
-    if p['mode'] == 'FLARE':
-        vs_demand = -150.0
-
-    vs_err = vs_demand - vs
-    p['vs']['i'] += vs_err * dt * 0.0008
-    p['vs']['i'] = max(-15, min(15, p['vs']['i']))
-    pitch_cmd = (vs_err * 0.004 + p['vs']['i']) * stall_margin
-    pitch_cmd = max(-15, min(15, pitch_cmd))
-
-    # Elevator output (relative to trim)
-    elev = pitch_cmd * 0.06
-    elev = max(-1.0, min(1.0, elev))
-    controls['elevator'] = elev
-
-    # === Roll / Heading Control ===
-    hdg_err = (tgt_hdg - hdg + 180) % 360 - 180
-    roll_cmd = hdg_err * 1.8
-    roll_cmd = max(-25, min(25, roll_cmd))
-    ail = roll_cmd * 0.035
-    controls['aileron'] = max(-1.0, min(1.0, ail))
-
-    # === Yaw / Rudder (simple yaw damper) ===
-    yaw_rate = _safe_get(state, 'gyro_1_yaw_rate_dps', 0.0)
-    controls['rudder'] = max(-0.3, min(0.3, -yaw_rate * 0.08))
-
-    # === Speed / Thrust ===
-    spd_err = tgt_ias - (ias or p['last_good_ias'])
-    p['spd']['i'] += spd_err * dt * 0.0015
-    p['spd']['i'] = max(-0.5, min(0.5, p['spd']['i']))
-    thrust = 0.55 + spd_err * 0.004 + p['spd']['i']
-    thrust = max(0.15, min(0.95, thrust))
-
-    # Simple engine symmetry protection
-    n1_diff = abs(_safe_get(state, 'engine_1_n1_pct') - _safe_get(state, 'engine_2_n1_pct'))
-    if n1_diff > 25:
-        thrust *= 0.7  # reduce thrust on asymmetric thrust
-
-    controls['throttle_1'] = thrust
-    controls['throttle_2'] = thrust
-
-    # === Trim, Flaps, Gear, Speedbrake ===
-    if abs(elev) > 0.4:
-        p['trim'] += elev * 0.015 * dt
-        p['trim'] = max(-0.8, min(0.8, p['trim']))
-    controls['elevator_trim'] = p['trim']
-
-    controls['flaps'] = p['flap_target']
-    controls['gear'] = p['gear_target']
-    controls['speedbrake'] = p['speedbrake']
-
-    # Vne protection
-    if ias and (ias > 355 or mach > 0.80):
-        controls['speedbrake'] = 0.6
-        p['speedbrake'] = 0.6
-
-    return controls
+        cmds['speedbrake'] = 0.0
+    
+    # Stall protection
+    if aoa > 12.0:
+        cmds['elevator'] = -0.6
+        cmds['throttle_1'] = 0.95
+        cmds['throttle_2'] = 0.95
+    
+    # === ALTITUDE / PITCH CONTROL ===
+    alt_err = target_alt - alt
+    vs_target = max(-1500, min(1500, alt_err * 0.8))
+    
+    # Simple VS hold with pitch
+    vs_err = vs_target - vs
+    _integrals['vs'] = max(-5, min(5, _integrals['vs'] + vs_err * dt * 0.001))
+    pitch_cmd = 0.015 * vs_err + 0.002 * _integrals['vs']
+    
+    # Pitch limiter
+    pitch_cmd = max(-8, min(12, pitch_cmd))
+    
+    # Convert to elevator (relative to trim)
+    elevator = (pitch_cmd - pitch) * 0.12
+    elevator = max(-1.0, min(1.0, elevator))
+    cmds['elevator'] = elevator
+    
+    # === HEADING / ROLL CONTROL ===
+    hdg_err = ((target_hdg - hdg + 180) % 360) - 180
+    roll_cmd = max(-25, min(25, hdg_err * 1.8))
+    aileron = (roll_cmd - roll) * 0.08
+    aileron = max(-1.0, min(1.0, aileron))
+    cmds['aileron'] = aileron
+    
+    # Rudder - basic yaw damping
+    yaw_rate = _fuse_triple(state, 'gyro_yaw_rate') or 0.0
+    cmds['rudder'] = -yaw_rate * 0.15
+    
+    # === AUTOTHRUST ===
+    ias_err = target_ias - ias
+    _integrals['ias'] += ias_err * dt * 0.0008
+    _integrals['ias'] = max(-20, min(20, _integrals['ias']))
+    
+    thr = 0.55 + ias_err * 0.004 + _integrals['ias'] * 0.0005
+    thr = max(0.15, min(0.95, thr))
+    
+    if 'speedbrake' not in cmds or cmds['speedbrake'] < 0.3:
+        cmds['throttle_1'] = thr
+        cmds['throttle_2'] = thr
+    
+    # === CONFIG ===
+    # Simple flap schedule
+    if alt < 2000:
+        cmds['flaps'] = 20
+    elif alt < 5000:
+        cmds['flaps'] = 10
+    else:
+        cmds['flaps'] = 0
+    
+    # Gear
+    if alt < 1500 and _safe_get(state, 'weight_on_wheels_nose', 0) == 0:
+        cmds['gear'] = 1
+    elif alt > 2000:
+        cmds['gear'] = 0
+    
+    # Trim slowly toward current attitude
+    cmds['elevator_trim'] = pitch * 0.015
+    
+    return cmds
 ```

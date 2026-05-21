@@ -2,225 +2,244 @@
 import numpy as np
 from collections import deque
 
-# Module-level persistent state
-_prev_lane_offset = 0.0
-_prev_speed = 0.0
-_lane_integral = 0.0
-_speed_integral = 0.0
-_last_good_lane_offset = 0.0
-_last_good_speed = 0.0
-_last_good_yaw = 0.0
-_obstacle_history = deque(maxlen=5)
-_lane_change_timer = 0.0
-_emergency_brake_timer = 0.0
+# Module-level persistent state for filtering and control
+_state = {
+    'filtered_speed': 0.0,
+    'filtered_yaw_rate': 0.0,
+    'filtered_lane_offset': 0.0,
+    'filtered_curvature': 0.0,
+    'speed_integral': 0.0,
+    'lane_integral': 0.0,
+    'last_obstacle_dist': 100.0,
+    'last_mu': 1.0,
+    'target_lane_history': deque(maxlen=5),
+    'emergency_brake_counter': 0,
+    'lane_change_cooldown': 0,
+}
 
-def _safe_get(state, key, default=0.0):
+def _get_median(values):
+    """Return median of non-None values"""
+    valid = [v for v in values if v is not None]
+    if not valid:
+        return None
+    return float(np.median(valid))
+
+def _safe_get(state, key, default=None):
     val = state.get(key, default)
     if val is None:
         return default
     return val
 
-def _get_median(values):
-    vals = [v for v in values if v is not None and not np.isnan(v)]
-    if not vals:
-        return None
-    return float(np.median(vals))
-
 def autopilot_step(state: dict, dt: float) -> dict:
-    global _prev_lane_offset, _prev_speed, _lane_integral, _speed_integral
-    global _last_good_lane_offset, _last_good_speed, _last_good_yaw
-    global _obstacle_history, _lane_change_timer, _emergency_brake_timer
-
-    # ==================== SENSOR FUSION ====================
+    global _state
     
-    # Speed estimation (robust to failures)
-    speeds = []
+    # ==========================================
+    # 1. SENSOR FUSION
+    # ==========================================
+    
+    # --- Speed fusion ---
+    wheel_speeds = []
     for prefix in ['fl', 'fr', 'rl', 'rr']:
-        if _safe_get(state, f'wheel_speed_{prefix}_valid', False):
-            speeds.append(_safe_get(state, f'wheel_speed_{prefix}_kmh'))
-    for i in [1, 2]:
-        speeds.append(_safe_get(state, f'vehicle_speed_{i}_kmh'))
-    for i in [1, 2]:
-        if _safe_get(state, f'gps_{i}_valid', False):
-            speeds.append(_safe_get(state, f'gps_{i}_speed_kmh'))
+        speed = _safe_get(state, f'wheel_speed_{prefix}_kmh')
+        valid = _safe_get(state, f'wheel_speed_{prefix}_valid', True)
+        if valid and speed is not None:
+            wheel_speeds.append(speed)
     
-    current_speed = _get_median(speeds) or _last_good_speed
-    if current_speed < 1.0:
-        current_speed = _last_good_speed
-    _last_good_speed = current_speed * 0.7 + _last_good_speed * 0.3  # light filtering
-
-    # Yaw rate fusion
+    vehicle_speeds = [_safe_get(state, 'vehicle_speed_1_kmh'), _safe_get(state, 'vehicle_speed_2_kmh')]
+    gps_speeds = [_safe_get(state, 'gps_1_speed_kmh'), _safe_get(state, 'gps_2_speed_kmh')]
+    
+    all_speeds = wheel_speeds + [s for s in vehicle_speeds + gps_speeds if s is not None]
+    current_speed = _get_median(all_speeds) or _state['filtered_speed']
+    
+    # Low-pass filter speed
+    _state['filtered_speed'] = 0.7 * _state['filtered_speed'] + 0.3 * current_speed
+    
+    # --- Yaw rate fusion ---
     yaw_rates = []
     for i in [1, 2, 3]:
-        if _safe_get(state, f'gyro_{i}_valid', False):
-            yaw_rates.append(_safe_get(state, f'gyro_{i}_yaw_rate_dps'))
-    yaw_rate = _get_median(yaw_rates) or _last_good_yaw
-    _last_good_yaw = yaw_rate * 0.6 + _last_good_yaw * 0.4
-
-    # Lane offset fusion (vision systems)
+        valid = _safe_get(state, f'gyro_{i}_valid', True)
+        rate = _safe_get(state, f'gyro_{i}_yaw_rate_dps')
+        if valid and rate is not None:
+            yaw_rates.append(rate)
+    
+    current_yaw = _get_median(yaw_rates) or _state['filtered_yaw_rate']
+    _state['filtered_yaw_rate'] = 0.6 * _state['filtered_yaw_rate'] + 0.4 * current_yaw
+    
+    # --- Lane and curvature fusion ---
     lane_offsets = []
     curvatures = []
     speed_limits = []
+    
+    for i in [1, 2, 3]:
+        if _safe_get(state, f'vision_{i}_left_line_valid', False) or _safe_get(state, f'vision_{i}_right_line_valid', False):
+            offset = _safe_get(state, f'vision_{i}_lane_offset_m')
+            if offset is not None:
+                lane_offsets.append(offset)
+            
+            curv = _safe_get(state, f'vision_{i}_road_curvature_1pm')
+            if curv is not None:
+                curvatures.append(curv)
+            
+            sl = _safe_get(state, f'vision_{i}_speed_limit_kmh')
+            if sl is not None:
+                speed_limits.append(sl)
+    
+    if lane_offsets:
+        current_offset = np.median(lane_offsets)
+        _state['filtered_lane_offset'] = 0.65 * _state['filtered_lane_offset'] + 0.35 * current_offset
+    
+    if curvatures:
+        current_curv = np.median(curvatures)
+        _state['filtered_curvature'] = 0.7 * _state['filtered_curvature'] + 0.3 * current_curv
+    
+    speed_limit = min(speed_limits) if speed_limits else None
+    
+    # --- Obstacle detection ---
     obstacle_dists = []
-    obstacle_rel_speeds = []
+    obstacle_speeds = []
     
-    for v in [1, 2, 3]:
-        if _safe_get(state, f'vision_{v}_left_line_valid', False) and \
-           _safe_get(state, f'vision_{v}_right_line_valid', False):
-            offset = _safe_get(state, f'vision_{v}_lane_offset_m', 0.0)
-            lane_offsets.append(offset)
-        
-        if _safe_get(state, f'vision_{v}_road_curvature_1pm', 0) != 0:
-            curvatures.append(_safe_get(state, f'vision_{v}_road_curvature_1pm'))
-        
-        if _safe_get(state, f'vision_{v}_speed_limit_valid', False):
-            speed_limits.append(_safe_get(state, f'vision_{v}_speed_limit_kmh'))
-        
-        if _safe_get(state, f'vision_{v}_obstacle_valid', False) and \
-           _safe_get(state, f'vision_{v}_obstacle_detected', False):
-            dist = _safe_get(state, f'vision_{v}_obstacle_dist_m', 200.0)
-            rel_speed = _safe_get(state, f'vision_{v}_obstacle_rel_speed_kmh', 0.0)
-            obstacle_dists.append(dist)
-            obstacle_rel_speeds.append(rel_speed)
-
-    lane_offset = _get_median(lane_offsets) if lane_offsets else _last_good_lane_offset
-    if abs(lane_offset) > 4.0:  # sanity check
-        lane_offset = _last_good_lane_offset
-    
-    _last_good_lane_offset = lane_offset * 0.75 + _last_good_lane_offset * 0.25
-    
-    road_curvature = _get_median(curvatures) or 0.0
-    speed_limit = _get_median(speed_limits) or 130.0
+    for i in [1, 2, 3]:
+        if _safe_get(state, f'vision_{i}_obstacle_valid', False):
+            dist = _safe_get(state, f'vision_{i}_obstacle_dist_m')
+            rel_speed = _safe_get(state, f'vision_{i}_obstacle_rel_speed_kmh')
+            if dist is not None:
+                obstacle_dists.append(dist)
+            if rel_speed is not None:
+                obstacle_speeds.append(rel_speed)
     
     # Lidar front detection
-    front_ranges = []
-    for angle in ['+005', '+015', '+030', '-005', '-015', '-030']:
-        if _safe_get(state, f'lidar_{angle}_deg_valid', False):
-            front_ranges.append(_safe_get(state, f'lidar_{angle}_deg_range_m', 200.0))
+    front_lidar = []
+    for angle in ['+005', '+015', '+030']:
+        key = f'lidar_{angle}_deg_range_m'
+        if _safe_get(state, f'lidar_{angle}_deg_valid', True):
+            val = _safe_get(state, key)
+            if val is not None:
+                front_lidar.append(val)
     
-    min_front_range = min(front_ranges) if front_ranges else 200.0
-
-    # ==================== TRACTION & SAFETY ====================
+    min_obstacle_dist = min(obstacle_dists) if obstacle_dists else min(front_lidar) if front_lidar else 100.0
+    _state['last_obstacle_dist'] = 0.8 * _state['last_obstacle_dist'] + 0.2 * min_obstacle_dist
+    
+    # --- Traction ---
     mu = _safe_get(state, 'estimated_mu', 1.0)
-    rain = _safe_get(state, 'rain_sensor', 0)
+    _state['last_mu'] = 0.8 * _state['last_mu'] + 0.2 * mu
     
-    # Reduce performance on low friction
-    if mu < 0.4:
-        speed_limit = min(speed_limit, 60.0)
-    elif mu < 0.6:
-        speed_limit = min(speed_limit, 90.0)
-
-    # ==================== OBSTACLE DETECTION ====================
-    target_speed = _safe_get(state, 'target_speed_kmh', 110.0)
+    # ==========================================
+    # 2. TARGET SELECTION
+    # ==========================================
+    
+    target_speed = _safe_get(state, 'target_speed_kmh', 100.0)
     target_lane = _safe_get(state, 'target_lane', 1)
-    current_lane = _safe_get(state, 'current_lane', 1)
     
-    obstacle_detected = False
-    obstacle_distance = 200.0
-    obstacle_rel_speed = 0.0
+    # Respect speed limits
+    if speed_limit is not None:
+        target_speed = min(target_speed, speed_limit)
     
-    if obstacle_dists:
-        obstacle_distance = min(obstacle_dists)
-        idx = obstacle_dists.index(obstacle_distance)
-        obstacle_rel_speed = obstacle_rel_speeds[idx]
+    # Reduce target speed on low friction
+    if _state['last_mu'] < 0.4:
+        target_speed = min(target_speed, 60.0)
+    elif _state['last_mu'] < 0.6:
+        target_speed = min(target_speed, 80.0)
     
-    # Combine with lidar
-    if min_front_range < 80.0:
-        obstacle_detected = True
-        obstacle_distance = min(obstacle_distance, min_front_range)
+    # ==========================================
+    # 3. LONGITUDINAL CONTROL (Speed + Obstacle)
+    # ==========================================
     
-    _obstacle_history.append(obstacle_detected)
-    recent_obstacle = any(_obstacle_history)
-
-    # ==================== LANE KEEPING (PID) ====================
-    lane_error = lane_offset
+    speed_error = target_speed - _state['filtered_speed']
+    _state['speed_integral'] += speed_error * dt
+    _state['speed_integral'] = np.clip(_state['speed_integral'], -50, 50)
     
-    # Adaptive gains based on speed and traction
-    speed_factor = max(0.5, min(1.5, current_speed / 100.0))
-    mu_factor = max(0.4, mu)
-    
-    Kp_lane = 0.85 * mu_factor / speed_factor
-    Ki_lane = 0.02 * mu_factor
-    Kd_lane = 0.35 * mu_factor
-    
-    _lane_integral += lane_error * dt
-    _lane_integral = max(-2.0, min(2.0, _lane_integral))  # anti-windup
-    
-    d_lane_error = (lane_error - _prev_lane_offset) / max(dt, 0.001)
-    steering = -(Kp_lane * lane_error + Ki_lane * _lane_integral + Kd_lane * d_lane_error)
-    
-    # Curvature feedforward
-    curvature_steering = road_curvature * 0.8 * (current_speed / 100.0)
-    steering += curvature_steering
-    
-    # Limit steering
-    steering = max(-1.0, min(1.0, steering))
-    
-    # ==================== SPEED CONTROL ====================
-    desired_speed = min(target_speed, speed_limit)
-    
-    # Obstacle response
-    brake = 0.0
+    # Base speed control
     throttle = 0.0
+    brake = 0.0
     
-    if obstacle_detected and obstacle_distance < 60.0:
-        # Emergency braking logic
-        ttc = obstacle_distance / max((current_speed - obstacle_rel_speed) / 3.6, 0.1)  # seconds
-        if ttc < 2.5 or obstacle_distance < 25.0:
-            brake = min(1.0, 0.6 + (60.0 - obstacle_distance) / 60.0)
-            throttle = 0.0
-            _emergency_brake_timer = 1.5
-        else:
-            desired_speed = max(30.0, current_speed - 20.0)
+    # Obstacle avoidance logic
+    obstacle_dist = _state['last_obstacle_dist']
+    time_to_collision = obstacle_dist / max(_state['filtered_speed'] / 3.6, 0.1)  # seconds
     
-    if _emergency_brake_timer > 0:
-        brake = max(brake, 0.7)
-        _emergency_brake_timer -= dt
-
-    # Normal speed PID
-    speed_error = desired_speed - current_speed
-    
-    Kp_speed = 0.025 * mu_factor
-    Ki_speed = 0.003 * mu_factor
-    Kd_speed = 0.015
-    
-    _speed_integral += speed_error * dt
-    _speed_integral = max(-200, min(200, _speed_integral))
-    
-    d_speed_error = (speed_error - _prev_speed) / max(dt, 0.001)
-    speed_output = Kp_speed * speed_error + Ki_speed * _speed_integral + Kd_speed * d_speed_error
-    
-    if brake > 0.1:
+    if obstacle_dist < 25 and time_to_collision < 3.0:
+        # Emergency braking
+        brake = min(1.0, 0.6 + (3.0 - time_to_collision) * 0.2)
         throttle = 0.0
-        brake = max(brake, min(1.0, brake))
+        _state['emergency_brake_counter'] = 15
+    elif obstacle_dist < 40:
+        # Moderate braking + prepare for lane change
+        brake = max(0.0, 0.3 * (40 - obstacle_dist) / 15)
+        throttle = 0.0
     else:
-        if speed_output > 0:
-            throttle = min(1.0, speed_output * 0.8)
-            brake = 0.0
+        # Normal speed control
+        if speed_error > 2:
+            throttle = min(0.9, 0.4 + speed_error * 0.03)
+        elif speed_error < -2:
+            brake = min(0.6, -speed_error * 0.05)
         else:
-            throttle = 0.0
-            brake = min(0.6, abs(speed_output) * 0.4)
-
-    # Low traction limiting
-    if mu < 0.5:
-        throttle = min(throttle, 0.6)
-        brake = min(brake, 0.5)
-
-    # ==================== UPDATE STATE ====================
-    _prev_lane_offset = lane_error
-    _prev_speed = current_speed
-
-    # Simple lane change logic (if obstacle persistent and in target lane)
-    if (recent_obstacle and obstacle_distance < 45.0 and 
-        abs(current_lane - target_lane) < 0.5 and _lane_change_timer <= 0):
-        # Would initiate lane change here in full system
-        _lane_change_timer = 4.0
+            throttle = 0.35 + speed_error * 0.02
     
-    _lane_change_timer = max(0.0, _lane_change_timer - dt)
-
+    # Reduce inputs on low friction
+    if _state['last_mu'] < 0.5:
+        throttle *= 0.6
+        brake = min(brake, 0.4)
+    
+    # ==========================================
+    # 4. LATERAL CONTROL (Lane Keeping + Lane Change)
+    # ==========================================
+    
+    lane_offset = _state['filtered_lane_offset']
+    curvature = _state['filtered_curvature']
+    yaw_rate = _state['filtered_yaw_rate']
+    
+    # Lane keeping PID-like controller
+    _state['lane_integral'] += lane_offset * dt
+    _state['lane_integral'] = np.clip(_state['lane_integral'], -2.0, 2.0)
+    
+    # Feedforward from curvature
+    curvature_ff = curvature * 0.8  # empirical gain
+    
+    # Main steering calculation
+    steering = (
+        -0.8 * lane_offset +                    # Lane centering
+        -0.4 * _state['lane_integral'] +        # Integral
+        -0.3 * yaw_rate +                       # Yaw damping
+        curvature_ff                            # Curvature compensation
+    )
+    
+    # Lane change logic
+    current_lane = _safe_get(state, 'current_lane', 1)
+    if target_lane != current_lane and _state['lane_change_cooldown'] <= 0:
+        # Check if safe to change lanes
+        if obstacle_dist > 35 and _state['last_mu'] > 0.4:
+            lane_diff = target_lane - current_lane
+            steering += lane_diff * 0.4  # Gentle lane change command
+            _state['lane_change_cooldown'] = 40  # ~2 seconds at 20Hz
+    
+    _state['lane_change_cooldown'] = max(0, _state['lane_change_cooldown'] - 1)
+    
+    # ==========================================
+    # 5. SAFETY OVERRIDES & GRACEFUL DEGRADATION
+    # ==========================================
+    
+    # Emergency brake cooldown
+    if _state['emergency_brake_counter'] > 0:
+        brake = max(brake, 0.7)
+        throttle = 0.0
+        _state['emergency_brake_counter'] -= 1
+    
+    # Very low friction safety
+    if _state['last_mu'] < 0.3:
+        steering *= 0.5  # Reduce steering authority
+        throttle = min(throttle, 0.3)
+    
+    # Clamp outputs
+    steering = float(np.clip(steering, -1.0, 1.0))
+    throttle = float(np.clip(throttle, 0.0, 1.0))
+    brake = float(np.clip(brake, 0.0, 1.0))
+    
+    # If we're braking hard, reduce throttle
+    if brake > 0.3:
+        throttle = 0.0
+    
     return {
-        'steering': round(steering, 3),
-        'throttle': round(throttle, 3),
-        'brake': round(brake, 3)
+        'steering': steering,
+        'throttle': throttle,
+        'brake': brake
     }
 ```

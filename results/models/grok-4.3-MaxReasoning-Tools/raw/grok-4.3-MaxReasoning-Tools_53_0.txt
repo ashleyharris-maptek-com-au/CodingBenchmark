@@ -1,0 +1,225 @@
+```python
+import numpy as np
+
+# Module-level persistence (survives across calls within a scenario)
+_prev_rel_pos = np.zeros(3)
+_prev_rel_vel = np.zeros(3)
+_integral = np.zeros(3)
+_last_dist = 1000.0
+_fuel_last = 100.0
+_step_count = 0
+
+def autopilot_step(state: dict, dt: float) -> dict:
+    global _prev_rel_pos, _prev_rel_vel, _integral, _last_dist, _fuel_last, _step_count
+    
+    _step_count += 1
+    
+    def safe_get(key, default=0.0):
+        val = state.get(key, default)
+        if val is None:
+            return default
+        try:
+            return float(val)
+        except (ValueError, TypeError):
+            return default
+    
+    def is_valid(key):
+        return bool(state.get(key, False))
+    
+    # === SENSOR FUSION: Relative Position & Velocity (LVLH) ===
+    rel_pos = np.zeros(3)
+    rel_vel = np.zeros(3)
+    pos_valid = False
+    vel_valid = False
+    
+    # Priority 1: Lidar (best for <500m)
+    if all(is_valid(f'lidar_rel_{ax}_valid') for ax in ['x', 'y', 'z']):
+        rel_pos = np.array([
+            safe_get('lidar_rel_pos_x_m'),
+            safe_get('lidar_rel_pos_y_m'),
+            safe_get('lidar_rel_pos_z_m')
+        ])
+        pos_valid = True
+        if all(is_valid(f'lidar_relv_{ax}_valid') for ax in ['x', 'y', 'z']):
+            rel_vel = np.array([
+                safe_get('lidar_rel_vel_x_ms'),
+                safe_get('lidar_rel_vel_y_ms'),
+                safe_get('lidar_rel_vel_z_ms')
+            ])
+            vel_valid = True
+    
+    # Priority 2: Radar fallback
+    if not pos_valid and all(is_valid(f'radar_rel_{ax}_valid') for ax in ['x', 'y', 'z']):
+        rel_pos = np.array([
+            safe_get('radar_rel_pos_x_m'),
+            safe_get('radar_rel_pos_y_m'),
+            safe_get('radar_rel_pos_z_m')
+        ])
+        pos_valid = True
+        if all(is_valid(f'radar_relv_{ax}_valid') for ax in ['x', 'y', 'z']):
+            rel_vel = np.array([
+                safe_get('radar_rel_vel_x_ms'),
+                safe_get('radar_rel_vel_y_ms'),
+                safe_get('radar_rel_vel_z_ms')
+            ])
+            vel_valid = True
+    
+    # Priority 3: Docking camera (fine approach)
+    camera_active = bool(safe_get('dock_camera_active', 0.0))
+    cam_range = safe_get('dock_camera_range_m', 0.0)
+    if camera_active and cam_range > 0 and is_valid('dock_camera_bearing_x_valid'):
+        bx = safe_get('dock_camera_bearing_x')
+        by = safe_get('dock_camera_bearing_y')
+        bz = safe_get('dock_camera_bearing_z')
+        bearing = np.array([bx, by, bz])
+        bnorm = np.linalg.norm(bearing)
+        if bnorm > 1e-4:
+            bearing = bearing / bnorm
+            if not pos_valid:
+                rel_pos = cam_range * bearing
+                pos_valid = True
+    
+    # Scalar range validation (range finders + target)
+    range_list = []
+    for i in [1, 2, 3]:
+        if is_valid(f'range_{i}_valid'):
+            r = safe_get(f'range_{i}_m')
+            if r > 0.1:
+                range_list.append(r)
+    
+    target_range = safe_get('target_dock_range_m', 9999.0)
+    est_dist = min(range_list) if range_list else target_range
+    
+    # Fallback if no 3D data
+    if not pos_valid:
+        if est_dist > 80:
+            # Conservative coast
+            return {
+                'thrust_x': 0.0, 'thrust_y': 0.0, 'thrust_z': 0.0,
+                'att_rate_roll': 0.0, 'att_rate_pitch': 0.0, 'att_rate_yaw': 0.0
+            }
+        else:
+            # Use previous estimate or target scalar
+            rel_pos = _prev_rel_pos.copy()
+            pos_valid = True
+    
+    # Velocity estimation / smoothing
+    if not vel_valid:
+        if dt > 1e-6:
+            rel_vel = (rel_pos - _prev_rel_pos) / max(dt, 0.05)
+        else:
+            rel_vel = _prev_rel_vel.copy()
+    
+    # Low-pass filter (noise rejection)
+    alpha = 0.75
+    rel_pos = alpha * rel_pos + (1 - alpha) * _prev_rel_pos
+    rel_vel = alpha * rel_vel + (1 - alpha) * _prev_rel_vel
+    
+    _prev_rel_pos = rel_pos.copy()
+    _prev_rel_vel = rel_vel.copy()
+    
+    # Current distance
+    current_dist = max(np.linalg.norm(rel_pos), 0.1)
+    _last_dist = current_dist
+    
+    # === PHASE / GAIN SCHEDULING ===
+    fuel_pct = safe_get('fuel_remaining_pct', 100.0)
+    fuel_kg = safe_get('fuel_remaining_kg', 500.0)
+    
+    if current_dist > 250:
+        # Far orbital regime (Hohmann-like)
+        kp = np.array([0.004, 0.009, 0.004])
+        kd = np.array([0.25, 0.45, 0.25])
+        max_cmd = 0.28
+        approach_gain = 0.045
+    elif current_dist > 60:
+        # Medium V-bar approach
+        kp = np.array([0.012, 0.018, 0.012])
+        kd = np.array([0.55, 0.85, 0.55])
+        max_cmd = 0.45
+        approach_gain = 0.065
+    else:
+        # Close linear regime (<60m)
+        kp = np.array([0.028, 0.035, 0.028])
+        kd = np.array([0.95, 1.35, 0.95])
+        max_cmd = 0.38
+        approach_gain = 0.09
+    
+    # Fuel conservation
+    if fuel_pct < 25 or fuel_kg < 80:
+        max_cmd *= 0.45
+        kp *= 0.6
+        kd *= 0.7
+    
+    # === GUIDANCE LAW (LVLH) ===
+    # x (radial): stabilize to 0
+    cmd_x = -kp[0] * rel_pos[0] - kd[0] * rel_vel[0]
+    
+    # z (cross-track): stabilize to 0
+    cmd_z = -kp[2] * rel_pos[2] - kd[2] * rel_vel[2]
+    
+    # y (along-track): counter-intuitive orbital feedback
+    # Negative y = behind → negative thrust_y (retrograde) to catch up
+    # desired closing velocity profile
+    desired_vy = np.clip(-approach_gain * rel_pos[1], -1.8, 1.8)
+    vel_err_y = rel_vel[1] - desired_vy
+    
+    # Position feedback with correct sign for orbital dynamics
+    # +kp_y * rel_pos_y produces correct retrograde when behind
+    cmd_y = 0.9 * kp[1] * rel_pos[1] - kd[1] * rel_vel[1] - 0.65 * vel_err_y
+    
+    cmd = np.array([cmd_x, cmd_y, cmd_z])
+    
+    # Thrust saturation + rate limiting
+    thrust = np.clip(cmd, -max_cmd, max_cmd)
+    
+    # Anti-windup / gentle final approach (<10m)
+    if current_dist < 12:
+        thrust *= 0.55
+        # Very gentle final braking
+        if np.abs(rel_vel[1]) > 0.12:
+            thrust[1] = np.clip(-1.2 * rel_vel[1], -0.35, 0.35)
+    
+    # === ATTITUDE RATE COMMANDS (stabilization) ===
+    # Damp rates using gyro data
+    gyro_sum = 0.0
+    gyro_count = 0
+    for g in [1, 2, 3]:
+        for ax in ['roll', 'pitch', 'yaw']:
+            if is_valid(f'gyro_{g}_{ax}_valid'):
+                rate_dps = safe_get(f'gyro_{g}_{ax}_dps')
+                gyro_sum += rate_dps
+                gyro_count += 1
+    
+    if gyro_count > 0:
+        avg_rate_dps = gyro_sum / gyro_count
+        damp = -0.008 * avg_rate_dps / 57.3   # dps → rad/s damping
+    else:
+        damp = 0.0
+    
+    # Keep rates near zero (LVLH stabilization) + small damping
+    att_roll = np.clip(damp * 0.6, -0.028, 0.028)
+    att_pitch = np.clip(damp * 0.6, -0.028, 0.028)
+    att_yaw = np.clip(damp * 0.6, -0.028, 0.028)
+    
+    # Docking camera alignment hint (fine pointing)
+    if camera_active and current_dist < 35:
+        # Slight bias toward camera bearing for port alignment
+        bx = safe_get('dock_camera_bearing_x')
+        by = safe_get('dock_camera_bearing_y')
+        bz = safe_get('dock_camera_bearing_z')
+        if abs(bx) + abs(by) + abs(bz) > 0.3:
+            # Gentle yaw/pitch nudge toward bearing
+            att_yaw = np.clip(-0.012 * by, -0.025, 0.025)
+            att_pitch = np.clip(-0.012 * bz, -0.025, 0.025)
+    
+    # Return normalized commands
+    return {
+        'thrust_x': float(np.clip(thrust[0], -1.0, 1.0)),
+        'thrust_y': float(np.clip(thrust[1], -1.0, 1.0)),
+        'thrust_z': float(np.clip(thrust[2], -1.0, 1.0)),
+        'att_rate_roll': float(att_roll),
+        'att_rate_pitch': float(att_pitch),
+        'att_rate_yaw': float(att_yaw)
+    }
+```
