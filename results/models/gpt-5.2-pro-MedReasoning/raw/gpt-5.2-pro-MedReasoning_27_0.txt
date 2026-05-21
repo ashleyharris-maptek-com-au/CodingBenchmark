@@ -1,0 +1,726 @@
+```cpp
+#include <algorithm>
+#include <chrono>
+#include <cstdint>
+#include <iostream>
+#include <limits>
+#include <numeric>
+#include <random>
+#include <string>
+#include <utility>
+#include <vector>
+
+#ifdef _MSC_VER
+  #include <intrin.h>
+#endif
+
+// ----------------------- Utilities -----------------------
+static inline int popcount64(uint64_t x) {
+#ifdef _MSC_VER
+    return (int)__popcnt64(x);
+#else
+    return __builtin_popcountll(x);
+#endif
+}
+
+struct Timer {
+    using clock = std::chrono::steady_clock;
+    clock::time_point t0;
+    explicit Timer() : t0(clock::now()) {}
+    double seconds() const {
+        return std::chrono::duration<double>(clock::now() - t0).count();
+    }
+};
+
+// ----------------------- Graph (CSR) -----------------------
+struct GraphCSR {
+    int n = 0;
+    int m = 0; // undirected edges count
+    std::vector<int> off; // size n+1
+    std::vector<int> adj; // size 2m
+
+    int degree(int v) const { return off[v + 1] - off[v]; }
+};
+
+// Build CSR from packed edges (u in high 32, v in low 32)
+static GraphCSR buildCSR(int n, int m, const std::vector<uint64_t>& edgesPacked) {
+    GraphCSR g;
+    g.n = n;
+    g.m = m;
+    g.off.assign(n + 1, 0);
+
+    for (uint64_t e : edgesPacked) {
+        int u = (int)(e >> 32);
+        int v = (int)(e & 0xFFFFFFFFu);
+        if ((unsigned)u >= (unsigned)n || (unsigned)v >= (unsigned)n) continue;
+        if (u == v) continue;
+        g.off[u + 1]++;
+        g.off[v + 1]++;
+    }
+    for (int i = 1; i <= n; i++) g.off[i] += g.off[i - 1];
+    g.adj.assign(g.off[n], 0);
+
+    std::vector<int> cur = g.off;
+    for (uint64_t e : edgesPacked) {
+        int u = (int)(e >> 32);
+        int v = (int)(e & 0xFFFFFFFFu);
+        if ((unsigned)u >= (unsigned)n || (unsigned)v >= (unsigned)n) continue;
+        if (u == v) continue;
+        g.adj[cur[u]++] = v;
+        g.adj[cur[v]++] = u;
+    }
+    return g;
+}
+
+// ----------------------- Degeneracy (smallest-last) order -----------------------
+// Returns smallest-degree-first ordering. Color in reverse for better greedy.
+static std::vector<int> degeneracyOrderSmallestFirst(const GraphCSR& g) {
+    const int n = g.n;
+    std::vector<int> deg(n);
+    int maxDeg = 0;
+    for (int v = 0; v < n; v++) {
+        deg[v] = g.degree(v);
+        if (deg[v] > maxDeg) maxDeg = deg[v];
+    }
+
+    std::vector<int> bin(maxDeg + 1, 0);
+    for (int v = 0; v < n; v++) bin[deg[v]]++;
+
+    std::vector<int> start(maxDeg + 1, 0);
+    for (int d = 1; d <= maxDeg; d++) start[d] = start[d - 1] + bin[d - 1];
+
+    std::vector<int> vert(n), pos(n);
+    // place vertices
+    {
+        std::vector<int> next = start;
+        for (int v = 0; v < n; v++) {
+            int p = next[deg[v]]++;
+            vert[p] = v;
+            pos[v] = p;
+        }
+    }
+    // restore start to bucket starts
+    for (int d = maxDeg; d >= 1; d--) start[d] = start[d - 1];
+    start[0] = 0;
+
+    std::vector<int> order;
+    order.reserve(n);
+
+    for (int i = 0; i < n; i++) {
+        int v = vert[i];
+        order.push_back(v);
+
+        int dv = deg[v];
+        // Decrease neighbors with higher current degree
+        for (int ei = g.off[v]; ei < g.off[v + 1]; ei++) {
+            int u = g.adj[ei];
+            if (deg[u] > dv) {
+                int du = deg[u];
+                int pu = pos[u];
+                int pw = start[du];
+                int w = vert[pw];
+                if (u != w) {
+                    std::swap(vert[pu], vert[pw]);
+                    pos[u] = pw;
+                    pos[w] = pu;
+                }
+                start[du]++;
+                deg[u]--;
+            }
+        }
+    }
+    return order; // smallest-first
+}
+
+// ----------------------- Greedy with limited recoloring -----------------------
+struct GreedyRecolor {
+    const GraphCSR& g;
+    int k;
+    uint64_t allMask; // for k<=64
+
+    // reusable work arrays sized k
+    std::vector<int> seen;
+    std::vector<int> cnt;
+    std::vector<int> who;
+    int stamp = 1;
+
+    explicit GreedyRecolor(const GraphCSR& graph, int colors)
+        : g(graph), k(colors) {
+        if (k >= 64) allMask = ~0ull;
+        else allMask = (k <= 0) ? 0ull : ((1ull << k) - 1ull);
+        seen.assign(k, 0);
+        cnt.assign(k, 0);
+        who.assign(k, -1);
+    }
+
+    inline void resetMarks() {
+        stamp++;
+        if (stamp == std::numeric_limits<int>::max() / 2) {
+            // rare: reset to avoid overflow
+            std::fill(seen.begin(), seen.end(), 0);
+            stamp = 1;
+        }
+    }
+
+    bool colorWithOrder(const std::vector<int>& order, std::vector<int>& color) {
+        const int n = g.n;
+        color.assign(n, -1);
+
+        for (int idx = 0; idx < n; idx++) {
+            int v = order[idx];
+
+            resetMarks();
+            uint64_t usedMask = 0;
+
+            // gather neighbor colors
+            for (int ei = g.off[v]; ei < g.off[v + 1]; ei++) {
+                int u = g.adj[ei];
+                int cu = color[u];
+                if (cu < 0) continue;
+                if (cu < k) {
+                    usedMask |= (1ull << cu);
+                    if (seen[cu] != stamp) {
+                        seen[cu] = stamp;
+                        cnt[cu] = 1;
+                        who[cu] = u;
+                    } else {
+                        cnt[cu]++;
+                        who[cu] = -2; // multiple
+                    }
+                }
+            }
+
+            uint64_t avail = allMask & ~usedMask;
+            if (avail) {
+                int c = popcount64((avail & -avail) - 1ull); // index of lowest set bit
+                color[v] = c;
+                continue;
+            }
+
+            // No direct available color. Try 1-step recoloring:
+            // find a color c where exactly one neighbor uses c, and recolor that neighbor.
+            bool fixed = false;
+            for (int c = 0; c < k && !fixed; c++) {
+                if (seen[c] != stamp) continue;        // not used among neighbors => would have been available
+                if (cnt[c] != 1) continue;            // only try unique neighbor
+                int u = who[c];
+                if (u < 0) continue;
+                int oldCu = color[u];
+                if (oldCu != c) continue; // sanity
+
+                // compute available colors for u (excluding c), based on its neighbors
+                resetMarks();
+                uint64_t usedU = 0;
+                for (int ej = g.off[u]; ej < g.off[u + 1]; ej++) {
+                    int w = g.adj[ej];
+                    int cw = color[w];
+                    if (cw < 0) continue;
+                    if (cw < k) usedU |= (1ull << cw);
+                }
+                uint64_t availU = (allMask & ~usedU);
+                availU &= ~(1ull << c); // must change
+
+                if (availU) {
+                    int newCu = popcount64((availU & -availU) - 1ull);
+                    color[u] = newCu;
+                    color[v] = c;
+                    fixed = true;
+                }
+            }
+
+            if (!fixed) return false;
+        }
+        return true;
+    }
+};
+
+// ----------------------- DSATUR (exact) for small graphs -----------------------
+struct DSATUR {
+    const GraphCSR& g;
+    int n;
+    int k;
+    uint64_t allMask;
+    const Timer& timer;
+    double timeLimitSec;
+
+    std::vector<int> color;
+    std::vector<uint64_t> satMask;
+    std::vector<uint8_t> satDeg;
+    std::vector<int> deg;
+
+    struct Change {
+        int v;
+        uint64_t oldMask;
+        uint8_t oldSat;
+    };
+    std::vector<Change> changes;
+
+    DSATUR(const GraphCSR& graph, int colors, const Timer& t, double limitSec)
+        : g(graph), n(graph.n), k(colors),
+          timer(t), timeLimitSec(limitSec) {
+        if (k >= 64) allMask = ~0ull;
+        else allMask = (k <= 0) ? 0ull : ((1ull << k) - 1ull);
+        color.assign(n, -1);
+        satMask.assign(n, 0ull);
+        satDeg.assign(n, 0);
+        deg.resize(n);
+        for (int v = 0; v < n; v++) deg[v] = g.degree(v);
+        changes.reserve((size_t)std::min<int>(g.adj.size(), 2000000));
+    }
+
+    bool timedOut() const { return timer.seconds() > timeLimitSec; }
+
+    int pickVertex() const {
+        int best = -1;
+        int bestSat = -1;
+        int bestDeg = -1;
+        for (int v = 0; v < n; v++) {
+            if (color[v] != -1) continue;
+            int s = (int)satDeg[v];
+            int d = deg[v];
+            if (s > bestSat || (s == bestSat && d > bestDeg)) {
+                best = v;
+                bestSat = s;
+                bestDeg = d;
+            }
+        }
+        return best;
+    }
+
+    bool dfs(int coloredCount) {
+        if (timedOut()) return false;
+        if (coloredCount == n) return true;
+
+        int v = pickVertex();
+        if (v < 0) return false;
+
+        uint64_t used = satMask[v];
+        uint64_t avail = allMask & ~used;
+        if (!avail) return false;
+
+        // Heuristic: try colors in ascending order (often fine with DSATUR).
+        // Could also try "most used first" etc.
+        while (avail) {
+            uint64_t bit = (avail & -avail);
+            int c = popcount64(bit - 1ull);
+            avail ^= bit;
+
+            // assign
+            color[v] = c;
+
+            size_t checkpoint = changes.size();
+            bool ok = true;
+
+            // update neighbors' saturation
+            for (int ei = g.off[v]; ei < g.off[v + 1]; ei++) {
+                int u = g.adj[ei];
+                if (color[u] != -1) {
+                    if (color[u] == c) { ok = false; break; }
+                    continue;
+                }
+                uint64_t oldM = satMask[u];
+                uint64_t newM = oldM | (1ull << c);
+                if (newM != oldM) {
+                    changes.push_back(Change{u, oldM, satDeg[u]});
+                    satMask[u] = newM;
+                    satDeg[u] = (uint8_t)popcount64(newM);
+                    // quick fail: if saturated with all colors and still uncolored => no move possible
+                    if (satMask[u] == allMask) {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+
+            if (ok && dfs(coloredCount + 1)) return true;
+
+            // undo
+            for (size_t i = changes.size(); i-- > checkpoint;) {
+                const Change& ch = changes[i];
+                satMask[ch.v] = ch.oldMask;
+                satDeg[ch.v] = ch.oldSat;
+            }
+            changes.resize(checkpoint);
+            color[v] = -1;
+        }
+        return false;
+    }
+
+    bool solve(std::vector<int>& outColor) {
+        if (k <= 0) return false;
+        if (k > 63) return false; // DSATUR uses 64-bit mask
+        bool ok = dfs(0);
+        if (ok) outColor = color;
+        return ok;
+    }
+};
+
+// ----------------------- TabuCol (heuristic repair) for medium graphs -----------------------
+struct TabuCol {
+    const GraphCSR& g;
+    int n;
+    int k;
+    const Timer& timer;
+    double timeLimitSec;
+
+    std::mt19937_64 rng;
+    std::vector<int> color;
+    std::vector<int> conf; // number of conflicting incident edges
+    long long totalConfEdges = 0;
+
+    // tabu expiry for assigning a specific color to a vertex is too big;
+    // common variant: forbid returning to the previous color.
+    std::vector<int> tabuExpire; // size n*k (only used when n*k manageable)
+
+    std::vector<int> inListPos; // position in conflicted list or -1
+    std::vector<int> conflicted; // vertices with conf>0
+
+    // work arrays
+    std::vector<int> seen;
+    std::vector<int> cnt;
+    int stamp = 1;
+
+    TabuCol(const GraphCSR& graph, int colors, const Timer& t, double limitSec, uint64_t seed)
+        : g(graph), n(graph.n), k(colors), timer(t), timeLimitSec(limitSec), rng(seed) {
+        color.assign(n, 0);
+        conf.assign(n, 0);
+        inListPos.assign(n, -1);
+        seen.assign(k, 0);
+        cnt.assign(k, 0);
+
+        // Only allocate tabu table if reasonably sized
+        // (n<=200k,k<=60 => 12M ints ~48MB).
+        if ((uint64_t)n * (uint64_t)k <= 15'000'000ull) {
+            tabuExpire.assign((size_t)n * (size_t)k, 0);
+        }
+    }
+
+    bool timedOut() const { return timer.seconds() > timeLimitSec; }
+
+    inline void resetMarks() {
+        stamp++;
+        if (stamp == std::numeric_limits<int>::max() / 2) {
+            std::fill(seen.begin(), seen.end(), 0);
+            stamp = 1;
+        }
+    }
+
+    void addIfConflicted(int v) {
+        if (conf[v] > 0) {
+            if (inListPos[v] == -1) {
+                inListPos[v] = (int)conflicted.size();
+                conflicted.push_back(v);
+            }
+        } else {
+            int p = inListPos[v];
+            if (p != -1) {
+                int last = conflicted.back();
+                conflicted[p] = last;
+                inListPos[last] = p;
+                conflicted.pop_back();
+                inListPos[v] = -1;
+            }
+        }
+    }
+
+    void initRandom() {
+        std::uniform_int_distribution<int> dist(0, k - 1);
+        for (int v = 0; v < n; v++) color[v] = dist(rng);
+
+        std::fill(conf.begin(), conf.end(), 0);
+        totalConfEdges = 0;
+
+        for (int v = 0; v < n; v++) {
+            int cv = color[v];
+            for (int ei = g.off[v]; ei < g.off[v + 1]; ei++) {
+                int u = g.adj[ei];
+                if (u > v && color[u] == cv) {
+                    conf[v]++; conf[u]++;
+                    totalConfEdges++;
+                }
+            }
+        }
+
+        conflicted.clear();
+        std::fill(inListPos.begin(), inListPos.end(), -1);
+        for (int v = 0; v < n; v++) addIfConflicted(v);
+    }
+
+    bool run(std::vector<int>& outColor) {
+        if (k <= 0) return false;
+        if (k > 1000) return false; // not expected here
+
+        initRandom();
+        if (totalConfEdges == 0) { outColor = color; return true; }
+
+        long long bestTotal = totalConfEdges;
+        std::vector<int> bestColor = color;
+
+        int iter = 0;
+        std::uniform_int_distribution<int> tenureDist(5, 15);
+
+        while (!timedOut()) {
+            iter++;
+            if (totalConfEdges == 0) { outColor = color; return true; }
+
+            if (conflicted.empty()) {
+                // Shouldn't happen if totalConfEdges>0, but keep safe.
+                initRandom();
+                continue;
+            }
+
+            int v = conflicted[(size_t)(rng() % conflicted.size())];
+            int curC = color[v];
+
+            // Count neighbor colors
+            resetMarks();
+            for (int c = 0; c < k; c++) cnt[c] = 0; // k<=60 typically; ok for medium graphs
+            for (int ei = g.off[v]; ei < g.off[v + 1]; ei++) {
+                int u = g.adj[ei];
+                int cu = color[u];
+                if ((unsigned)cu < (unsigned)k) cnt[cu]++;
+            }
+
+            int bestC = curC;
+            int bestNewConfV = cnt[curC];
+            long long bestNewTotal = totalConfEdges;
+
+            for (int c = 0; c < k; c++) {
+                if (c == curC) continue;
+                int newConfV = cnt[c];
+                long long newTotal = totalConfEdges + (long long)(newConfV - conf[v]);
+
+                bool isTabu = false;
+                if (!tabuExpire.empty()) {
+                    int exp = tabuExpire[(size_t)v * (size_t)k + (size_t)c];
+                    isTabu = (exp > iter);
+                }
+                bool aspiration = (newTotal < bestTotal);
+
+                if (!isTabu || aspiration) {
+                    if (newTotal < bestNewTotal || (newTotal == bestNewTotal && newConfV < bestNewConfV)) {
+                        bestC = c;
+                        bestNewConfV = newConfV;
+                        bestNewTotal = newTotal;
+                    }
+                }
+            }
+
+            if (bestC == curC) {
+                // No improving move found (or all tabu); do a random allowed move.
+                int c = (int)(rng() % k);
+                if (c == curC) c = (c + 1) % k;
+                bestC = c;
+                bestNewConfV = cnt[c];
+                bestNewTotal = totalConfEdges + (long long)(bestNewConfV - conf[v]);
+            }
+
+            int oldC = curC;
+            int newC = bestC;
+
+            // Set tabu: forbid re-assigning old color soon
+            if (!tabuExpire.empty()) {
+                int tenure = tenureDist(rng);
+                tabuExpire[(size_t)v * (size_t)k + (size_t)oldC] = iter + tenure;
+            }
+
+            // Apply move and update conflicts incrementally.
+            color[v] = newC;
+
+            // Update neighbors' conf and totalConfEdges (only edges incident to v change)
+            for (int ei = g.off[v]; ei < g.off[v + 1]; ei++) {
+                int u = g.adj[ei];
+                int cu = color[u];
+
+                // edge (v,u) used to conflict if cu==oldC (before move)
+                if (cu == oldC) {
+                    conf[u]--;
+                    totalConfEdges--;
+                    addIfConflicted(u);
+                }
+                // edge (v,u) conflicts now if cu==newC
+                if (cu == newC) {
+                    conf[u]++;
+                    totalConfEdges++;
+                    addIfConflicted(u);
+                }
+            }
+
+            conf[v] = bestNewConfV;
+            addIfConflicted(v);
+
+            if (totalConfEdges < bestTotal) {
+                bestTotal = totalConfEdges;
+                bestColor = color;
+                if (bestTotal == 0) { outColor = bestColor; return true; }
+            }
+
+            // occasional restart if stuck (lightweight)
+            if (iter % 20000 == 0 && totalConfEdges > bestTotal + 1000) {
+                initRandom();
+            }
+        }
+
+        // If time runs out, only return valid if bestTotal==0
+        if (bestTotal == 0) { outColor = bestColor; return true; }
+        return false;
+    }
+};
+
+// ----------------------- Validation (optional, cheap enough for debugging small) -----------------------
+static bool isValidColoring(const GraphCSR& g, const std::vector<int>& col, int k) {
+    if ((int)col.size() != g.n) return false;
+    for (int v = 0; v < g.n; v++) {
+        if (col[v] < 0 || col[v] >= k) return false;
+    }
+    for (int v = 0; v < g.n; v++) {
+        int cv = col[v];
+        for (int ei = g.off[v]; ei < g.off[v + 1]; ei++) {
+            int u = g.adj[ei];
+            if (u > v && col[u] == cv) return false;
+        }
+    }
+    return true;
+}
+
+// ----------------------- Main adaptive solver -----------------------
+int main() {
+    std::ios::sync_with_stdio(false);
+    std::cin.tie(nullptr);
+
+    int n = 0, m = 0, k = 0;
+    if (!(std::cin >> n >> m >> k)) return 0;
+
+    std::vector<uint64_t> edgesPacked;
+    edgesPacked.reserve((size_t)std::max(0, m));
+
+    for (int i = 0; i < m; i++) {
+        int u, v;
+        std::cin >> u >> v;
+        uint64_t e = (uint64_t)(uint32_t)u;
+        e = (e << 32) | (uint64_t)(uint32_t)v;
+        edgesPacked.push_back(e);
+    }
+
+    Timer globalTimer;
+    const double hardLimitSec = 295.0; // keep a few seconds margin
+
+    GraphCSR g = buildCSR(n, m, edgesPacked);
+    edgesPacked.clear();
+    edgesPacked.shrink_to_fit();
+
+    // Quick trivial cases
+    std::vector<int> color(n, 0);
+    if (n == 0) {
+        std::cout << "\n";
+        return 0;
+    }
+    if (k <= 0) {
+        // No valid coloring possible; output something (will be judged invalid if tested).
+        for (int i = 0; i < n; i++) {
+            if (i) std::cout << ' ';
+            std::cout << 0;
+        }
+        std::cout << "\n";
+        return 0;
+    }
+    if (m == 0) {
+        for (int i = 0; i < n; i++) {
+            if (i) std::cout << ' ';
+            std::cout << 0;
+        }
+        std::cout << "\n";
+        return 0;
+    }
+
+    // Strategy selection
+    // - DSATUR exact for small graphs (good for tight k).
+    // - Otherwise greedy degeneracy + limited recoloring.
+    // - If still fails and graph is medium, try TabuCol repair.
+    bool solved = false;
+
+    const bool smallEnoughForDSATUR = (n <= 700 && k <= 63 && (long long)g.adj.size() <= 3'000'000LL);
+    if (smallEnoughForDSATUR) {
+        DSATUR ds(g, k, globalTimer, std::min(40.0, hardLimitSec)); // cap DSATUR time
+        std::vector<int> dsCol;
+        if (ds.solve(dsCol) && isValidColoring(g, dsCol, k)) {
+            color = std::move(dsCol);
+            solved = true;
+        }
+    }
+
+    if (!solved && globalTimer.seconds() < hardLimitSec) {
+        // Build a strong base order once
+        std::vector<int> smallFirst = degeneracyOrderSmallestFirst(g);
+        std::vector<int> order = smallFirst;
+        std::reverse(order.begin(), order.end()); // color in largest-last order
+
+        GreedyRecolor gr(g, k);
+
+        // Attempt deterministic
+        if (gr.colorWithOrder(order, color) && isValidColoring(g, color, k)) {
+            solved = true;
+        } else {
+            // Randomized restarts (shuffle blocks to keep it cheap on huge graphs)
+            std::mt19937_64 rng(0xC001D00DULL ^ (uint64_t)n * 1315423911ULL ^ (uint64_t)m);
+            int attempts = 0;
+
+            // For huge n, keep attempts small.
+            int maxAttempts = (n >= 500000 ? 6 : (n >= 100000 ? 12 : 25));
+
+            while (!solved && attempts < maxAttempts && globalTimer.seconds() < hardLimitSec) {
+                attempts++;
+
+                // block shuffle
+                std::vector<int> ord = order;
+                const int block = (n >= 200000 ? 8192 : 2048);
+                for (int i = 0; i < n; i += block) {
+                    int r = std::min(n, i + block);
+                    std::shuffle(ord.begin() + i, ord.begin() + r, rng);
+                }
+
+                if (gr.colorWithOrder(ord, color) && isValidColoring(g, color, k)) {
+                    solved = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    if (!solved && globalTimer.seconds() < hardLimitSec) {
+        // Tabu repair for medium graphs only (avoid huge memory/time on million-node).
+        if (n <= 200000 && k <= 200) {
+            uint64_t seed = 0x9E3779B97F4A7C15ULL ^ (uint64_t)n ^ ((uint64_t)m << 1);
+            TabuCol tabu(g, k, globalTimer, hardLimitSec, seed);
+            std::vector<int> tabuCol;
+            if (tabu.run(tabuCol) && isValidColoring(g, tabuCol, k)) {
+                color = std::move(tabuCol);
+                solved = true;
+            }
+        }
+    }
+
+    // Last resort: plain greedy in input order (should almost never be needed if instances are solvable)
+    if (!solved && globalTimer.seconds() < hardLimitSec) {
+        std::vector<int> ord(n);
+        std::iota(ord.begin(), ord.end(), 0);
+        GreedyRecolor gr(g, k);
+        if (gr.colorWithOrder(ord, color)) {
+            // might still be invalid if recolor logic couldn't fix some cases; check
+            solved = isValidColoring(g, color, k);
+        }
+    }
+
+    // Output (must always output something).
+    // If not solved, this output may be invalid; but the solver tried multiple strategies until time.
+    for (int i = 0; i < n; i++) {
+        if (i) std::cout << ' ';
+        int c = color[i];
+        if (c < 0) c = 0;
+        if (c >= k) c = (k > 0 ? (c % k) : 0);
+        std::cout << c;
+    }
+    std::cout << "\n";
+    return 0;
+}
+```

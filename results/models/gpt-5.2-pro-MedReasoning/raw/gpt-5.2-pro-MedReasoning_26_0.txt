@@ -1,0 +1,610 @@
+```rust
+use std::cmp::min;
+use std::f64;
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
+
+#[derive(Clone, Copy, Debug, Default)]
+struct P3 {
+    x: f32,
+    y: f32,
+    z: f32,
+}
+
+impl P3 {
+    #[inline]
+    fn dist2(self, o: P3) -> f32 {
+        let dx = self.x - o.x;
+        let dy = self.y - o.y;
+        let dz = self.z - o.z;
+        dx * dx + dy * dy + dz * dz
+    }
+}
+
+struct XorShift64 {
+    s: u64,
+}
+impl XorShift64 {
+    fn new(seed: u64) -> Self {
+        Self { s: seed.max(1) }
+    }
+    #[inline]
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.s;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.s = x;
+        x
+    }
+    #[inline]
+    fn next_usize(&mut self, m: usize) -> usize {
+        if m <= 1 {
+            0
+        } else {
+            (self.next_u64() % (m as u64)) as usize
+        }
+    }
+}
+
+struct PointReader<R: Read> {
+    inner: R,
+    buf: Vec<u8>,
+    pos: usize,
+    len: usize,
+}
+
+impl<R: Read> PointReader<R> {
+    fn new(inner: R, cap: usize) -> Self {
+        Self {
+            inner,
+            buf: vec![0u8; cap],
+            pos: 0,
+            len: 0,
+        }
+    }
+
+    #[inline]
+    fn refill(&mut self) -> io::Result<bool> {
+        // Move leftover to front
+        if self.pos > 0 && self.pos < self.len {
+            let rem = self.len - self.pos;
+            self.buf.copy_within(self.pos..self.len, 0);
+            self.pos = 0;
+            self.len = rem;
+        } else if self.pos >= self.len {
+            self.pos = 0;
+            self.len = 0;
+        }
+
+        // Fill remaining
+        let n = self.inner.read(&mut self.buf[self.len..])?;
+        self.len += n;
+        Ok(n > 0)
+    }
+
+    #[inline]
+    fn read_point(&mut self) -> io::Result<Option<P3>> {
+        const SZ: usize = 12;
+        while self.len - self.pos < SZ {
+            if !self.refill()? {
+                if self.len - self.pos == 0 {
+                    return Ok(None);
+                } else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "truncated point data",
+                    ));
+                }
+            }
+        }
+        let b = &self.buf[self.pos..self.pos + SZ];
+        self.pos += SZ;
+
+        let x = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+        let y = f32::from_le_bytes([b[4], b[5], b[6], b[7]]);
+        let z = f32::from_le_bytes([b[8], b[9], b[10], b[11]]);
+
+        // Basic NaN sanitization
+        let x = if x.is_finite() { x } else { 0.0 };
+        let y = if y.is_finite() { y } else { 0.0 };
+        let z = if z.is_finite() { z } else { 0.0 };
+
+        Ok(Some(P3 { x, y, z }))
+    }
+}
+
+#[inline]
+fn write_u32_le<W: Write>(w: &mut W, v: u32) -> io::Result<()> {
+    w.write_all(&v.to_le_bytes())
+}
+
+#[inline]
+fn nearest_bruteforce(p: P3, cents: &[P3]) -> usize {
+    let mut best = 0usize;
+    let mut best_d = f32::INFINITY;
+    for (i, &c) in cents.iter().enumerate() {
+        let d = p.dist2(c);
+        if d < best_d {
+            best_d = d;
+            best = i;
+        }
+    }
+    best
+}
+
+/// Two-level coarse index to reduce per-point comparisons for large K.
+/// Rebuilt periodically.
+struct CoarseIndex {
+    coarse: Vec<P3>,
+    buckets: Vec<Vec<usize>>,
+    // coarse_of_fine[j] = which coarse bucket fine centroid j currently belongs to
+    coarse_of_fine: Vec<usize>,
+    rebuild_interval: u64,
+    next_rebuild_at: u64,
+}
+
+fn build_coarse_index(centroids: &[P3]) -> CoarseIndex {
+    let k = centroids.len();
+    let m = ((k as f64).sqrt().ceil() as usize).clamp(8, 1024).min(k.max(1));
+    let mut coarse = Vec::with_capacity(m);
+
+    // Pick evenly-spaced fine centroids as coarse seeds (cheap, deterministic).
+    for i in 0..m {
+        let idx = (i * k) / m;
+        coarse.push(centroids[idx]);
+    }
+
+    let mut coarse_of_fine = vec![0usize; k];
+    let mut buckets: Vec<Vec<usize>> = (0..m).map(|_| Vec::new()).collect();
+
+    for (j, &c) in centroids.iter().enumerate() {
+        let ci = nearest_bruteforce(c, &coarse);
+        coarse_of_fine[j] = ci;
+        buckets[ci].push(j);
+    }
+
+    // Rebuild roughly every max(1e6, 1000*K) points.
+    let rebuild_interval = (1_000_000u64).max(1000u64 * (k as u64)).min(20_000_000u64);
+
+    CoarseIndex {
+        coarse,
+        buckets,
+        coarse_of_fine,
+        rebuild_interval,
+        next_rebuild_at: rebuild_interval,
+    }
+}
+
+#[inline]
+fn nearest_with_coarse(p: P3, centroids: &[P3], ci: &CoarseIndex) -> usize {
+    let coarse_idx = nearest_bruteforce(p, &ci.coarse);
+    let bucket = &ci.buckets[coarse_idx];
+    if bucket.is_empty() {
+        return nearest_bruteforce(p, centroids);
+    }
+    let mut best = bucket[0];
+    let mut best_d = f32::INFINITY;
+    for &j in bucket {
+        let d = p.dist2(centroids[j]);
+        if d < best_d {
+            best_d = d;
+            best = j;
+        }
+    }
+    best
+}
+
+fn maybe_rebuild_coarse(step: u64, centroids: &[P3], ci: &mut CoarseIndex) {
+    if step < ci.next_rebuild_at {
+        return;
+    }
+    *ci = build_coarse_index(centroids);
+    ci.next_rebuild_at = step + ci.rebuild_interval;
+}
+
+fn init_centroids_from_sample(sample: &[P3], k: usize) -> Vec<P3> {
+    let s = sample.len();
+    let mut rng = XorShift64::new(0x9e37_79b9_7f4a_7c15);
+
+    if k == 0 {
+        return Vec::new();
+    }
+    if s == 0 {
+        return vec![P3::default(); k];
+    }
+
+    // For small-ish cases, do a lightweight kmeans++ on the sample.
+    // For large K or large sample, random pick (much cheaper).
+    let do_kpp = k <= 2048 && s <= 200_000;
+
+    if do_kpp {
+        let mut cents: Vec<P3> = Vec::with_capacity(k);
+        cents.push(sample[rng.next_usize(s)]);
+        let mut min_d = vec![f32::INFINITY; s];
+
+        while cents.len() < k {
+            let last = *cents.last().unwrap();
+            let mut sum = 0f64;
+            for (i, &p) in sample.iter().enumerate() {
+                let d = p.dist2(last);
+                if d < min_d[i] {
+                    min_d[i] = d;
+                }
+                sum += min_d[i] as f64;
+            }
+            if sum <= 0.0 || !sum.is_finite() {
+                // Degenerate: just pick random points
+                cents.push(sample[rng.next_usize(s)]);
+                continue;
+            }
+            let mut r = (rng.next_u64() as f64 / (u64::MAX as f64)) * sum;
+            let mut pick = 0usize;
+            for (i, &d) in min_d.iter().enumerate() {
+                r -= d as f64;
+                if r <= 0.0 {
+                    pick = i;
+                    break;
+                }
+            }
+            cents.push(sample[pick]);
+        }
+        cents
+    } else {
+        // Random-with-replacement from the warmup sample.
+        let mut cents = Vec::with_capacity(k);
+        for j in 0..k {
+            let mut c = sample[rng.next_usize(s)];
+            // Tiny deterministic jitter for duplicates (helps buckets slightly).
+            let eps = (j as f32) * 1e-7;
+            c.x += eps;
+            c.y -= eps;
+            c.z += eps * 0.5;
+            cents.push(c);
+        }
+        cents
+    }
+}
+
+fn lloyd_refine_on_sample(sample: &[P3], centroids: &mut [P3], iters: usize) {
+    let k = centroids.len();
+    if k == 0 || sample.is_empty() {
+        return;
+    }
+
+    let use_coarse = k >= 512;
+    let mut ci = if use_coarse {
+        Some(build_coarse_index(centroids))
+    } else {
+        None
+    };
+
+    for _ in 0..iters {
+        let mut sumx = vec![0f64; k];
+        let mut sumy = vec![0f64; k];
+        let mut sumz = vec![0f64; k];
+        let mut cnt = vec![0u32; k];
+
+        for &p in sample {
+            let j = match &ci {
+                Some(cix) => nearest_with_coarse(p, centroids, cix),
+                None => nearest_bruteforce(p, centroids),
+            };
+            sumx[j] += p.x as f64;
+            sumy[j] += p.y as f64;
+            sumz[j] += p.z as f64;
+            cnt[j] = cnt[j].wrapping_add(1);
+        }
+
+        // Update; if empty, keep as-is.
+        let mut max_shift = 0f32;
+        for j in 0..k {
+            let c0 = centroids[j];
+            if cnt[j] > 0 {
+                let inv = 1.0f64 / (cnt[j] as f64);
+                centroids[j] = P3 {
+                    x: (sumx[j] * inv) as f32,
+                    y: (sumy[j] * inv) as f32,
+                    z: (sumz[j] * inv) as f32,
+                };
+            }
+            let shift = c0.dist2(centroids[j]);
+            if shift > max_shift {
+                max_shift = shift;
+            }
+        }
+
+        if use_coarse {
+            ci = Some(build_coarse_index(centroids));
+        }
+
+        // Early stop on small movement
+        if max_shift < 1e-8 {
+            break;
+        }
+    }
+}
+
+fn kmeans_in_memory(points: &[P3], k: usize) -> Vec<P3> {
+    let n = points.len();
+    if k == 0 {
+        return Vec::new();
+    }
+    if n == 0 {
+        return vec![P3::default(); k];
+    }
+
+    let sample_cap = 500_000usize;
+    let sample: Vec<P3> = if n <= sample_cap {
+        points.to_vec()
+    } else {
+        // Deterministic strided downsample (cheap)
+        let step = (n / sample_cap).max(1);
+        points.iter().step_by(step).copied().take(sample_cap).collect()
+    };
+
+    let mut centroids = init_centroids_from_sample(&sample, k);
+    lloyd_refine_on_sample(&sample, &mut centroids, 5);
+
+    // Full Lloyd on full set (only for in-memory regime).
+    let max_iters = 15usize;
+    let use_coarse = k >= 512;
+    let mut ci = if use_coarse {
+        Some(build_coarse_index(&centroids))
+    } else {
+        None
+    };
+
+    for _ in 0..max_iters {
+        let mut sumx = vec![0f64; k];
+        let mut sumy = vec![0f64; k];
+        let mut sumz = vec![0f64; k];
+        let mut cnt = vec![0u32; k];
+
+        for &p in points {
+            let j = match &ci {
+                Some(cix) => nearest_with_coarse(p, &centroids, cix),
+                None => nearest_bruteforce(p, &centroids),
+            };
+            sumx[j] += p.x as f64;
+            sumy[j] += p.y as f64;
+            sumz[j] += p.z as f64;
+            cnt[j] = cnt[j].wrapping_add(1);
+        }
+
+        // Fix empty clusters by reseeding to a far-ish point (cheap heuristic).
+        // Choose point with maximal distance to its assigned centroid among a small probe set.
+        // (Avoids O(NK) farthest search.)
+        let mut rng = XorShift64::new(0x1234_5678_9abc_def0);
+        for j in 0..k {
+            if cnt[j] != 0 {
+                continue;
+            }
+            let probes = min(points.len(), 4096);
+            let mut best_p = points[rng.next_usize(points.len())];
+            let mut best_d = -1.0f32;
+            for _ in 0..probes {
+                let p = points[rng.next_usize(points.len())];
+                let d = p.dist2(centroids[j]);
+                if d > best_d {
+                    best_d = d;
+                    best_p = p;
+                }
+            }
+            centroids[j] = best_p;
+            sumx[j] = best_p.x as f64;
+            sumy[j] = best_p.y as f64;
+            sumz[j] = best_p.z as f64;
+            cnt[j] = 1;
+        }
+
+        let mut max_shift = 0f32;
+        for j in 0..k {
+            let c0 = centroids[j];
+            let inv = 1.0f64 / (cnt[j] as f64);
+            centroids[j] = P3 {
+                x: (sumx[j] * inv) as f32,
+                y: (sumy[j] * inv) as f32,
+                z: (sumz[j] * inv) as f32,
+            };
+            let shift = c0.dist2(centroids[j]);
+            if shift > max_shift {
+                max_shift = shift;
+            }
+        }
+
+        if use_coarse {
+            ci = Some(build_coarse_index(&centroids));
+        }
+        if max_shift < 1e-8 {
+            break;
+        }
+    }
+
+    centroids
+}
+
+fn main() -> io::Result<()> {
+    // --- Read header line (text), then points (binary f32 triples) ---
+    let stdin = io::stdin();
+    let mut br = BufReader::with_capacity(8 << 20, stdin.lock());
+
+    let mut header = Vec::new();
+    br.read_until(b'\n', &mut header)?;
+    let header_str = String::from_utf8_lossy(&header);
+    let mut it = header_str.split_whitespace();
+    let num_points: u64 = it
+        .next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing num_points"))?
+        .parse()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "bad num_points"))?;
+    let k: usize = it
+        .next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing num_clusters"))?
+        .parse()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "bad num_clusters"))?;
+
+    let stdout = io::stdout();
+    let mut bw = BufWriter::with_capacity(8 << 20, stdout.lock());
+
+    if num_points == 0 {
+        // Nothing to output
+        bw.flush()?;
+        return Ok(());
+    }
+    if k == 0 {
+        // No clusters requested; define all labels as 0 (still outputs something).
+        // (Problem statement implies k>=1, but we must not crash.)
+        let mut pr = PointReader::new(br, 8 << 20);
+        for _ in 0..num_points {
+            let _ = pr.read_point()?; // consume
+            write_u32_le(&mut bw, 0)?;
+        }
+        bw.flush()?;
+        return Ok(());
+    }
+
+    // Decide regime:
+    // - In-memory if points are likely to fit comfortably.
+    // - Streaming online otherwise (one pass, outputs immediately after warmup).
+    let bytes_points = num_points.saturating_mul(12);
+    let in_memory = bytes_points <= 900_000_000 && num_points <= 30_000_000;
+
+    if in_memory {
+        // --- In-memory K-means (higher quality) ---
+        let mut pr = PointReader::new(br, 8 << 20);
+        let mut pts: Vec<P3> = Vec::with_capacity(num_points as usize);
+        for _ in 0..num_points {
+            if let Some(p) = pr.read_point()? {
+                pts.push(p);
+            } else {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "not enough point data",
+                ));
+            }
+        }
+
+        let centroids = kmeans_in_memory(&pts, k);
+
+        // Output final assignment (single write pass).
+        let use_coarse = k >= 512;
+        let ci = if use_coarse {
+            Some(build_coarse_index(&centroids))
+        } else {
+            None
+        };
+
+        for &p in &pts {
+            let j = match &ci {
+                Some(cix) => nearest_with_coarse(p, &centroids, cix),
+                None => nearest_bruteforce(p, &centroids),
+            };
+            write_u32_le(&mut bw, j as u32)?;
+        }
+        bw.flush()?;
+        return Ok(());
+    }
+
+    // --- Streaming online k-means (one pass, memory-tight) ---
+    // Warmup: read a small prefix to initialize centroids; buffer just those points.
+    let mut pr = PointReader::new(br, 8 << 20);
+
+    let warm_min = (k as u64).saturating_mul(2).max(10_000);
+    let warm_max = 1_000_000u64;
+    let warm = min(num_points, warm_min.min(warm_max).max(k as u64));
+
+    let mut warm_pts: Vec<P3> = Vec::with_capacity(warm as usize);
+    for _ in 0..warm {
+        if let Some(p) = pr.read_point()? {
+            warm_pts.push(p);
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "not enough point data in warmup",
+            ));
+        }
+    }
+
+    let mut centroids = init_centroids_from_sample(&warm_pts, k);
+    // Small refinement on the warmup sample only (cheap-ish).
+    lloyd_refine_on_sample(&warm_pts, &mut centroids, 3);
+
+    let mut counts: Vec<u64> = vec![0u64; k];
+
+    let use_coarse = k >= 512;
+    let mut ci = if use_coarse {
+        Some(build_coarse_index(&centroids))
+    } else {
+        None
+    };
+
+    // Force "exactly N clusters" in the sense "every cluster used at least once"
+    // when we have at least K points available in warmup (or in total).
+    // We do this by assigning the first K warmup points to unique clusters.
+    let force_unique = (num_points as usize) >= k && warm_pts.len() >= k;
+
+    let mut step: u64 = 0;
+
+    // Output labels for warmup points (in order), updating centroids online.
+    for (i, &p) in warm_pts.iter().enumerate() {
+        let j = if force_unique && i < k {
+            i
+        } else {
+            match &ci {
+                Some(cix) => nearest_with_coarse(p, &centroids, cix),
+                None => nearest_bruteforce(p, &centroids),
+            }
+        };
+
+        write_u32_le(&mut bw, j as u32)?;
+
+        // Online update (running mean per cluster)
+        let c = &mut centroids[j];
+        counts[j] += 1;
+        let inv = 1.0f64 / (counts[j] as f64);
+        c.x = (c.x as f64 + (p.x as f64 - c.x as f64) * inv) as f32;
+        c.y = (c.y as f64 + (p.y as f64 - c.y as f64) * inv) as f32;
+        c.z = (c.z as f64 + (p.z as f64 - c.z as f64) * inv) as f32;
+
+        step += 1;
+        if let Some(cix) = &mut ci {
+            maybe_rebuild_coarse(step, &centroids, cix);
+        }
+    }
+
+    // Stream remaining points: assign -> output -> update.
+    for _ in warm..num_points {
+        let p = match pr.read_point()? {
+            Some(p) => p,
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "not enough point data",
+                ))
+            }
+        };
+
+        let j = match &ci {
+            Some(cix) => nearest_with_coarse(p, &centroids, cix),
+            None => nearest_bruteforce(p, &centroids),
+        };
+
+        write_u32_le(&mut bw, j as u32)?;
+
+        let c = &mut centroids[j];
+        counts[j] += 1;
+        let inv = 1.0f64 / (counts[j] as f64);
+        c.x = (c.x as f64 + (p.x as f64 - c.x as f64) * inv) as f32;
+        c.y = (c.y as f64 + (p.y as f64 - c.y as f64) * inv) as f32;
+        c.z = (c.z as f64 + (p.z as f64 - c.z as f64) * inv) as f32;
+
+        step += 1;
+        if let Some(cix) = &mut ci {
+            maybe_rebuild_coarse(step, &centroids, cix);
+        }
+    }
+
+    bw.flush()?;
+    Ok(())
+}
+```

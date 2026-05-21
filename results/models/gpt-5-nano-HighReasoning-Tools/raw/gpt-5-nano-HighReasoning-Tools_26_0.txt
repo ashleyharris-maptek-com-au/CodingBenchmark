@@ -1,1 +1,256 @@
-{'__exception__': "Can't run here - we're trying to get this working in codex."}
+```rust
+// Adaptive Rust K-means / streaming clustering for 3D points (binary f32 triples).
+// Edition 2021 compliant.
+// 
+// Input (stdin):
+//   - First line: two decimal integers: num_points num_clusters
+//   - Then: a binary stream of num_points triples (12 bytes each: f32 little-endian X Y Z)
+// Output (stdout):
+//   - For each input point, a 4-byte little-endian uint32: the assigned cluster index
+//
+// Strategy (adaptive):
+//   - If num_points <= 10,000,000: load all points in memory and run standard Lloyd's k-means.
+//     - Uses first min(num_points, num_clusters) points as initial centroids.
+//     - Iterates up to MAX_ITERS (e.g., 25) or until centroids converge.
+//     - Handles empty clusters by reinitializing them from existing points.
+//   - Otherwise: streaming/minibatch style.
+//     - Initialize centroids from the first min(num_points, num_clusters) points read.
+//     - For each subsequent point, assign to nearest centroid and update that centroid online:
+//         centroid = centroid + lr * (point - centroid)
+//     - Writes the assigned cluster index immediately to stdout to avoid buffering large outputs.
+//     - lr (learning rate) is a small constant (e.g., 0.01) to keep memory usage ultra-low.
+//     - This mode is approximate but far memory-efficient and scalable to huge datasets.
+// 
+// Notes/edge cases:
+//   - If num_clusters > num_points, the algorithm naturally produces some empty clusters.
+//     In in-memory mode, empty clusters are reinitialized from an existing point.
+//     In streaming mode, the first num_points points initialize that many centroids; extra clusters remain unused.
+//   - All I/O is binary and little-endian per the problem statement.
+//
+// This code aims to be robust and self-contained, with no external crates.
+
+use std::io::{self, Read, Write, BufRead, BufReader, BufWriter};
+
+// Small utility: distance squared between two 3D points.
+#[inline]
+fn dist2(a: &[f32; 3], b: &[f32; 3]) -> f32 {
+    let dx = a[0] - b[0];
+    let dy = a[1] - b[1];
+    let dz = a[2] - b[2];
+    dx * dx + dy * dy + dz * dz
+}
+
+// Read a single 3D point (12 bytes) from a binary stream (little-endian f32 triples).
+fn read_point<R: Read>(r: &mut R) -> io::Result<Option<[f32; 3]>> {
+    let mut buf = [0u8; 12];
+    match r.read_exact(&mut buf) {
+        Ok(()) => {
+            let x = f32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+            let y = f32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+            let z = f32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
+            Ok(Some([x, y, z]))
+        }
+        Err(ref e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+// In-memory K-means ( Lloyd's algorithm ) for k clusters.
+// Returns per-point cluster indices (0..k-1) as u32.
+fn in_memory_kmeans(points: Vec<[f32; 3]>, k: usize, max_iters: usize) -> Vec<u32> {
+    let n = points.len();
+    if n == 0 || k == 0 {
+        return Vec::new();
+    }
+
+    // Initialize centroids: first k points if available, else repeat last point (or zero if empty)
+    let mut centroids: Vec<[f32; 3]> = Vec::with_capacity(k);
+    for i in 0..k {
+        if i < n {
+            centroids.push(points[i]);
+        } else if n > 0 {
+            centroids.push(points[n - 1]);
+        } else {
+            centroids.push([0.0, 0.0, 0.0]);
+        }
+    }
+
+    // Assignments per point
+    let mut assignments = vec![0u32; n];
+
+    // Lloyd iterations
+    const EPS_SQ: f32 = 1e-7; // convergence threshold for centroid movement (squared)
+    for _iter in 0..max_iters {
+        // Sums and counts for each cluster
+        let mut sums = vec![[0f32; 3]; k];
+        let mut counts = vec![0usize; k];
+        let mut max_shift2 = 0.0f32;
+
+        // Assign all points
+        for i in 0..n {
+            let p = points[i];
+            // Find nearest centroid
+            let mut best_j = 0usize;
+            let mut best_d2 = f32::MAX;
+            for j in 0..k {
+                let d2 = dist2(&p, &centroids[j]);
+                if d2 < best_d2 {
+                    best_d2 = d2;
+                    best_j = j;
+                }
+            }
+            assignments[i] = best_j as u32;
+            sums[best_j][0] += p[0];
+            sums[best_j][1] += p[1];
+            sums[best_j][2] += p[2];
+            counts[best_j] += 1;
+        }
+
+        // Recompute centroids
+        for j in 0..k {
+            if counts[j] > 0 {
+                let new_x = sums[j][0] / counts[j] as f32;
+                let new_y = sums[j][1] / counts[j] as f32;
+                let new_z = sums[j][2] / counts[j] as f32;
+                let old = centroids[j];
+                let dx = old[0] - new_x;
+                let dy = old[1] - new_y;
+                let dz = old[2] - new_z;
+                let shift2 = dx * dx + dy * dy + dz * dz;
+                if shift2 > max_shift2 {
+                    max_shift2 = shift2;
+                }
+                centroids[j] = [new_x, new_y, new_z];
+            } else {
+                // Empty cluster: reinitialize to an existing point to avoid stagnation
+                let idx = if n > 0 { j % n } else { 0 };
+                centroids[j] = points[idx];
+            }
+        }
+
+        // Convergence check
+        if max_shift2.sqrt() < EPS_SQ.sqrt() {
+            break;
+        }
+    }
+
+    assignments
+}
+
+fn main() -> io::Result<()> {
+    // Configuration / thresholds
+    const IN_MEMORY_POINT_THRESHOLD: usize = 10_000_000; // small to medium datasets
+    const MAX_ITERS: usize = 25;
+    const LEARNING_RATE: f32 = 0.01; // for streaming updates
+
+    // Read header line: "num_points num_clusters"
+    let stdin = io::stdin();
+    let mut reader = BufReader::new(stdin.lock());
+    let mut header_line = String::new();
+    reader.read_line(&mut header_line)?;
+    let mut it = header_line.split_whitespace();
+    let num_points: usize = it.next().unwrap_or("0").parse().unwrap_or(0);
+    let num_clusters: usize = it.next().unwrap_or("0").parse().unwrap_or(0);
+
+    // Prepare binary writer for output
+    let stdout = io::stdout();
+    let mut writer = BufWriter::new(stdout.lock());
+
+    // Adaptive strategy
+    if num_points <= IN_MEMORY_POINT_THRESHOLD {
+        // In-memory path: load all points, run Lloyd's k-means, and output final assignments
+        let mut points: Vec<[f32; 3]> = Vec::with_capacity(num_points);
+        for _ in 0..num_points {
+            if let Some(p) = read_point(&mut reader)? {
+                points.push(p);
+            } else {
+                // Unexpected EOF; stop early
+                break;
+            }
+        }
+
+        // If there are fewer points than claimed, adjust
+        let actual_points = points.len();
+        if actual_points == 0 {
+            // Nothing to output
+            writer.flush()?;
+            return Ok(());
+        }
+
+        // Run k-means (may handle empty clusters)
+        let assignments = in_memory_kmeans(points, num_clusters, MAX_ITERS);
+
+        // Write output: one u32 per point, little-endian
+        for idx in assignments {
+            writer.write_all(&idx.to_le_bytes())?;
+        }
+        writer.flush()?;
+    } else {
+        // Large-scale streaming path
+        // Initialize centroids from the first min(num_points, num_clusters) points
+        let init_k = std::cmp::min(num_points, num_clusters);
+        let mut centroids: Vec<[f32; 3]> = vec![[0.0, 0.0, 0.0]; init_k];
+
+        // Read first init_k points (or fewer if not enough data)
+        let mut i: usize = 0;
+        while i < init_k {
+            if let Some(p) = read_point(&mut reader)? {
+                centroids[i] = p;
+                // Output initial assignment: point i is its own cluster
+                writer.write_all(&(i as u32).to_le_bytes())?;
+                i += 1;
+            } else {
+                // No more points
+                break;
+            }
+        }
+
+        // If there were fewer points than clusters, we're done
+        if i >= num_points || i == init_k {
+            writer.flush()?;
+            // If init_k > actual points, we may have nothing more to process
+            // Exit gracefully
+            writer.flush()?;
+            return Ok(());
+        }
+
+        // Process remaining points in streaming fashion
+        // For points after initial centroids, assign to nearest centroid and online-update
+        // We maintain centroids in-place; we do not store all points.
+        // We keep processing until we reach num_points points total.
+        while i < num_points {
+            if let Some(p) = read_point(&mut reader)? {
+                // Assign to nearest centroid
+                let mut best_j = 0usize;
+                let mut best_d2 = f32::MAX;
+                for j in 0..centroids.len() {
+                    let d2 = dist2(&p, &centroids[j]);
+                    if d2 < best_d2 {
+                        best_d2 = d2;
+                        best_j = j;
+                    }
+                }
+                // Output cluster index for this point
+                writer.write_all(&(best_j as u32).to_le_bytes())?;
+
+                // Online update of the chosen centroid
+                let c = centroids[best_j];
+                // centroid = centroid + lr * (point - centroid)
+                let nx = c[0] + LEARNING_RATE * (p[0] - c[0]);
+                let ny = c[1] + LEARNING_RATE * (p[1] - c[1]);
+                let nz = c[2] + LEARNING_RATE * (p[2] - c[2]);
+                centroids[best_j] = [nx, ny, nz];
+
+                i += 1;
+            } else {
+                // EOF
+                break;
+            }
+        }
+
+        writer.flush()?;
+    }
+
+    Ok(())
+}
+```

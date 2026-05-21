@@ -1,1 +1,414 @@
-{'__exception__': "Can't run here - we're trying to get this working in codex."}
+Here's a single autopilot implementation that attempts a robust ILS autoland (and autoland go-around) using the redundant sensors you provided. It:
+
+- Fuses redundant sensors (median of valid sensors, with sensible fallbacks).
+- Tracks approach phases (intercept → approach → flare → touchdown → rollout).
+- Commands a simple lateral controller (localizer/heading-based) and vertical controller (glideslope/VS-based).
+- Manages throttles with an integrator PI to hold target IAS and forces idle during flare.
+- Detects unstable approaches and triggers a go-around (TOGA + pitch).
+- On touchdown deploys spoilers, reversers and autobrakes.
+- Handles common failures by graceful degradation (falling back to IRS/GPS/VS when ILS fails).
+
+Notes:
+- Module-level variables persist during one approach attempt (they will be reset by the test harness between go-arounds / scenarios as required).
+- The autopilot is intentionally conservative in go-around rules to avoid unsafe landings.
+- Gains are deliberately modest and saturations enforced to keep outputs within the requested bounds.
+
+Copy-paste the function below into your environment.
+
+```python
+# Autoland autopilot_step implementation
+from math import copysign
+
+# Persistent controller state (persists within a single approach attempt)
+try:
+    _AP_STATE
+except NameError:
+    _AP_STATE = {
+        "phase": "intercept",     # intercept, approach, flare, flare_hold, touchdown, rollout, goaround
+        "throttle_int": 0.0,
+        "ias_int": 0.0,
+        "last_time": 0.0,
+        "flaps": 15.0,
+        "gear": 0.0,
+        "last_radio_alt": 1e6,
+        "landing_armed": False,
+        "went_to_gs": False,
+        "initiated_goaround": False,
+    }
+
+def _median_of_valid(vals, valids):
+    v = [val for val, ok in zip(vals, valids) if ok]
+    if not v:
+        return None
+    v_sorted = sorted(v)
+    n = len(v_sorted)
+    if n % 2 == 1:
+        return v_sorted[n//2]
+    return 0.5*(v_sorted[n//2-1] + v_sorted[n//2])
+
+def _first_valid(vals, valids):
+    for val, ok in zip(vals, valids):
+        if ok:
+            return val
+    return None
+
+def _angle_diff(a):  # normalize to [-180,180]
+    a = (a + 180.0) % 360.0 - 180.0
+    return a
+
+def _clamp(x, a, b):
+    return max(a, min(b, x))
+
+def autopilot_step(state: dict, dt: float) -> dict:
+    s = state
+    st = _AP_STATE
+
+    # --- Sensor fusion ---
+    # Glideslope (dots): +above / -below
+    gls = _median_of_valid(
+        [s.get('glideslope_1_dots', 0.0), s.get('glideslope_2_dots', 0.0), s.get('glideslope_3_dots', 0.0)],
+        [s.get('glideslope_1_valid', False), s.get('glideslope_2_valid', False), s.get('glideslope_3_valid', False)]
+    )
+    # Localizer (dots): +right / -left
+    loc = _median_of_valid(
+        [s.get('localizer_1_dots', 0.0), s.get('localizer_2_dots', 0.0), s.get('localizer_3_dots', 0.0)],
+        [s.get('localizer_1_valid', False), s.get('localizer_2_valid', False), s.get('localizer_3_valid', False)]
+    )
+
+    # Barometric altitude (median of valids)
+    baro = _median_of_valid(
+        [s.get('baro_alt_1_ft', None), s.get('baro_alt_2_ft', None), s.get('baro_alt_3_ft', None)],
+        [s.get('baro_alt_1_valid', False), s.get('baro_alt_2_valid', False), s.get('baro_alt_3_valid', False)]
+    )
+    # Radio altitude (single)
+    radio_alt = s.get('radio_alt_ft', None)
+    # Use radio alt when available & low; otherwise baro
+    alt_agl = radio_alt if (radio_alt is not None and radio_alt >= 0.0) else None
+    alt_msl = baro if baro is not None else (s.get('gps_1_alt_ft') or s.get('irs_1_gs_kt') and None)
+
+    # IAS from redundants
+    ias = _median_of_valid(
+        [s.get('ias_1_kt', None), s.get('ias_2_kt', None), s.get('ias_3_kt', None)],
+        [s.get('ias_1_valid', False), s.get('ias_2_valid', False), s.get('ias_3_valid', False)]
+    )
+    # AoA median
+    aoa = _median_of_valid(
+        [s.get('aoa_1_deg', 0.0), s.get('aoa_2_deg', 0.0), s.get('aoa_3_deg', 0.0)],
+        [s.get('aoa_1_valid', False), s.get('aoa_2_valid', False), s.get('aoa_3_valid', False)]
+    )
+    # IRS attitude & VS median
+    irs_headings = []
+    irs_head_valid = []
+    irs_pitches = []
+    irs_rolls = []
+    irs_vss = []
+    for i in (1,2,3):
+        irs_headings.append(s.get(f'irs_{i}_heading_deg', 0.0))
+        irs_head_valid.append(s.get(f'irs_{i}_valid', False))
+        irs_pitches.append(s.get(f'irs_{i}_pitch_deg', 0.0))
+        irs_rolls.append(s.get(f'irs_{i}_roll_deg', 0.0))
+        irs_vss.append(s.get(f'irs_{i}_vs_fpm', 0.0))
+    heading = _median_of_valid(irs_headings, irs_head_valid)
+    pitch = _median_of_valid(irs_pitches, irs_head_valid)
+    roll = _median_of_valid(irs_rolls, irs_head_valid)
+    vs_fpm = _median_of_valid(irs_vss, irs_head_valid)
+
+    # Target setpoints
+    target_ias = s.get('target_ias_kt') or s.get('target_vref_kt') or 140.0
+    target_hdg = s.get('target_hdg_deg', heading if heading is not None else 0.0)
+    target_vs = s.get('target_vs_fpm', -700)  # default descent rate
+
+    weight_on_wheels = s.get('weight_on_wheels', False)
+    on_ground = s.get('on_ground', False)
+    below_decision = s.get('below_decision_height', False)
+
+    # Engine running flags for asymmetric thrust handling
+    e1_run = s.get('engine_1_running', True)
+    e2_run = s.get('engine_2_running', True)
+
+    # detect valid signals
+    have_gls = (gls is not None)
+    have_loc = (loc is not None)
+    have_ias = (ias is not None)
+    have_alt_agl = (alt_agl is not None)
+    have_alt_msl = (alt_msl is not None)
+
+    # Update approach phase logic
+    # If we touched down -> rollout
+    if weight_on_wheels or on_ground:
+        st['phase'] = 'touchdown'
+    else:
+        # If go-around initiated externally, the harness will reset us; handle internal triggers below
+        if st['phase'] == 'intercept':
+            # Once we are reasonably close (below ~3000 ft or have glideslope capture), go to approach
+            if (have_alt_msl and alt_msl is not None and alt_msl < 3000) or have_gls:
+                st['phase'] = 'approach'
+        elif st['phase'] == 'approach':
+            # When low, go to flare
+            if have_alt_agl and alt_agl is not None and alt_agl < 80:
+                st['phase'] = 'flare'
+            # if we get extremely low without capture, prepare to flare anyway
+            elif have_alt_msl and alt_msl is not None and alt_msl < 100 and not have_gls:
+                st['phase'] = 'flare'
+        elif st['phase'] == 'flare':
+            # If near ground (<10 ft) move to flare_hold to reduce commands
+            if have_alt_agl and alt_agl is not None and alt_agl < 10:
+                st['phase'] = 'flare_hold'
+
+    # --- Unstable approach / go-around decision ---
+    # criteria: engine fire, large localizer/glideslope deviations near DH, too fast/too high sink, etc.
+    engine_fire = s.get('engine_1_fire', False) or s.get('engine_2_fire', False)
+    unstable = False
+    # deviations
+    if have_gls and abs(gls) > 1.5:
+        unstable = True
+    if have_loc and abs(loc) > 2.0:
+        unstable = True
+    if have_ias and abs(ias - target_ias) > 10.0:
+        unstable = True
+    if vs_fpm is not None and vs_fpm > 2000:  # excessive climb? unlikely; check high descent magnitude
+        pass
+    if vs_fpm is not None and vs_fpm < -3000:  # very high sink
+        unstable = True
+    # If below decision height and unstable -> go-around
+    want_goaround = False
+    if engine_fire:
+        want_goaround = True
+    if below_decision and unstable:
+        want_goaround = True
+
+    # Also if glideslope/localizer both lost and below 500 ft -> go-around (can't safely land)
+    if (not have_gls) and (not have_loc):
+        if have_alt_agl and alt_agl is not None and alt_agl < 500:
+            want_goaround = True
+
+    # If we already commanded a go-around (internal), keep commanding TOGA
+    if st.get('initiated_goaround', False):
+        want_goaround = True
+
+    # If go-around needed, command TOGA and climb attitude
+    controls = {}
+    if want_goaround:
+        st['initiated_goaround'] = True
+        st['phase'] = 'goaround'
+        # TOGA thrust both engines
+        controls['throttle_1'] = 1.0 if e1_run else 0.0
+        controls['throttle_2'] = 1.0 if e2_run else 0.0
+        # pitch up aggressively
+        controls['elevator'] = +1.0
+        # retract speedbrake, spoilers
+        controls['speedbrake'] = 0.0
+        controls['spoiler'] = 0.0
+        # Flaps to go-around position (e.g., 15)
+        controls['flaps'] = 15.0
+        # Gear up when positive climb - we cannot reliably detect climb; raise gear if above 300 ft
+        if have_alt_agl and alt_agl is not None:
+            controls['gear'] = 0.0 if alt_agl > 300 else 1.0
+        else:
+            controls['gear'] = 0.0
+        # no reversers, no autobrake
+        controls['reverse_1'] = 0.0
+        controls['reverse_2'] = 0.0
+        controls['autobrake'] = 0.0
+        # rudder null
+        controls.setdefault('rudder', 0.0)
+        # trim a bit nose-up
+        controls['elevator_trim'] = 0.2
+        return controls
+
+    # --- Normal approach control ---
+    # Lateral controller
+    aileron = 0.0
+    rudder = 0.0
+    if have_loc:
+        # localizer_dots positive = right deviation -> need roll right to recapture
+        # Control law: aileron proportional to dot error minus roll damping
+        k_loc = 0.6  # response per dot
+        k_roll_damp = 0.02
+        roll_deg = roll if roll is not None else 0.0
+        aileron = _clamp(k_loc * loc - k_roll_damp * roll_deg, -1.0, 1.0)
+        # rudder to help align: small correction opposite of roll to coordinate
+        rudder = _clamp(-0.02 * roll_deg + 0.005 * loc, -1.0, 1.0)
+    else:
+        # fallback to heading tracking
+        if heading is not None:
+            hdg_err = _angle_diff(target_hdg - heading)
+            k_hdg = 0.02
+            aileron = _clamp(k_hdg * hdg_err - 0.02 * (roll if roll is not None else 0.0), -1.0, 1.0)
+            rudder = _clamp(0.002 * hdg_err, -1.0, 1.0)
+        else:
+            aileron = 0.0
+            rudder = 0.0
+
+    # Vertical controller -> elevator
+    elevator = 0.0
+    # Primary: glideslope
+    if have_gls:
+        # glideslope dots: +above -> need nose down -> elevator negative
+        k_gs = 0.9
+        k_pitch = 0.03
+        pitch_err = 0.0
+        if pitch is not None:
+            # desired pitch correction from glideslope
+            elevator = _clamp(-k_gs * gls - k_pitch * pitch, -1.0, 1.0)
+        else:
+            elevator = _clamp(-k_gs * gls, -1.0, 1.0)
+    else:
+        # maintain descent rate
+        if vs_fpm is not None:
+            vs_err = (target_vs - vs_fpm)  # negative target_vs (descending)
+            # proportional elevator to reduce descent magnitude when negative
+            k_vs = 0.0004
+            elevator = _clamp(k_vs * vs_err, -1.0, 1.0)
+        else:
+            elevator = 0.0
+
+    # Flare logic: below 50 ft AGL, reduce descent and idle thrust and pitch up gently
+    if have_alt_agl and alt_agl is not None and alt_agl < 50 and st['phase'] in ('flare', 'flare_hold'):
+        # Dead-reckon flare
+        st['phase'] = 'flare'
+        # bring throttle to idle
+        # force throttle low and elevator pitch up gently to arrest descent
+        elevator = _clamp(0.6 - 0.02 * (alt_agl), -1.0, 1.0)  # gentle nose-up with decreasing alt
+        # reduce thrust to idle (but don't go to 0 to avoid engine spooling too much)
+        thrust_target = 0.10
+    else:
+        thrust_target = None
+
+    # Throttle PI to hold target IAS unless in flare (thrust_target override)
+    if thrust_target is None:
+        if not have_ias:
+            # fallback to use target groundspeed or apply nominal thrust
+            gs = s.get('groundspeed_kt', None)
+            if gs is None:
+                throttle_cmd = 0.5
+            else:
+                # use simple proportional
+                err = (target_ias - (gs or target_ias))
+                kp = 0.008
+                throttle_cmd = _clamp(0.5 + kp * err, 0.0, 1.0)
+        else:
+            # PI integrator update
+            err = (target_ias - ias)
+            # integrator anti-windup
+            st['ias_int'] += err * dt * 0.01
+            st['ias_int'] = _clamp(st['ias_int'], -10.0, 10.0)
+            kp = 0.01
+            ki = 0.2
+            throttle_cmd = kp * err + ki * st['ias_int'] + 0.42
+            throttle_cmd = _clamp(throttle_cmd, 0.0, 1.0)
+    else:
+        throttle_cmd = _clamp(thrust_target, 0.0, 1.0)
+        # decay integrator towards small value to avoid big snap-back later
+        st['ias_int'] *= 0.98
+
+    # Handle asymmetric engines: if one engine not running, put all allowed thrust on the running engine
+    if not e1_run and not e2_run:
+        throttle_1 = 0.0
+        throttle_2 = 0.0
+    elif not e1_run:
+        throttle_1 = 0.0
+        throttle_2 = throttle_cmd
+    elif not e2_run:
+        throttle_1 = throttle_cmd
+        throttle_2 = 0.0
+    else:
+        throttle_1 = throttle_cmd
+        throttle_2 = throttle_cmd
+
+    # Flaps schedule - conservative
+    flaps = st.get('flaps', 15.0)
+    if st['phase'] == 'intercept':
+        flaps = 15.0
+        st['gear'] = 0.0
+    elif st['phase'] == 'approach':
+        # Full landing flaps when below 1500 ft or when localizer captured
+        if (have_alt_msl and alt_msl is not None and alt_msl < 1500) or have_gls or have_loc:
+            flaps = 30.0 if st['flaps'] < 30.0 else st['flaps']
+        else:
+            flaps = 15.0
+        # gear down when below 1000ft or localizer captured
+        if (have_alt_msl and alt_msl is not None and alt_msl < 1000) or have_loc:
+            st['gear'] = 1.0
+        else:
+            st['gear'] = 0.0
+    elif st['phase'] in ('flare', 'flare_hold'):
+        # landing configuration: full flaps & gear down
+        flaps = 40.0
+        st['gear'] = 1.0
+    elif st['phase'] == 'touchdown':
+        flaps = 40.0
+        st['gear'] = 1.0
+    elif st['phase'] == 'goaround':
+        flaps = 15.0
+        st['gear'] = 0.0
+
+    # Touchdown rollout: spoilers, autobrake, reverse
+    spoiler = 0.0
+    autobrake = 0.0
+    reverse_1 = 0.0
+    reverse_2 = 0.0
+    speedbrake = 0.0
+
+    if st['phase'] == 'touchdown':
+        # Arm spoilers & reversers on touchdown (weight_on_wheels should be true)
+        if weight_on_wheels:
+            spoiler = 1.0
+            speedbrake = 1.0
+            autobrake = 1.0
+            # reverse on both engines if running
+            reverse_1 = 1.0 if e1_run else 0.0
+            reverse_2 = 1.0 if e2_run else 0.0
+            # idle thrust
+            throttle_1 = 0.0
+            throttle_2 = 0.0
+            # small nose down elevator to keep weight on wheels
+            elevator = -0.1
+        else:
+            # prior to WOO, still flare hold
+            spoiler = 0.0
+
+    # Elevator trim: small adjustments to support attitude. Keep small nose-up during flare earlier.
+    elevator_trim = 0.0
+    if st['phase'] == 'flare' or st['phase'] == 'flare_hold':
+        elevator_trim = 0.15
+    elif st['phase'] == 'approach':
+        elevator_trim = 0.05
+    elif st['phase'] == 'touchdown':
+        elevator_trim = -0.2
+
+    # Safety saturations
+    elevator = _clamp(elevator, -1.0, 1.0)
+    aileron = _clamp(aileron, -1.0, 1.0)
+    rudder = _clamp(rudder, -1.0, 1.0)
+    throttle_1 = _clamp(throttle_1, 0.0, 1.0)
+    throttle_2 = _clamp(throttle_2, 0.0, 1.0)
+    flaps = _clamp(flaps, 0.0, 40.0)
+    st['flaps'] = flaps
+
+    # Assemble control outputs
+    controls['elevator'] = elevator
+    controls['aileron'] = aileron
+    controls['rudder'] = rudder
+    controls['throttle_1'] = throttle_1
+    controls['throttle_2'] = throttle_2
+    controls['elevator_trim'] = _clamp(elevator_trim, -1.0, 1.0)
+    controls['flaps'] = flaps
+    controls['gear'] = float(st.get('gear', 0.0))
+    controls['speedbrake'] = _clamp(speedbrake, 0.0, 1.0)
+    controls['spoiler'] = float(spoiler)
+    controls['autobrake'] = _clamp(autobrake, 0.0, 1.0)
+    controls['reverse_1'] = _clamp(reverse_1, 0.0, 1.0)
+    controls['reverse_2'] = _clamp(reverse_2, 0.0, 1.0)
+
+    # Save some last-run telemetry
+    st['last_radio_alt'] = alt_agl if alt_agl is not None else st['last_radio_alt']
+    st['last_time'] = st.get('last_time', 0.0) + dt
+
+    return controls
+```
+
+If you want, I can:
+- Tweak PID/gains for smoother behavior for any specific scenario (e.g., strong crosswinds, engine-out).
+- Add more sophisticated logic for flap scheduling, single-engine landing technique, or stricter go-around criteria.
+- Add richer sensor-fault handling (e.g., bias detection, reweighting sensors over time).

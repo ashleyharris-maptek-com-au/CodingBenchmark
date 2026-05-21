@@ -1,0 +1,320 @@
+def autopilot_step(state: dict, dt: float) -> dict:
+    # Module-level state for persistence across calls
+    if not hasattr(autopilot_step, 'nav'):
+        autopilot_step.nav = {
+            'prev_pos': [0.0, 0.0, 0.0],
+            'prev_vel': [0.0, 0.0, 0.0],
+            'phase': 'approach',
+            'steps': 0,
+            'last_good_pos': None,
+            'last_good_vel': None,
+            'hover_target': None
+        }
+
+    nav = autopilot_step.nav
+    nav['steps'] += 1
+
+    # ========== SENSOR FUSION ==========
+    rel_pos = fuse_position(state, nav)
+    rel_vel = fuse_velocity(state, nav)
+    att = fuse_attitude(state)
+    range_m = magnitude(rel_pos)
+    closing_rate = dot(rel_vel, rel_pos) / (range_m + 1e-6)
+    fuel_pct = state.get('fuel_remaining_pct', 100)
+
+    # ========== DOCKING SUCCESS CHECK ==========
+    if range_m < 2.0 and abs(closing_rate) < 0.3:
+        return zero_control()
+
+    # ========== FUEL EMERGENCY ==========
+    if fuel_pct < 5:
+        return emergency_control(rel_pos, rel_vel, range_m)
+
+    # ========== PHASE-DEPENDENT CONTROL ==========
+    if range_m > 200:
+        thrust = far_approach(rel_pos, rel_vel, range_m, state)
+    elif range_m > 50:
+        thrust = medium_approach(rel_pos, rel_vel, range_m, closing_rate)
+    elif range_m > 10:
+        thrust = close_approach(rel_pos, rel_vel, range_m, closing_rate)
+    else:
+        thrust = final_approach(rel_pos, rel_vel, range_m, closing_rate)
+
+    # ========== ATTITUDE CONTROL ==========
+    att_rates = attitude_control(att, thrust, nav)
+
+    # ========== APPLY LIMITS AND RETURN ==========
+    thrust = [max(-1.0, min(1.0, t)) for t in thrust]
+    att_rates = [max(-0.035, min(0.035, r)) for r in att_rates]
+
+    nav['prev_pos'] = rel_pos
+    nav['prev_vel'] = rel_vel
+
+    return {
+        'thrust_x': thrust[0],
+        'thrust_y': thrust[1],
+        'thrust_z': thrust[2],
+        'att_rate_roll': att_rates[0],
+        'att_rate_pitch': att_rates[1],
+        'att_rate_yaw': att_rates[2]
+    }
+
+
+def fuse_position(state, nav):
+    """Fuse radar, lidar, and docking camera position data."""
+    candidates = []
+    weights = []
+
+    # Radar (prefer if valid, generally stable)
+    if all(state.get(f'radar_rel_{ax}_valid') for ax in ['x', 'y', 'z']):
+        pos = [state[f'radar_rel_pos_{ax}_m'] for ax in ['x', 'y', 'z']]
+        candidates.append(pos)
+        weights.append(1.0)
+
+    # Lidar (prefer if valid, good for close range)
+    if all(state.get(f'lidar_rel_{ax}_valid') for ax in ['x', 'y', 'z']):
+        pos = [state[f'lidar_rel_pos_{ax}_m'] for ax in ['x', 'y', 'z']]
+        candidates.append(pos)
+        weights.append(1.0)
+
+    # Docking camera (highest precision when active)
+    if (state.get('dock_camera_active') and
+        state.get('dock_camera_bearing_x_valid')):
+        bearing = [state[f'dock_camera_bearing_{ax}'] for ax in ['x', 'y', 'z']]
+        norm = magnitude(bearing)
+        if norm > 0.01:
+            range_m = state.get('dock_camera_range_m', 0)
+            pos = [b / norm * range_m for b in bearing]
+            candidates.append(pos)
+            weights.append(2.0)  # Higher weight for camera
+
+    if candidates:
+        total_weight = sum(weights)
+        result = [
+            sum(c[i] * weights[j] for j, c in enumerate(candidates)) / total_weight
+            for i in range(3)
+        ]
+        nav['last_good_pos'] = result
+        return result
+
+    return nav['last_good_pos'] if nav['last_good_pos'] else [0, 0, 0]
+
+
+def fuse_velocity(state, nav):
+    """Fuse radar and lidar velocity data."""
+    candidates = []
+
+    # Radar velocity
+    if all(state.get(f'radar_relv_{ax}_valid') for ax in ['x', 'y', 'z']):
+        vel = [state[f'radar_rel_vel_{ax}_ms'] for ax in ['x', 'y', 'z']]
+        candidates.append(vel)
+
+    # Lidar velocity
+    if all(state.get(f'lidar_relv_{ax}_valid') for ax in ['x', 'y', 'z']):
+        vel = [state[f'lidar_rel_vel_{ax}_ms'] for ax in ['x', 'y', 'z']]
+        candidates.append(vel)
+
+    if candidates:
+        result = [sum(c[i] for c in candidates) / len(candidates) for i in range(3)]
+        nav['last_good_vel'] = result
+        return result
+
+    return nav['last_good_vel'] if nav['last_good_vel'] else [0, 0, 0]
+
+
+def fuse_attitude(state):
+    """Fuse star tracker attitude estimates."""
+    candidates = []
+
+    for st_num in [1, 2]:
+        prefix = f'star_tracker_{st_num}'
+        if all(state.get(f'{prefix}_{axis}_valid') for axis in ['pitch', 'roll', 'yaw']):
+            att = [state[f'{prefix}_{axis}_deg'] for axis in ['pitch', 'roll', 'yaw']]
+            candidates.append(att)
+
+    if candidates:
+        return [sum(c[i] for c in candidates) / len(candidates) for i in range(3)]
+
+    return [0, 0, 0]
+
+
+def far_approach(rel_pos, rel_vel, range_m, state):
+    """Control for >200m: Hohmann transfer-like approach."""
+    thrust = [0.0, 0.0, 0.0]
+
+    y_pos = rel_pos[1]  # along-track
+    y_vel = rel_vel[1]  # along-track velocity
+
+    if y_pos < -50:  # Far behind
+        # Retrograde burn to lower orbit and speed up relative
+        thrust[1] = -0.4
+    elif y_pos > 50:  # Ahead
+        # Prograde burn to raise orbit and slow down
+        thrust[1] = 0.3
+    else:
+        # Close in y-gap, manage radial and cross-track
+        thrust[1] = -0.2 if y_vel > -0.3 else 0.1
+
+    # Radial correction (slow)
+    if abs(rel_pos[0]) > 50:
+        thrust[0] = -0.15 * sign(rel_pos[0])
+
+    # Cross-track correction (slow)
+    if abs(rel_pos[2]) > 50:
+        thrust[2] = -0.15 * sign(rel_pos[2])
+
+    return thrust
+
+
+def medium_approach(rel_pos, rel_vel, range_m, closing_rate):
+    """Control for 50-200m: V-bar approach with velocity damping."""
+    thrust = [0.0, 0.0, 0.0]
+
+    y_pos = rel_pos[1]  # along-track
+    y_vel = rel_vel[1]  # along-track velocity
+
+    # Target closing rate: -0.5 m/s when far, -0.1 m/s when near
+    target_closing = -0.5 + (range_m - 50) / 150.0 * 0.4
+
+    # Y-axis (along-track) control
+    if y_pos < -30 and y_vel > target_closing:  # Behind and too slow
+        thrust[1] = -0.35
+    elif y_pos < -30 and y_vel < target_closing - 0.2:  # Behind but too fast
+        thrust[1] = 0.15
+    elif y_pos > 20:  # Ahead
+        thrust[1] = 0.25
+    else:
+        # Maintain velocity
+        if y_vel > -0.1:
+            thrust[1] = -0.2
+        elif y_vel < -0.8:
+            thrust[1] = 0.05
+
+    # Radial damping and correction
+    x_pos = rel_pos[0]
+    x_vel = rel_vel[0]
+    thrust[0] = -0.08 * sign(x_vel) if abs(x_vel) > 0.1 else 0.0
+    if abs(x_pos) > 30:
+        thrust[0] += -0.1 * sign(x_pos)
+
+    # Cross-track damping and correction
+    z_pos = rel_pos[2]
+    z_vel = rel_vel[2]
+    thrust[2] = -0.08 * sign(z_vel) if abs(z_vel) > 0.1 else 0.0
+    if abs(z_pos) > 30:
+        thrust[2] += -0.12 * sign(z_pos)
+
+    return thrust
+
+
+def close_approach(rel_pos, rel_vel, range_m, closing_rate):
+    """Control for 10-50m: Linear control using CW-like equations."""
+    thrust = [0.0, 0.0, 0.0]
+
+    # PID-like control on all axes
+    # Proportional term on position
+    kp = 0.06 if range_m > 25 else 0.08
+    kd = 0.12
+
+    for i in range(3):
+        thrust[i] = -kp * rel_pos[i] - kd * rel_vel[i]
+
+    # Velocity damping override for safety
+    if abs(closing_rate) > 0.5:
+        y_vel = rel_vel[1]
+        if y_vel < -0.5:
+            thrust[1] = max(thrust[1], 0.2)
+
+    return thrust
+
+
+def final_approach(rel_pos, rel_vel, range_m, closing_rate):
+    """Control for <10m: Very gentle approach to dock."""
+    thrust = [0.0, 0.0, 0.0]
+
+    # Very gentle control
+    kp = 0.04
+    kd = 0.15
+
+    for i in range(3):
+        thrust[i] = -kp * rel_pos[i] - kd * rel_vel[i]
+
+    # Ensure approach speed is safe
+    if closing_rate < -0.15:
+        # Closing too fast, apply gentle retrograde
+        thrust[1] = max(thrust[1], 0.1)
+
+    return thrust
+
+
+def emergency_control(rel_pos, rel_vel, range_m):
+    """Minimal control on very low fuel."""
+    thrust = [0.0, 0.0, 0.0]
+
+    # Only care about closing speed
+    y_vel = rel_vel[1]
+    if y_vel < -0.3:
+        thrust[1] = 0.05
+
+    # Gentle velocity nulling on other axes
+    for i in [0, 2]:
+        if abs(rel_vel[i]) > 0.05:
+            thrust[i] = -0.02 * sign(rel_vel[i])
+
+    return thrust
+
+
+def attitude_control(att, thrust, nav):
+    """Generate attitude rates to align spacecraft with thrust vector."""
+    att_rates = [0.0, 0.0, 0.0]  # [roll, pitch, yaw]
+
+    thrust_mag = magnitude(thrust)
+    if thrust_mag < 0.01:
+        return att_rates
+
+    # Desired attitude from thrust vector
+    # Simplified: map thrust to pitch/roll corrections
+    desired_pitch = -thrust[0] * 0.3  # Radial thrust
+    desired_roll = thrust[2] * 0.2    # Cross-track thrust
+
+    # Proportional control on attitude error
+    pitch_error = desired_pitch - att[0]
+    roll_error = desired_roll - att[1]
+
+    att_rates[0] = 0.02 * roll_error
+    att_rates[1] = 0.02 * pitch_error
+    att_rates[2] = 0.0
+
+    return att_rates
+
+
+def zero_control():
+    """Return zero thrust command."""
+    return {
+        'thrust_x': 0.0,
+        'thrust_y': 0.0,
+        'thrust_z': 0.0,
+        'att_rate_roll': 0.0,
+        'att_rate_pitch': 0.0,
+        'att_rate_yaw': 0.0
+    }
+
+
+def magnitude(v):
+    """Compute vector magnitude."""
+    return (v[0]**2 + v[1]**2 + v[2]**2) ** 0.5
+
+
+def dot(a, b):
+    """Compute dot product."""
+    return a[0]*b[0] + a[1]*b[1] + a[2]*b[2]
+
+
+def sign(x):
+    """Return sign of x."""
+    if x > 0:
+        return 1.0
+    elif x < 0:
+        return -1.0
+    else:
+        return 0.0

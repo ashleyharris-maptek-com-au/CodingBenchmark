@@ -1,1 +1,344 @@
-{'__exception__': "Can't run here - we're trying to get this working in codex."}
+```rust
+use std::io::{self, BufWriter, Read, Write};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::thread;
+use std::time::{Duration, Instant};
+
+fn main() {
+    let (config_tx, config_rx) = mpsc::channel();
+    let (state_tx, state_rx) = mpsc::channel();
+
+    let reader_handle = thread::spawn(move || {
+        reader_thread(config_tx, state_tx);
+    });
+
+    let init = match config_rx.recv() {
+        Ok(init) => init,
+        Err(_) => return,
+    };
+
+    run_controller(init, state_rx);
+
+    let _ = reader_handle.join();
+}
+
+fn run_controller(init: InitData, state_rx: Receiver<State>) {
+    let mut controller = Controller::new(&init);
+    let stdout = io::stdout();
+    let mut out = BufWriter::new(stdout.lock());
+
+    let interval = Duration::from_millis(40); // 25 Hz
+    let mut last_emit = Instant::now();
+    let mut emitted_once = false;
+    let mut latest_state: Option<State> = None;
+    let mut disconnected = false;
+    let mut last_state_time = Instant::now();
+
+    loop {
+        loop {
+            match state_rx.try_recv() {
+                Ok(state) => {
+                    latest_state = Some(state);
+                    last_state_time = Instant::now();
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
+            }
+        }
+
+        if latest_state.is_none() {
+            if disconnected {
+                break;
+            }
+            thread::sleep(Duration::from_millis(2));
+            continue;
+        }
+
+        if emitted_once {
+            let since_last = last_emit.elapsed();
+            if since_last < interval {
+                thread::sleep(interval - since_last);
+                continue;
+            }
+        }
+
+        let state = latest_state.unwrap();
+        let command = controller.compute(state);
+
+        if writeln!(out, "{:.4} {:.4}", command.thrust, command.turn).is_err() {
+            break;
+        }
+        if out.flush().is_err() {
+            break;
+        }
+
+        emitted_once = true;
+        last_emit = Instant::now();
+
+        if disconnected && last_emit.duration_since(last_state_time) > Duration::from_millis(200) {
+            break;
+        }
+    }
+
+    let _ = out.flush();
+}
+
+fn reader_thread(config_tx: Sender<InitData>, state_tx: Sender<State>) {
+    let stdin = io::stdin();
+    let handle = stdin.lock();
+    let mut input = FastInput::new(handle);
+
+    let width = match input.next_usize() {
+        Some(v) => v,
+        None => return,
+    };
+    let height = match input.next_usize() {
+        Some(v) => v,
+        None => return,
+    };
+    let gravity = input.next_f64().unwrap_or(1.62);
+    let max_thrust = input.next_f64().unwrap_or(5.0);
+    let fuel = input.next_f64().unwrap_or(0.0);
+
+    let start_x = input.next_f64().unwrap_or(0.0);
+    let start_y = input.next_f64().unwrap_or(0.0);
+    let target_x = input.next_f64().unwrap_or(0.0);
+    let target_y = input.next_f64().unwrap_or(0.0);
+
+    for _ in 0..height {
+        if !input.skip_line() {
+            break;
+        }
+    }
+
+    let init = InitData {
+        width,
+        height,
+        gravity,
+        max_thrust,
+        initial_fuel: fuel,
+        start_x,
+        start_y,
+        target_x,
+        target_y,
+    };
+
+    if config_tx.send(init).is_err() {
+        return;
+    }
+
+    while let Some(state) = read_state(&mut input) {
+        if state_tx.send(state).is_err() {
+            break;
+        }
+    }
+}
+
+fn read_state<R: Read>(input: &mut FastInput<R>) -> Option<State> {
+    let x = input.next_f64()?;
+    let y = input.next_f64()?;
+    let vx = input.next_f64()?;
+    let vy = input.next_f64()?;
+    let angle = input.next_f64()?;
+    let angular_vel = input.next_f64()?;
+    let fuel_remaining = input.next_f64()?;
+
+    Some(State {
+        x,
+        y,
+        vx,
+        vy,
+        angle,
+        angular_vel,
+        fuel_remaining,
+    })
+}
+
+#[derive(Clone, Copy, Debug)]
+struct State {
+    x: f64,
+    y: f64,
+    vx: f64,
+    vy: f64,
+    angle: f64,
+    angular_vel: f64,
+    fuel_remaining: f64,
+}
+
+#[derive(Clone, Copy)]
+struct Command {
+    thrust: f64,
+    turn: f64,
+}
+
+#[derive(Clone, Copy)]
+struct InitData {
+    width: usize,
+    height: usize,
+    gravity: f64,
+    max_thrust: f64,
+    initial_fuel: f64,
+    start_x: f64,
+    start_y: f64,
+    target_x: f64,
+    target_y: f64,
+}
+
+struct Controller {
+    gravity: f64,
+    max_thrust: f64,
+    target_x: f64,
+    target_y: f64,
+    last_angle_cmd: f64,
+}
+
+impl Controller {
+    fn new(init: &InitData) -> Self {
+        Controller {
+            gravity: init.gravity,
+            max_thrust: init.max_thrust.max(0.1),
+            target_x: init.target_x,
+            target_y: init.target_y,
+            last_angle_cmd: 0.0,
+        }
+    }
+
+    fn compute(&mut self, state: State) -> Command {
+        if state.fuel_remaining <= 0.0 {
+            return Command {
+                thrust: 0.0,
+                turn: 0.0,
+            };
+        }
+
+        let dx = self.target_x - state.x;
+        let altitude = self.target_y - state.y; // positive when target is below current position
+        let altitude_for_gain = altitude.max(0.0);
+
+        let horizontal_gain = if altitude_for_gain > 60.0 { 0.010 } else { 0.018 };
+        let velocity_gain = if altitude_for_gain > 60.0 { 0.030 } else { 0.045 };
+
+        let mut raw_angle = dx * horizontal_gain - state.vx * velocity_gain;
+        let far_limit = 0.65;
+        let near_limit = 0.20;
+        let blend = (altitude_for_gain / 80.0).clamp(0.0, 1.0);
+        let angle_limit = near_limit + (far_limit - near_limit) * blend;
+        raw_angle = raw_angle.clamp(-angle_limit, angle_limit);
+
+        let smoothed = 0.65 * raw_angle + 0.35 * self.last_angle_cmd;
+        let desired_angle = smoothed.clamp(-angle_limit, angle_limit);
+        self.last_angle_cmd = desired_angle;
+
+        let angle_error = desired_angle - state.angle;
+        let turn = (angle_error * 2.8 - state.angular_vel * 0.9).clamp(-1.0, 1.0);
+
+        let mut desired_vy = (altitude_for_gain * 0.07).clamp(0.0, 3.5);
+        if altitude_for_gain < 5.0 {
+            desired_vy = desired_vy.min(0.8);
+        }
+        let vy_error = desired_vy - state.vy;
+        let mut desired_acc = (vy_error * 1.4).clamp(-self.max_thrust * 0.9, self.max_thrust);
+
+        if altitude < 0.0 {
+            desired_acc = (-state.vy) * 1.2;
+        }
+
+        let tilt_penalty = desired_angle.abs() * 0.5;
+        desired_acc -= tilt_penalty;
+
+        let cos_ang = state.angle.cos().max(0.15);
+        let mut thrust = (self.gravity - desired_acc) / (self.max_thrust * cos_ang);
+        thrust = thrust.clamp(0.0, 1.0);
+
+        Command { thrust, turn }
+    }
+}
+
+struct FastInput<R: Read> {
+    reader: R,
+    buf: [u8; 1 << 16],
+    pos: usize,
+    len: usize,
+}
+
+impl<R: Read> FastInput<R> {
+    fn new(reader: R) -> Self {
+        Self {
+            reader,
+            buf: [0; 1 << 16],
+            pos: 0,
+            len: 0,
+        }
+    }
+
+    fn refill(&mut self) -> bool {
+        match self.reader.read(&mut self.buf) {
+            Ok(0) | Err(_) => {
+                self.len = 0;
+                false
+            }
+            Ok(n) => {
+                self.pos = 0;
+                self.len = n;
+                true
+            }
+        }
+    }
+
+    fn next_string(&mut self) -> Option<String> {
+        let mut bytes = Vec::new();
+        loop {
+            if self.pos >= self.len {
+                if !self.refill() {
+                    if bytes.is_empty() {
+                        return None;
+                    }
+                    break;
+                }
+            }
+            let b = self.buf[self.pos];
+            if b.is_ascii_whitespace() {
+                self.pos += 1;
+                if !bytes.is_empty() {
+                    break;
+                } else {
+                    continue;
+                }
+            } else {
+                bytes.push(b);
+                self.pos += 1;
+            }
+        }
+        String::from_utf8(bytes).ok()
+    }
+
+    fn next_f64(&mut self) -> Option<f64> {
+        self.next_string()?.parse::<f64>().ok()
+    }
+
+    fn next_usize(&mut self) -> Option<usize> {
+        self.next_string()?.parse::<usize>().ok()
+    }
+
+    fn skip_line(&mut self) -> bool {
+        let mut saw_any = false;
+        loop {
+            if self.pos >= self.len {
+                if !self.refill() {
+                    return saw_any;
+                }
+            }
+            let b = self.buf[self.pos];
+            self.pos += 1;
+            saw_any = true;
+            if b == b'\n' {
+                break;
+            }
+        }
+        true
+    }
+}
+```

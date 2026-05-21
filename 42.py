@@ -47,12 +47,9 @@ import tempfile
 from typing import Tuple, Optional, Dict
 from PIL import Image
 
-from solver_utils import normalize_code_result
-from shader_test_utils import (
-    assemble_spirv, validate_spirv, compare_images,
-    load_reference, save_reference, UBO_SIZE,
-    get_reference_path, image_pair_html
-)
+from solver_utils import normalize_code_result, GradeCache
+from shader_test_utils import (assemble_spirv, validate_spirv, compare_images, load_reference,
+                               save_reference, UBO_SIZE, get_reference_path, image_pair_html)
 
 title = "Geometry Shaders (SPIR-V Assembly)"
 
@@ -222,11 +219,11 @@ Same layout as test 41 (model/view/proj matrices, lightPos, cameraPos, params).
 # ---------------------------------------------------------------------------
 
 PRIM_ARRAY_SIZES = {
-    "points": 1,
-    "lines": 2,
-    "triangles": 3,
-    "line_adjacency": 4,
-    "triangle_adjacency": 6,
+  "points": 1,
+  "lines": 2,
+  "triangles": 3,
+  "line_adjacency": 4,
+  "triangle_adjacency": 6,
 }
 
 # ---------------------------------------------------------------------------
@@ -234,11 +231,14 @@ PRIM_ARRAY_SIZES = {
 # ---------------------------------------------------------------------------
 
 SUBPASSES = [
-    # ===== POINTS (subpasses 0-2) =====
-    {
-        "description": "Points to Quads",
-        "topology": "points",
-        "prompt": f"""{GEOM_INTERFACE_DESC}
+  # ===== POINTS (subpasses 0-2) =====
+  {
+    "description":
+    "Points to Quads",
+    "topology":
+    "points",
+    "prompt":
+    f"""{GEOM_INTERFACE_DESC}
 
 **Input primitive:** InputPoints (1 vertex per invocation, array size 1)
 **Geometry:** 25 colored points in a 5x5 grid spread across [-0.8, 0.8].
@@ -252,11 +252,14 @@ SUBPASSES = [
    - All with z=0, w=1, and the same color.
 5. Output as triangle strip, max 4 vertices.
 """,
-    },
-    {
-        "description": "Points to Diamonds",
-        "topology": "points",
-        "prompt": f"""{GEOM_INTERFACE_DESC}
+  },
+  {
+    "description":
+    "Points to Diamonds",
+    "topology":
+    "points",
+    "prompt":
+    f"""{GEOM_INTERFACE_DESC}
 
 **Input primitive:** InputPoints (1 vertex per invocation, array size 1)
 **Geometry:** 25 colored points in a 5x5 grid.
@@ -270,11 +273,14 @@ SUBPASSES = [
 4. Use the point's color for all vertices.
 5. Output as triangle strip, max 4 vertices.
 """,
-    },
-    {
-        "description": "Points to Hexagons",
-        "topology": "points",
-        "prompt": f"""{GEOM_INTERFACE_DESC}
+  },
+  {
+    "description":
+    "Points to Hexagons",
+    "topology":
+    "points",
+    "prompt":
+    f"""{GEOM_INTERFACE_DESC}
 
 **Input primitive:** InputPoints (1 vertex per invocation, array size 1)
 **Geometry:** 25 colored points in a 5x5 grid.
@@ -297,13 +303,16 @@ SUBPASSES = [
 4. Use point color for center, slightly darker for edges.
 5. OutputTriangleStrip, OutputVertices 18.
 """,
-    },
+  },
 
-    # ===== LINES (subpasses 3-5) =====
-    {
-        "description": "Thick Lines",
-        "topology": "lines",
-        "prompt": f"""{GEOM_INTERFACE_DESC}
+  # ===== LINES (subpasses 3-5) =====
+  {
+    "description":
+    "Thick Lines",
+    "topology":
+    "lines",
+    "prompt":
+    f"""{GEOM_INTERFACE_DESC}
 
 **Input primitive:** InputLines (2 vertices per invocation, array size 2)
 **Geometry:** 8 radial line segments from center outward.
@@ -318,11 +327,14 @@ SUBPASSES = [
 6. Interpolate color from c0 to c1.
 7. OutputTriangleStrip, OutputVertices 4.
 """,
-    },
-    {
-        "description": "Tapered Lines",
-        "topology": "lines",
-        "prompt": f"""{GEOM_INTERFACE_DESC}
+  },
+  {
+    "description":
+    "Tapered Lines",
+    "topology":
+    "lines",
+    "prompt":
+    f"""{GEOM_INTERFACE_DESC}
 
 **Input primitive:** InputLines (2 vertices per invocation, array size 2)
 **Geometry:** 8 radial line segments from center outward.
@@ -337,11 +349,14 @@ SUBPASSES = [
 5. Color: c0 at start vertices, c1 at end vertices.
 6. OutputTriangleStrip, OutputVertices 4.
 """,
-    },
-    {
-        "description": "Arrow Lines",
-        "topology": "lines",
-        "prompt": f"""{GEOM_INTERFACE_DESC}
+  },
+  {
+    "description":
+    "Arrow Lines",
+    "topology":
+    "lines",
+    "prompt":
+    f"""{GEOM_INTERFACE_DESC}
 
 **Input primitive:** InputLines (2 vertices per invocation, array size 2)
 **Geometry:** 8 radial line segments from center outward.
@@ -357,13 +372,16 @@ SUBPASSES = [
 6. Shaft colored c0, arrowhead colored c1.
 7. OutputTriangleStrip, OutputVertices 7.
 """,
-    },
+  },
 
-    # ===== TRIANGLES (subpasses 6-8) =====
-    {
-        "description": "Triangle Passthrough",
-        "topology": "triangles",
-        "prompt": f"""{GEOM_INTERFACE_DESC}
+  # ===== TRIANGLES (subpasses 6-8) =====
+  {
+    "description":
+    "Triangle Passthrough",
+    "topology":
+    "triangles",
+    "prompt":
+    f"""{GEOM_INTERFACE_DESC}
 
 **Input primitive:** Triangles (3 vertices per invocation, array size 3)
 **Geometry:** A sphere mesh (triangle list with indices).
@@ -377,11 +395,14 @@ SUBPASSES = [
 3. This should produce an image identical to rendering without a geometry shader.
 4. OutputTriangleStrip, OutputVertices 3.
 """,
-    },
-    {
-        "description": "Exploded Triangles",
-        "topology": "triangles",
-        "prompt": f"""{GEOM_INTERFACE_DESC}
+  },
+  {
+    "description":
+    "Exploded Triangles",
+    "topology":
+    "triangles",
+    "prompt":
+    f"""{GEOM_INTERFACE_DESC}
 
 **Input primitive:** Triangles (3 vertices per invocation, array size 3)
 **Geometry:** A sphere mesh.
@@ -398,11 +419,14 @@ SUBPASSES = [
 Use GLSL.std.450 for Normalize (69), Cross (68) if needed, or compute manually.
 The cross product of vec3 (a,b,c) x (d,e,f) = (bf-ce, cd-af, ae-bd).
 """,
-    },
-    {
-        "description": "Shrunk Triangles",
-        "topology": "triangles",
-        "prompt": f"""{GEOM_INTERFACE_DESC}
+  },
+  {
+    "description":
+    "Shrunk Triangles",
+    "topology":
+    "triangles",
+    "prompt":
+    f"""{GEOM_INTERFACE_DESC}
 
 **Input primitive:** Triangles (3 vertices per invocation, array size 3)
 **Geometry:** A sphere mesh.
@@ -415,13 +439,16 @@ The cross product of vec3 (a,b,c) x (d,e,f) = (bf-ce, cd-af, ae-bd).
 5. Emit 3 shrunk vertices with their original colors.
 6. OutputTriangleStrip, OutputVertices 3.
 """,
-    },
+  },
 
-    # ===== LINE ADJACENCY (subpasses 9-11) =====
-    {
-        "description": "Smooth Thick Curve",
-        "topology": "line_adjacency",
-        "prompt": f"""{GEOM_INTERFACE_DESC}
+  # ===== LINE ADJACENCY (subpasses 9-11) =====
+  {
+    "description":
+    "Smooth Thick Curve",
+    "topology":
+    "line_adjacency",
+    "prompt":
+    f"""{GEOM_INTERFACE_DESC}
 
 **Input primitive:** InputLinesAdjacency (4 vertices per invocation, array size 4)
 **Geometry:** A sine wave curve. Vertices: [prev, start, end, next].
@@ -439,11 +466,14 @@ The cross product of vec3 (a,b,c) x (d,e,f) = (bf-ce, cd-af, ae-bd).
 7. Use colors from color[1] and color[2].
 8. OutputTriangleStrip, OutputVertices 4.
 """,
-    },
-    {
-        "description": "Thick Bezier Curve",
-        "topology": "line_adjacency",
-        "prompt": f"""{GEOM_INTERFACE_DESC}
+  },
+  {
+    "description":
+    "Thick Bezier Curve",
+    "topology":
+    "line_adjacency",
+    "prompt":
+    f"""{GEOM_INTERFACE_DESC}
 
 **Input primitive:** InputLinesAdjacency (4 vertices per invocation, array size 4)
 **Geometry:** A sine wave curve with adjacency.
@@ -462,11 +492,14 @@ For Catmull-Rom: lerp between P1 and P2, using P0 and P3 to influence curvature.
 Simplified: just linearly interpolate between P1 and P2 for positions, but use
 (P2-P0) and (P3-P1) for tangent directions at start/end to get smooth perpendiculars.
 """,
-    },
-    {
-        "description": "Dashed Curve",
-        "topology": "line_adjacency",
-        "prompt": f"""{GEOM_INTERFACE_DESC}
+  },
+  {
+    "description":
+    "Dashed Curve",
+    "topology":
+    "line_adjacency",
+    "prompt":
+    f"""{GEOM_INTERFACE_DESC}
 
 **Input primitive:** InputLinesAdjacency (4 vertices per invocation, array size 4)
 **Geometry:** A sine wave curve with adjacency.
@@ -481,13 +514,16 @@ Simplified: just linearly interpolate between P1 and P2 for positions, but use
 7. Color from color[1] and color[2], interpolated.
 8. OutputTriangleStrip, OutputVertices 8.
 """,
-    },
+  },
 
-    # ===== TRIANGLE ADJACENCY (subpasses 12-14) =====
-    {
-        "description": "Silhouette Edges",
-        "topology": "triangle_adjacency",
-        "prompt": f"""{GEOM_INTERFACE_DESC}
+  # ===== TRIANGLE ADJACENCY (subpasses 12-14) =====
+  {
+    "description":
+    "Silhouette Edges",
+    "topology":
+    "triangle_adjacency",
+    "prompt":
+    f"""{GEOM_INTERFACE_DESC}
 
 **Input primitive:** InputTrianglesAdjacency (6 vertices per invocation, array size 6)
 **Geometry:** A grid mesh with triangle adjacency indices.
@@ -510,11 +546,14 @@ Simplified: just linearly interpolate between P1 and P2 for positions, but use
 
 Simplified approach: just emit all 3 edges as thick lines plus the filled triangle.
 """,
-    },
-    {
-        "description": "Wireframe from Adjacency",
-        "topology": "triangle_adjacency",
-        "prompt": f"""{GEOM_INTERFACE_DESC}
+  },
+  {
+    "description":
+    "Wireframe from Adjacency",
+    "topology":
+    "triangle_adjacency",
+    "prompt":
+    f"""{GEOM_INTERFACE_DESC}
 
 **Input primitive:** InputTrianglesAdjacency (6 vertices per invocation, array size 6)
 **Geometry:** A grid mesh with adjacency.
@@ -527,11 +566,14 @@ Simplified approach: just emit all 3 edges as thick lines plus the filled triang
 5. Emit EndPrimitive after each edge quad.
 6. OutputTriangleStrip, OutputVertices 12 (3 edges × 4 verts).
 """,
-    },
-    {
-        "description": "Flat-Shaded Triangles",
-        "topology": "triangle_adjacency",
-        "prompt": f"""{GEOM_INTERFACE_DESC}
+  },
+  {
+    "description":
+    "Flat-Shaded Triangles",
+    "topology":
+    "triangle_adjacency",
+    "prompt":
+    f"""{GEOM_INTERFACE_DESC}
 
 **Input primitive:** InputTrianglesAdjacency (6 vertices per invocation, array size 6)
 **Geometry:** A grid mesh with adjacency.
@@ -549,7 +591,7 @@ Simplified approach: just emit all 3 edges as thick lines plus the filled triang
 Compute cross product manually: (a×b) = (a.y*b.z-a.z*b.y, a.z*b.x-a.x*b.z, a.x*b.y-a.y*b.x).
 Use GLSL.std.450 Normalize(69), FMax(40) for the lighting math.
 """,
-    },
+  },
 ]
 
 # ---------------------------------------------------------------------------
@@ -560,9 +602,9 @@ structure = None
 
 
 def prepareSubpassPrompt(subPass: int) -> str:
-    if subPass >= len(SUBPASSES):
-        raise StopIteration
-    return SUBPASSES[subPass]["prompt"]
+  if subPass >= len(SUBPASSES):
+    raise StopIteration
+  return SUBPASSES[subPass]["prompt"]
 
 
 extraGradeAnswerRuns = []
@@ -572,213 +614,265 @@ _vert_spv = None
 _frag_spv = None
 _renderer = None
 _OUTPUT_IMAGE_CACHE: Dict[Tuple[int, str], str] = {}
+_GRADE_CACHE = GradeCache("test42")
+
+
+def _grade_cache_key_parts(subPass: int, aiEngineName: str, spirv_code: str) -> tuple:
+  return (
+    "test42-grade-v1",
+    f"model={aiEngineName}",
+    f"subpass={subPass}",
+    spirv_code,
+  )
+
+
+def _restore_cached_output_image(subPass: int, aiEngineName: str,
+                                 output_image: Optional[str]) -> None:
+  cache_key = (subPass, aiEngineName)
+  if output_image:
+    _OUTPUT_IMAGE_CACHE[cache_key] = output_image
+  else:
+    _OUTPUT_IMAGE_CACHE.pop(cache_key, None)
+
 
 def _get_fixed_shaders():
-    global _vert_spv, _frag_spv
-    if _vert_spv is None:
-        _vert_spv = assemble_spirv(VERT_SHADER_ASM)
-        _frag_spv = assemble_spirv(FRAG_SHADER_ASM)
-    return _vert_spv, _frag_spv
+  global _vert_spv, _frag_spv
+  if _vert_spv is None:
+    _vert_spv = assemble_spirv(VERT_SHADER_ASM)
+    _frag_spv = assemble_spirv(FRAG_SHADER_ASM)
+  return _vert_spv, _frag_spv
 
 
 def _get_renderer():
-    global _renderer
-    if _renderer is None:
-        from geometry_renderer import VulkanGeometryRenderer
-        _renderer = VulkanGeometryRenderer(512, 512)
-    return _renderer
+  global _renderer
+  if _renderer is None:
+    from geometry_renderer import VulkanGeometryRenderer
+    _renderer = VulkanGeometryRenderer(512, 512)
+  return _renderer
 
 
 def _get_geometry_data(topology):
-    """Get vertex/index data for the given topology."""
-    from geometry_renderer import (
-        generate_point_grid, generate_line_segments,
-        generate_sphere_triangles, generate_line_adjacency_curve,
-        generate_triangle_adjacency_mesh,
-    )
-    if topology == "points":
-        vb, vc = generate_point_grid(5, 5)
-        return vb, vc, None, 0
-    elif topology == "lines":
-        vb, vc = generate_line_segments(8)
-        return vb, vc, None, 0
-    elif topology == "triangles":
-        return generate_sphere_triangles()
-    elif topology == "line_adjacency":
-        vb, vc = generate_line_adjacency_curve(16)
-        return vb, vc, None, 0
-    elif topology == "triangle_adjacency":
-        return generate_triangle_adjacency_mesh()
-    raise ValueError(f"Unknown topology: {topology}")
+  """Get vertex/index data for the given topology."""
+  from geometry_renderer import (
+    generate_point_grid,
+    generate_line_segments,
+    generate_sphere_triangles,
+    generate_line_adjacency_curve,
+    generate_triangle_adjacency_mesh,
+  )
+  if topology == "points":
+    vb, vc = generate_point_grid(5, 5)
+    return vb, vc, None, 0
+  elif topology == "lines":
+    vb, vc = generate_line_segments(8)
+    return vb, vc, None, 0
+  elif topology == "triangles":
+    return generate_sphere_triangles()
+  elif topology == "line_adjacency":
+    vb, vc = generate_line_adjacency_curve(16)
+    return vb, vc, None, 0
+  elif topology == "triangle_adjacency":
+    return generate_triangle_adjacency_mesh()
+  raise ValueError(f"Unknown topology: {topology}")
 
 
 def _grade_answer_inner(result: dict, subPass: int, aiEngineName: str) -> tuple:
-    result = normalize_code_result(result, "spirv_code")
-    if not result:
-        return 0.0, "No result provided", {"error": "no_result"}
-    if "spirv_code" not in result:
-        return 0.0, "No SPIR-V code provided", {"error": "no_spirv_code"}
+  result = normalize_code_result(result, "spirv_code")
+  if not result:
+    return 0.0, "No result provided", {"error": "no_result"}
+  if "spirv_code" not in result:
+    return 0.0, "No SPIR-V code provided", {"error": "no_spirv_code"}
 
-    desc = SUBPASSES[subPass]["description"]
-    topology = SUBPASSES[subPass]["topology"]
-    geom_text = result["spirv_code"]
+  desc = SUBPASSES[subPass]["description"]
+  topology = SUBPASSES[subPass]["topology"]
+  geom_text = result["spirv_code"]
 
-    # Assemble geometry shader
-    try:
-        geom_spv = assemble_spirv(geom_text)
-    except RuntimeError as e:
-        return 0.0, f"[{desc}] SPIR-V assembly failed: {e}", {"error": str(e)}
+  # Assemble geometry shader
+  try:
+    geom_spv = assemble_spirv(geom_text)
+  except RuntimeError as e:
+    return 0.0, f"[{desc}] SPIR-V assembly failed: {e}", {"error": str(e)}
 
-    # Validate
-    valid, err = validate_spirv(geom_spv)
-    if not valid:
-        return 0.0, f"[{desc}] SPIR-V validation failed: {err[:300]}", {"error": err}
+  # Validate
+  valid, err = validate_spirv(geom_spv)
+  if not valid:
+    return 0.0, f"[{desc}] SPIR-V validation failed: {err[:300]}", {"error": err}
 
-    # Get fixed shaders
-    try:
-        vert_spv, frag_spv = _get_fixed_shaders()
-    except RuntimeError as e:
-        return 0.0, f"[{desc}] Fixed shader error: {e}", {"error": str(e)}
+  # Get fixed shaders
+  try:
+    vert_spv, frag_spv = _get_fixed_shaders()
+  except RuntimeError as e:
+    return 0.0, f"[{desc}] Fixed shader error: {e}", {"error": str(e)}
 
-    # Get geometry data
-    vb_data, vert_count, ib_data, idx_count = _get_geometry_data(topology)
+  # Get geometry data
+  vb_data, vert_count, ib_data, idx_count = _get_geometry_data(topology)
 
-    # Render
-    try:
-        renderer = _get_renderer()
-        pixels = renderer.render(
-            vert_spv, geom_spv, frag_spv,
-            vb_data, vert_count, topology,
-            ib_data, idx_count,
-        )
-    except Exception as e:
-        return 0.0, f"[{desc}] Rendering failed: {e}", {"error": str(e)}
+  # Render
+  try:
+    renderer = _get_renderer()
+    pixels = renderer.render(
+      vert_spv,
+      geom_spv,
+      frag_spv,
+      vb_data,
+      vert_count,
+      topology,
+      ib_data,
+      idx_count,
+    )
+  except Exception as e:
+    return 0.0, f"[{desc}] Rendering failed: {e}", {"error": str(e)}
 
-    output_image = _save_rendered_image(42, subPass, aiEngineName, pixels)
+  output_image = _save_rendered_image(42, subPass, aiEngineName, pixels)
 
-    # Compare to reference
-    import numpy as np
-    reference = load_reference(42, subPass)
-    if reference is None:
-        save_reference(pixels, 42, subPass)
-        return 1.0, f"[{desc}] No reference - saved current render as reference", {
-            "output_image": output_image
-        }
+  # Compare to reference
+  import numpy as np
+  reference = load_reference(42, subPass)
+  if reference is None:
+    save_reference(pixels, 42, subPass)
+    return 1.0, f"[{desc}] No reference - saved current render as reference", {
+      "output_image": output_image
+    }
 
-    score, comparison = compare_images(pixels, reference, color_tolerance=2, spatial_tolerance=1)
-    return score, f"[{desc}] {comparison}", {"output_image": output_image}
+  score, comparison = compare_images(pixels, reference, color_tolerance=2, spatial_tolerance=1)
+  return score, f"[{desc}] {comparison}", {"output_image": output_image}
 
 
 def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
-    """Run grading in an isolated subprocess to survive GPU hangs/TDRs."""
-    result = normalize_code_result(result, "spirv_code")
-    if not result or "spirv_code" not in result:
-        return 0.0, "No SPIR-V code provided"
+  """Run grading in an isolated subprocess to survive GPU hangs/TDRs."""
+  result = normalize_code_result(result, "spirv_code")
+  if not result or "spirv_code" not in result:
+    return 0.0, "No SPIR-V code provided"
 
+  cache_parts = _grade_cache_key_parts(subPass, aiEngineName, result.get("spirv_code", ""))
+
+  def compute_grade_record() -> Dict:
     payload = {
-        "spirv_code": result.get("spirv_code", ""),
-        "subPass": subPass,
-        "aiEngineName": aiEngineName,
+      "spirv_code": result.get("spirv_code", ""),
+      "subPass": subPass,
+      "aiEngineName": aiEngineName,
     }
 
     with tempfile.TemporaryDirectory() as tmp_dir:
-        in_path = os.path.join(tmp_dir, "grade_input.json")
-        out_path = os.path.join(tmp_dir, "grade_output.json")
-        with open(in_path, "w", encoding="utf-8") as f:
-            json.dump(payload, f)
+      in_path = os.path.join(tmp_dir, "grade_input.json")
+      out_path = os.path.join(tmp_dir, "grade_output.json")
+      with open(in_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f)
 
-        cmd = [sys.executable, __file__, "--grade", in_path, out_path]
-        try:
-            subprocess.run(
-                cmd,
-                check=False,
-                timeout=TIMEOUT_SECONDS + 10,
-                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
-            )
-        except subprocess.TimeoutExpired:
-            return 0.0, "GPU execution timed out or hung (subprocess killed)"
-        except Exception as e:
-            return 0.0, f"Subprocess failed: {e}"
+      cmd = [sys.executable, __file__, "--grade", in_path, out_path]
+      try:
+        subprocess.run(
+          cmd,
+          check=False,
+          timeout=TIMEOUT_SECONDS + 10,
+          creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
+        )
+      except subprocess.TimeoutExpired:
+        return {
+          "score": 0.0,
+          "explanation": "GPU execution timed out or hung (subprocess killed)",
+          "output_image": "",
+        }
+      except Exception as e:
+        return {
+          "score": 0.0,
+          "explanation": f"Subprocess failed: {e}",
+          "output_image": "",
+        }
 
-        if not os.path.exists(out_path):
-            return 0.0, "Subprocess produced no result (crash or TDR)"
+      if not os.path.exists(out_path):
+        return {
+          "score": 0.0,
+          "explanation": "Subprocess produced no result (crash or TDR)",
+          "output_image": "",
+        }
 
-        try:
-            with open(out_path, "r", encoding="utf-8") as f:
-                out = json.load(f)
-            score = out.get("score", 0.0)
-            explanation = out.get("explanation", "No explanation")
-            details = out.get("details", {}) or {}
-            output_image = details.get("output_image")
-            if output_image:
-                _OUTPUT_IMAGE_CACHE[(subPass, aiEngineName)] = output_image
-            return score, explanation
-        except Exception as e:
-            return 0.0, f"Failed to read subprocess result: {e}"
+      try:
+        with open(out_path, "r", encoding="utf-8") as f:
+          out = json.load(f)
+        details = out.get("details", {}) or {}
+        return {
+          "score": out.get("score", 0.0),
+          "explanation": out.get("explanation", "No explanation"),
+          "output_image": details.get("output_image") or "",
+        }
+      except Exception as e:
+        return {
+          "score": 0.0,
+          "explanation": f"Failed to read subprocess result: {e}",
+          "output_image": "",
+        }
+
+  record = _GRADE_CACHE.get_or_compute_json("grade_record", compute_grade_record, *cache_parts)
+  _restore_cached_output_image(subPass, aiEngineName, record.get("output_image"))
+  return float(record.get("score", 0.0)), record.get("explanation", "No explanation")
 
 
 def _run_grade_subprocess(in_path: str, out_path: str) -> int:
+  try:
+    with open(in_path, "r", encoding="utf-8") as f:
+      payload = json.load(f)
+    result = {"spirv_code": payload.get("spirv_code", "")}
+    subPass = int(payload.get("subPass", 0))
+    aiEngineName = payload.get("aiEngineName", "")
+    score, explanation, details = _grade_answer_inner(result, subPass, aiEngineName)
+    with open(out_path, "w", encoding="utf-8") as f:
+      json.dump({"score": score, "explanation": explanation, "details": details}, f)
+    return 0
+  except Exception as e:
     try:
-        with open(in_path, "r", encoding="utf-8") as f:
-            payload = json.load(f)
-        result = {"spirv_code": payload.get("spirv_code", "")}
-        subPass = int(payload.get("subPass", 0))
-        aiEngineName = payload.get("aiEngineName", "")
-        score, explanation, details = _grade_answer_inner(result, subPass, aiEngineName)
-        with open(out_path, "w", encoding="utf-8") as f:
-            json.dump({"score": score, "explanation": explanation, "details": details}, f)
-        return 0
-    except Exception as e:
-        try:
-            with open(out_path, "w", encoding="utf-8") as f:
-                json.dump({"score": 0.0, "explanation": f"Subprocess error: {e}",
-                           "details": {"error": str(e)}}, f)
-        except Exception:
-            pass
-        return 1
-
-
-if __name__ == "__main__":
-    if len(sys.argv) >= 4 and sys.argv[1] == "--grade":
-        sys.exit(_run_grade_subprocess(sys.argv[2], sys.argv[3]))
+      with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(
+          {
+            "score": 0.0,
+            "explanation": f"Subprocess error: {e}",
+            "details": {
+              "error": str(e)
+            }
+          }, f)
+    except Exception:
+      pass
+    return 1
 
 
 def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
-    result = normalize_code_result(result, "spirv_code")
-    if not result:
-        return "<p style='color:red'>No result provided</p>"
-    desc = SUBPASSES[subPass]["description"]
-    topo = SUBPASSES[subPass]["topology"]
-    html = f"<h4>Geometry Shader - {desc} ({topo})</h4>"
-    if "reasoning" in result:
-        r = result['reasoning'][:400] + ('...' if len(result.get('reasoning', '')) > 400 else '')
-        html += f"<p><strong>Approach:</strong> {r}</p>"
-    if "spirv_code" in result:
-        code = result["spirv_code"].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        html += f"<details><summary>View SPIR-V ({len(result['spirv_code'])} chars)</summary><pre>{code}</pre></details>"
-    html += image_pair_html(
-        _OUTPUT_IMAGE_CACHE.get((subPass, aiEngineName), ""),
-        str(get_reference_path(42, subPass))
-    )
-    return html
+  result = normalize_code_result(result, "spirv_code")
+  if not result:
+    return "<p style='color:red'>No result provided</p>"
+  desc = SUBPASSES[subPass]["description"]
+  topo = SUBPASSES[subPass]["topology"]
+  html = f"<h4>Geometry Shader - {desc} ({topo})</h4>"
+  if "reasoning" in result:
+    r = result['reasoning'][:400] + ('...' if len(result.get('reasoning', '')) > 400 else '')
+    html += f"<p><strong>Approach:</strong> {r}</p>"
+  if "spirv_code" in result:
+    code = result["spirv_code"].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    html += f"<details><summary>View SPIR-V ({len(result['spirv_code'])} chars)</summary><pre>{code}</pre></details>"
+  html += image_pair_html(_OUTPUT_IMAGE_CACHE.get((subPass, aiEngineName), ""),
+                          str(get_reference_path(42, subPass)))
+  return html
 
 
 def resultToImage(result: dict, subPass: int, aiEngineName: str) -> str:
-    return _OUTPUT_IMAGE_CACHE.get((subPass, aiEngineName), "")
+  return _OUTPUT_IMAGE_CACHE.get((subPass, aiEngineName), "")
 
 
 def getReferenceImage(subPass: int, aiEngineName: str) -> str:
-    return str(get_reference_path(42, subPass))
+  return str(get_reference_path(42, subPass))
 
 
 def _save_rendered_image(test_num: int, subPass: int, aiEngineName: str, pixels) -> str:
-    base_dir = os.path.dirname(__file__)
-    out_dir = os.path.join(base_dir, "results", "models", aiEngineName, "renders")
-    os.makedirs(out_dir, exist_ok=True)
-    out_path = os.path.join(out_dir, f"test{test_num}_subpass_{subPass:02d}.png")
-    Image.fromarray(pixels, "RGBA").save(out_path)
-    return out_path
+  base_dir = os.path.dirname(__file__)
+  out_dir = os.path.join(base_dir, "results", "models", aiEngineName, "renders")
+  os.makedirs(out_dir, exist_ok=True)
+  out_path = os.path.join(out_dir, f"test{test_num}_subpass_{subPass:02d}.png")
+  Image.fromarray(pixels, "RGBA").save(out_path)
+  return out_path
 
+
+if __name__ == "__main__":
+  if len(sys.argv) >= 4 and sys.argv[1] == "--grade":
+    sys.exit(_run_grade_subprocess(sys.argv[2], sys.argv[3]))
 
 highLevelSummary = """
 <p>Write GPU geometry shaders in raw SPIR-V assembly. Geometry shaders receive

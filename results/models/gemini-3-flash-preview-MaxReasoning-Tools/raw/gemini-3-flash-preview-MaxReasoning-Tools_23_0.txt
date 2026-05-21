@@ -1,0 +1,201 @@
+use std::io::{self, BufRead, Write};
+use std::thread;
+use std::time::{Duration, Instant};
+use std::sync::{mpsc, Arc, Mutex};
+
+#[derive(Clone, Copy)]
+struct State {
+    x: f64,
+    y: f64,
+    vx: f64,
+    vy: f64,
+    angle: f64,
+    angular_vel: f64,
+    _fuel: f64,
+}
+
+struct MapInfo {
+    width: usize,
+    height: usize,
+    gravity: f64,
+    max_thrust: f64,
+    target_x: f64,
+    target_y: f64,
+    ground_profile: Arc<Mutex<Vec<f64>>>,
+}
+
+enum ControlMsg {
+    Map(MapInfo),
+    Update(State),
+}
+
+fn main() {
+    let (tx, rx) = mpsc::channel();
+
+    // Reader Thread: Parses initial parameters, map, and continuous state updates.
+    thread::spawn(move || {
+        let stdin = io::stdin();
+        let mut reader = io::BufReader::with_capacity(1024 * 1024, stdin.lock());
+        let mut line = String::new();
+
+        // Line 1: width height gravity max_thrust fuel
+        if reader.read_line(&mut line).is_err() { return; }
+        let params: Vec<f64> = line.split_whitespace().filter_map(|s| s.parse().ok()).collect();
+        if params.len() < 5 { return; }
+        let width = params[0] as usize;
+        let height = params[1] as usize;
+        let gravity = params[2];
+        let max_thrust = params[3];
+        
+        line.clear();
+        // Line 2: start_x start_y target_x target_y
+        if reader.read_line(&mut line).is_err() { return; }
+        let coords: Vec<f64> = line.split_whitespace().filter_map(|s| s.parse().ok()).collect();
+        if coords.len() < 4 { return; }
+        let target_x = coords[2];
+        let target_y = coords[3];
+
+        let ground_profile = Arc::new(Mutex::new(vec![height as f64; width]));
+        
+        // Notify the main thread about the map parameters.
+        tx.send(ControlMsg::Map(MapInfo {
+            width, height, gravity, max_thrust, target_x, target_y,
+            ground_profile: ground_profile.clone(),
+        })).ok();
+
+        // Read the map row by row to build a ground profile for obstacle avoidance.
+        let mut buf = Vec::with_capacity(width + 2);
+        for y in 0..height {
+            buf.clear();
+            if reader.read_until(b'\n', &mut buf).is_err() { break; }
+            
+            // Lock briefly to update the profile for this row.
+            {
+                let mut profile = ground_profile.lock().unwrap();
+                for (x, &b) in buf.iter().enumerate() {
+                    if x < width && (b == b'#' || b == b'T' || b == b'L') {
+                        if (y as f64) < profile[x] {
+                            profile[x] = y as f64;
+                        }
+                    }
+                }
+            }
+        }
+
+        // After the map, read continuous state updates.
+        loop {
+            line.clear();
+            if reader.read_line(&mut line).is_err() || line.is_empty() { break; }
+            let s: Vec<f64> = line.split_whitespace().filter_map(|v| v.parse().ok()).collect();
+            if s.len() >= 7 {
+                tx.send(ControlMsg::Update(State {
+                    x: s[0], y: s[1], vx: s[2], vy: s[3],
+                    angle: s[4], angular_vel: s[5], _fuel: s[6],
+                })).ok();
+            }
+        }
+    });
+
+    let mut map_info: Option<MapInfo> = None;
+    let mut last_state: Option<State> = None;
+    let mut stdout = io::stdout().lock();
+    let interval = Duration::from_millis(50); // 20Hz output requirement
+    
+    loop {
+        let loop_start = Instant::now();
+        
+        // Wait for map info to initialize.
+        if map_info.is_none() {
+            match rx.recv_timeout(Duration::from_secs(5)) {
+                Ok(ControlMsg::Map(info)) => map_info = Some(info),
+                _ => continue,
+            }
+        }
+
+        // Collect any new updates.
+        while let Ok(msg) = rx.try_recv() {
+            match msg {
+                ControlMsg::Update(s) => last_state = Some(s),
+                ControlMsg::Map(info) => map_info = Some(info),
+            }
+        }
+
+        if let (Some(info), Some(s)) = (&map_info, &last_state) {
+            let dx = info.target_x - s.x;
+            let dy = info.target_y - s.y;
+            
+            // 1. Horizontal Control
+            // Aim for a target horizontal velocity proportional to distance.
+            let target_vx = (dx * 0.8).clamp(-15.0, 15.0);
+            let desired_ax = (target_vx - s.vx) * 1.5;
+            
+            // 2. Vertical Control & Obstacle Avoidance
+            let mut highest_y = info.height as f64;
+            {
+                // Sample ground profile to find the highest point between current position and target.
+                let profile = info.ground_profile.lock().unwrap();
+                let x_min = s.x.min(info.target_x);
+                let x_max = s.x.max(info.target_x);
+                let x1 = (x_min - 2.0).max(0.0) as usize;
+                let x2 = (x_max + 2.0).min(info.width as f64 - 1.0) as usize;
+                
+                let step = ((x2 - x1) / 50).max(1);
+                for i in (x1..=x2).step_by(step) {
+                    if profile[i] < highest_y {
+                        highest_y = profile[i];
+                    }
+                }
+            }
+            
+            // Safe target altitude is above the highest obstacle in the path.
+            let mut hover_y = (highest_y - 20.0).min(info.target_y);
+            if dx.abs() < 5.0 {
+                hover_y = info.target_y;
+            }
+            
+            let mut target_vy = ((hover_y - s.y) * 0.5).clamp(-8.0, 8.0);
+            
+            // 3. Landing Mode
+            // Prioritize vertical alignment and soft descent when near the target pad.
+            let mut landing_mode = false;
+            if dx.abs() < 2.0 && dy.abs() < 15.0 {
+                landing_mode = true;
+                target_vy = (dy * 0.5).clamp(-2.0, 1.2); // Soft descent speed
+            }
+            
+            // Vertical acceleration needed to reach target_vy.
+            let desired_ay = (target_vy - s.vy) * 2.0;
+            
+            // Force vector: f_x is horizontal, f_y is upward force to counter gravity.
+            let f_x = desired_ax;
+            let mut f_y = info.gravity - desired_ay;
+            
+            // Ensure we don't try to thrust downwards (flip over).
+            if f_y < 0.1 { f_y = 0.1; }
+            
+            // Calculate required angle and thrust.
+            let mut target_angle = f_x.atan2(f_y);
+            if landing_mode {
+                target_angle = target_angle.clamp(-0.2, 0.2); // Stay upright
+            } else {
+                target_angle = target_angle.clamp(-1.0, 1.0);
+            }
+            
+            let thrust_needed = (f_x*f_x + f_y*f_y).sqrt();
+            let thrust = (thrust_needed / info.max_thrust).clamp(0.0, 1.0);
+            
+            // PD control for angular velocity.
+            let turn = ((target_angle - s.angle) * 8.0 - s.angular_vel * 1.2).clamp(-1.0, 1.0);
+            
+            // Output command.
+            if let Err(_) = writeln!(stdout, "{:.3} {:.3}", thrust, turn) { break; }
+            if let Err(_) = stdout.flush() { break; }
+        }
+
+        // Maintain frequency of at least 20Hz.
+        let elapsed = loop_start.elapsed();
+        if elapsed < interval {
+            thread::sleep(interval - elapsed);
+        }
+    }
+}

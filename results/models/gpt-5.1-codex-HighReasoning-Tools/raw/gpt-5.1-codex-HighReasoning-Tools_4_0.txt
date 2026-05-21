@@ -1,1 +1,528 @@
-{'__exception__': "Can't run here - we're trying to get this working in codex."}
+Below is a single-file C++20 program that (1) builds a convex hull from the supplied container vertices, (2) derives half-space constraints so any placement check becomes a fast plane-evaluation, (3) generates tetrahedron orientations ahead of time, (4) fills the container via an adaptive lattice plus jittered sampling so it scales from tiny to huge volumes without blowing past the time budget, and (5) guards overlaps with a spatial hash using each tetrahedron’s circumradius. The solver stops early if either the estimated packing bound is reached or the 30‑second window is in danger.
+
+```cpp
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <iomanip>
+#include <iostream>
+#include <limits>
+#include <random>
+#include <unordered_map>
+#include <vector>
+
+struct Vec3 {
+    double x{}, y{}, z{};
+    Vec3 operator+(const Vec3& o) const { return {x + o.x, y + o.y, z + o.z}; }
+    Vec3 operator-(const Vec3& o) const { return {x - o.x, y - o.y, z - o.z}; }
+    Vec3 operator*(double s) const { return {x * s, y * s, z * s}; }
+};
+
+static inline double dot(const Vec3& a, const Vec3& b) {
+    return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+
+static inline Vec3 cross(const Vec3& a, const Vec3& b) {
+    return {a.y * b.z - a.z * b.y,
+            a.z * b.x - a.x * b.z,
+            a.x * b.y - a.y * b.x};
+}
+
+static inline double length(const Vec3& v) { return std::sqrt(dot(v, v)); }
+
+static inline Vec3 normalize(const Vec3& v) {
+    double len = length(v);
+    if (len < 1e-12) return {0, 0, 0};
+    return v * (1.0 / len);
+}
+
+struct Plane {
+    Vec3 normal;
+    double offset{};
+};
+
+struct Hull {
+    std::vector<Plane> planes;
+    Vec3 minCorner{0, 0, 0};
+    Vec3 maxCorner{0, 0, 0};
+    double volume{0};
+    double insideEps{1e-7};
+    bool valid{false};
+
+    bool contains(const Vec3& p) const {
+        if (planes.empty()) return false;
+        for (const auto& plane : planes) {
+            if (dot(plane.normal, p) - plane.offset > insideEps) {
+                return false;
+            }
+        }
+        return true;
+    }
+};
+
+struct Face {
+    int a{}, b{}, c{};
+    Vec3 normal{};
+    double offset{};
+    bool deleted{false};
+};
+
+static Vec3 rotateXYZ(const Vec3& v, double rx, double ry, double rz) {
+    double cx = std::cos(rx), sx = std::sin(rx);
+    double cy = std::cos(ry), sy = std::sin(ry);
+    double cz = std::cos(rz), sz = std::sin(rz);
+    Vec3 r = v;
+    double ty = cx * r.y - sx * r.z;
+    double tz = sx * r.y + cx * r.z;
+    r.y = ty;
+    r.z = tz;
+    double tx = cy * r.x + sy * r.z;
+    tz = -sy * r.x + cy * r.z;
+    r.x = tx;
+    r.z = tz;
+    tx = cz * r.x - sz * r.y;
+    ty = sz * r.x + cz * r.y;
+    r.x = tx;
+    r.y = ty;
+    return r;
+}
+
+static Hull buildAxisAlignedHull(const std::vector<Vec3>& pts) {
+    Hull h;
+    if (pts.empty()) return h;
+    Vec3 mn = pts[0], mx = pts[0];
+    for (const auto& p : pts) {
+        mn.x = std::min(mn.x, p.x); mn.y = std::min(mn.y, p.y); mn.z = std::min(mn.z, p.z);
+        mx.x = std::max(mx.x, p.x); mx.y = std::max(mx.y, p.y); mx.z = std::max(mx.z, p.z);
+    }
+    Vec3 dims = mx - mn;
+    double vol = dims.x * dims.y * dims.z;
+    if (vol <= 0.0) return h;
+    h.minCorner = mn;
+    h.maxCorner = mx;
+    h.volume = vol;
+    h.insideEps = std::max(1e-8, length(dims) * 1e-6 + 1e-9);
+    h.planes = {
+        {{ 1, 0, 0}, mx.x}, {{-1, 0, 0}, -mn.x},
+        {{0,  1, 0}, mx.y}, {{ 0,-1, 0}, -mn.y},
+        {{0,  0, 1}, mx.z}, {{ 0, 0,-1}, -mn.z}
+    };
+    h.valid = true;
+    return h;
+}
+
+static Hull buildConvexHull(const std::vector<Vec3>& pts) {
+    Hull hull;
+    const int n = static_cast<int>(pts.size());
+    if (n < 4) return hull;
+
+    Vec3 mn = pts[0], mx = pts[0], interior{0, 0, 0};
+    for (const auto& p : pts) {
+        interior = interior + p;
+        mn.x = std::min(mn.x, p.x); mn.y = std::min(mn.y, p.y); mn.z = std::min(mn.z, p.z);
+        mx.x = std::max(mx.x, p.x); mx.y = std::max(mx.y, p.y); mx.z = std::max(mx.z, p.z);
+    }
+    interior = interior * (1.0 / n);
+    Vec3 dims = mx - mn;
+    double diag = length(dims);
+    double eps = std::max(1e-9, diag * 1e-9);
+
+    int i0 = 0;
+    for (int i = 1; i < n; ++i) if (pts[i].x < pts[i0].x) i0 = i;
+
+    int i1 = -1;
+    double best = -1;
+    for (int i = 0; i < n; ++i) {
+        if (i == i0) continue;
+        double dist = dot(pts[i] - pts[i0], pts[i] - pts[i0]);
+        if (dist > best) { best = dist; i1 = i; }
+    }
+    if (i1 < 0 || best < eps) return hull;
+
+    int i2 = -1;
+    best = -1;
+    Vec3 baseVec = pts[i1] - pts[i0];
+    for (int i = 0; i < n; ++i) {
+        if (i == i0 || i == i1) continue;
+        Vec3 diff = pts[i] - pts[i0];
+        double area = length(cross(baseVec, diff));
+        if (area > best) { best = area; i2 = i; }
+    }
+    if (i2 < 0 || best < eps) return hull;
+
+    Vec3 normal = cross(pts[i1] - pts[i0], pts[i2] - pts[i0]);
+    double normalLen = length(normal);
+    if (normalLen < eps) return hull;
+
+    int i3 = -1;
+    best = -1;
+    Vec3 normDir = normal * (1.0 / normalLen);
+    for (int i = 0; i < n; ++i) {
+        if (i == i0 || i == i1 || i == i2) continue;
+        double height = std::fabs(dot(pts[i] - pts[i0], normDir));
+        if (height > best) { best = height; i3 = i; }
+    }
+    if (i3 < 0 || best < eps) return hull;
+
+    std::vector<Face> faces;
+    faces.reserve(n * 4);
+
+    auto makeFace = [&](int a, int b, int c) -> bool {
+        Vec3 pa = pts[a], pb = pts[b], pc = pts[c];
+        Vec3 nrm = cross(pb - pa, pc - pa);
+        double len = length(nrm);
+        if (len < eps) return false;
+        nrm = nrm * (1.0 / len);
+        double off = dot(nrm, pa);
+        if (dot(nrm, interior - pa) > 0) {
+            std::swap(b, c);
+            pb = pts[b]; pc = pts[c];
+            nrm = cross(pb - pa, pc - pa);
+            len = length(nrm);
+            if (len < eps) return false;
+            nrm = nrm * (1.0 / len);
+            off = dot(nrm, pa);
+        }
+        faces.push_back(Face{a, b, c, nrm, off, false});
+        return true;
+    };
+
+    makeFace(i0, i1, i2);
+    makeFace(i0, i3, i1);
+    makeFace(i0, i2, i3);
+    makeFace(i1, i3, i2);
+
+    auto addPoint = [&](int idx) {
+        std::vector<int> visible;
+        visible.reserve(16);
+        for (int fi = 0; fi < static_cast<int>(faces.size()); ++fi) {
+            if (faces[fi].deleted) continue;
+            double dist = dot(faces[fi].normal, pts[idx]) - faces[fi].offset;
+            if (dist > eps) visible.push_back(fi);
+        }
+        if (visible.empty()) return;
+
+        struct EdgeInfo { int start = 0; int end = 0; int count = 0; };
+        std::unordered_map<uint64_t, EdgeInfo> edgeMap;
+        edgeMap.reserve(visible.size() * 3);
+
+        auto addEdge = [&](int u, int v) {
+            int uu = std::min(u, v);
+            int vv = std::max(u, v);
+            uint64_t key = (static_cast<uint64_t>(uu) << 32) | static_cast<uint64_t>(vv);
+            EdgeInfo& info = edgeMap[key];
+            info.count++;
+            if (info.count == 1) { info.start = u; info.end = v; }
+        };
+
+        for (int fi : visible) {
+            Face& face = faces[fi];
+            face.deleted = true;
+            addEdge(face.a, face.b);
+            addEdge(face.b, face.c);
+            addEdge(face.c, face.a);
+        }
+
+        for (const auto& kv : edgeMap) {
+            if (kv.second.count != 1) continue;
+            makeFace(kv.second.start, kv.second.end, idx);
+        }
+    };
+
+    for (int i = 0; i < n; ++i) {
+        if (i == i0 || i == i1 || i == i2 || i == i3) continue;
+        addPoint(i);
+    }
+
+    std::vector<Plane> planes;
+    planes.reserve(faces.size());
+    double vol = 0.0;
+    for (const auto& face : faces) {
+        if (face.deleted) continue;
+        planes.push_back({face.normal, face.offset});
+        const Vec3& a = pts[face.a];
+        const Vec3& b = pts[face.b];
+        const Vec3& c = pts[face.c];
+        vol += dot(a, cross(b, c));
+    }
+    vol = std::fabs(vol) / 6.0;
+
+    if (planes.size() < 4 || vol <= 0.0) return hull;
+
+    hull.planes = std::move(planes);
+    hull.minCorner = mn;
+    hull.maxCorner = mx;
+    hull.volume = vol;
+    hull.insideEps = std::max(1e-8, diag * 1e-7 + 1e-9);
+    hull.valid = true;
+    return hull;
+}
+
+struct Orientation {
+    double rx{}, ry{}, rz{};
+    std::array<Vec3, 4> verts{};
+};
+
+static std::vector<Orientation> buildOrientations(double edge) {
+    constexpr double PI = 3.14159265358979323846;
+    double scale = edge / (2.0 * std::sqrt(2.0));
+    std::array<Vec3, 4> base = {
+        Vec3{ 1,  1,  1}, Vec3{ 1, -1, -1},
+        Vec3{-1,  1, -1}, Vec3{-1, -1,  1}
+    };
+    for (auto& v : base) v = v * scale;
+
+    std::vector<std::array<double, 3>> angles = {
+        {0, 0, 0}, {0, 0, PI / 2}, {0, 0, PI}, {0, 0, 3 * PI / 2},
+        {PI / 2, 0, 0}, {3 * PI / 2, 0, 0}, {0, PI / 2, 0}, {0, 3 * PI / 2, 0},
+        {PI / 2, PI / 2, 0}, {PI / 2, 0, PI / 2}, {0, PI / 2, PI / 2}, {PI / 2, PI / 2, PI / 2},
+        {PI / 4, 0, 0}, {0, PI / 4, 0}, {0, 0, PI / 4},
+        {PI / 3, 0, PI / 3}, {0, PI / 3, PI / 3}, {PI / 3, PI / 3, 0},
+        {2 * PI / 3, 0, 0}, {0, 2 * PI / 3, 0}
+    };
+
+    std::vector<Orientation> result;
+    result.reserve(angles.size());
+    for (const auto& ang : angles) {
+        Orientation o;
+        o.rx = ang[0]; o.ry = ang[1]; o.rz = ang[2];
+        for (int i = 0; i < 4; ++i) {
+            o.verts[i] = rotateXYZ(base[i], o.rx, o.ry, o.rz);
+        }
+        result.push_back(o);
+    }
+    return result;
+}
+
+static double deterministicShift(int ix, int iy, int iz, int axis) {
+    uint32_t h = 2166136261u;
+    h ^= static_cast<uint32_t>(ix * 73856093u + axis * 0x9e3779b9u);
+    h *= 16777619u;
+    h ^= static_cast<uint32_t>(iy * 19349663u + axis * 0x85ebca6bu);
+    h *= 16777619u;
+    h ^= static_cast<uint32_t>(iz * 83492791u + axis * 0xc2b2ae35u);
+    h *= 16777619u;
+    double frac = (h & 0xffffu) / 65535.0;
+    return (frac - 0.5) * 0.12;
+}
+
+static double coordinateFromRatio(double minVal, double maxVal, int count, int idx, double shift) {
+    if (count <= 0) return (minVal + maxVal) * 0.5;
+    double extent = maxVal - minVal;
+    if (extent < 1e-9) return minVal;
+    double t = (static_cast<double>(idx) + 0.5) / count;
+    t += shift;
+    const double margin = 1e-4;
+    if (t < margin) t = margin;
+    if (t > 1.0 - margin) t = 1.0 - margin;
+    return minVal + extent * t;
+}
+
+struct Placement {
+    Vec3 center;
+    double rx{}, ry{}, rz{};
+};
+
+struct SpatialHash {
+    struct CellKey {
+        int64_t ix{}, iy{}, iz{};
+        bool operator==(const CellKey& o) const noexcept {
+            return ix == o.ix && iy == o.iy && iz == o.iz;
+        }
+    };
+    struct CellHash {
+        std::size_t operator()(const CellKey& key) const noexcept {
+            std::size_t h = static_cast<std::size_t>(key.ix * 73856093LL);
+            h ^= static_cast<std::size_t>(key.iy * 19349663LL) << 1;
+            h ^= static_cast<std::size_t>(key.iz * 83492791LL) << 2;
+            return h;
+        }
+    };
+    double cellSize;
+    Vec3 origin;
+    std::unordered_map<CellKey, std::vector<int>, CellHash> cells;
+
+    SpatialHash(double size, const Vec3& o) : cellSize(size), origin(o) {
+        cells.reserve(4096);
+    }
+
+    CellKey keyFromPoint(const Vec3& p) const {
+        return CellKey{
+            static_cast<int64_t>(std::floor((p.x - origin.x) / cellSize)),
+            static_cast<int64_t>(std::floor((p.y - origin.y) / cellSize)),
+            static_cast<int64_t>(std::floor((p.z - origin.z) / cellSize))
+        };
+    }
+
+    bool violates(const Vec3& point, double minDistSq, const std::vector<Placement>& placements) const {
+        CellKey base = keyFromPoint(point);
+        for (int dx = -1; dx <= 1; ++dx) {
+            for (int dy = -1; dy <= 1; ++dy) {
+                for (int dz = -1; dz <= 1; ++dz) {
+                    CellKey neigh{base.ix + dx, base.iy + dy, base.iz + dz};
+                    auto it = cells.find(neigh);
+                    if (it == cells.end()) continue;
+                    for (int idx : it->second) {
+                        const Vec3& other = placements[idx].center;
+                        Vec3 diff = {other.x - point.x, other.y - point.y, other.z - point.z};
+                        if (dot(diff, diff) < minDistSq) return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    void insert(const Vec3& point, int index) {
+        cells[keyFromPoint(point)].push_back(index);
+    }
+};
+
+static bool tryPlace(const Vec3& center,
+                     std::size_t orientationSeed,
+                     const Hull& hull,
+                     const std::vector<Orientation>& orientations,
+                     double minDistSq,
+                     std::vector<Placement>& placements,
+                     SpatialHash& grid) {
+    if (!hull.contains(center)) return false;
+    const std::size_t oriCount = orientations.size();
+    const std::size_t attempts = std::min<std::size_t>(oriCount, oriCount);
+    for (std::size_t t = 0; t < attempts; ++t) {
+        const Orientation& orient = orientations[(orientationSeed + t) % oriCount];
+        bool inside = true;
+        for (const auto& v : orient.verts) {
+            if (!hull.contains(center + v)) {
+                inside = false;
+                break;
+            }
+        }
+        if (!inside) continue;
+        if (grid.violates(center, minDistSq, placements)) continue;
+        Placement placed{center, orient.rx, orient.ry, orient.rz};
+        placements.push_back(placed);
+        grid.insert(center, static_cast<int>(placements.size() - 1));
+        return true;
+    }
+    return false;
+}
+
+int main() {
+    std::ios::sync_with_stdio(false);
+    std::cin.tie(nullptr);
+
+    int vertexCount = 0;
+    double edgeLength = 1.0;
+    if (!(std::cin >> vertexCount >> edgeLength)) {
+        std::cout << "0\n";
+        return 0;
+    }
+    std::vector<Vec3> vertices(vertexCount);
+    for (int i = 0; i < vertexCount; ++i) {
+        std::cin >> vertices[i].x >> vertices[i].y >> vertices[i].z;
+    }
+    if (edgeLength <= 1e-9 || vertices.size() < 4) {
+        std::cout << "0\n";
+        return 0;
+    }
+
+    auto startTime = std::chrono::steady_clock::now();
+    auto timeExceeded = [&]() {
+        auto now = std::chrono::steady_clock::now();
+        return std::chrono::duration<double>(now - startTime).count() > 28.5;
+    };
+
+    Hull hull = buildConvexHull(vertices);
+    if (!hull.valid) hull = buildAxisAlignedHull(vertices);
+    if (!hull.valid || hull.volume <= 1e-9) {
+        std::cout << "0\n";
+        return 0;
+    }
+
+    const double tetraVolume = edgeLength * edgeLength * edgeLength / (6.0 * std::sqrt(2.0));
+    if (tetraVolume <= 0.0) {
+        std::cout << "0\n";
+        return 0;
+    }
+
+    std::vector<Orientation> orientations = buildOrientations(edgeLength);
+    if (orientations.empty()) {
+        std::cout << "0\n";
+        return 0;
+    }
+
+    const double circumradius = edgeLength * std::sqrt(3.0 / 8.0);
+    const double minCenterDist = 2.0 * circumradius + 1e-6;
+    const double minDistSq = minCenterDist * minCenterDist;
+
+    Vec3 dims = hull.maxCorner - hull.minCorner;
+    double baseSpacing = std::max(minCenterDist * 0.95, edgeLength * 0.5);
+    std::size_t maxGridSamples = 350000;
+    double spacingScale = 1.0;
+    auto countForAxis = [&](double extent) -> int {
+        if (extent < 1e-6) return 1;
+        double span = baseSpacing * spacingScale;
+        return std::max(1, static_cast<int>(std::ceil(extent / span)));
+    };
+
+    int nx = 1, ny = 1, nz = 1;
+    while (true) {
+        nx = countForAxis(dims.x);
+        ny = countForAxis(dims.y);
+        nz = countForAxis(dims.z);
+        long double product = static_cast<long double>(nx) * ny * nz;
+        if (product <= static_cast<long double>(maxGridSamples) || spacingScale > 1e5) break;
+        spacingScale *= 1.4;
+    }
+
+    SpatialHash grid(minCenterDist, hull.minCorner);
+    std::vector<Placement> placements;
+    placements.reserve(20000);
+
+    for (int iz = 0; iz < nz && !timeExceeded(); ++iz) {
+        double shiftZ = (nz > 1) ? (((iz & 1) ? 0.05 : -0.05) + deterministicShift(0, 0, iz, 2)) : 0.0;
+        double cz = coordinateFromRatio(hull.minCorner.z, hull.maxCorner.z, nz, iz, shiftZ);
+        for (int iy = 0; iy < ny && !timeExceeded(); ++iy) {
+            double shiftY = (ny > 1) ? ((((iy + iz) & 1) ? 0.08 : -0.08) + deterministicShift(0, iy, iz, 1)) : 0.0;
+            double cy = coordinateFromRatio(hull.minCorner.y, hull.maxCorner.y, ny, iy, shiftY);
+            for (int ix = 0; ix < nx && !timeExceeded(); ++ix) {
+                double shiftX = (nx > 1) ? ((((ix + iy + iz) & 1) ? 0.08 : -0.08) + deterministicShift(ix, iy, iz, 0)) : 0.0;
+                double cx = coordinateFromRatio(hull.minCorner.x, hull.maxCorner.x, nx, ix, shiftX);
+                Vec3 center{cx, cy, cz};
+                std::size_t orientSeed = (static_cast<std::size_t>(ix) * 73856093u) ^
+                                         (static_cast<std::size_t>(iy) * 19349663u) ^
+                                         (static_cast<std::size_t>(iz) * 83492791u);
+                tryPlace(center, orientSeed % orientations.size(), hull, orientations, minDistSq, placements, grid);
+            }
+        }
+    }
+
+    double approxMaxDouble = hull.volume / tetraVolume;
+    std::size_t approxMax = approxMaxDouble > 1e12 ? static_cast<std::size_t>(1e12) : static_cast<std::size_t>(approxMaxDouble);
+    std::size_t randomTrials = std::min<std::size_t>(500000, approxMax * 3 + 20000);
+
+    std::mt19937_64 rng(std::random_device{}());
+    std::uniform_real_distribution<double> distX(hull.minCorner.x, hull.maxCorner.x);
+    std::uniform_real_distribution<double> distY(hull.minCorner.y, hull.maxCorner.y);
+    std::uniform_real_distribution<double> distZ(hull.minCorner.z, hull.maxCorner.z);
+    std::uniform_int_distribution<std::size_t> orientDist(0, orientations.size() - 1);
+
+    for (std::size_t attempt = 0; attempt < randomTrials && !timeExceeded(); ++attempt) {
+        Vec3 center{distX(rng), distY(rng), distZ(rng)};
+        std::size_t seed = orientDist(rng);
+        tryPlace(center, seed, hull, orientations, minDistSq, placements, grid);
+    }
+
+    std::cout << placements.size() << "\n";
+    std::cout << std::fixed << std::setprecision(6);
+    for (const auto& p : placements) {
+        std::cout << p.center.x << " " << p.center.y << " " << p.center.z << " "
+                  << p.rx << " " << p.ry << " " << p.rz << "\n";
+    }
+    return 0;
+}
+```
+
+This implementation stays within the standard library supported by MSVC 19.50, adapts its sampling density so it won’t blow up on giant volumes, and enforces both hull containment and non-overlap constraints for every tetrahedron it emits.

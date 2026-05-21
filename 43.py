@@ -36,12 +36,9 @@ import tempfile
 from typing import Tuple, Optional, Dict
 from PIL import Image
 
-from solver_utils import normalize_code_result
-from shader_test_utils import (
-    ShaderRenderer, compile_hlsl, validate_spirv,
-    compare_images, load_reference, save_reference, get_reference_path,
-    image_pair_html
-)
+from solver_utils import normalize_code_result, GradeCache
+from shader_test_utils import (ShaderRenderer, compile_hlsl, validate_spirv, compare_images,
+                               load_reference, save_reference, get_reference_path, image_pair_html)
 
 title = "Fragment Shaders (HLSL)"
 
@@ -56,13 +53,33 @@ TIMEOUT_SECONDS = 60
 
 _renderer_instance: Optional[ShaderRenderer] = None
 _OUTPUT_IMAGE_CACHE: Dict[Tuple[int, str], str] = {}
+_GRADE_CACHE = GradeCache("test43")
+
+
+def _grade_cache_key_parts(subPass: int, aiEngineName: str, shader_code: str) -> tuple:
+  return (
+    "test43-grade-v1",
+    f"model={aiEngineName}",
+    f"subpass={subPass}",
+    shader_code,
+  )
+
+
+def _restore_cached_output_image(subPass: int, aiEngineName: str,
+                                 output_image: Optional[str]) -> None:
+  cache_key = (subPass, aiEngineName)
+  if output_image:
+    _OUTPUT_IMAGE_CACHE[cache_key] = output_image
+  else:
+    _OUTPUT_IMAGE_CACHE.pop(cache_key, None)
 
 
 def _get_renderer() -> ShaderRenderer:
-    global _renderer_instance
-    if _renderer_instance is None:
-        _renderer_instance = ShaderRenderer(512, 512)
-    return _renderer_instance
+  global _renderer_instance
+  if _renderer_instance is None:
+    _renderer_instance = ShaderRenderer(512, 512)
+  return _renderer_instance
+
 
 # ---------------------------------------------------------------------------
 # Common HLSL interface description for prompts
@@ -118,146 +135,186 @@ outside the shader source.
 # ---------------------------------------------------------------------------
 
 SUBPASSES = [
-    {
-        "description": "Solid Red",
-        "prompt": f"""{HLSL_INTERFACE_DESC}
+  {
+    "description":
+    "Solid Red",
+    "prompt":
+    f"""{HLSL_INTERFACE_DESC}
 
 **Task:** Output a solid red color (float4(1.0, 0.0, 0.0, 1.0)).
 """,
-    },
-    {
-        "description": "Normal to RGB",
-        "prompt": f"""{HLSL_INTERFACE_DESC}
+  },
+  {
+    "description":
+    "Normal to RGB",
+    "prompt":
+    f"""{HLSL_INTERFACE_DESC}
 
 **Task:** Visualize the surface normal as color by mapping the normalized normal from [-1, 1] into [0, 1] and outputting it with alpha 1.0.
 """,
-    },
-    {
-        "description": "UV to RG",
-        "prompt": f"""{HLSL_INTERFACE_DESC}
+  },
+  {
+    "description":
+    "UV to RG",
+    "prompt":
+    f"""{HLSL_INTERFACE_DESC}
 
 **Task:** Visualize texture coordinates as color (R=uv.x, G=uv.y, B=0, A=1).
 """,
-    },
-    {
-        "description": "Vertex Color",
-        "prompt": f"""{HLSL_INTERFACE_DESC}
+  },
+  {
+    "description":
+    "Vertex Color",
+    "prompt":
+    f"""{HLSL_INTERFACE_DESC}
 
 **Task:** Pass through the per-vertex color directly with alpha 1.0.
 """,
-    },
-    {
-        "description": "Lambertian Diffuse",
-        "prompt": f"""{HLSL_INTERFACE_DESC}
+  },
+  {
+    "description":
+    "Lambertian Diffuse",
+    "prompt":
+    f"""{HLSL_INTERFACE_DESC}
 
 **Task:** Implement Lambertian diffuse lighting using N=normalize(normal) and L=normalize(lightPos.xyz - worldPos), outputting grayscale intensity d=max(dot(N,L),0) with alpha 1.0.
 """,
-    },
-    {
-        "description": "Phong Specular",
-        "prompt": f"""{HLSL_INTERFACE_DESC}
+  },
+  {
+    "description":
+    "Phong Specular",
+    "prompt":
+    f"""{HLSL_INTERFACE_DESC}
 
 **Task:** Implement Phong specular highlights using N, L, V and R=reflect(-L,N), with diffuse=max(dot(N,L),0) and specular=pow(max(dot(R,V),0),32). Output grayscale intensity (0.2 + 0.5*diffuse + 0.8*specular) with alpha 1.0.
 """,
-    },
-    {
-        "description": "Blinn-Phong",
-        "prompt": f"""{HLSL_INTERFACE_DESC}
+  },
+  {
+    "description":
+    "Blinn-Phong",
+    "prompt":
+    f"""{HLSL_INTERFACE_DESC}
 
 **Task:** Implement Blinn-Phong shading using N, L, V and half-vector H=normalize(L+V), with diffuse=max(dot(N,L),0) and specular=pow(max(dot(N,H),0),64). Output grayscale intensity (0.1 + 0.6*diffuse + 0.8*specular) with alpha 1.0.
 """,
-    },
-    {
-        "description": "Rim Lighting",
-        "prompt": f"""{HLSL_INTERFACE_DESC}
+  },
+  {
+    "description":
+    "Rim Lighting",
+    "prompt":
+    f"""{HLSL_INTERFACE_DESC}
 
 **Task:** Implement rim (Fresnel) lighting with rim = pow(1 - max(dot(N,V),0), 3). Use base color (0.2, 0.3, 0.8) modulated by (0.3 + 0.5*diffuse), and add rim tint (1.0, 0.8, 0.5) * rim. Output alpha 1.0.
 """,
-    },
-    {
-        "description": "Toon Shading",
-        "prompt": f"""{HLSL_INTERFACE_DESC}
+  },
+  {
+    "description":
+    "Toon Shading",
+    "prompt":
+    f"""{HLSL_INTERFACE_DESC}
 
 **Task:** Implement toon/cel shading by quantizing the Lambertian diffuse term d=max(dot(N,L),0) into bands with thresholds 0.75/0.5/0.25 and values 1.0/0.7/0.4/0.2. Multiply the vertex color by the band and output alpha 1.0.
 """,
-    },
-    {
-        "description": "Checkerboard",
-        "prompt": f"""{HLSL_INTERFACE_DESC}
+  },
+  {
+    "description":
+    "Checkerboard",
+    "prompt":
+    f"""{HLSL_INTERFACE_DESC}
 
 **Task:** Render a UV checkerboard at 8x8 frequency, alternating colors 0.9 and 0.2 by parity. Apply Lambertian shading with factor (0.5 + 0.5*diffuse) and output alpha 1.0.
 """,
-    },
-    {
-        "description": "Horizontal Stripes",
-        "prompt": f"""{HLSL_INTERFACE_DESC}
+  },
+  {
+    "description":
+    "Horizontal Stripes",
+    "prompt":
+    f"""{HLSL_INTERFACE_DESC}
 
 **Task:** Render horizontal stripes driven by sin(uv.y * 3.14159 * 16.0), alternating red (0.9, 0.1, 0.1) and blue (0.1, 0.1, 0.9). Apply Lambertian shading with factor (0.4 + 0.6*diffuse) and output alpha 1.0.
 """,
-    },
-    {
-        "description": "Polka Dots",
-        "prompt": f"""{HLSL_INTERFACE_DESC}
+  },
+  {
+    "description":
+    "Polka Dots",
+    "prompt":
+    f"""{HLSL_INTERFACE_DESC}
 
 **Task:** Render a 6x6 UV polka-dot pattern with circular dots of radius 0.3 (in cell space). Dots are yellow (1.0, 0.8, 0.0) on a dark blue background (0.1, 0.1, 0.3). Apply Lambertian shading with factor (0.3 + 0.7*diffuse) and output alpha 1.0.
 """,
-    },
-    {
-        "description": "Hemisphere Lighting",
-        "prompt": f"""{HLSL_INTERFACE_DESC}
+  },
+  {
+    "description":
+    "Hemisphere Lighting",
+    "prompt":
+    f"""{HLSL_INTERFACE_DESC}
 
 **Task:** Implement hemisphere ambient lighting with skyColor (0.4, 0.6, 1.0) and groundColor (0.3, 0.15, 0.05) blended by N.y * 0.5 + 0.5. Add a small diffuse term 0.3*d and output alpha 1.0.
 """,
-    },
-    {
-        "description": "Y-Gradient",
-        "prompt": f"""{HLSL_INTERFACE_DESC}
+  },
+  {
+    "description":
+    "Y-Gradient",
+    "prompt":
+    f"""{HLSL_INTERFACE_DESC}
 
 **Task:** Color based on world-space Y: t=clamp(worldPos.y * 0.5 + 0.5), lerp bottom (0.1, 0.4, 0.1) to top (1.0, 1.0, 1.0), output alpha 1.0.
 """,
-    },
-    {
-        "description": "Fog Effect",
-        "prompt": f"""{HLSL_INTERFACE_DESC}
+  },
+  {
+    "description":
+    "Fog Effect",
+    "prompt":
+    f"""{HLSL_INTERFACE_DESC}
 
 **Task:** Apply distance-based fog: base color is (0.8, 0.2, 0.2) with Lambertian factor (0.3 + 0.7*diffuse). Fog factor is clamp((dist - 1.5) / 3.0), fog color (0.7, 0.7, 0.8), and output the lerp with alpha 1.0.
 """,
-    },
-    {
-        "description": "Gooch Shading",
-        "prompt": f"""{HLSL_INTERFACE_DESC}
+  },
+  {
+    "description":
+    "Gooch Shading",
+    "prompt":
+    f"""{HLSL_INTERFACE_DESC}
 
 **Task:** Implement Gooch warm/cool shading with cool (0.2, 0.2, 0.75), warm (0.7, 0.7, 0.4), and t = dot(N,L) * 0.5 + 0.5. Output alpha 1.0.
 """,
-    },
-    {
-        "description": "Mandelbrot Set",
-        "prompt": f"""{HLSL_INTERFACE_DESC}
+  },
+  {
+    "description":
+    "Mandelbrot Set",
+    "prompt":
+    f"""{HLSL_INTERFACE_DESC}
 
 **Task:** Render the Mandelbrot set using UVs mapped to c = (uv.x*3-2, uv.y*2-1). Iterate up to 20 steps, escape when |z|^2 > 4, and color with t=iterations/20 as (t, t*0.5, 1.0-t), alpha 1.0.
 """,
-    },
-    {
-        "description": "Brick Pattern",
-        "prompt": f"""{HLSL_INTERFACE_DESC}
+  },
+  {
+    "description":
+    "Brick Pattern",
+    "prompt":
+    f"""{HLSL_INTERFACE_DESC}
 
 **Task:** Render a procedural brick pattern at 8x16 UV scale with staggered rows (half-brick offset every other row). Mortar thickness is 0.05 in X and 0.1 in Y; mortar color is (0.7, 0.7, 0.7) and brick color is (0.7, 0.2, 0.1). Apply Lambertian shading with factor (0.4 + 0.6*diffuse) and output alpha 1.0.
 """,
-    },
-    {
-        "description": "Fresnel Heatmap",
-        "prompt": f"""{HLSL_INTERFACE_DESC}
+  },
+  {
+    "description":
+    "Fresnel Heatmap",
+    "prompt":
+    f"""{HLSL_INTERFACE_DESC}
 
 **Task:** Create a heatmap based on viewing angle using NdotV = max(dot(N, V), 0). If NdotV < 0.5 use (r=1, g=2*NdotV, b=0); otherwise use r=g=1-(NdotV-0.5)*2 and b=(NdotV-0.5)*2. Output alpha 1.0.
 """,
-    },
-    {
-        "description": "Full Phong Model",
-        "prompt": f"""{HLSL_INTERFACE_DESC}
+  },
+  {
+    "description":
+    "Full Phong Model",
+    "prompt":
+    f"""{HLSL_INTERFACE_DESC}
 
 **Task:** Complete Phong lighting with colored materials: ambient (0.1, 0.05, 0.05), diffuse uses vertex color with max(dot(N,L),0), specular uses (1,1,1) with shininess 32 and R=reflect(-L,N). Clamp the sum to [0,1], output alpha 1.0.
 """,
-    },
+  },
 ]
 
 # ---------------------------------------------------------------------------
@@ -268,166 +325,191 @@ structure = None
 
 
 def prepareSubpassPrompt(subPass: int) -> str:
-    if subPass >= len(SUBPASSES):
-        raise StopIteration
-    return SUBPASSES[subPass]["prompt"]
+  if subPass >= len(SUBPASSES):
+    raise StopIteration
+  return SUBPASSES[subPass]["prompt"]
 
 
 extraGradeAnswerRuns = []
 
 
 def _grade_answer_inner(result: dict, subPass: int, aiEngineName: str) -> tuple:
-    result = normalize_code_result(result, "shader_code")
-    if not result:
-        return 0.0, "No result provided", {"error": "no_result"}
-    if "shader_code" not in result:
-        return 0.0, "No shader code provided", {"error": "no_shader_code"}
+  result = normalize_code_result(result, "shader_code")
+  if not result:
+    return 0.0, "No result provided", {"error": "no_result"}
+  if "shader_code" not in result:
+    return 0.0, "No shader code provided", {"error": "no_shader_code"}
 
-    desc = SUBPASSES[subPass]["description"]
-    hlsl_src = result["shader_code"]
+  desc = SUBPASSES[subPass]["description"]
+  hlsl_src = result["shader_code"]
 
-    # Compile HLSL to SPIR-V
-    try:
-        frag_spirv = compile_hlsl(hlsl_src, stage="frag", entry_point="main")
-    except RuntimeError as e:
-        return 0.0, f"[{desc}] HLSL compilation failed: {e}", {"error": str(e)}
+  # Compile HLSL to SPIR-V
+  try:
+    frag_spirv = compile_hlsl(hlsl_src, stage="frag", entry_point="main")
+  except RuntimeError as e:
+    return 0.0, f"[{desc}] HLSL compilation failed: {e}", {"error": str(e)}
 
-    try:
-        renderer = _get_renderer()
-    except Exception as e:
-        return 0.0, f"[{desc}] Failed to create renderer: {e}", {"error": str(e)}
+  try:
+    renderer = _get_renderer()
+  except Exception as e:
+    return 0.0, f"[{desc}] Failed to create renderer: {e}", {"error": str(e)}
 
-    valid, err = validate_spirv(frag_spirv)
-    if not valid:
-        return 0.0, f"[{desc}] SPIR-V validation failed: {err}", {"error": err}
+  valid, err = validate_spirv(frag_spirv)
+  if not valid:
+    return 0.0, f"[{desc}] SPIR-V validation failed: {err}", {"error": err}
 
-    try:
-        pixels = renderer.render(frag_spirv)
-    except Exception as e:
-        return 0.0, f"[{desc}] Rendering failed: {e}", {"error": str(e)}
+  try:
+    pixels = renderer.render(frag_spirv)
+  except Exception as e:
+    return 0.0, f"[{desc}] Rendering failed: {e}", {"error": str(e)}
 
-    output_image = _save_rendered_image(43, subPass, aiEngineName, pixels)
+  output_image = _save_rendered_image(43, subPass, aiEngineName, pixels)
 
-    reference = load_reference(41, subPass)
-    if reference is None:
-        save_reference(pixels, 41, subPass)
-        return 1.0, f"[{desc}] No reference - saved current render as reference", {
-            "output_image": output_image
-        }
+  reference = load_reference(41, subPass)
+  if reference is None:
+    save_reference(pixels, 41, subPass)
+    return 1.0, f"[{desc}] No reference - saved current render as reference", {
+      "output_image": output_image
+    }
 
-    score, explanation = compare_images(pixels, reference, color_tolerance=2, spatial_tolerance=1)
-    return score, f"[{desc}] {explanation}", {"output_image": output_image}
+  score, explanation = compare_images(pixels, reference, color_tolerance=2, spatial_tolerance=1)
+  return score, f"[{desc}] {explanation}", {"output_image": output_image}
 
 
 def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
-    """Run grading in an isolated subprocess to survive GPU hangs/TDRs."""
-    result = normalize_code_result(result, "shader_code")
-    if not result or "shader_code" not in result:
-        return 0.0, "No shader code provided"
+  """Run grading in an isolated subprocess to survive GPU hangs/TDRs."""
+  result = normalize_code_result(result, "shader_code")
+  if not result or "shader_code" not in result:
+    return 0.0, "No shader code provided"
 
+  cache_parts = _grade_cache_key_parts(subPass, aiEngineName, result.get("shader_code", ""))
+
+  def compute_grade_record() -> Dict:
     payload = {
-        "shader_code": result.get("shader_code", ""),
-        "subPass": subPass,
-        "aiEngineName": aiEngineName,
+      "shader_code": result.get("shader_code", ""),
+      "subPass": subPass,
+      "aiEngineName": aiEngineName,
     }
 
     with tempfile.TemporaryDirectory() as tmp_dir:
-        in_path = os.path.join(tmp_dir, "grade_input.json")
-        out_path = os.path.join(tmp_dir, "grade_output.json")
-        with open(in_path, "w", encoding="utf-8") as f:
-            json.dump(payload, f)
+      in_path = os.path.join(tmp_dir, "grade_input.json")
+      out_path = os.path.join(tmp_dir, "grade_output.json")
+      with open(in_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f)
 
-        cmd = [sys.executable, __file__, "--grade", in_path, out_path]
-        try:
-            subprocess.run(
-                cmd,
-                check=False,
-                timeout=TIMEOUT_SECONDS + 10,
-                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
-            )
-        except subprocess.TimeoutExpired:
-            return 0.0, "GPU execution timed out or hung (subprocess killed)"
-        except Exception as e:
-            return 0.0, f"Subprocess failed: {e}"
+      cmd = [sys.executable, __file__, "--grade", in_path, out_path]
+      try:
+        subprocess.run(
+          cmd,
+          check=False,
+          timeout=TIMEOUT_SECONDS + 10,
+          creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
+        )
+      except subprocess.TimeoutExpired:
+        return {
+          "score": 0.0,
+          "explanation": "GPU execution timed out or hung (subprocess killed)",
+          "output_image": "",
+        }
+      except Exception as e:
+        return {
+          "score": 0.0,
+          "explanation": f"Subprocess failed: {e}",
+          "output_image": "",
+        }
 
-        if not os.path.exists(out_path):
-            return 0.0, "Subprocess produced no result (crash or TDR)"
+      if not os.path.exists(out_path):
+        return {
+          "score": 0.0,
+          "explanation": "Subprocess produced no result (crash or TDR)",
+          "output_image": "",
+        }
 
-        try:
-            with open(out_path, "r", encoding="utf-8") as f:
-                out = json.load(f)
-            score = out.get("score", 0.0)
-            explanation = out.get("explanation", "No explanation")
-            details = out.get("details", {}) or {}
-            output_image = details.get("output_image")
-            if output_image:
-                _OUTPUT_IMAGE_CACHE[(subPass, aiEngineName)] = output_image
-            return score, explanation
-        except Exception as e:
-            return 0.0, f"Failed to read subprocess result: {e}"
+      try:
+        with open(out_path, "r", encoding="utf-8") as f:
+          out = json.load(f)
+        details = out.get("details", {}) or {}
+        return {
+          "score": out.get("score", 0.0),
+          "explanation": out.get("explanation", "No explanation"),
+          "output_image": details.get("output_image") or "",
+        }
+      except Exception as e:
+        return {
+          "score": 0.0,
+          "explanation": f"Failed to read subprocess result: {e}",
+          "output_image": "",
+        }
+
+  record = _GRADE_CACHE.get_or_compute_json("grade_record", compute_grade_record, *cache_parts)
+  _restore_cached_output_image(subPass, aiEngineName, record.get("output_image"))
+  return float(record.get("score", 0.0)), record.get("explanation", "No explanation")
 
 
 def _run_grade_subprocess(in_path: str, out_path: str) -> int:
+  try:
+    with open(in_path, "r", encoding="utf-8") as f:
+      payload = json.load(f)
+    result = {"shader_code": payload.get("shader_code", "")}
+    subPass = int(payload.get("subPass", 0))
+    aiEngineName = payload.get("aiEngineName", "")
+    score, explanation, details = _grade_answer_inner(result, subPass, aiEngineName)
+    with open(out_path, "w", encoding="utf-8") as f:
+      json.dump({"score": score, "explanation": explanation, "details": details}, f)
+    return 0
+  except Exception as e:
     try:
-        with open(in_path, "r", encoding="utf-8") as f:
-            payload = json.load(f)
-        result = {"shader_code": payload.get("shader_code", "")}
-        subPass = int(payload.get("subPass", 0))
-        aiEngineName = payload.get("aiEngineName", "")
-        score, explanation, details = _grade_answer_inner(result, subPass, aiEngineName)
-        with open(out_path, "w", encoding="utf-8") as f:
-            json.dump({"score": score, "explanation": explanation, "details": details}, f)
-        return 0
-    except Exception as e:
-        try:
-            with open(out_path, "w", encoding="utf-8") as f:
-                json.dump({"score": 0.0, "explanation": f"Subprocess error: {e}",
-                           "details": {"error": str(e)}}, f)
-        except Exception:
-            pass
-        return 1
-
-
-if __name__ == "__main__":
-    if len(sys.argv) >= 4 and sys.argv[1] == "--grade":
-        sys.exit(_run_grade_subprocess(sys.argv[2], sys.argv[3]))
+      with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(
+          {
+            "score": 0.0,
+            "explanation": f"Subprocess error: {e}",
+            "details": {
+              "error": str(e)
+            }
+          }, f)
+    except Exception:
+      pass
+    return 1
 
 
 def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
-    result = normalize_code_result(result, "shader_code")
-    if not result:
-        return "<p style='color:red'>No result provided</p>"
-    desc = SUBPASSES[subPass]["description"]
-    html = f"<h4>HLSL Shader - {desc}</h4>"
-    if "reasoning" in result:
-        r = result['reasoning'][:400] + ('...' if len(result.get('reasoning', '')) > 400 else '')
-        html += f"<p><strong>Approach:</strong> {r}</p>"
-    if "shader_code" in result:
-        code = result["shader_code"].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        html += f"<details><summary>View HLSL ({len(result['shader_code'])} chars)</summary><pre>{code}</pre></details>"
-    html += image_pair_html(
-        _OUTPUT_IMAGE_CACHE.get((subPass, aiEngineName), ""),
-        str(get_reference_path(41, subPass))
-    )
-    return html
+  result = normalize_code_result(result, "shader_code")
+  if not result:
+    return "<p style='color:red'>No result provided</p>"
+  desc = SUBPASSES[subPass]["description"]
+  html = f"<h4>HLSL Shader - {desc}</h4>"
+  if "reasoning" in result:
+    r = result['reasoning'][:400] + ('...' if len(result.get('reasoning', '')) > 400 else '')
+    html += f"<p><strong>Approach:</strong> {r}</p>"
+  if "shader_code" in result:
+    code = result["shader_code"].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    html += f"<details><summary>View HLSL ({len(result['shader_code'])} chars)</summary><pre>{code}</pre></details>"
+  html += image_pair_html(_OUTPUT_IMAGE_CACHE.get((subPass, aiEngineName), ""),
+                          str(get_reference_path(41, subPass)))
+  return html
 
 
 def resultToImage(result: dict, subPass: int, aiEngineName: str) -> str:
-    return _OUTPUT_IMAGE_CACHE.get((subPass, aiEngineName), "")
+  return _OUTPUT_IMAGE_CACHE.get((subPass, aiEngineName), "")
 
 
 def getReferenceImage(subPass: int, aiEngineName: str) -> str:
-    return str(get_reference_path(41, subPass))
+  return str(get_reference_path(41, subPass))
 
 
 def _save_rendered_image(test_num: int, subPass: int, aiEngineName: str, pixels) -> str:
-    base_dir = os.path.dirname(__file__)
-    out_dir = os.path.join(base_dir, "results", "models", aiEngineName, "renders")
-    os.makedirs(out_dir, exist_ok=True)
-    out_path = os.path.join(out_dir, f"test{test_num}_subpass_{subPass:02d}.png")
-    Image.fromarray(pixels, "RGBA").save(out_path)
-    return out_path
+  base_dir = os.path.dirname(__file__)
+  out_dir = os.path.join(base_dir, "results", "models", aiEngineName, "renders")
+  os.makedirs(out_dir, exist_ok=True)
+  out_path = os.path.join(out_dir, f"test{test_num}_subpass_{subPass:02d}.png")
+  Image.fromarray(pixels, "RGBA").save(out_path)
+  return out_path
 
+
+if __name__ == "__main__":
+  if len(sys.argv) >= 4 and sys.argv[1] == "--grade":
+    sys.exit(_run_grade_subprocess(sys.argv[2], sys.argv[3]))
 
 highLevelSummary = """
 <p>Write GPU pixel shaders in HLSL (Microsoft&rsquo;s high-level shading language)

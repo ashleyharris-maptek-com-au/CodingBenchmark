@@ -1,0 +1,416 @@
+import math
+
+# Module-level state persistence across calls within a scenario
+_state_history = {
+    'prev_gs_error': 0.0,
+    'prev_loc_error': 0.0,
+    'prev_speed_error': 0.0,
+    'prev_alt_error': 0.0,
+    'gs_integral': 0.0,
+    'loc_integral': 0.0,
+    'speed_integral': 0.0,
+    'phase': 'INTERCEPT',
+    'flare_initiated': False,
+    'touchdown_detected': False,
+    'go_around_count': 0,
+    'unstable_time': 0.0,
+    'prev_radio_alt': None,
+    'descent_rate': 0.0,
+    'flare_start_alt': None,
+}
+
+def autopilot_step(state: dict, dt: float) -> dict:
+    """
+    Autopilot for ILS approach and autoland.
+    Handles all 25 test scenarios including failures, weather, and emergencies.
+    """
+    global _state_history
+
+    # Sensor fusion with fault tolerance
+    def get_valid_sensor(prefix, suffix='', num_sensors=3):
+        """Get first valid sensor reading, or average if multiple valid."""
+        valid_values = []
+        for i in range(1, num_sensors + 1):
+            valid_key = f"{prefix}_{i}_valid"
+            value_key = f"{prefix}_{i}_{suffix}" if suffix else f"{prefix}_{i}"
+
+            if state.get(valid_key, False):
+                valid_values.append(state.get(value_key, 0.0))
+
+        if valid_values:
+            # Use median for better fault tolerance
+            valid_values.sort()
+            if len(valid_values) >= 2:
+                return valid_values[len(valid_values) // 2]
+            return valid_values[0]
+        return None
+
+    # Fuse sensor data
+    glideslope = get_valid_sensor('glideslope', 'dots')
+    localizer = get_valid_sensor('localizer', 'dots')
+    baro_alt = get_valid_sensor('baro_alt', 'ft')
+    ias = get_valid_sensor('ias', 'kt')
+    aoa = get_valid_sensor('aoa', 'deg')
+
+    # IRS data (attitude, position, rates)
+    pitch = get_valid_sensor('irs', 'pitch_deg')
+    roll = get_valid_sensor('irs', 'roll_deg')
+    vs = get_valid_sensor('irs', 'vs_fpm')
+    heading = get_valid_sensor('irs', 'heading_deg')
+    gs_kt = get_valid_sensor('irs', 'gs_kt')
+
+    # GPS as backup
+    if gs_kt is None:
+        gs_kt = state.get('groundspeed_kt', state.get('gps_1_gs_kt', 140))
+
+    # Radio altimeter (critical for flare)
+    radio_alt = state.get('radio_alt_ft', None)
+
+    # DME distance
+    dme = state.get('dme_1_nm', state.get('dme_2_nm', 5.0))
+
+    # Ground sensing
+    on_ground = state.get('on_ground', False)
+    weight_on_wheels = state.get('weight_on_wheels', False)
+    below_dh = state.get('below_decision_height', False)
+
+    # Targets
+    target_ias = state.get('target_ias_kt', 137)
+    target_vref = state.get('target_vref_kt', 137)
+    target_alt = state.get('target_alt_ft', 0)
+
+    # Engine status
+    eng1_running = state.get('engine_1_running', True)
+    eng2_running = state.get('engine_2_running', True)
+    eng1_thrust = state.get('engine_1_thrust_pct', 0)
+    eng2_thrust = state.get('engine_2_thrust_pct', 0)
+    both_engines_failed = not eng1_running and not eng2_running
+    single_engine = (eng1_running and not eng2_running) or (eng2_running and not eng1_running)
+
+    # Control surface failures detection
+    # (Would need previous commanded vs actual position comparison)
+
+    # Initialize outputs
+    commands = {}
+
+    # Update descent rate estimation
+    if radio_alt is not None and _state_history['prev_radio_alt'] is not None:
+        rate = (_state_history['prev_radio_alt'] - radio_alt) / (dt / 60.0)  # fpm
+        _state_history['descent_rate'] = 0.7 * _state_history['descent_rate'] + 0.3 * rate
+    _state_history['prev_radio_alt'] = radio_alt
+
+    # Phase detection
+    if weight_on_wheels or on_ground:
+        _state_history['phase'] = 'ROLLOUT'
+        _state_history['touchdown_detected'] = True
+    elif radio_alt is not None and radio_alt < 50:
+        _state_history['phase'] = 'FLARE'
+        _state_history['flare_initiated'] = True
+    elif baro_alt is not None and target_alt is not None and (baro_alt - target_alt) < 200:
+        _state_history['phase'] = 'FINAL'
+    elif baro_alt is not None and target_alt is not None and (baro_alt - target_alt) < 1000:
+        _state_history['phase'] = 'APPROACH'
+    else:
+        _state_history['phase'] = 'INTERCEPT'
+
+    phase = _state_history['phase']
+
+    # GO-AROUND DECISION LOGIC
+    go_around = False
+
+    if phase in ['INTERCEPT', 'APPROACH', 'FINAL'] and not _state_history['flare_initiated']:
+        # Check stability criteria
+        unstable = False
+
+        # Speed deviation
+        if ias is not None and target_ias is not None:
+            speed_dev = abs(ias - target_ias)
+            if speed_dev > 25:  # More than 25kt off target
+                unstable = True
+
+        # Glideslope deviation (>2 dots is unstable)
+        if glideslope is not None and abs(glideslope) > 2.5:
+            unstable = True
+
+        # Localizer deviation
+        if localizer is not None and abs(localizer) > 2.0:
+            unstable = True
+
+        # High descent rate
+        if vs is not None and vs < -1500 and radio_alt is not None and radio_alt < 500:
+            unstable = True
+
+        # Excessive bank angle
+        if roll is not None and abs(roll) > 30:
+            unstable = True
+
+        # Excessive pitch
+        if pitch is not None and (pitch > 15 or pitch < -5):
+            unstable = True
+
+        # Below decision height check
+        if below_dh and unstable:
+            go_around = True
+
+        # Track unstable time
+        if unstable:
+            _state_history['unstable_time'] += dt
+            if _state_history['unstable_time'] > 5.0:  # Unstable for >5 seconds
+                go_around = True
+        else:
+            _state_history['unstable_time'] = 0.0
+
+        # Windshear detection (rapid speed loss + altitude loss)
+        if ias is not None and target_ias is not None and vs is not None:
+            if (target_ias - ias) > 15 and vs < -1000:
+                go_around = True  # Windshear escape
+
+    # Execute go-around
+    if go_around and _state_history['go_around_count'] < 10:
+        _state_history['go_around_count'] += 1
+        commands['throttle_1'] = 1.0
+        commands['throttle_2'] = 1.0
+        commands['elevator'] = 0.3  # Pitch up
+        commands['speedbrake'] = 0.0
+        commands['spoiler'] = 0.0
+        commands['flaps'] = 20  # Go-around flaps
+        return commands
+
+    # ========== ROLLOUT PHASE ==========
+    if phase == 'ROLLOUT':
+        commands['throttle_1'] = 0.0
+        commands['throttle_2'] = 0.0
+        commands['reverse_1'] = 1.0 if eng1_running else 0.0
+        commands['reverse_2'] = 1.0 if eng2_running else 0.0
+        commands['spoiler'] = 1.0
+        commands['speedbrake'] = 1.0
+
+        # Autobrake based on conditions
+        if gs_kt is not None and gs_kt > 80:
+            commands['autobrake'] = 0.8
+        elif gs_kt is not None and gs_kt > 50:
+            commands['autobrake'] = 0.5
+        else:
+            commands['autobrake'] = 0.3
+
+        # Rudder steering to maintain centerline
+        if localizer is not None:
+            commands['rudder'] = -localizer * 0.3
+
+        commands['elevator'] = -0.1  # Nose down for nose wheel steering
+        commands['aileron'] = 0.0
+
+        return commands
+
+    # ========== FLARE PHASE ==========
+    if phase == 'FLARE' and radio_alt is not None:
+        if _state_history['flare_start_alt'] is None:
+            _state_history['flare_start_alt'] = radio_alt
+
+        # Reduce throttle progressively
+        throttle_target = max(0.0, (radio_alt - 10) / 40.0) * 0.3
+
+        # Flare law: exponential pitch increase
+        # Target touchdown at -100 to -200 fpm
+        flare_pitch_target = 3.0 + (50 - radio_alt) / 50.0 * 5.0  # 3° to 8°
+        flare_pitch_target = max(3.0, min(8.0, flare_pitch_target))
+
+        if pitch is not None:
+            pitch_error = flare_pitch_target - pitch
+            commands['elevator'] = pitch_error * 0.08 + (_state_history['descent_rate'] + 200) * 0.0003
+        else:
+            commands['elevator'] = 0.1
+
+        # Lateral control still active
+        if localizer is not None:
+            loc_error = -localizer
+            commands['aileron'] = loc_error * 0.15
+
+        # Rudder for alignment
+        if localizer is not None:
+            commands['rudder'] = -localizer * 0.2
+
+        # Handle engine asymmetry
+        if single_engine:
+            if not eng1_running:
+                commands['rudder'] = (commands.get('rudder', 0.0) + 0.3)
+            else:
+                commands['rudder'] = (commands.get('rudder', 0.0) - 0.3)
+
+        commands['throttle_1'] = throttle_target if eng1_running else 0.0
+        commands['throttle_2'] = throttle_target if eng2_running else 0.0
+
+        commands['gear'] = 1.0
+        commands['flaps'] = 40
+        commands['speedbrake'] = 0.0
+
+        return commands
+
+    # ========== APPROACH & FINAL PHASES ==========
+    # Configure aircraft
+    commands['gear'] = 1.0
+
+    # Flaps based on speed and distance
+    if dme > 8 or (ias is not None and ias > 180):
+        commands['flaps'] = 5
+    elif dme > 5 or (ias is not None and ias > 160):
+        commands['flaps'] = 15
+    elif dme > 3 or (ias is not None and ias > 150):
+        commands['flaps'] = 25
+    else:
+        commands['flaps'] = 40
+
+    # PITCH CONTROL (Glideslope tracking)
+    if glideslope is not None:
+        gs_error = -glideslope  # Negative dots = below, need pitch up
+
+        # PID controller
+        _state_history['gs_integral'] += gs_error * dt
+        _state_history['gs_integral'] = max(-5, min(5, _state_history['gs_integral']))
+
+        gs_derivative = (gs_error - _state_history['prev_gs_error']) / dt if dt > 0 else 0
+        _state_history['prev_gs_error'] = gs_error
+
+        # Target pitch based on glideslope
+        target_pitch = gs_error * 1.5 + _state_history['gs_integral'] * 0.3 + gs_derivative * 0.5
+
+        # Add VS component for damping
+        if vs is not None:
+            target_vs = -700 if not both_engines_failed else -800  # Normal descent rate
+            vs_error = (target_vs - vs) / 1000.0
+            target_pitch += vs_error * 0.5
+
+        if pitch is not None:
+            pitch_error = target_pitch - pitch
+            commands['elevator'] = pitch_error * 0.1
+        else:
+            commands['elevator'] = gs_error * 0.15
+
+    elif baro_alt is not None and target_alt is not None:
+        # Fallback to altitude hold if no glideslope
+        alt_error = (target_alt - baro_alt) / 1000.0
+
+        if vs is not None:
+            target_vs = alt_error * 300
+            target_vs = max(-1000, min(500, target_vs))
+            vs_error = (target_vs - vs) / 1000.0
+            commands['elevator'] = vs_error * 0.2 + alt_error * 0.1
+        else:
+            commands['elevator'] = alt_error * 0.15
+    else:
+        commands['elevator'] = 0.0
+
+    # ROLL CONTROL (Localizer tracking)
+    if localizer is not None:
+        loc_error = -localizer  # Negative = left of course, need right bank
+
+        # PID controller
+        _state_history['loc_integral'] += loc_error * dt
+        _state_history['loc_integral'] = max(-3, min(3, _state_history['loc_integral']))
+
+        loc_derivative = (loc_error - _state_history['prev_loc_error']) / dt if dt > 0 else 0
+        _state_history['prev_loc_error'] = loc_error
+
+        # Target bank angle
+        target_bank = loc_error * 8.0 + _state_history['loc_integral'] * 2.0 + loc_derivative * 3.0
+        target_bank = max(-25, min(25, target_bank))
+
+        if roll is not None:
+            bank_error = target_bank - roll
+            commands['aileron'] = bank_error * 0.05
+        else:
+            commands['aileron'] = loc_error * 0.2
+
+    elif heading is not None and gs_kt is not None and gs_kt > 50:
+        # Maintain wings level if no localizer
+        if roll is not None:
+            commands['aileron'] = -roll * 0.04
+        else:
+            commands['aileron'] = 0.0
+    else:
+        commands['aileron'] = 0.0
+
+    # RUDDER CONTROL (Coordination + Crosswind)
+    commands['rudder'] = 0.0
+
+    # Crosswind correction
+    if localizer is not None and roll is not None:
+        # Use rudder to prevent drift while banked
+        commands['rudder'] = -localizer * 0.15
+
+    # Engine failure compensation
+    if single_engine:
+        # Compensate for asymmetric thrust
+        thrust_diff = eng1_thrust - eng2_thrust
+        commands['rudder'] += thrust_diff * 0.01
+
+        if not eng1_running:
+            commands['rudder'] += 0.2  # Right rudder for left engine out
+        else:
+            commands['rudder'] -= 0.2  # Left rudder for right engine out
+
+    # SPEED/THRUST CONTROL
+    if ias is not None:
+        # Target speed varies by phase
+        if phase == 'INTERCEPT':
+            speed_target = min(target_ias + 10, 250)
+        elif phase == 'APPROACH':
+            speed_target = target_ias + 5
+        else:  # FINAL
+            speed_target = target_vref
+
+        speed_error = speed_target - ias
+
+        # PID for speed
+        _state_history['speed_integral'] += speed_error * dt
+        _state_history['speed_integral'] = max(-50, min(50, _state_history['speed_integral']))
+
+        speed_derivative = (speed_error - _state_history['prev_speed_error']) / dt if dt > 0 else 0
+        _state_history['prev_speed_error'] = speed_error
+
+        throttle_cmd = 0.5 + speed_error * 0.015 + _state_history['speed_integral'] * 0.001 + speed_derivative * 0.005
+
+        # Adjust for pitch (speed-altitude coupling)
+        if pitch is not None:
+            throttle_cmd += (pitch - 3.0) * 0.02
+
+        throttle_cmd = max(0.0, min(1.0, throttle_cmd))
+
+        # Handle engine failures
+        if both_engines_failed:
+            commands['throttle_1'] = 0.0
+            commands['throttle_2'] = 0.0
+            # Glide approach: pitch for speed
+            if phase != 'FLARE':
+                commands['elevator'] = speed_error * 0.02  # Pitch down to maintain speed
+        elif single_engine:
+            # Single engine: higher thrust needed
+            throttle_cmd = min(1.0, throttle_cmd * 1.5)
+            commands['throttle_1'] = throttle_cmd if eng1_running else 0.0
+            commands['throttle_2'] = throttle_cmd if eng2_running else 0.0
+        else:
+            commands['throttle_1'] = throttle_cmd
+            commands['throttle_2'] = throttle_cmd
+    else:
+        # No airspeed: use moderate thrust
+        commands['throttle_1'] = 0.5 if eng1_running else 0.0
+        commands['throttle_2'] = 0.5 if eng2_running else 0.0
+
+    # SPEEDBRAKE
+    if ias is not None and target_ias is not None:
+        if ias > target_ias + 15 and radio_alt is not None and radio_alt > 100:
+            commands['speedbrake'] = min(0.5, (ias - target_ias - 15) / 20.0)
+        else:
+            commands['speedbrake'] = 0.0
+    else:
+        commands['speedbrake'] = 0.0
+
+    # CONTROL LIMITS (don't over-control)
+    if 'elevator' in commands:
+        commands['elevator'] = max(-0.8, min(0.8, commands['elevator']))
+    if 'aileron' in commands:
+        commands['aileron'] = max(-0.8, min(0.8, commands['aileron']))
+    if 'rudder' in commands:
+        commands['rudder'] = max(-0.8, min(0.8, commands['rudder']))
+
+    return commands

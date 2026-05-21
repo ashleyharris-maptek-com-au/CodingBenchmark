@@ -1,0 +1,276 @@
+from math import copysign
+
+# Persistent controller state (reset by harness between scenarios/attempts)
+_AP = {
+    "mode": "APP",          # APP, GA, FLARE, ROLLOUT
+    "ga_count": 0,
+    "flare_started": False,
+    "last_throttle": 0.55,
+    "integrators": {
+        "gs": 0.0,
+        "loc": 0.0,
+        "spd": 0.0,
+        "roll": 0.0,
+    },
+}
+
+
+def _clamp(x, lo, hi):
+    return lo if x < lo else hi if x > hi else x
+
+
+def _median(vals):
+    if not vals:
+        return None
+    vals = sorted(vals)
+    n = len(vals)
+    m = n // 2
+    return vals[m] if n % 2 else 0.5 * (vals[m - 1] + vals[m])
+
+
+def _vote_triplex(state, base):
+    vals = []
+    for i in (1, 2, 3):
+        vkey = f"{base}_{i}_valid"
+        dkey = f"{base}_{i}_dots"
+        if state.get(vkey, False) and dkey in state:
+            vals.append(float(state[dkey]))
+    return _median(vals)
+
+
+def _best_alt_agl(state):
+    ra = state.get("radio_alt_ft", None)
+    if ra is not None and ra > -10:
+        return float(ra)
+
+    vals = []
+    for i in (1, 2, 3):
+        if state.get(f"baro_alt_{i}_valid", False):
+            vals.append(float(state.get(f"baro_alt_{i}_ft", 0.0)))
+    if vals:
+        return max(0.0, _median(vals))
+
+    gps = []
+    for i in (1, 2, 3):
+        if state.get(f"gps_{i}_valid", False):
+            gps.append(float(state.get(f"gps_{i}_alt_ft", 0.0)))
+    return max(0.0, _median(gps) if gps else 500.0)
+
+
+def _best_speed(state):
+    vals = []
+    for i in (1, 2, 3):
+        if state.get(f"ias_{i}_valid", False):
+            vals.append(float(state.get(f"ias_{i}_kt", 0.0)))
+    if vals:
+        return _median(vals)
+    gs = state.get("groundspeed_kt", None)
+    if gs is not None:
+        return float(gs)
+    gvals = []
+    for i in (1, 2, 3):
+        if state.get(f"gps_{i}_valid", False):
+            gvals.append(float(state.get(f"gps_{i}_gs_kt", 0.0)))
+    return _median(gvals) if gvals else 140.0
+
+
+def _best_vs_fpm(state):
+    vals = []
+    for i in (1, 2, 3):
+        if state.get(f"irs_{i}_valid", False):
+            vals.append(float(state.get(f"irs_{i}_vs_fpm", 0.0)))
+    return _median(vals) if vals else -700.0
+
+
+def _engines_alive(state):
+    e1 = bool(state.get("engine_1_running", True)) and not bool(state.get("engine_1_fire", False))
+    e2 = bool(state.get("engine_2_running", True)) and not bool(state.get("engine_2_fire", False))
+    return e1, e2
+
+
+def _approach_unstable(agl, ias, vs, gs_dots, loc_dots, target_vref):
+    # Stabilized-approach criteria tighten below 500 ft.
+    speed_hi = target_vref + (25 if agl > 500 else 20)
+    speed_lo = max(90.0, target_vref - (10 if agl > 500 else 5))
+    if ias > speed_hi or ias < speed_lo:
+        return True
+    if agl < 1000 and abs(vs) > 1300:
+        return True
+    if agl < 500 and abs(vs) > 1000:
+        return True
+    if agl < 1000 and gs_dots is not None and abs(gs_dots) > 1.6:
+        return True
+    if agl < 1000 and loc_dots is not None and abs(loc_dots) > 1.8:
+        return True
+    return False
+
+
+def autopilot_step(state: dict, dt: float) -> dict:
+    dt = float(_clamp(dt if dt and dt > 0 else 0.05, 0.01, 0.2))
+
+    # Sensor fusion
+    agl = _best_alt_agl(state)
+    ias = _best_speed(state)
+    vs = _best_vs_fpm(state)
+    gs_dots = _vote_triplex(state, "glideslope")
+    loc_dots = _vote_triplex(state, "localizer")
+
+    if gs_dots is None:
+        gs_dots = float(state.get("target_gs_dots", 0.0))
+    if loc_dots is None:
+        loc_dots = float(state.get("target_loc_dots", 0.0))
+
+    on_ground = bool(state.get("on_ground", False) or state.get("weight_on_wheels", False))
+    below_dh = bool(state.get("below_decision_height", False))
+
+    target_vref = float(state.get("target_vref_kt", 137.0))
+    target_ias = float(state.get("target_ias_kt", target_vref + 8.0))
+
+    # Speed schedule
+    if agl > 1500:
+        spd_cmd = max(target_ias, target_vref + 25)
+    elif agl > 1000:
+        spd_cmd = max(target_vref + 18, min(target_ias, target_vref + 25))
+    elif agl > 500:
+        spd_cmd = target_vref + 10
+    elif agl > 50:
+        spd_cmd = target_vref + 5
+    else:
+        spd_cmd = target_vref + 2
+
+    # Configuration schedule
+    if agl > 2000:
+        flaps = 10
+    elif agl > 1200:
+        flaps = 20
+    elif agl > 600:
+        flaps = 30
+    else:
+        flaps = 40
+    gear = 1.0 if agl < 1800 else 0.0
+
+    e1_alive, e2_alive = _engines_alive(state)
+    both_dead = not e1_alive and not e2_alive
+
+    # Trigger go-around when unstable (unless in flare/rollout, or total power loss)
+    if _AP["mode"] not in ("FLARE", "ROLLOUT", "GA") and not both_dead:
+        if (not below_dh and agl < 900 and _approach_unstable(agl, ias, vs, gs_dots, loc_dots, target_vref)) or (agl < 250 and _approach_unstable(agl, ias, vs, gs_dots, loc_dots, target_vref)):
+            _AP["mode"] = "GA"
+            _AP["ga_count"] += 1
+
+    # Enter flare
+    if _AP["mode"] == "APP" and agl < 55:
+        _AP["mode"] = "FLARE"
+        _AP["flare_started"] = True
+
+    # Touchdown handling
+    if on_ground:
+        _AP["mode"] = "ROLLOUT"
+
+    out = {}
+
+    if _AP["mode"] == "GA":
+        # TOGA and climb away
+        out.update({
+            "throttle_1": 1.0 if e1_alive else 0.0,
+            "throttle_2": 1.0 if e2_alive else 0.0,
+            "elevator": 0.45,
+            "aileron": _clamp(-0.20 * loc_dots, -0.35, 0.35),
+            "rudder": _clamp(-0.10 * loc_dots, -0.25, 0.25),
+            "elevator_trim": 0.20,
+            "flaps": 15 if agl > 400 else 20,
+            "gear": 1.0 if agl < 200 else 0.0,
+            "speedbrake": 0.0,
+            "spoiler": 0.0,
+            "autobrake": 0.0,
+            "reverse_1": 0.0,
+            "reverse_2": 0.0,
+        })
+        # Once safe climb achieved, revert to approach capture behavior.
+        if agl > 1500:
+            _AP["mode"] = "APP"
+            _AP["flare_started"] = False
+        return out
+
+    if _AP["mode"] == "ROLLOUT":
+        gs = float(state.get("groundspeed_kt", ias))
+        rev = 1.0 if gs > 70 else (0.5 if gs > 45 else 0.0)
+        brk = 1.0 if gs > 80 else (0.7 if gs > 40 else 0.35)
+        out.update({
+            "elevator": -0.05,
+            "aileron": _clamp(-0.10 * loc_dots, -0.2, 0.2),
+            "rudder": _clamp(-0.22 * loc_dots, -0.35, 0.35),
+            "throttle_1": 0.0,
+            "throttle_2": 0.0,
+            "elevator_trim": 0.0,
+            "flaps": 40,
+            "gear": 1.0,
+            "speedbrake": 1.0,
+            "spoiler": 1.0,
+            "autobrake": brk,
+            "reverse_1": rev if e1_alive else 0.0,
+            "reverse_2": rev if e2_alive else 0.0,
+        })
+        return out
+
+    # APP / FLARE control laws
+    integ = _AP["integrators"]
+    integ["gs"] = _clamp(integ["gs"] + gs_dots * dt, -1.0, 1.0)
+    integ["loc"] = _clamp(integ["loc"] + loc_dots * dt, -1.0, 1.0)
+
+    # Vertical channel: track glideslope + damp vertical speed.
+    pitch_cmd = -0.18 * gs_dots - 0.0007 * (vs + 700.0) - 0.03 * integ["gs"]
+
+    # Flare shaping: smoothly increase pitch and close throttles.
+    if _AP["mode"] == "FLARE":
+        flare_gain = _clamp((55.0 - agl) / 55.0, 0.0, 1.0)
+        pitch_cmd += 0.35 * flare_gain
+
+    # Lateral channel: localizer to bank, with mild yaw assist for crosswind.
+    aileron = _clamp(-0.22 * loc_dots - 0.02 * integ["loc"], -0.45, 0.45)
+    rudder = _clamp(-0.12 * loc_dots, -0.30, 0.30)
+
+    # Speed/throttle loop. In dual-engine-out glide, keep idle.
+    spd_err = spd_cmd - ias
+    integ["spd"] = _clamp(integ["spd"] + spd_err * dt * 0.02, -0.25, 0.25)
+
+    if both_dead:
+        thr = 0.0
+    else:
+        base = 0.50 if agl > 300 else 0.42
+        thr = base + 0.015 * spd_err + integ["spd"]
+        # If sinking rapidly near runway, transient thrust protection (unless already flaring very low).
+        if agl < 300 and vs < -1050 and _AP["mode"] != "FLARE":
+            thr += 0.12
+        if _AP["mode"] == "FLARE":
+            thr *= _clamp((agl - 5.0) / 45.0, 0.0, 1.0)
+        thr = _clamp(thr, 0.0, 1.0)
+
+    # Asymmetric thrust compensation (single-engine)
+    t1 = thr if e1_alive else 0.0
+    t2 = thr if e2_alive else 0.0
+    if e1_alive != e2_alive:
+        live_sign = 1.0 if e1_alive else -1.0
+        rudder += _clamp(0.18 * live_sign, -0.25, 0.25)
+
+    # Anti-hard-landing guard in short final.
+    if agl < 80 and vs < -900:
+        pitch_cmd += 0.15
+
+    out.update({
+        "elevator": _clamp(pitch_cmd, -0.6, 0.7),
+        "aileron": aileron,
+        "rudder": _clamp(rudder, -0.5, 0.5),
+        "throttle_1": t1,
+        "throttle_2": t2,
+        "elevator_trim": _clamp(0.35 * _clamp(pitch_cmd, -0.5, 0.5), -0.35, 0.35),
+        "flaps": flaps,
+        "gear": gear,
+        "speedbrake": 0.0,
+        "spoiler": 0.0,
+        "autobrake": 0.0,
+        "reverse_1": 0.0,
+        "reverse_2": 0.0,
+    })
+
+    return out

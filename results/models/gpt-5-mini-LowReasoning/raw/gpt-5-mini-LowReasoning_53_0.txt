@@ -1,1 +1,369 @@
-{'__exception__': "Can't run here - we're trying to get this working in codex."}
+Below is a single self-contained Python function autopilot_step plus a small set of module-level variables it uses for persistence between calls (filters, integrators, simple state). The autopilot is deliberately conservative, fault-tolerant, and implements the key orbital mechanics insight you provided:
+
+- Far (>200 m): uses along-track (y) control applying retrograde thrust to lower orbit and catch up if behind, prograde to slow if ahead.
+- Medium (50–200 m): gentle V-bar corrections (close along-track first, small radial/cross-track).
+- Close (<50 m): linear CW-like PD control on relative position/velocity.
+- Final (<10 m): very gentle approach with tight velocity cap.
+- Makes heavy use of sensor redundancy and validity flags; falls back gracefully.
+- Limits attitude rates to ±0.035 rad/s and thrust axes to [-1,1].
+- Scales thrust for low fuel.
+- Keeps small integrators (anti-windup) for smoothing.
+
+You can drop this into a simulator that repeatedly calls autopilot_step(state, dt). It returns the required dictionary with thrust_x/y/z and att_rate_roll/pitch/yaw.
+
+Code:
+```python
+# Module-level persistence
+_prev_time = None
+_prev_rel_pos = [0.0, 0.0, 0.0]
+_prev_rel_vel = [0.0, 0.0, 0.0]
+_int_error_y = 0.0
+_int_error_x = 0.0
+_int_error_z = 0.0
+_filter_rel_pos = [None, None, None]  # simple exponential filters
+_filter_rel_vel = [None, None, None]
+_last_command = None
+
+def _clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+def _choose_vector(state):
+    """
+    Choose best available relative position and velocity in LVLH.
+    Priority:
+      1) Lidar (if all valid)
+      2) Radar (if all valid)
+      3) Dock camera + range (if camera active)
+      4) Range finders only: can't give vector -> use along-track only (assume behind if most common)
+      5) Fallback: last known filtered values
+    Returns (pos_xyz, vel_xyz, source)
+    """
+    # Lidar
+    lidar_valid = (state.get('lidar_rel_x_valid') and state.get('lidar_rel_y_valid') and state.get('lidar_rel_z_valid'))
+    lidar_vel_valid = (state.get('lidar_relv_x_valid') and state.get('lidar_relv_y_valid') and state.get('lidar_relv_z_valid'))
+    if lidar_valid:
+        pos = [state['lidar_rel_pos_x_m'], state['lidar_rel_pos_y_m'], state['lidar_rel_pos_z_m']]
+        vel = [state['lidar_rel_vel_x_ms'], state['lidar_rel_vel_y_ms'], state['lidar_rel_vel_z_ms']] if lidar_vel_valid else None
+        return pos, vel, 'lidar'
+    # Radar
+    radar_valid = (state.get('radar_rel_x_valid') and state.get('radar_rel_y_valid') and state.get('radar_rel_z_valid'))
+    radar_vel_valid = (state.get('radar_relv_x_valid') and state.get('radar_relv_y_valid') and state.get('radar_relv_z_valid'))
+    if radar_valid:
+        pos = [state['radar_rel_pos_x_m'], state['radar_rel_pos_y_m'], state['radar_rel_pos_z_m']]
+        vel = [state['radar_rel_vel_x_ms'], state['radar_rel_vel_y_ms'], state['radar_rel_vel_z_ms']] if radar_vel_valid else None
+        return pos, vel, 'radar'
+    # Dock camera: gives bearing and scalar range (active within 500m)
+    if state.get('dock_camera_active'):
+        # Validate bearings
+        bx_ok = state.get('dock_camera_bearing_x_valid', False)
+        by_ok = state.get('dock_camera_bearing_y_valid', False)
+        bz_ok = state.get('dock_camera_bearing_z_valid', False)
+        brange = state.get('dock_camera_range_m', None)
+        if brange is not None and (bx_ok or by_ok or bz_ok):
+            # Construct direction vector from available bearings (they are typically small angles or direction cosines)
+            bx = state.get('dock_camera_bearing_x', 0.0) if bx_ok else 0.0
+            by = state.get('dock_camera_bearing_y', 0.0) if by_ok else 0.0
+            bz = state.get('dock_camera_bearing_z', 0.0) if bz_ok else 0.0
+            # If these are angles, assume small-angle approx, else assume direction cosines — both work approximately.
+            dirvec = [bx, by, bz]
+            # Normalize if nonzero
+            mag = max(1e-6, (dirvec[0]**2 + dirvec[1]**2 + dirvec[2]**2)**0.5)
+            dirvec = [d/mag for d in dirvec]
+            pos = [dirvec[0]*brange, dirvec[1]*brange, dirvec[2]*brange]
+            # No direct velocity from camera; try radar/lidar velocity if available
+            vel = None
+            if radar_vel_valid:
+                vel = [state['radar_rel_vel_x_ms'], state['radar_rel_vel_y_ms'], state['radar_rel_vel_z_ms']]
+            elif lidar_vel_valid:
+                vel = [state['lidar_rel_vel_x_ms'], state['lidar_rel_vel_y_ms'], state['lidar_rel_vel_z_ms']]
+            return pos, vel, 'camera'
+    # Range finders: scalar only. Use last-known y-based heuristics.
+    # If at least one range valid, use that as total range with direction assumed mostly along y (V-bar).
+    ranges = []
+    for i in (1,2,3):
+        rv = state.get(f'range_{i}_valid')
+        if rv:
+            ranges.append(state.get(f'range_{i}_m', None))
+    if ranges:
+        # choose median
+        valid_ranges = [r for r in ranges if r is not None]
+        if valid_ranges:
+            rng = sorted(valid_ranges)[len(valid_ranges)//2]
+            # Assume approach along -y (behind) unless radar/lidar indicate otherwise (which they didn't)
+            # Heuristic: assume y = -rng, x=z = 0
+            pos = [0.0, -rng, 0.0]
+            vel = None
+            return pos, vel, 'range_only'
+    # Fallback: use previous filtered
+    if _filter_rel_pos[0] is not None:
+        return list(_filter_rel_pos), list(_filter_rel_vel) if _filter_rel_vel[0] is not None else None, 'filtered'
+    # Totally blind: assume some nominal large distance behind
+    return [0.0, -200.0, 0.0], [0.0, 0.0, 0.0], 'blind'
+
+def autopilot_step(state: dict, dt: float) -> dict:
+    global _prev_time, _prev_rel_pos, _prev_rel_vel, _int_error_x, _int_error_y, _int_error_z
+    global _filter_rel_pos, _filter_rel_vel, _last_command
+
+    # Safety defaults
+    if dt <= 0:
+        dt = 0.1
+
+    # Fuse relative measurements
+    pos, vel, src = _choose_vector(state)
+
+    # Simple exponential filter for pos/vel to smooth flicker/noise
+    alpha = 0.6  # smoothing
+    for i in range(3):
+        if _filter_rel_pos[i] is None:
+            _filter_rel_pos[i] = pos[i]
+        else:
+            _filter_rel_pos[i] = alpha*pos[i] + (1-alpha)*_filter_rel_pos[i]
+    if vel is not None:
+        for i in range(3):
+            if _filter_rel_vel[i] is None:
+                _filter_rel_vel[i] = vel[i]
+            else:
+                _filter_rel_vel[i] = alpha*vel[i] + (1-alpha)*_filter_rel_vel[i]
+    else:
+        # If no direct velocity, estimate via finite diff of filtered pos
+        for i in range(3):
+            _filter_rel_vel[i] = (_filter_rel_pos[i] - _prev_rel_pos[i]) / max(1e-6, dt)
+
+    rel_pos = list(_filter_rel_pos)
+    rel_vel = list(_filter_rel_vel)
+
+    # Persist previous pos for next derivative estimate
+    _prev_rel_pos = list(rel_pos)
+    _prev_rel_vel = list(rel_vel)
+
+    rx, ry, rz = rel_pos
+    vx, vy, vz = rel_vel
+
+    range_norm = (rx*rx + ry*ry + rz*rz)**0.5
+
+    # Fuel-aware thrust scale
+    fuel_pct = state.get('fuel_remaining_pct', 100.0)
+    fuel_scale = 1.0
+    if fuel_pct < 10.0:
+        fuel_scale = 0.25
+    elif fuel_pct < 30.0:
+        fuel_scale = 0.6
+
+    # Guidance phases
+    # Safety caps for velocities per phase
+    desired_speed_along = 0.0
+    # along-track (y) strategy:
+    # If far >200m: use orbital strategy: if behind (ry < 0) apply retrograde (thrust_y negative) to lower orbit and speed up relative; if ahead apply prograde to slow
+    # We'll implement via setpoint for vy: want relative vy to be slightly negative when behind to close gap (but we must ensure correct orbital logic)
+    # Simpler practical method:
+    # - If ry < -200: we want to CATCH UP: set desired along-track delta-v negative (i.e., apply retrograde) -> request thrust_y negative.
+    # - If ry > +200: we are ahead; request prograde (positive thrust_y) to slow approach.
+    # - In medium range, aim to null position and velocity softly.
+    # Note: in LVLH, negative y = behind station (must close y gap), catching up is achieved by lowering orbit via retrograde burn (negative thrust_y)
+    thrust_x = 0.0
+    thrust_y = 0.0
+    thrust_z = 0.0
+
+    # PD gains tuned for normalized thruster [-1..1] outputs. These are conservative.
+    # Close-in (linear) controller gains
+    Kp_close = 0.02  # m^-1 -> normalized thrust per meter
+    Kd_close = 0.6   # s/m -> normalized thrust per (m/s)
+    # Medium gains
+    Kp_med = 0.01
+    Kd_med = 0.4
+    # Far guidance uses along-track bias
+    Kp_far_y = 0.008
+    Kd_far_y = 0.2
+
+    # Phase thresholds
+    if range_norm > 200.0:
+        # Far: primarily control y (along-track) using orbital maneuver heuristic
+        # if behind, request retrograde (negative thrust_y) proportional to distance and closure velocity desire
+        if ry < 0.0:
+            # behind: catch up -> retrograde (thrust_y negative)
+            # Desire: increase negative along-track velocity (vy more negative) until within ~200m
+            err_y = ry  # negative
+            derr_y = vy
+            # PD control: produce negative thrust_y
+            thrust_y_cmd = Kp_far_y * err_y + Kd_far_y * (-derr_y)  # err_y negative -> negative command
+        else:
+            # ahead: slow relative along-track motion by raising orbit (prograde)
+            err_y = ry
+            derr_y = vy
+            thrust_y_cmd = Kp_far_y * err_y + Kd_far_y * (-derr_y)
+        # Gentle radial/cross-track bias to null large offsets slowly
+        thrust_x_cmd = _clamp(Kp_far_y * rx + 0.1 * (-vx), -0.2, 0.2)
+        thrust_z_cmd = _clamp(Kp_far_y * rz + 0.1 * (-vz), -0.2, 0.2)
+
+        thrust_x = _clamp(thrust_x_cmd, -1.0, 1.0) * fuel_scale
+        thrust_y = _clamp(thrust_y_cmd, -1.0, 1.0) * fuel_scale
+        thrust_z = _clamp(thrust_z_cmd, -1.0, 1.0) * fuel_scale
+
+    elif 50.0 < range_norm <= 200.0:
+        # Medium: V-bar approach preferred: prioritize aligning y and vy, then gently reduce rx & rz.
+        # Compute PD control
+        err_y = ry
+        derr_y = vy
+        thrust_y_cmd = Kp_med * err_y + Kd_med * (-derr_y)
+        # radial and cross-track gentle
+        thrust_x_cmd = Kp_med * rx + Kd_med * (-vx)
+        thrust_z_cmd = Kp_med * rz + Kd_med * (-vz)
+
+        # clip more tightly
+        thrust_x = _clamp(thrust_x_cmd, -0.6, 0.6) * fuel_scale
+        thrust_y = _clamp(thrust_y_cmd, -0.9, 0.9) * fuel_scale
+        thrust_z = _clamp(thrust_z_cmd, -0.6, 0.6) * fuel_scale
+
+    else:
+        # Close-in: linear control (Clohessy-Wiltshire approx). Very gentle final approach under 50m.
+        # Tight PD for accurate stopping
+        err_x = rx
+        err_y = ry
+        err_z = rz
+        derr_x = vx
+        derr_y = vy
+        derr_z = vz
+
+        # Gains more aggressive for small distances but scaled
+        thrust_x_cmd = Kp_close * err_x + Kd_close * (-derr_x)
+        thrust_y_cmd = Kp_close * err_y + Kd_close * (-derr_y)
+        thrust_z_cmd = Kp_close * err_z + Kd_close * (-derr_z)
+
+        # Final safety for very close distances (<10m) reduce thrust magnitude and velocity setpoints
+        if range_norm < 10.0:
+            # cap approach speed
+            max_approach_speed = 0.1  # m/s desired
+            if abs(vy) > max_approach_speed:
+                # add stronger braking in y
+                thrust_y_cmd += _clamp(-0.8 * derr_y, -1.0, 1.0)
+            # reduce gains to avoid overshoot
+            thrust_x_cmd *= 0.6
+            thrust_y_cmd *= 0.5
+            thrust_z_cmd *= 0.6
+
+        thrust_x = _clamp(thrust_x_cmd, -1.0, 1.0) * fuel_scale
+        thrust_y = _clamp(thrust_y_cmd, -1.0, 1.0) * fuel_scale
+        thrust_z = _clamp(thrust_z_cmd, -1.0, 1.0) * fuel_scale
+
+    # Enforce absolute final approach throttle limits for safety
+    # If within 2 m and slow enough, cut thrust to avoid bumping
+    if range_norm < 2.0 and (vx*vx + vy*vy + vz*vz)**0.5 < 0.3:
+        thrust_x = 0.0
+        thrust_y = 0.0
+        thrust_z = 0.0
+
+    # Anti-uncommanded thrust mitigation: if sensors detect persistent uncommanded acceleration via accelerometers, attempt to counteract
+    # Simple heuristic: if net accel measured indicates persistent thrust in +Y direction (uncommanded), add small opposing command
+    # Use accelerometers if at least one valid set is present
+    accel_bias_y = 0.0
+    acc_valid_count = 0
+    sum_acc_y = 0.0
+    for i in (1,2,3):
+        vkey = f'accel_{i}_y_valid'
+        if state.get(vkey):
+            sum_acc_y += state.get(f'accel_{i}_y_ms2', 0.0)
+            acc_valid_count += 1
+    if acc_valid_count > 0:
+        accel_bias_y = sum_acc_y / acc_valid_count
+        # if there's persistent small acceleration (e.g., 0.02 m/s2) in +y, counter it
+        if abs(accel_bias_y) > 0.02:
+            # map to tiny thrust opposite sign
+            # 1 normalized thrust ~ 220 N per thruster; unknown mass, so be conservative
+            thrust_y += _clamp(-0.2 * accel_bias_y, -0.2, 0.2)
+
+    # Safety saturations
+    thrust_x = _clamp(thrust_x, -1.0, 1.0)
+    thrust_y = _clamp(thrust_y, -1.0, 1.0)
+    thrust_z = _clamp(thrust_z, -1.0, 1.0)
+
+    # Attitude rate commands: attempt to align spacecraft such that docking camera bearing goes to zero if camera active.
+    # Otherwise, damp angular rates measured by gyros if available; otherwise request zero small rates.
+    # Use star tracker if available for absolute attitude but here we only provide angular rate commands.
+    att_rate_roll = 0.0
+    att_rate_pitch = 0.0
+    att_rate_yaw = 0.0
+    max_rate = 0.035
+
+    # Use docking camera bearing to produce attitude rates to steer docking axis to zero
+    if state.get('dock_camera_active'):
+        # Try to use available bearing components
+        bx = state.get('dock_camera_bearing_x', 0.0) if state.get('dock_camera_bearing_x_valid', False) else None
+        by = state.get('dock_camera_bearing_y', 0.0) if state.get('dock_camera_bearing_y_valid', False) else None
+        bz = state.get('dock_camera_bearing_z', 0.0) if state.get('dock_camera_bearing_z_valid', False) else None
+        # PD on bearing angles (small-angle approx): control pitch/yaw
+        if bx is not None:
+            # Assume bearing_x -> pitch error (up/down)
+            att_rate_pitch = _clamp(-0.5 * bx, -max_rate, max_rate)
+        if by is not None:
+            # bearing_y -> yaw error (left/right), sign chosen heuristically
+            att_rate_yaw = _clamp(-0.5 * by, -max_rate, max_rate)
+        if bz is not None:
+            # z bearing could map to roll small correction
+            att_rate_roll = _clamp(-0.3 * bz, -max_rate, max_rate)
+    else:
+        # Camera not active: damp measured gyro rates if available
+        # average gyros if valid
+        gyro_counts = 0
+        gx_sum = gy_sum = gz_sum = 0.0
+        for i in (1,2,3):
+            # gyros provide pitch/roll/yaw in dps; convert to rad/s
+            if state.get(f'gyro_{i}_pitch_valid'):
+                gy_sum += state.get(f'gyro_{i}_pitch_dps', 0.0) * (3.141592653589793/180.0)
+                gyro_counts += 1
+            if state.get(f'gyro_{i}_roll_valid'):
+                gx_sum += state.get(f'gyro_{i}_roll_dps', 0.0) * (3.141592653589793/180.0)
+                gyro_counts += 1
+            if state.get(f'gyro_{i}_yaw_valid'):
+                gz_sum += state.get(f'gyro_{i}_yaw_dps', 0.0) * (3.141592653589793/180.0)
+                gyro_counts += 1
+        # if we have some gyro info, simple damping to zero
+        if gyro_counts > 0:
+            # Use small proportional damping
+            att_rate_roll = _clamp(-0.1 * gx_sum, -max_rate, max_rate)
+            att_rate_pitch = _clamp(-0.1 * gy_sum, -max_rate, max_rate)
+            att_rate_yaw = _clamp(-0.1 * gz_sum, -max_rate, max_rate)
+        else:
+            # No gyro info: hold still
+            att_rate_roll = 0.0
+            att_rate_pitch = 0.0
+            att_rate_yaw = 0.0
+
+    # Ensure rates within allowed limits
+    att_rate_roll = _clamp(att_rate_roll, -max_rate, max_rate)
+    att_rate_pitch = _clamp(att_rate_pitch, -max_rate, max_rate)
+    att_rate_yaw = _clamp(att_rate_yaw, -max_rate, max_rate)
+
+    # Record last command for persistence/debugging
+    _last_command = {
+        'thrust_x': thrust_x,
+        'thrust_y': thrust_y,
+        'thrust_z': thrust_z,
+        'att_rate_roll': att_rate_roll,
+        'att_rate_pitch': att_rate_pitch,
+        'att_rate_yaw': att_rate_yaw,
+        'source': src,
+        'range_m': range_norm,
+        'rel_pos': rel_pos,
+        'rel_vel': rel_vel,
+    }
+
+    return {
+        'thrust_x': float(thrust_x),
+        'thrust_y': float(thrust_y),
+        'thrust_z': float(thrust_z),
+        'att_rate_roll': float(att_rate_roll),
+        'att_rate_pitch': float(att_rate_pitch),
+        'att_rate_yaw': float(att_rate_yaw),
+    }
+```
+
+Notes and behavior highlights:
+- The controller is conservative to avoid overshoot and to conserve fuel. It uses an orbital heuristic in the far phase: if behind (negative y) it commands retrograde thrust (negative thrust_y) to lower orbit and thus speed up relative to the target, and if ahead it commands prograde thrust to raise orbit and slow approach.
+- In medium and close ranges the controller transitions to PD control in LVLH to null relative position and velocity, switching to a linear (CW) approximation under 50 m.
+- Dock camera, lidar, and radar are prioritized for relative pose; range-only sensors are used as a fallback. If sensors flicker the exponential filter smooths them.
+- Attitude pointing attempts to null camera bearing when available, otherwise damps measured gyro rates.
+- Low-fuel scaling reduces thrust magnitudes.
+- Small mitigation for possible uncommanded thrusts using accelerometer averages.
+- Returns values clipped to the requested ranges.
+
+This function is generic and intentionally robust across the described 25 test scenarios. You can tune the PD gains, smoothing alpha, and thresholds to match your vehicle mass and thruster authority as needed.

@@ -1,0 +1,584 @@
+```python
+import math
+from typing import Dict, List, Optional, Tuple
+
+# Persistent memory across calls (integrators, filters, previous estimates)
+_AP = {
+    "init": False,
+
+    # Fused state (filtered)
+    "alt_ft": 0.0,
+    "vs_fpm": 0.0,
+    "ias_kt": 0.0,
+    "mach": 0.0,
+    "hdg_deg": 0.0,
+    "track_deg": 0.0,
+    "pitch_deg": 0.0,
+    "roll_deg": 0.0,
+    "pitch_rate_dps": 0.0,
+    "roll_rate_dps": 0.0,
+    "yaw_rate_dps": 0.0,
+    "aoa_deg": 0.0,
+    "radar_alt_ft": 99999.0,
+    "drift_deg": 0.0,
+
+    # Integrators
+    "ias_i": 0.0,
+    "pitch_i": 0.0,
+    "roll_i": 0.0,
+
+    # For trim biasing
+    "trim_bias": 0.0,     # internal desired trim increment (deg-like abstract)
+    "trim_out": 0.0,      # output in [-1, +1]
+
+    # Previous targets (for capture logic / smoothing)
+    "target_alt_ft": None,
+}
+
+def _clamp(x: float, lo: float, hi: float) -> float:
+    return lo if x < lo else hi if x > hi else x
+
+def _wrap180(deg: float) -> float:
+    d = (deg + 180.0) % 360.0 - 180.0
+    return 180.0 if d == -180.0 else d
+
+def _is_num(x) -> bool:
+    return isinstance(x, (int, float)) and math.isfinite(x)
+
+def _median(vals: List[float]) -> Optional[float]:
+    v = sorted(vals)
+    if not v:
+        return None
+    n = len(v)
+    m = n // 2
+    return v[m] if (n % 2 == 1) else 0.5 * (v[m - 1] + v[m])
+
+def _robust_fuse(values: List[Tuple[float, float]], max_dev: float) -> Optional[float]:
+    """
+    values: list of (value, weight) where weight >= 0
+    Returns weighted average of inliers around median; rejects gross outliers.
+    """
+    nums = [v for v, w in values if _is_num(v) and w > 0.0]
+    if not nums:
+        return None
+
+    med = _median(nums)
+    if med is None:
+        return None
+
+    inliers = []
+    for v, w in values:
+        if not _is_num(v) or w <= 0.0:
+            continue
+        if abs(v - med) <= max_dev:
+            inliers.append((v, w))
+
+    if not inliers:
+        # fall back to median even if everyone is an outlier
+        return med
+
+    sw = sum(w for _, w in inliers)
+    if sw <= 1e-9:
+        return med
+    return sum(v * w for v, w in inliers) / sw
+
+def _lp(prev: float, new: float, tau: float, dt: float) -> float:
+    """First-order low-pass filter with time-constant tau (s)."""
+    if dt <= 0.0:
+        return prev
+    a = _clamp(dt / (tau + dt), 0.0, 1.0)
+    return prev + a * (new - prev)
+
+def _rate_limit(prev: float, new: float, max_rate_per_s: float, dt: float) -> float:
+    if dt <= 0.0:
+        return new
+    max_step = abs(max_rate_per_s) * dt
+    return prev + _clamp(new - prev, -max_step, +max_step)
+
+def autopilot_step(state: dict, dt: float) -> dict:
+    """
+    Simulation autopilot for an A320-class twin.
+    Outputs normalized control commands.
+    """
+    global _AP
+    dt = float(dt) if _is_num(dt) else float(state.get("dt", 0.05) or 0.05)
+    dt = _clamp(dt, 0.001, 0.2)
+
+    ap_on = bool(state.get("ap_engaged", False))
+    at_on = bool(state.get("at_engaged", False))
+
+    # If AP is off: do nothing (maintain current values)
+    if not ap_on and not at_on:
+        return {}
+
+    # -------------------------
+    # Robust sensor fusion
+    # -------------------------
+    # Valid flags can lie: use them only as weak weights, still do outlier rejection.
+
+    # Baro altitude (ft MSL)
+    baro_vals = []
+    for i in (1, 2, 3):
+        v = state.get(f"baro_alt_{i}_ft")
+        valid = bool(state.get(f"baro_alt_{i}_valid", True))
+        if _is_num(v):
+            baro_vals.append((float(v), 1.0 if valid else 0.5))
+    baro_alt = _robust_fuse(baro_vals, max_dev=250.0)  # ft
+
+    # GPS altitude (ft MSL)
+    gps_alt_vals = []
+    for i in (1, 2, 3):
+        v = state.get(f"gps_{i}_alt_ft")
+        valid = bool(state.get(f"gps_{i}_valid", True))
+        if _is_num(v):
+            gps_alt_vals.append((float(v), 1.0 if valid else 0.5))
+    gps_alt = _robust_fuse(gps_alt_vals, max_dev=400.0)
+
+    # Radar altitude (ft AGL) - good near ground, unreliable high / over terrain changes
+    rad_vals = []
+    for i in (1, 2, 3):
+        v = state.get(f"radar_alt_{i}_ft")
+        valid = bool(state.get(f"radar_alt_{i}_valid", True))
+        if _is_num(v):
+            rad_vals.append((float(v), 1.0 if valid else 0.5))
+    radar_alt = _robust_fuse(rad_vals, max_dev=80.0)  # ft AGL
+
+    # IAS (kt)
+    ias_vals = []
+    for i in (1, 2, 3):
+        v = state.get(f"ias_{i}_kt")
+        valid = bool(state.get(f"ias_{i}_valid", True))
+        if _is_num(v):
+            ias_vals.append((float(v), 1.0 if valid else 0.4))
+    ias = _robust_fuse(ias_vals, max_dev=12.0)
+
+    # Mach
+    mach_vals = []
+    for i in (1, 2, 3):
+        v = state.get(f"mach_{i}")
+        if _is_num(v):
+            mach_vals.append((float(v), 1.0))
+    mach = _robust_fuse(mach_vals, max_dev=0.03)
+
+    # AOA (deg)
+    aoa_vals = []
+    for i in (1, 2, 3):
+        v = state.get(f"aoa_{i}_deg")
+        valid = bool(state.get(f"aoa_{i}_valid", True))
+        if _is_num(v):
+            aoa_vals.append((float(v), 1.0 if valid else 0.4))
+    aoa = _robust_fuse(aoa_vals, max_dev=2.5)
+
+    # IRS attitude / heading / track / VS
+    pitch_vals, roll_vals, hdg_vals, trk_vals, vs_vals = [], [], [], [], []
+    for i in (1, 2, 3):
+        valid = bool(state.get(f"irs_{i}_valid", True))
+        w = 1.0 if valid else 0.4
+        p = state.get(f"irs_{i}_pitch_deg")
+        r = state.get(f"irs_{i}_roll_deg")
+        h = state.get(f"irs_{i}_heading_deg")
+        t = state.get(f"irs_{i}_track_deg")
+        vs = state.get(f"irs_{i}_vs_fpm")
+        if _is_num(p): pitch_vals.append((float(p), w))
+        if _is_num(r): roll_vals.append((float(r), w))
+        if _is_num(h): hdg_vals.append((float(h) % 360.0, w))
+        if _is_num(t): trk_vals.append((float(t) % 360.0, w))
+        if _is_num(vs): vs_vals.append((float(vs), w))
+
+    pitch = _robust_fuse(pitch_vals, max_dev=3.0)
+    roll  = _robust_fuse(roll_vals,  max_dev=5.0)
+
+    # Heading/track are circular; fuse by choosing median on a locally-unwrapped set.
+    def fuse_angle(deg_list: List[Tuple[float, float]], max_dev: float) -> Optional[float]:
+        nums = [(v, w) for v, w in deg_list if _is_num(v) and w > 0.0]
+        if not nums:
+            return None
+        base = nums[0][0]
+        unwrapped = []
+        for v, w in nums:
+            dv = _wrap180(v - base)
+            unwrapped.append((base + dv, w))
+        fused = _robust_fuse(unwrapped, max_dev=max_dev)
+        return (fused % 360.0) if fused is not None else None
+
+    hdg = fuse_angle(hdg_vals, max_dev=8.0)
+    trk = fuse_angle(trk_vals, max_dev=8.0)
+
+    vs = _robust_fuse(vs_vals, max_dev=400.0)
+    if _is_num(state.get("vertical_speed_fpm")):
+        # Use nav VS as an additional weak input
+        nav_vs = float(state["vertical_speed_fpm"])
+        vs = _robust_fuse([(vs, 1.0)] if vs is not None else [] + [(nav_vs, 0.5)], max_dev=600.0) or nav_vs
+
+    # Gyro rates (deg/s)
+    pr_vals, rr_vals, yr_vals = [], [], []
+    for i in (1, 2, 3):
+        valid = bool(state.get(f"gyro_{i}_valid", True))
+        w = 1.0 if valid else 0.4
+        pr = state.get(f"gyro_{i}_pitch_rate_dps")
+        rr = state.get(f"gyro_{i}_roll_rate_dps")
+        yr = state.get(f"gyro_{i}_yaw_rate_dps")
+        if _is_num(pr): pr_vals.append((float(pr), w))
+        if _is_num(rr): rr_vals.append((float(rr), w))
+        if _is_num(yr): yr_vals.append((float(yr), w))
+    pitch_rate = _robust_fuse(pr_vals, max_dev=8.0)
+    roll_rate  = _robust_fuse(rr_vals, max_dev=10.0)
+    yaw_rate   = _robust_fuse(yr_vals, max_dev=8.0)
+
+    # Drift angle
+    drift = float(state.get("drift_angle_deg", 0.0) or 0.0)
+
+    # If anything missing, fall back to last filtered values
+    def fallback(key: str, val: Optional[float]) -> float:
+        return _AP[key] if (val is None or not _is_num(val)) else float(val)
+
+    baro_alt = fallback("alt_ft", baro_alt)
+    ias      = fallback("ias_kt", ias)
+    mach     = fallback("mach", mach if mach is not None else 0.0)
+    aoa      = fallback("aoa_deg", aoa if aoa is not None else _AP["aoa_deg"])
+    pitch    = fallback("pitch_deg", pitch)
+    roll     = fallback("roll_deg", roll)
+    hdg      = fallback("hdg_deg", hdg)
+    trk      = fallback("track_deg", trk)
+    vs       = fallback("vs_fpm", vs)
+    pitch_rate = fallback("pitch_rate_dps", pitch_rate if pitch_rate is not None else 0.0)
+    roll_rate  = fallback("roll_rate_dps",  roll_rate  if roll_rate  is not None else 0.0)
+    yaw_rate   = fallback("yaw_rate_dps",   yaw_rate   if yaw_rate   is not None else 0.0)
+    radar_alt  = fallback("radar_alt_ft", radar_alt if radar_alt is not None else 99999.0)
+
+    # Plausibility / smoothing (reject jumps)
+    if not _AP["init"]:
+        _AP["init"] = True
+        _AP["alt_ft"] = baro_alt
+        _AP["vs_fpm"] = vs
+        _AP["ias_kt"] = ias
+        _AP["mach"] = mach
+        _AP["pitch_deg"] = pitch
+        _AP["roll_deg"] = roll
+        _AP["hdg_deg"] = hdg
+        _AP["track_deg"] = trk
+        _AP["pitch_rate_dps"] = pitch_rate
+        _AP["roll_rate_dps"] = roll_rate
+        _AP["yaw_rate_dps"] = yaw_rate
+        _AP["aoa_deg"] = aoa
+        _AP["radar_alt_ft"] = radar_alt
+        _AP["drift_deg"] = drift
+
+    # Rate-limit then low-pass for robustness against silent sensor spikes
+    baro_alt = _rate_limit(_AP["alt_ft"], baro_alt, max_rate_per_s=8000/60.0, dt=dt)  # 8000 fpm
+    vs       = _rate_limit(_AP["vs_fpm"], vs,       max_rate_per_s=15000/60.0, dt=dt)
+    ias      = _rate_limit(_AP["ias_kt"], ias,      max_rate_per_s=40.0, dt=dt)       # 40 kt/s is generous
+    pitch    = _rate_limit(_AP["pitch_deg"], pitch, max_rate_per_s=20.0, dt=dt)
+    roll     = _rate_limit(_AP["roll_deg"], roll,   max_rate_per_s=35.0, dt=dt)
+    hdg      = ( _AP["hdg_deg"] + _clamp(_wrap180(hdg - _AP["hdg_deg"]), -20*dt, 20*dt) ) % 360.0
+    trk      = ( _AP["track_deg"] + _clamp(_wrap180(trk - _AP["track_deg"]), -20*dt, 20*dt) ) % 360.0
+    radar_alt = _rate_limit(_AP["radar_alt_ft"], radar_alt, max_rate_per_s=12000/60.0, dt=dt)
+
+    _AP["alt_ft"] = _lp(_AP["alt_ft"], baro_alt, tau=0.6, dt=dt)
+    _AP["vs_fpm"] = _lp(_AP["vs_fpm"], vs,       tau=0.4, dt=dt)
+    _AP["ias_kt"] = _lp(_AP["ias_kt"], ias,      tau=0.4, dt=dt)
+    _AP["mach"]   = _lp(_AP["mach"],   mach,     tau=0.8, dt=dt)
+    _AP["pitch_deg"] = _lp(_AP["pitch_deg"], pitch, tau=0.3, dt=dt)
+    _AP["roll_deg"]  = _lp(_AP["roll_deg"],  roll,  tau=0.25, dt=dt)
+    _AP["hdg_deg"]   = hdg
+    _AP["track_deg"] = trk
+    _AP["pitch_rate_dps"] = _lp(_AP["pitch_rate_dps"], pitch_rate, tau=0.2, dt=dt)
+    _AP["roll_rate_dps"]  = _lp(_AP["roll_rate_dps"],  roll_rate,  tau=0.2, dt=dt)
+    _AP["yaw_rate_dps"]   = _lp(_AP["yaw_rate_dps"],   yaw_rate,   tau=0.25, dt=dt)
+    _AP["aoa_deg"]        = _lp(_AP["aoa_deg"],        aoa,        tau=0.35, dt=dt)
+    _AP["radar_alt_ft"]   = _lp(_AP["radar_alt_ft"],   radar_alt,  tau=0.5, dt=dt)
+    _AP["drift_deg"]      = _lp(_AP["drift_deg"],      drift,      tau=0.8, dt=dt)
+
+    alt_ft = _AP["alt_ft"]
+    vs_fpm = _AP["vs_fpm"]
+    ias_kt = _AP["ias_kt"]
+    mach   = _AP["mach"]
+    pitch_deg = _AP["pitch_deg"]
+    roll_deg  = _AP["roll_deg"]
+    hdg_deg   = _AP["hdg_deg"]
+    pitch_rate_dps = _AP["pitch_rate_dps"]
+    roll_rate_dps  = _AP["roll_rate_dps"]
+    yaw_rate_dps   = _AP["yaw_rate_dps"]
+    aoa_deg        = _AP["aoa_deg"]
+    radar_alt_ft   = _AP["radar_alt_ft"]
+    drift_deg      = _AP["drift_deg"]
+
+    # -------------------------
+    # Targets and mode inference
+    # -------------------------
+    tgt_alt = float(state.get("target_alt_ft", alt_ft) or alt_ft)
+    tgt_hdg = float(state.get("target_hdg_deg", hdg_deg) or hdg_deg) % 360.0
+    tgt_ias = float(state.get("target_ias_kt", ias_kt) or ias_kt)
+    tgt_vs  = float(state.get("target_vs_fpm", 0.0) or 0.0)
+
+    # If target altitude changed significantly, reset capture memory a bit
+    prev_tgt_alt = _AP.get("target_alt_ft")
+    if prev_tgt_alt is None or abs(tgt_alt - prev_tgt_alt) > 50.0:
+        # avoid integrator fights when targets jump
+        _AP["pitch_i"] *= 0.5
+    _AP["target_alt_ft"] = tgt_alt
+
+    # Mode heuristic:
+    # - If a meaningful target_vs is set, use VS mode (but still capture altitude when close).
+    # - Otherwise altitude-hold/capture.
+    use_vs_mode = abs(tgt_vs) > 100.0
+
+    # -------------------------
+    # Envelope protection
+    # -------------------------
+    VNE_IAS = 365.0
+    VMO_MARGIN = 5.0
+    overspeed = (ias_kt > (VNE_IAS - VMO_MARGIN)) or (mach > 0.82)
+
+    # Stall / low-speed cues: use AoA + IAS; keep conservative.
+    # A320 alpha-prot is complex; here we do a simple protected logic.
+    aoa_high = aoa_deg > 12.0
+    very_slow = ias_kt < max(110.0, 0.55 * max(tgt_ias, 160.0))  # crude safeguard
+    stall_risk = aoa_high or very_slow
+
+    # Ground proximity inhibits aggressive descent
+    near_ground = (radar_alt_ft is not None) and (radar_alt_ft < 600.0)
+
+    # -------------------------
+    # Lateral control: heading hold -> bank command -> aileron PID
+    # -------------------------
+    hdg_err = _wrap180(tgt_hdg - hdg_deg)
+
+    # Convert heading error to desired bank angle (deg)
+    # Softer at small errors; limited to typical AP bank (25 deg)
+    bank_cmd = _clamp(0.35 * hdg_err, -25.0, 25.0)
+
+    # If near stall or very slow, keep bank small
+    if stall_risk:
+        bank_cmd = _clamp(bank_cmd, -10.0, 10.0)
+    if near_ground:
+        bank_cmd = _clamp(bank_cmd, -15.0, 15.0)
+
+    # Roll control (PID-like): aileron command
+    roll_err = bank_cmd - roll_deg
+    kp_roll = 0.055
+    kd_roll = 0.018
+    ki_roll = 0.012
+
+    # Integrator with anti-windup
+    _AP["roll_i"] = _clamp(_AP["roll_i"] + ki_roll * roll_err * dt, -0.35, 0.35)
+    aileron = kp_roll * roll_err - kd_roll * roll_rate_dps + _AP["roll_i"]
+    aileron = _clamp(aileron, -1.0, 1.0)
+
+    # -------------------------
+    # Vertical control: altitude/VS -> pitch command -> elevator PID
+    # -------------------------
+    alt_err = tgt_alt - alt_ft
+
+    # Outer loop: produce VS command
+    if use_vs_mode:
+        vs_cmd = _clamp(tgt_vs, -3500.0, 3500.0)
+        # Altitude capture: when close to target altitude, smoothly transition to hold
+        if abs(alt_err) < 250.0:
+            vs_cmd = _clamp(0.8 * alt_err, -1000.0, 1000.0)
+    else:
+        # Altitude capture/hold
+        # proportional to altitude error -> vertical speed
+        vs_cmd = _clamp(1.2 * alt_err, -2500.0, 2500.0)
+        # soften close in
+        if abs(alt_err) < 200.0:
+            vs_cmd = _clamp(0.9 * alt_err, -800.0, 800.0)
+
+    # Ground proximity: don't command big descents close to terrain
+    if near_ground:
+        vs_cmd = max(vs_cmd, -600.0)
+
+    # Inner loop: VS error -> pitch command
+    vs_err = vs_cmd - vs_fpm
+
+    # Base pitch command from VS (deg). Limits roughly consistent with transport AP.
+    pitch_cmd = _clamp(0.0030 * vs_err, -8.0, +12.0)
+
+    # Speed/energy coupling:
+    # If too slow, reduce pitch command (pitch down) and if too fast, allow mild pitch up.
+    ias_err = tgt_ias - ias_kt
+    pitch_cmd += _clamp(0.03 * ias_err, -4.0, +3.0)
+
+    # Overspeed: pitch up a bit (within reason) to help slow
+    if overspeed:
+        pitch_cmd = max(pitch_cmd, +2.0)
+
+    # Stall risk: strong nose-down command
+    if stall_risk:
+        pitch_cmd = min(pitch_cmd, -4.0)
+
+    # Final pitch command limits (more conservative near ground)
+    if near_ground:
+        pitch_cmd = _clamp(pitch_cmd, -5.0, +10.0)
+    else:
+        pitch_cmd = _clamp(pitch_cmd, -10.0, +15.0)
+
+    # Pitch control to elevator
+    pitch_err = pitch_cmd - pitch_deg
+    kp_pitch = 0.075
+    kd_pitch = 0.028
+    ki_pitch = 0.020
+
+    # Integrator with anti-windup; dump integral in extreme protections
+    if overspeed or stall_risk:
+        _AP["pitch_i"] *= 0.6
+    _AP["pitch_i"] = _clamp(_AP["pitch_i"] + ki_pitch * pitch_err * dt, -0.35, 0.35)
+
+    elevator = kp_pitch * pitch_err - kd_pitch * pitch_rate_dps + _AP["pitch_i"]
+    elevator = _clamp(elevator, -1.0, 1.0)
+
+    # Trim management: slowly bias trim to reduce sustained elevator command
+    # Only trim when stable-ish and not in envelope protection.
+    trim_cmd = 0.0
+    stable = (abs(roll_err) < 5.0 and abs(pitch_err) < 2.0 and abs(vs_err) < 300.0)
+    if stable and not overspeed and not stall_risk and not near_ground:
+        # drive trim toward canceling long-term elevator
+        _AP["trim_bias"] = _clamp(_AP["trim_bias"] + 0.10 * elevator * dt, -1.0, 1.0)
+        trim_cmd = _clamp(_AP["trim_bias"], -1.0, 1.0)
+    else:
+        # decay trim bias change rate to avoid chasing transients
+        _AP["trim_bias"] *= (1.0 - _clamp(0.15 * dt, 0.0, 0.05))
+        trim_cmd = 0.0
+
+    # -------------------------
+    # Yaw / rudder: yaw damper + drift + asymmetric thrust compensation
+    # -------------------------
+    # Basic yaw damper
+    rudder = 0.0
+    rudder += _clamp(-0.06 * yaw_rate_dps, -0.35, 0.35)
+    rudder += _clamp(-0.015 * drift_deg,   -0.25, 0.25)
+
+    # Asymmetric thrust (engine-out / split thrust)
+    t1 = float(state.get("engine_1_thrust_pct", 0.0) or 0.0)
+    t2 = float(state.get("engine_2_thrust_pct", 0.0) or 0.0)
+    thrust_diff = (t2 - t1) / 100.0  # -1..+1
+    rudder += _clamp(0.45 * thrust_diff, -0.45, 0.45)
+
+    # Reduce rudder commands near ground
+    if near_ground:
+        rudder *= 0.7
+    rudder = _clamp(rudder, -1.0, 1.0)
+
+    # -------------------------
+    # Autothrottle: IAS hold with protections
+    # -------------------------
+    out: Dict[str, float] = {}
+
+    if at_on:
+        # Throttle PID on IAS error; slow integral to avoid oscillations.
+        kp_t = 0.018
+        ki_t = 0.010
+        kd_t = 0.006
+
+        # Derivative term from rate of IAS change (approx)
+        # (We can approximate with vs of IAS by using previous filtered ias in _AP;
+        #  here we re-use the low-pass output, so use a simple differencer.)
+        # Keep a local memory for d/dt IAS.
+        if "ias_prev" not in _AP:
+            _AP["ias_prev"] = ias_kt
+            _AP["ias_d"] = 0.0
+        ias_dot = (ias_kt - _AP["ias_prev"]) / dt
+        _AP["ias_prev"] = ias_kt
+        _AP["ias_d"] = _lp(_AP["ias_d"], ias_dot, tau=0.5, dt=dt)
+
+        # Integrator anti-windup on saturation conditions
+        # Use a conservative integrator bound.
+        _AP["ias_i"] = _clamp(_AP["ias_i"] + ki_t * ias_err * dt, -0.35, 0.55)
+
+        throttle_cmd = 0.50 + (kp_t * ias_err) - (kd_t * _AP["ias_d"]) + _AP["ias_i"]
+
+        # Protections:
+        if overspeed:
+            throttle_cmd = min(throttle_cmd, 0.05)
+            _AP["ias_i"] *= 0.7
+        if stall_risk:
+            throttle_cmd = max(throttle_cmd, 0.92)
+            _AP["ias_i"] *= 0.5
+
+        # Near ground: avoid abrupt thrust chops (but still allow idle for landing)
+        if near_ground and not overspeed and not stall_risk:
+            throttle_cmd = _clamp(throttle_cmd, 0.25, 1.0)
+
+        throttle_cmd = _clamp(throttle_cmd, 0.0, 1.0)
+
+        # If an engine is not running, keep its throttle low and let the other work.
+        e1_run = bool(state.get("engine_1_running", True))
+        e2_run = bool(state.get("engine_2_running", True))
+        if not e1_run and e2_run:
+            out["throttle_1"] = 0.0
+            out["throttle_2"] = throttle_cmd
+        elif not e2_run and e1_run:
+            out["throttle_1"] = throttle_cmd
+            out["throttle_2"] = 0.0
+        else:
+            out["throttle_1"] = throttle_cmd
+            out["throttle_2"] = throttle_cmd
+
+    # -------------------------
+    # Speedbrake / configuration (simple, conservative)
+    # -------------------------
+    # Only use speedbrake for overspeed or large positive speed error (too fast),
+    # and avoid deploying with flaps out near the ground.
+    flap_l = float(state.get("flap_pos_left_deg", 0.0) or 0.0)
+    flap_r = float(state.get("flap_pos_right_deg", 0.0) or 0.0)
+    flap_avg = 0.5 * (flap_l + flap_r)
+
+    speedbrake = None
+    if overspeed and (radar_alt_ft > 800.0 or radar_alt_ft > 9999.0):
+        speedbrake = 1.0 if flap_avg < 10.0 else 0.5
+    else:
+        fast = (ias_kt - tgt_ias)
+        if fast > 30.0 and flap_avg < 10.0 and (radar_alt_ft > 1000.0 or radar_alt_ft > 9999.0):
+            speedbrake = 0.8
+        elif fast > 15.0 and flap_avg < 10.0 and (radar_alt_ft > 1500.0 or radar_alt_ft > 9999.0):
+            speedbrake = 0.4
+        elif stall_risk:
+            speedbrake = 0.0
+
+    if speedbrake is not None:
+        out["speedbrake"] = _clamp(speedbrake, 0.0, 1.0)
+
+    # Optional conservative flap/gear scheduling for approach ONLY when clearly low:
+    # (Avoid acting on possibly-faulty radar altitude at cruise by requiring baro low too.)
+    flaps_cmd = None
+    gear_cmd = None
+    low_baro = alt_ft < 12000.0
+    low_agl = radar_alt_ft < 3500.0
+    if low_baro and low_agl and (tgt_alt < alt_ft + 2000.0):
+        # crude approach hint: based on target IAS
+        if tgt_ias >= 210:
+            flaps_cmd = 0
+        elif tgt_ias >= 195:
+            flaps_cmd = 5
+        elif tgt_ias >= 175:
+            flaps_cmd = 10
+        elif tgt_ias >= 160:
+            flaps_cmd = 20
+        else:
+            flaps_cmd = 30
+
+        # gear: only if slow and low-ish
+        if (tgt_ias < 185.0) and (radar_alt_ft < 1600.0):
+            gear_cmd = 1
+
+    # Stall risk close to ground: allow some flaps (but don't slam full)
+    if stall_risk and low_baro and low_agl and tgt_ias < 200.0:
+        flaps_cmd = max(flaps_cmd or 0, 10)
+
+    if flaps_cmd is not None:
+        out["flaps"] = float(_clamp(flaps_cmd, 0, 40))
+    if gear_cmd is not None:
+        out["gear"] = int(gear_cmd)
+
+    # -------------------------
+    # Output primary controls
+    # -------------------------
+    if ap_on:
+        out["elevator"] = float(elevator)
+        out["aileron"] = float(aileron)
+        out["rudder"] = float(rudder)
+        if trim_cmd != 0.0:
+            out["elevator_trim"] = float(_clamp(trim_cmd, -1.0, 1.0))
+
+    return out
+```

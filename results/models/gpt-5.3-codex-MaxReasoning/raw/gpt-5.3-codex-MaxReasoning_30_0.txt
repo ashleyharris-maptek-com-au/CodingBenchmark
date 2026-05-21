@@ -1,0 +1,643 @@
+#!/usr/bin/env python3
+import sys
+import tempfile
+from array import array
+
+TEXT_CHUNK = 1 << 20
+BIN_CLAUSE_CHUNK = 65536  # clauses per binary read chunk
+MASK64 = (1 << 64) - 1
+
+# Use full in-memory WalkSAT only when occurrence indexing is practical.
+FULL_MODE_MAX_CLAUSES = 1_500_000
+FULL_MODE_MAX_VARS = 2_500_000
+
+
+def xorshift64(seed: int) -> int:
+    seed ^= (seed << 13) & MASK64
+    seed ^= (seed >> 7)
+    seed ^= (seed << 17) & MASK64
+    return seed & MASK64
+
+
+def int_stream():
+    """Yield signed integers from stdin using chunked byte parsing."""
+    read = sys.stdin.buffer.read
+    data = read(TEXT_CHUNK)
+    num = 0
+    sign = 1
+    in_num = False
+
+    while data:
+        for b in data:
+            if 48 <= b <= 57:  # '0'..'9'
+                num = num * 10 + (b - 48)
+                in_num = True
+            elif b == 45:  # '-'
+                sign = -1
+            else:
+                if in_num:
+                    yield sign * num
+                    num = 0
+                    sign = 1
+                    in_num = False
+                else:
+                    sign = 1
+        data = read(TEXT_CHUNK)
+
+    if in_num:
+        yield sign * num
+
+
+def build_clause_store_and_scores(n_vars, n_clauses, ints):
+    """
+    Store clauses as packed uint32 literals in a temp file.
+    literal encoding: (var << 1) | neg_bit
+      neg_bit = 0 for positive literal, 1 for negated literal.
+    Also build signed occurrence score per variable.
+    """
+    scores = array('i', [0]) * (n_vars + 1)
+    tmp = tempfile.TemporaryFile()
+
+    buf = array('I')
+    append = buf.append
+    flush_threshold = 1 << 20  # uint32 values
+
+    clauses_read = 0
+    for _ in range(n_clauses):
+        try:
+            a = next(ints)
+            b = next(ints)
+            c = next(ints)
+        except StopIteration:
+            break
+
+        for lit in (a, b, c):
+            if lit > 0:
+                v = lit
+                scores[v] += 1
+                append(v << 1)
+            else:
+                v = -lit
+                scores[v] -= 1
+                append((v << 1) | 1)
+
+        clauses_read += 1
+
+        if len(buf) >= flush_threshold:
+            buf.tofile(tmp)
+            buf = array('I')
+            append = buf.append
+
+    if buf:
+        buf.tofile(tmp)
+
+    return tmp, scores, clauses_read
+
+
+def initial_assignment(scores):
+    """Set variable to majority polarity: True if score >= 0 else False."""
+    n_vars = len(scores) - 1
+    assign = bytearray(n_vars + 1)
+    for i in range(1, n_vars + 1):
+        if scores[i] >= 0:
+            assign[i] = 1
+    return assign
+
+
+def count_unsat_stream(clause_file, assign, n_clauses):
+    """Single verification sweep: count unsatisfied clauses."""
+    clause_file.seek(0)
+    read = clause_file.read
+
+    unsat = 0
+    done = 0
+    carry = b''
+    chunk_bytes = BIN_CLAUSE_CHUNK * 12
+
+    while done < n_clauses:
+        block = read(chunk_bytes)
+        if not block:
+            break
+
+        data = carry + block
+        usable = (len(data) // 12) * 12
+        carry = data[usable:]
+
+        if usable == 0:
+            continue
+
+        words = memoryview(data[:usable]).cast('I')
+        i = 0
+        wlen = len(words)
+
+        while i < wlen and done < n_clauses:
+            e1 = words[i]
+            e2 = words[i + 1]
+            e3 = words[i + 2]
+            i += 3
+            done += 1
+
+            v1 = e1 >> 1
+            n1 = e1 & 1
+            v2 = e2 >> 1
+            n2 = e2 & 1
+            v3 = e3 >> 1
+            n3 = e3 & 1
+
+            if assign[v1] == n1 and assign[v2] == n2 and assign[v3] == n3:
+                unsat += 1
+
+    return unsat
+
+
+def repair_sweep_stream(clause_file, assign, scores, n_clauses, random_mode=False, seed=0x9E3779B97F4A7C15):
+    """
+    Sweep clauses and repair unsatisfied ones in-place.
+    Returns (unsat_before_repairs, updated_seed).
+    """
+    clause_file.seek(0)
+    read = clause_file.read
+
+    unsat = 0
+    done = 0
+    carry = b''
+    chunk_bytes = BIN_CLAUSE_CHUNK * 12
+
+    while done < n_clauses:
+        block = read(chunk_bytes)
+        if not block:
+            break
+
+        data = carry + block
+        usable = (len(data) // 12) * 12
+        carry = data[usable:]
+
+        if usable == 0:
+            continue
+
+        words = memoryview(data[:usable]).cast('I')
+        i = 0
+        wlen = len(words)
+
+        while i < wlen and done < n_clauses:
+            e1 = words[i]
+            e2 = words[i + 1]
+            e3 = words[i + 2]
+            i += 3
+            done += 1
+
+            v1 = e1 >> 1
+            n1 = e1 & 1
+            v2 = e2 >> 1
+            n2 = e2 & 1
+            v3 = e3 >> 1
+            n3 = e3 & 1
+
+            if assign[v1] == n1 and assign[v2] == n2 and assign[v3] == n3:
+                unsat += 1
+
+                if random_mode:
+                    seed = xorshift64(seed)
+                    pick = seed % 3
+                    if pick == 0:
+                        assign[v1] = 1 - n1
+                    elif pick == 1:
+                        assign[v2] = 1 - n2
+                    else:
+                        assign[v3] = 1 - n3
+                else:
+                    d1 = 1 - n1
+                    d2 = 1 - n2
+                    d3 = 1 - n3
+
+                    w1 = scores[v1] if d1 else -scores[v1]
+                    w2 = scores[v2] if d2 else -scores[v2]
+                    w3 = scores[v3] if d3 else -scores[v3]
+
+                    best_v = v1
+                    best_d = d1
+                    best_w = w1
+
+                    if w2 > best_w:
+                        best_v = v2
+                        best_d = d2
+                        best_w = w2
+
+                    if w3 > best_w:
+                        best_v = v3
+                        best_d = d3
+
+                    assign[best_v] = best_d
+
+    return unsat, seed
+
+
+def load_literals(clause_file, n_clauses):
+    clause_file.seek(0)
+    lits = array('I')
+    need = n_clauses * 3
+    try:
+        lits.fromfile(clause_file, need)
+    except EOFError:
+        # Partial read fallback (should not happen in normal flow).
+        remaining = clause_file.read()
+        if remaining:
+            tail = len(remaining) // 4 * 4
+            if tail:
+                lits.frombytes(remaining[:tail])
+    return lits
+
+
+def build_occurrence_index(lits, n_vars, n_clauses):
+    occ_count = array('I', [0]) * (n_vars + 1)
+    for e in lits:
+        occ_count[e >> 1] += 1
+
+    occ_start = array('I', [0]) * (n_vars + 2)
+    run = 0
+    for v in range(1, n_vars + 1):
+        occ_start[v] = run
+        run += occ_count[v]
+    occ_start[n_vars + 1] = run
+
+    next_pos = array('I', occ_start)
+    occ_clause = array('I', [0]) * run
+    occ_neg = bytearray(run)
+
+    for cid in range(n_clauses):
+        b = 3 * cid
+        e1 = lits[b]
+        e2 = lits[b + 1]
+        e3 = lits[b + 2]
+        for e in (e1, e2, e3):
+            v = e >> 1
+            p = next_pos[v]
+            occ_clause[p] = cid
+            occ_neg[p] = e & 1
+            next_pos[v] = p + 1
+
+    return occ_start, occ_clause, occ_neg
+
+
+def init_sat_state(lits, assign, n_clauses):
+    sat_count = bytearray(n_clauses)
+    unsat = array('I')
+    pos_in_unsat = array('i', [-1]) * n_clauses
+
+    for cid in range(n_clauses):
+        b = 3 * cid
+        e1 = lits[b]
+        e2 = lits[b + 1]
+        e3 = lits[b + 2]
+
+        c = 0
+        if assign[e1 >> 1] != (e1 & 1):
+            c += 1
+        if assign[e2 >> 1] != (e2 & 1):
+            c += 1
+        if assign[e3 >> 1] != (e3 & 1):
+            c += 1
+
+        sat_count[cid] = c
+        if c == 0:
+            pos_in_unsat[cid] = len(unsat)
+            unsat.append(cid)
+
+    return sat_count, unsat, pos_in_unsat
+
+
+def walksat_attempt(assign, lits, occ_start, occ_clause, occ_neg, n_clauses, seed, max_flips, noise_bits):
+    sat_count, unsat, pos_in_unsat = init_sat_state(lits, assign, n_clauses)
+    if len(unsat) == 0:
+        return True, 0, seed
+
+    for _ in range(max_flips):
+        ulen = len(unsat)
+        if ulen == 0:
+            return True, 0, seed
+
+        seed = xorshift64(seed)
+        cid = unsat[seed % ulen]
+        b = 3 * cid
+
+        e1 = lits[b]
+        e2 = lits[b + 1]
+        e3 = lits[b + 2]
+
+        v1 = e1 >> 1
+        v2 = e2 >> 1
+        v3 = e3 >> 1
+
+        # Compute breakcount for each candidate variable.
+        a1 = assign[v1]
+        a2 = assign[v2]
+        a3 = assign[v3]
+
+        br1 = 0
+        p = occ_start[v1]
+        q = occ_start[v1 + 1]
+        while p < q:
+            c = occ_clause[p]
+            if sat_count[c] == 1 and a1 != occ_neg[p]:
+                br1 += 1
+            p += 1
+
+        br2 = 0
+        p = occ_start[v2]
+        q = occ_start[v2 + 1]
+        while p < q:
+            c = occ_clause[p]
+            if sat_count[c] == 1 and a2 != occ_neg[p]:
+                br2 += 1
+            p += 1
+
+        br3 = 0
+        p = occ_start[v3]
+        q = occ_start[v3 + 1]
+        while p < q:
+            c = occ_clause[p]
+            if sat_count[c] == 1 and a3 != occ_neg[p]:
+                br3 += 1
+            p += 1
+
+        # WalkSAT variable choice.
+        zero_mask = 0
+        if br1 == 0:
+            zero_mask |= 1
+        if br2 == 0:
+            zero_mask |= 2
+        if br3 == 0:
+            zero_mask |= 4
+
+        if zero_mask:
+            seed = xorshift64(seed)
+            if zero_mask == 1:
+                flip_v = v1
+            elif zero_mask == 2:
+                flip_v = v2
+            elif zero_mask == 4:
+                flip_v = v3
+            elif zero_mask == 3:
+                flip_v = v1 if (seed & 1) == 0 else v2
+            elif zero_mask == 5:
+                flip_v = v1 if (seed & 1) == 0 else v3
+            elif zero_mask == 6:
+                flip_v = v2 if (seed & 1) == 0 else v3
+            else:
+                pick = seed % 3
+                if pick == 0:
+                    flip_v = v1
+                elif pick == 1:
+                    flip_v = v2
+                else:
+                    flip_v = v3
+        else:
+            seed = xorshift64(seed)
+            if (seed & 1023) < noise_bits:
+                pick = seed % 3
+                if pick == 0:
+                    flip_v = v1
+                elif pick == 1:
+                    flip_v = v2
+                else:
+                    flip_v = v3
+            else:
+                # Minimum breakcount, random tie break.
+                best_b = br1
+                flip_v = v1
+                tie_mask = 1
+
+                if br2 < best_b:
+                    best_b = br2
+                    flip_v = v2
+                    tie_mask = 2
+                elif br2 == best_b:
+                    tie_mask |= 2
+
+                if br3 < best_b:
+                    flip_v = v3
+                    tie_mask = 4
+                elif br3 == best_b:
+                    tie_mask |= 4
+
+                if tie_mask == 3:
+                    flip_v = v1 if (seed & 1) == 0 else v2
+                elif tie_mask == 5:
+                    flip_v = v1 if (seed & 1) == 0 else v3
+                elif tie_mask == 6:
+                    flip_v = v2 if (seed & 1) == 0 else v3
+                elif tie_mask == 7:
+                    pick = seed % 3
+                    if pick == 0:
+                        flip_v = v1
+                    elif pick == 1:
+                        flip_v = v2
+                    else:
+                        flip_v = v3
+
+        # Apply flip incrementally.
+        old = assign[flip_v]
+        new = 1 - old
+        assign[flip_v] = new
+
+        p = occ_start[flip_v]
+        q = occ_start[flip_v + 1]
+
+        while p < q:
+            c = occ_clause[p]
+            neg = occ_neg[p]
+
+            was_true = 1 if old != neg else 0
+            now_true = 1 if new != neg else 0
+
+            if was_true != now_true:
+                before = sat_count[c]
+                after = before + (1 if now_true else -1)
+                sat_count[c] = after
+
+                if before == 0 and after > 0:
+                    # remove c from unsat
+                    pos = pos_in_unsat[c]
+                    if pos >= 0:
+                        last_idx = len(unsat) - 1
+                        last_clause = unsat[last_idx]
+                        unsat[pos] = last_clause
+                        pos_in_unsat[last_clause] = pos
+                        unsat.pop()
+                        pos_in_unsat[c] = -1
+                elif before > 0 and after == 0:
+                    # add c to unsat
+                    pos_in_unsat[c] = len(unsat)
+                    unsat.append(c)
+
+            p += 1
+
+    return len(unsat) == 0, len(unsat), seed
+
+
+def perturb_assignment(assign, seed, flip_mask=7):
+    """Flip ~1/(flip_mask+1) variables to escape local minima."""
+    n_vars = len(assign) - 1
+    for i in range(1, n_vars + 1):
+        seed = xorshift64(seed)
+        if (seed & flip_mask) == 0:
+            assign[i] ^= 1
+    return seed
+
+
+def solve_full_mode(n_vars, n_clauses, clause_file, scores):
+    lits = load_literals(clause_file, n_clauses)
+    if len(lits) < n_clauses * 3:
+        # Corrupted / partial input fallback.
+        assign = initial_assignment(scores)
+        return assign, False
+
+    occ_start, occ_clause, occ_neg = build_occurrence_index(lits, n_vars, n_clauses)
+
+    base_assign = initial_assignment(scores)
+    best_assign = bytearray(base_assign)
+    best_unsat = n_clauses + 1
+
+    if n_clauses <= 150_000:
+        restarts = 8
+        max_flips = 2_000_000
+    elif n_clauses <= 600_000:
+        restarts = 5
+        max_flips = 3_000_000
+    else:
+        restarts = 3
+        max_flips = 4_000_000
+
+    noise_bits = 580  # about 0.566 * 1024
+    seed = 0x9E3779B97F4A7C15 ^ n_clauses ^ (n_vars << 1)
+
+    for r in range(restarts):
+        if r == 0:
+            assign = bytearray(base_assign)
+        else:
+            assign = bytearray(best_assign)
+            seed = perturb_assignment(assign, seed, flip_mask=7)
+
+        solved, unsat_left, seed = walksat_attempt(
+            assign,
+            lits,
+            occ_start,
+            occ_clause,
+            occ_neg,
+            n_clauses,
+            seed,
+            max_flips,
+            noise_bits,
+        )
+
+        if solved:
+            return assign, True
+
+        if unsat_left < best_unsat:
+            best_unsat = unsat_left
+            best_assign = bytearray(assign)
+
+    return best_assign, False
+
+
+def solve_stream_mode(clause_file, scores, n_vars, n_clauses):
+    assign = initial_assignment(scores)
+
+    unsat = count_unsat_stream(clause_file, assign, n_clauses)
+    if unsat == 0:
+        return assign
+
+    if n_clauses <= 5_000_000:
+        det_passes = 8
+        rnd_passes = 6
+    elif n_clauses <= 20_000_000:
+        det_passes = 5
+        rnd_passes = 4
+    else:
+        det_passes = 3
+        rnd_passes = 3
+
+    seed = 0xD1B54A32D192ED03 ^ n_clauses ^ (n_vars << 2)
+
+    for _ in range(det_passes):
+        before, seed = repair_sweep_stream(clause_file, assign, scores, n_clauses, random_mode=False, seed=seed)
+        if before == 0:
+            break
+        unsat = count_unsat_stream(clause_file, assign, n_clauses)
+        if unsat == 0:
+            break
+
+    if unsat != 0:
+        for _ in range(rnd_passes):
+            before, seed = repair_sweep_stream(clause_file, assign, scores, n_clauses, random_mode=True, seed=seed)
+            if before == 0:
+                break
+            unsat = count_unsat_stream(clause_file, assign, n_clauses)
+            if unsat == 0:
+                break
+
+    return assign
+
+
+def write_solution(assign):
+    out = sys.stdout.buffer
+    out.write(b"SAT\n")
+
+    n_vars = len(assign) - 1
+    chunk = bytearray()
+    flush_at = 1 << 20
+
+    for i in range(1, n_vars + 1):
+        chunk.append(49 if assign[i] else 48)  # '1' or '0'
+        if i < n_vars:
+            chunk.append(32)  # space
+        else:
+            chunk.append(10)  # newline
+
+        if len(chunk) >= flush_at:
+            out.write(chunk)
+            chunk.clear()
+
+    if chunk:
+        out.write(chunk)
+
+
+def main():
+    ints = int_stream()
+
+    try:
+        n_vars = next(ints)
+        n_clauses = next(ints)
+    except StopIteration:
+        return
+
+    if n_vars <= 0:
+        sys.stdout.write("SAT\n\n")
+        return
+
+    clause_file, scores, clauses_read = build_clause_store_and_scores(n_vars, n_clauses, ints)
+
+    use_full_mode = (
+        clauses_read <= FULL_MODE_MAX_CLAUSES
+        and n_vars <= FULL_MODE_MAX_VARS
+    )
+
+    if use_full_mode:
+        assign, solved = solve_full_mode(n_vars, clauses_read, clause_file, scores)
+        if not solved:
+            # Finish with additional streaming repairs from the best full-mode state.
+            seed = 0xA24BAED4963EE407 ^ clauses_read
+            for _ in range(3):
+                before, seed = repair_sweep_stream(clause_file, assign, scores, clauses_read, random_mode=True, seed=seed)
+                if before == 0:
+                    break
+                if count_unsat_stream(clause_file, assign, clauses_read) == 0:
+                    break
+    else:
+        assign = solve_stream_mode(clause_file, scores, n_vars, clauses_read)
+
+    write_solution(assign)
+
+
+if __name__ == "__main__":
+    main()

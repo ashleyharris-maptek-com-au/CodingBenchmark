@@ -1,0 +1,395 @@
+use std::cmp::min;
+use std::env;
+use std::fs::{remove_file, File};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+const POINT_BYTES: usize = 12;
+const OUTPUT_BUF_POINTS: usize = 1 << 16;
+const SMALL_POINTS_THRESHOLD: u64 = 2_000_000;
+const MEDIUM_POINTS_THRESHOLD: u64 = 20_000_000;
+const SAMPLE_CAP: usize = 1_000_000;
+const MEDIUM_SAMPLE_CAP: usize = 300_000;
+const LARGE_SAMPLE_CAP: usize = 100_000;
+const KMEANS_ITERS_SMALL: usize = 15;
+const KMEANS_ITERS_MEDIUM: usize = 10;
+const KMEANS_ITERS_LARGE: usize = 6;
+const REFINEMENT_PASSES_MEDIUM: usize = 3;
+const REFINEMENT_PASSES_LARGE: usize = 2;
+
+#[derive(Clone, Copy, Debug, Default)]
+struct Point {
+    x: f32,
+    y: f32,
+    z: f32,
+}
+
+impl Point {
+    fn zero() -> Self {
+        Self { x: 0.0, y: 0.0, z: 0.0 }
+    }
+
+    fn add_assign(&mut self, other: Point) {
+        self.x += other.x;
+        self.y += other.y;
+        self.z += other.z;
+    }
+
+    fn scale(&self, inv: f32) -> Self {
+        Self {
+            x: self.x * inv,
+            y: self.y * inv,
+            z: self.z * inv,
+        }
+    }
+
+    fn dist2(&self, other: &Point) -> f32 {
+        let dx = self.x - other.x;
+        let dy = self.y - other.y;
+        let dz = self.z - other.z;
+        dx * dx + dy * dy + dz * dz
+    }
+}
+
+struct Rng64 {
+    state: u64,
+}
+
+impl Rng64 {
+    fn new(seed: u64) -> Self {
+        let s = if seed == 0 { 0x9E3779B97F4A7C15 } else { seed };
+        Self { state: s }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.state;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.state = x;
+        x.wrapping_mul(0x2545F4914F6CDD1D)
+    }
+
+    fn gen_range(&mut self, upper: u64) -> u64 {
+        if upper <= 1 {
+            0
+        } else {
+            self.next_u64() % upper
+        }
+    }
+}
+
+fn nearest_center(p: &Point, centers: &[Point]) -> usize {
+    let mut best = 0usize;
+    let mut best_d = f32::INFINITY;
+    for (i, c) in centers.iter().enumerate() {
+        let d = p.dist2(c);
+        if d < best_d {
+            best_d = d;
+            best = i;
+        }
+    }
+    best
+}
+
+fn choose_sample_cap(n: u64, k: usize) -> usize {
+    let base = if n <= SMALL_POINTS_THRESHOLD {
+        SAMPLE_CAP
+    } else if n <= MEDIUM_POINTS_THRESHOLD {
+        MEDIUM_SAMPLE_CAP
+    } else {
+        LARGE_SAMPLE_CAP
+    };
+    let min_need = k.saturating_mul(32).max(k);
+    base.max(min_need).min(SAMPLE_CAP)
+}
+
+fn parse_header<R: BufRead>(reader: &mut R) -> io::Result<(u64, usize)> {
+    let mut header = String::new();
+    reader.read_line(&mut header)?;
+    let mut parts = header.split_whitespace();
+    let n: u64 = parts
+        .next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing num_points"))?
+        .parse()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid num_points"))?;
+    let k: usize = parts
+        .next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing num_clusters"))?
+        .parse()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid num_clusters"))?;
+    if k == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "num_clusters must be positive",
+        ));
+    }
+    Ok((n, k))
+}
+
+fn unique_temp_path() -> PathBuf {
+    let mut path = env::temp_dir();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let pid = std::process::id();
+    path.push(format!("rust_kmeans_{}_{}.bin", pid, now));
+    path
+}
+
+fn read_point_from(bytes: &[u8]) -> Point {
+    let x = f32::from_le_bytes(bytes[0..4].try_into().unwrap());
+    let y = f32::from_le_bytes(bytes[4..8].try_into().unwrap());
+    let z = f32::from_le_bytes(bytes[8..12].try_into().unwrap());
+    Point { x, y, z }
+}
+
+fn write_assignments<W: Write>(writer: &mut W, idxs: &[u32]) -> io::Result<()> {
+    let mut out = vec![0u8; idxs.len() * 4];
+    for (i, &v) in idxs.iter().enumerate() {
+        out[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    writer.write_all(&out)
+}
+
+fn spool_and_sample<R: Read>(
+    reader: &mut R,
+    file: &mut File,
+    n: u64,
+    sample_cap: usize,
+    keep_all: bool,
+    rng: &mut Rng64,
+) -> io::Result<(Vec<Point>, Option<Vec<Point>>)> {
+    let mut sample = Vec::with_capacity(sample_cap.min(n as usize));
+    let mut all_points = if keep_all {
+        Some(Vec::with_capacity(n as usize))
+    } else {
+        None
+    };
+
+    let mut buf = vec![0u8; POINT_BYTES * 8192];
+    let mut seen: u64 = 0;
+    while seen < n {
+        let remaining = (n - seen) as usize;
+        let points_this = min(remaining, buf.len() / POINT_BYTES);
+        let bytes_needed = points_this * POINT_BYTES;
+        reader.read_exact(&mut buf[..bytes_needed])?;
+        file.write_all(&buf[..bytes_needed])?;
+
+        for chunk in buf[..bytes_needed].chunks_exact(POINT_BYTES) {
+            let p = read_point_from(chunk);
+            if let Some(v) = &mut all_points {
+                v.push(p);
+            }
+            if sample.len() < sample_cap {
+                sample.push(p);
+            } else {
+                let j = rng.gen_range(seen + 1);
+                if (j as usize) < sample_cap {
+                    sample[j as usize] = p;
+                }
+            }
+            seen += 1;
+        }
+    }
+    file.flush()?;
+    Ok((sample, all_points))
+}
+
+fn init_centers(sample: &[Point], k: usize, rng: &mut Rng64) -> Vec<Point> {
+    if sample.is_empty() {
+        return vec![Point::zero(); k];
+    }
+    let mut centers = Vec::with_capacity(k);
+    centers.push(sample[rng.gen_range(sample.len() as u64) as usize]);
+
+    while centers.len() < k {
+        let mut best_point = sample[rng.gen_range(sample.len() as u64) as usize];
+        let mut best_score = -1.0f32;
+        let tries = min(8, sample.len());
+        for _ in 0..tries {
+            let cand = sample[rng.gen_range(sample.len() as u64) as usize];
+            let d = centers
+                .iter()
+                .map(|c| cand.dist2(c))
+                .fold(f32::INFINITY, f32::min);
+            if d > best_score {
+                best_score = d;
+                best_point = cand;
+            }
+        }
+        centers.push(best_point);
+    }
+    centers
+}
+
+fn repair_empty_centers(centers: &mut [Point], counts: &[u64], sample: &[Point], rng: &mut Rng64) {
+    if sample.is_empty() {
+        return;
+    }
+    for (i, c) in counts.iter().enumerate() {
+        if *c == 0 {
+            centers[i] = sample[rng.gen_range(sample.len() as u64) as usize];
+        }
+    }
+}
+
+fn kmeans_on_slice(data: &[Point], k: usize, iters: usize, rng: &mut Rng64) -> Vec<Point> {
+    let mut centers = init_centers(data, k, rng);
+    if data.is_empty() {
+        return centers;
+    }
+
+    for _ in 0..iters {
+        let mut sums = vec![Point::zero(); k];
+        let mut counts = vec![0u64; k];
+
+        for p in data {
+            let idx = nearest_center(p, &centers);
+            sums[idx].add_assign(*p);
+            counts[idx] += 1;
+        }
+
+        let mut movement = 0.0f32;
+        for i in 0..k {
+            if counts[i] > 0 {
+                let next = sums[i].scale(1.0 / counts[i] as f32);
+                movement += centers[i].dist2(&next);
+                centers[i] = next;
+            }
+        }
+        repair_empty_centers(&mut centers, &counts, data, rng);
+        if movement <= 1e-8 * k as f32 {
+            break;
+        }
+    }
+    centers
+}
+
+fn streaming_refine(
+    file: &mut File,
+    n: u64,
+    centers: &mut [Point],
+    sample: &[Point],
+    passes: usize,
+    rng: &mut Rng64,
+) -> io::Result<()> {
+    let k = centers.len();
+    let mut buf = vec![0u8; POINT_BYTES * 8192];
+
+    for _ in 0..passes {
+        file.seek(SeekFrom::Start(0))?;
+        let mut sums = vec![Point::zero(); k];
+        let mut counts = vec![0u64; k];
+        let mut seen = 0u64;
+
+        while seen < n {
+            let remaining = (n - seen) as usize;
+            let points_this = min(remaining, buf.len() / POINT_BYTES);
+            let bytes_needed = points_this * POINT_BYTES;
+            file.read_exact(&mut buf[..bytes_needed])?;
+
+            for chunk in buf[..bytes_needed].chunks_exact(POINT_BYTES) {
+                let p = read_point_from(chunk);
+                let idx = nearest_center(&p, centers);
+                sums[idx].add_assign(p);
+                counts[idx] += 1;
+            }
+            seen += points_this as u64;
+        }
+
+        for i in 0..k {
+            if counts[i] > 0 {
+                centers[i] = sums[i].scale(1.0 / counts[i] as f32);
+            }
+        }
+        repair_empty_centers(centers, &counts, sample, rng);
+    }
+    Ok(())
+}
+
+fn assign_and_write(file: &mut File, n: u64, centers: &[Point]) -> io::Result<()> {
+    file.seek(SeekFrom::Start(0))?;
+    let stdout = io::stdout();
+    let mut out = BufWriter::new(stdout.lock());
+    let mut in_buf = vec![0u8; POINT_BYTES * 8192];
+    let mut out_idxs = Vec::with_capacity(OUTPUT_BUF_POINTS);
+    let mut seen = 0u64;
+
+    while seen < n {
+        let remaining = (n - seen) as usize;
+        let points_this = min(remaining, in_buf.len() / POINT_BYTES);
+        let bytes_needed = points_this * POINT_BYTES;
+        file.read_exact(&mut in_buf[..bytes_needed])?;
+
+        for chunk in in_buf[..bytes_needed].chunks_exact(POINT_BYTES) {
+            let p = read_point_from(chunk);
+            out_idxs.push(nearest_center(&p, centers) as u32);
+            if out_idxs.len() >= OUTPUT_BUF_POINTS {
+                write_assignments(&mut out, &out_idxs)?;
+                out_idxs.clear();
+            }
+        }
+        seen += points_this as u64;
+    }
+    if !out_idxs.is_empty() {
+        write_assignments(&mut out, &out_idxs)?;
+    }
+    out.flush()
+}
+
+fn main() -> io::Result<()> {
+    let stdin = io::stdin();
+    let mut reader = BufReader::new(stdin.lock());
+    let (n, k) = parse_header(&mut reader)?;
+
+    if n == 0 {
+        return Ok(());
+    }
+
+    let mut rng = Rng64::new((n ^ k as u64).wrapping_add(0xD1B54A32D192ED03));
+    let sample_cap = choose_sample_cap(n, k);
+    let keep_all = n <= SMALL_POINTS_THRESHOLD;
+
+    let temp_path = unique_temp_path();
+    let mut temp_file = File::create(&temp_path)?;
+
+    let (sample, all_points) = spool_and_sample(&mut reader, &mut temp_file, n, sample_cap, keep_all, &mut rng)?;
+
+    let mut centers = if let Some(points) = &all_points {
+        kmeans_on_slice(points, k, KMEANS_ITERS_SMALL, &mut rng)
+    } else if n <= MEDIUM_POINTS_THRESHOLD {
+        let mut c = kmeans_on_slice(&sample, k, KMEANS_ITERS_MEDIUM, &mut rng);
+        streaming_refine(
+            &mut temp_file,
+            n,
+            &mut c,
+            &sample,
+            REFINEMENT_PASSES_MEDIUM,
+            &mut rng,
+        )?;
+        c
+    } else {
+        let mut c = kmeans_on_slice(&sample, k, KMEANS_ITERS_LARGE, &mut rng);
+        streaming_refine(
+            &mut temp_file,
+            n,
+            &mut c,
+            &sample,
+            REFINEMENT_PASSES_LARGE,
+            &mut rng,
+        )?;
+        c
+    };
+
+    if centers.len() < k {
+        centers.resize(k, Point::zero());
+    }
+
+    assign_and_write(&mut temp_file, n, &centers)?;
+
+    let _ = remove_file(&temp_path);
+    Ok(())
+}

@@ -1,0 +1,908 @@
+```csharp
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Text;
+
+public static class Program
+{
+    // Cell states in board[]
+    // 0  = unknown (' ')
+    // 1..9 = revealed number 0..8 stored as (digit + 1)
+    // 10 = mine ('*' or inferred)
+    // 11 = proven safe (was unknown, inferred safe)
+    private const byte Unknown = 0;
+    private const byte NumBase = 1;
+    private const byte Mine = 10;
+    private const byte Safe = 11;
+
+    public static void Main()
+    {
+        var input = new FastInput(Console.OpenStandardInput());
+
+        int h = input.ReadInt();
+        int w = input.ReadInt();
+        if (h <= 0 || w <= 0)
+        {
+            Console.WriteLine(0);
+            return;
+        }
+
+        long totalCellsLong = (long)h * w;
+        if (totalCellsLong > int.MaxValue)
+            throw new InvalidOperationException("Board too large for a single .NET array.");
+
+        int total = (int)totalCellsLong;
+        byte[] board = new byte[total];
+
+        // Queue seeded with all number cells
+        var queue = new IntQueue(Math.Min(total, 1 << 20));
+
+        // Store safe cells to output (indices); no duplicates because we only add when flipping Unknown->Safe.
+        var safeOut = new List<int>(capacity: 1024);
+
+        // For smaller boards, keep list of number cells to avoid rescanning.
+        // For gigantic boards, storing all numbers could be too memory-heavy in worst case.
+        List<int>? numberCells = total <= 20_000_000 ? new List<int>(capacity: Math.Min(total, 1_000_000)) : null;
+
+        byte[] rowBuf = new byte[w];
+        for (int r = 0; r < h; r++)
+        {
+            input.ReadRow(w, rowBuf);
+            int rowStart = r * w;
+            for (int c = 0; c < w; c++)
+            {
+                byte ch = rowBuf[c];
+                int idx = rowStart + c;
+
+                byte st;
+                if (ch == (byte)'*') st = Mine;
+                else if ((uint)(ch - (byte)'0') <= 8) st = (byte)(NumBase + (ch - (byte)'0'));
+                else st = Unknown; // includes space, '.' etc.
+
+                board[idx] = st;
+                if (st >= NumBase && st <= NumBase + 8)
+                {
+                    queue.Enqueue(idx);
+                    numberCells?.Add(idx);
+                }
+            }
+        }
+
+        // Adaptive configuration (safe, conservative thresholds).
+        bool enableCsp =
+            total <= 60_000_000 &&               // avoid too many full passes on ludicrous boards
+            (numberCells != null);               // we rely on numberCells to build constraints efficiently
+
+        // Frontier/CSP limits (adaptive-ish by scale)
+        int maxFrontierVars = total <= 2_000_000 ? 500_000 : (total <= 20_000_000 ? 250_000 : 120_000);
+        int maxConstraints = total <= 2_000_000 ? 500_000 : (total <= 20_000_000 ? 250_000 : 120_000);
+
+        int exactMaxVars = total <= 5_000_000 ? 24 : 22; // exact enumeration cutoff
+        int subsetMaxVars = 600;                          // for subset rule (pairwise) components
+        int subsetMaxConstraints = 1200;
+
+        // Main solve loop: fast propagation, then (optional) CSP pass, repeat if CSP adds new facts.
+        for (int iter = 0; iter < 6; iter++)
+        {
+            bool changed = PropagateBasic(h, w, board, queue, safeOut);
+
+            if (!enableCsp) break;
+
+            bool cspChanged = RunCspPass(
+                h, w, board, numberCells!,
+                queue, safeOut,
+                maxFrontierVars, maxConstraints,
+                exactMaxVars, subsetMaxVars, subsetMaxConstraints);
+
+            if (!cspChanged) break;
+            // If CSP changed something, it enqueued affected numbers; next iteration PropagateBasic will run.
+        }
+
+        // Output
+        using var sw = new StreamWriter(Console.OpenStandardOutput(), new UTF8Encoding(false), bufferSize: 1 << 20);
+        sw.WriteLine(safeOut.Count);
+        foreach (int idx in safeOut)
+        {
+            int y = idx / w;
+            int x = idx - y * w;
+            sw.Write(x);
+            sw.Write(' ');
+            sw.WriteLine(y);
+        }
+    }
+
+    private static bool PropagateBasic(int h, int w, byte[] board, IntQueue q, List<int> safeOut)
+    {
+        bool changed = false;
+
+        Span<int> unks = stackalloc int[8];
+
+        while (q.Count != 0)
+        {
+            int idx = q.Dequeue();
+            byte st = board[idx];
+            if (st < NumBase || st > NumBase + 8) continue;
+
+            int target = st - NumBase;
+            int r = idx / w;
+            int c = idx - r * w;
+
+            int mines = 0;
+            int uCount = 0;
+
+            for (int dr = -1; dr <= 1; dr++)
+            {
+                int nr = r + dr;
+                if ((uint)nr >= (uint)h) continue;
+
+                int baseRow = nr * w;
+                for (int dc = -1; dc <= 1; dc++)
+                {
+                    if (dr == 0 && dc == 0) continue;
+                    int nc = c + dc;
+                    if ((uint)nc >= (uint)w) continue;
+
+                    int nidx = baseRow + nc;
+                    byte nst = board[nidx];
+                    if (nst == Mine) mines++;
+                    else if (nst == Unknown) unks[uCount++] = nidx;
+                }
+            }
+
+            if (uCount == 0) continue;
+
+            if (mines == target)
+            {
+                for (int i = 0; i < uCount; i++)
+                    changed |= MarkSafe(h, w, board, unks[i], q, safeOut);
+            }
+            else if (mines + uCount == target)
+            {
+                for (int i = 0; i < uCount; i++)
+                    changed |= MarkMine(h, w, board, unks[i], q);
+            }
+        }
+
+        return changed;
+    }
+
+    private static bool RunCspPass(
+        int h, int w,
+        byte[] board,
+        List<int> numberCells,
+        IntQueue q,
+        List<int> safeOut,
+        int maxFrontierVars,
+        int maxConstraints,
+        int exactMaxVars,
+        int subsetMaxVars,
+        int subsetMaxConstraints)
+    {
+        bool changed = false;
+
+        // Map frontier unknown cell index -> variable id
+        var varIdByCell = new Dictionary<int, int>(capacity: Math.Min(maxFrontierVars, 1 << 20));
+        var varCellById = new List<int>(capacity: Math.Min(maxFrontierVars, 1 << 20));
+        var constraints = new List<Constraint>(capacity: Math.Min(maxConstraints, 1 << 20));
+
+        Span<int> unkCells = stackalloc int[8];
+
+        // Build constraints from number cells.
+        foreach (int idx in numberCells)
+        {
+            byte st = board[idx];
+            if (st < NumBase || st > NumBase + 8) continue;
+
+            int target = st - NumBase;
+            int r = idx / w;
+            int c = idx - r * w;
+
+            int mines = 0;
+            int uCount = 0;
+
+            for (int dr = -1; dr <= 1; dr++)
+            {
+                int nr = r + dr;
+                if ((uint)nr >= (uint)h) continue;
+
+                int baseRow = nr * w;
+                for (int dc = -1; dc <= 1; dc++)
+                {
+                    if (dr == 0 && dc == 0) continue;
+                    int nc = c + dc;
+                    if ((uint)nc >= (uint)w) continue;
+
+                    int nidx = baseRow + nc;
+                    byte nst = board[nidx];
+                    if (nst == Mine) mines++;
+                    else if (nst == Unknown) unkCells[uCount++] = nidx;
+                }
+            }
+
+            int need = target - mines;
+            if (uCount == 0) continue;
+            if (need < 0 || need > uCount) continue; // inconsistent inputs ignored safely
+
+            // If immediately resolvable, apply (should usually already be handled by PropagateBasic).
+            if (need == 0)
+            {
+                for (int i = 0; i < uCount; i++) changed |= MarkSafe(h, w, board, unkCells[i], q, safeOut);
+                continue;
+            }
+            if (need == uCount)
+            {
+                for (int i = 0; i < uCount; i++) changed |= MarkMine(h, w, board, unkCells[i], q);
+                continue;
+            }
+
+            // Create constraint over frontier variables.
+            int[] vars = new int[uCount];
+            for (int i = 0; i < uCount; i++)
+            {
+                int cell = unkCells[i];
+                if (!varIdByCell.TryGetValue(cell, out int vid))
+                {
+                    vid = varCellById.Count;
+                    varIdByCell.Add(cell, vid);
+                    varCellById.Add(cell);
+
+                    if (varCellById.Count > maxFrontierVars)
+                        return changed; // abort CSP, still sound
+                }
+                vars[i] = vid;
+            }
+
+            if (vars.Length == 1)
+            {
+                // Single variable: must be mine (need==1) or safe (need==0), but need!=0 here so must be mine.
+                changed |= MarkMine(h, w, board, varCellById[vars[0]], q);
+                continue;
+            }
+
+            constraints.Add(new Constraint(vars, need));
+            if (constraints.Count > maxConstraints)
+                return changed; // abort CSP, still sound
+        }
+
+        if (constraints.Count == 0 || varCellById.Count == 0) return changed;
+
+        // Union-find components of variables linked by constraints.
+        int varCount = varCellById.Count;
+        var uf = new UnionFind(varCount);
+        for (int ci = 0; ci < constraints.Count; ci++)
+        {
+            int[] v = constraints[ci].Vars;
+            int a = v[0];
+            for (int i = 1; i < v.Length; i++)
+                uf.Union(a, v[i]);
+        }
+
+        // Group vars and constraints by component.
+        var compIdByRoot = new Dictionary<int, int>();
+        var compVars = new List<List<int>>();
+        var compCons = new List<List<int>>();
+
+        for (int v = 0; v < varCount; v++)
+        {
+            int root = uf.Find(v);
+            if (!compIdByRoot.TryGetValue(root, out int cid))
+            {
+                cid = compVars.Count;
+                compIdByRoot.Add(root, cid);
+                compVars.Add(new List<int>());
+                compCons.Add(new List<int>());
+            }
+            compVars[cid].Add(v);
+        }
+
+        for (int ci = 0; ci < constraints.Count; ci++)
+        {
+            int root = uf.Find(constraints[ci].Vars[0]);
+            int cid = compIdByRoot[root];
+            compCons[cid].Add(ci);
+        }
+
+        // Solve each component with an adaptive strategy.
+        for (int cid = 0; cid < compVars.Count; cid++)
+        {
+            var vars = compVars[cid];
+            var cons = compCons[cid];
+            if (vars.Count == 0 || cons.Count == 0) continue;
+
+            if (vars.Count <= exactMaxVars)
+            {
+                changed |= SolveExactComponent(h, w, board, q, safeOut, varCellById, constraints, vars, cons);
+            }
+            else if (vars.Count <= subsetMaxVars && cons.Count <= subsetMaxConstraints)
+            {
+                changed |= SolveSubsetComponent(h, w, board, q, safeOut, varCellById, constraints, vars, cons);
+            }
+            // else: too big/complex to attack safely with heavier methods in this pass; skip.
+        }
+
+        return changed;
+    }
+
+    private static bool SolveExactComponent(
+        int h, int w,
+        byte[] board,
+        IntQueue q,
+        List<int> safeOut,
+        List<int> varCellByIdGlobal,
+        List<Constraint> constraintsGlobal,
+        List<int> compVarIdsGlobal,
+        List<int> compConstraintIdsGlobal)
+    {
+        int n = compVarIdsGlobal.Count;
+        int m = compConstraintIdsGlobal.Count;
+
+        // Map global var id -> local index [0..n)
+        var localIndex = new Dictionary<int, int>(n * 2);
+        int[] localToCell = new int[n];
+        for (int i = 0; i < n; i++)
+        {
+            int gv = compVarIdsGlobal[i];
+            localIndex[gv] = i;
+            localToCell[i] = varCellByIdGlobal[gv];
+        }
+
+        // Build local constraints
+        var consVars = new List<int[]>(m);
+        var consNeed = new List<int>(m);
+
+        for (int i = 0; i < m; i++)
+        {
+            Constraint c = constraintsGlobal[compConstraintIdsGlobal[i]];
+            int[] gvs = c.Vars;
+            int[] lvs = new int[gvs.Length];
+            for (int k = 0; k < gvs.Length; k++)
+                lvs[k] = localIndex[gvs[k]];
+            Array.Sort(lvs);
+            consVars.Add(lvs);
+            consNeed.Add(c.Need);
+        }
+
+        // Build degrees and reorder vars by degree (most constrained first).
+        int[] deg = new int[n];
+        for (int ci = 0; ci < consVars.Count; ci++)
+        {
+            foreach (int v in consVars[ci]) deg[v]++;
+        }
+
+        int[] permOldToNew = new int[n];
+        int[] order = new int[n];
+        for (int i = 0; i < n; i++) order[i] = i;
+        Array.Sort(order, (a, b) =>
+        {
+            int d = deg[b].CompareTo(deg[a]);
+            return d != 0 ? d : a.CompareTo(b);
+        });
+        for (int newI = 0; newI < n; newI++) permOldToNew[order[newI]] = newI;
+
+        int[] newToCell = new int[n];
+        for (int oldI = 0; oldI < n; oldI++)
+            newToCell[permOldToNew[oldI]] = localToCell[oldI];
+
+        // Remap constraints to new variable indices, rebuild var->constraints adjacency.
+        int consCount = consVars.Count;
+        int[][] cVars = new int[consCount][];
+        int[] need = new int[consCount];
+        int[] unassigned = new int[consCount];
+
+        var varCons = new List<int>[n];
+        for (int i = 0; i < n; i++) varCons[i] = new List<int>(deg[order[i]]);
+
+        for (int ci = 0; ci < consCount; ci++)
+        {
+            int[] arr = consVars[ci];
+            for (int k = 0; k < arr.Length; k++) arr[k] = permOldToNew[arr[k]];
+            Array.Sort(arr);
+            cVars[ci] = arr;
+
+            int nd = consNeed[ci];
+            need[ci] = nd;
+            unassigned[ci] = arr.Length;
+
+            foreach (int v in arr) varCons[v].Add(ci);
+        }
+
+        // Backtracking enumeration with pruning; track whether each var can be 0 and/or 1 across all solutions.
+        var seen0 = new bool[n];
+        var seen1 = new bool[n];
+        var assign = new sbyte[n];
+        Array.Fill(assign, (sbyte)-1);
+
+        bool earlyStop = false;
+        long solutions = 0;
+
+        bool AllVarsSeenBoth()
+        {
+            for (int i = 0; i < n; i++)
+                if (!(seen0[i] && seen1[i])) return false;
+            return true;
+        }
+
+        void Dfs(int pos)
+        {
+            if (earlyStop) return;
+            if (pos == n)
+            {
+                solutions++;
+                for (int i = 0; i < n; i++)
+                {
+                    if (assign[i] == 0) seen0[i] = true;
+                    else if (assign[i] == 1) seen1[i] = true;
+                }
+                if (AllVarsSeenBoth()) earlyStop = true;
+                return;
+            }
+
+            // Try 0 then 1.
+            for (sbyte val = 0; val <= 1; val++)
+            {
+                assign[pos] = val;
+                bool ok = true;
+
+                List<int> touched = varCons[pos];
+                for (int t = 0; t < touched.Count; t++)
+                {
+                    int ci = touched[t];
+                    unassigned[ci]--;
+                    if (val == 1) need[ci]--;
+                    if (need[ci] < 0 || need[ci] > unassigned[ci])
+                    {
+                        ok = false;
+                        // still need to undo below
+                    }
+                }
+
+                if (ok) Dfs(pos + 1);
+
+                // undo
+                for (int t = 0; t < touched.Count; t++)
+                {
+                    int ci = touched[t];
+                    if (val == 1) need[ci]++;
+                    unassigned[ci]++;
+                }
+
+                if (earlyStop) return;
+            }
+
+            assign[pos] = -1;
+        }
+
+        Dfs(0);
+
+        if (solutions == 0) return false; // no satisfying assignments -> no safe deductions
+
+        bool changed = false;
+        for (int i = 0; i < n; i++)
+        {
+            int cell = newToCell[i];
+            if (!seen1[i])
+                changed |= MarkSafe(h, w, board, cell, q, safeOut); // always 0 => safe
+            else if (!seen0[i])
+                changed |= MarkMine(h, w, board, cell, q);          // always 1 => mine
+        }
+        return changed;
+    }
+
+    private static bool SolveSubsetComponent(
+        int h, int w,
+        byte[] board,
+        IntQueue q,
+        List<int> safeOut,
+        List<int> varCellByIdGlobal,
+        List<Constraint> constraintsGlobal,
+        List<int> compVarIdsGlobal,
+        List<int> compConstraintIdsGlobal)
+    {
+        int n = compVarIdsGlobal.Count;
+
+        // Map global var id -> local index [0..n)
+        var localIndex = new Dictionary<int, int>(n * 2);
+        int[] localToCell = new int[n];
+        for (int i = 0; i < n; i++)
+        {
+            int gv = compVarIdsGlobal[i];
+            localIndex[gv] = i;
+            localToCell[i] = varCellByIdGlobal[gv];
+        }
+
+        // Local var state: -1 unknown, 0 safe, 1 mine
+        sbyte[] vState = new sbyte[n];
+        Array.Fill(vState, (sbyte)-1);
+
+        // Build local constraints (sorted var arrays) and needs
+        var baseCons = new List<(int[] vars, int need)>(compConstraintIdsGlobal.Count);
+        foreach (int cidx in compConstraintIdsGlobal)
+        {
+            Constraint c = constraintsGlobal[cidx];
+            int[] lvs = new int[c.Vars.Length];
+            for (int i = 0; i < lvs.Length; i++)
+                lvs[i] = localIndex[c.Vars[i]];
+            Array.Sort(lvs);
+            baseCons.Add((lvs, c.Need));
+        }
+
+        bool changed = false;
+
+        // A few rounds of: simplify constraints, apply forced (need==0 or need==len), then subset differences.
+        for (int round = 0; round < 4; round++)
+        {
+            // Simplify constraints given current vState.
+            var cons = new List<(int[] vars, int need)>(baseCons.Count);
+            bool anyNew = false;
+
+            foreach (var (vars0, need0) in baseCons)
+            {
+                int need = need0;
+                int mineCnt = 0;
+
+                // Filter unknown vars; subtract known mines from need.
+                int[] tmp = new int[vars0.Length];
+                int k = 0;
+                for (int i = 0; i < vars0.Length; i++)
+                {
+                    int v = vars0[i];
+                    if (vState[v] == 1) mineCnt++;
+                    else if (vState[v] < 0) tmp[k++] = v;
+                }
+                need -= mineCnt;
+                if (k == 0) continue;
+
+                if (need < 0 || need > k)
+                {
+                    // Inconsistent relative to current deductions -> ignore further deductions this round.
+                    // (Staying sound by not asserting anything from a contradictory set.)
+                    continue;
+                }
+
+                if (need == 0)
+                {
+                    for (int i = 0; i < k; i++)
+                    {
+                        int v = tmp[i];
+                        if (vState[v] < 0) { vState[v] = 0; anyNew = true; }
+                    }
+                    continue;
+                }
+                if (need == k)
+                {
+                    for (int i = 0; i < k; i++)
+                    {
+                        int v = tmp[i];
+                        if (vState[v] < 0) { vState[v] = 1; anyNew = true; }
+                    }
+                    continue;
+                }
+
+                if (k != tmp.Length) Array.Resize(ref tmp, k);
+                cons.Add((tmp, need));
+            }
+
+            if (anyNew)
+            {
+                anyNew = false;
+                continue; // re-simplify next round
+            }
+
+            // Subset rule between constraints:
+            // If A ⊆ B then Sum(B\A) = needB - needA.
+            // If that difference is 0 => B\A all safe; if equals |B\A| => all mines.
+            bool subsetChanged = false;
+
+            for (int i = 0; i < cons.Count; i++)
+            {
+                var (aVars, aNeed) = cons[i];
+                for (int j = i + 1; j < cons.Count; j++)
+                {
+                    var (bVars, bNeed) = cons[j];
+
+                    if (aVars.Length <= bVars.Length)
+                        subsetChanged |= ApplySubset(aVars, aNeed, bVars, bNeed, vState);
+                    if (bVars.Length <= aVars.Length)
+                        subsetChanged |= ApplySubset(bVars, bNeed, aVars, aNeed, vState);
+
+                    if (subsetChanged) break;
+                }
+                if (subsetChanged) break;
+            }
+
+            if (!subsetChanged) break; // no more progress
+
+            anyNew = true;
+        }
+
+        // Apply local deductions to global board.
+        for (int i = 0; i < n; i++)
+        {
+            if (vState[i] == 0)
+            {
+                changed |= MarkSafe(h, w, board, localToCell[i], q, safeOut);
+            }
+            else if (vState[i] == 1)
+            {
+                changed |= MarkMine(h, w, board, localToCell[i], q);
+            }
+        }
+
+        return changed;
+
+        static bool ApplySubset(int[] aVars, int aNeed, int[] bVars, int bNeed, sbyte[] vState)
+        {
+            // Check if aVars ⊆ bVars (both sorted).
+            int ai = 0, bi = 0;
+            while (ai < aVars.Length && bi < bVars.Length)
+            {
+                int av = aVars[ai], bv = bVars[bi];
+                if (av == bv) { ai++; bi++; }
+                else if (bv < av) bi++;
+                else return false; // missing av in b
+            }
+            if (ai != aVars.Length) return false;
+
+            int diffNeed = bNeed - aNeed;
+            if (diffNeed < 0) return false;
+
+            // Compute B\A and possibly mark it.
+            // Since arrays are small-ish (subset strategy component-limited), a simple diff is fine.
+            int dCount = 0;
+            int ai2 = 0, bi2 = 0;
+
+            // First pass: count difference size.
+            while (bi2 < bVars.Length)
+            {
+                if (ai2 < aVars.Length && aVars[ai2] == bVars[bi2]) { ai2++; bi2++; }
+                else { dCount++; bi2++; }
+            }
+
+            if (diffNeed == 0)
+            {
+                // all in B\A are safe
+                bool changed = false;
+                ai2 = 0; bi2 = 0;
+                while (bi2 < bVars.Length)
+                {
+                    int bv = bVars[bi2];
+                    if (ai2 < aVars.Length && aVars[ai2] == bv) { ai2++; bi2++; }
+                    else
+                    {
+                        if (vState[bv] < 0) { vState[bv] = 0; changed = true; }
+                        bi2++;
+                    }
+                }
+                return changed;
+            }
+            else if (diffNeed == dCount)
+            {
+                // all in B\A are mines
+                bool changed = false;
+                ai2 = 0; bi2 = 0;
+                while (bi2 < bVars.Length)
+                {
+                    int bv = bVars[bi2];
+                    if (ai2 < aVars.Length && aVars[ai2] == bv) { ai2++; bi2++; }
+                    else
+                    {
+                        if (vState[bv] < 0) { vState[bv] = 1; changed = true; }
+                        bi2++;
+                    }
+                }
+                return changed;
+            }
+
+            return false;
+        }
+    }
+
+    private static bool MarkSafe(int h, int w, byte[] board, int idx, IntQueue q, List<int> safeOut)
+    {
+        if (board[idx] != Unknown) return false;
+        board[idx] = Safe;
+        safeOut.Add(idx);
+        EnqueueAdjacentNumbers(h, w, board, idx, q);
+        return true;
+    }
+
+    private static bool MarkMine(int h, int w, byte[] board, int idx, IntQueue q)
+    {
+        if (board[idx] != Unknown) return false;
+        board[idx] = Mine;
+        EnqueueAdjacentNumbers(h, w, board, idx, q);
+        return true;
+    }
+
+    private static void EnqueueAdjacentNumbers(int h, int w, byte[] board, int idx, IntQueue q)
+    {
+        int r = idx / w;
+        int c = idx - r * w;
+
+        for (int dr = -1; dr <= 1; dr++)
+        {
+            int nr = r + dr;
+            if ((uint)nr >= (uint)h) continue;
+
+            int baseRow = nr * w;
+            for (int dc = -1; dc <= 1; dc++)
+            {
+                if (dr == 0 && dc == 0) continue;
+                int nc = c + dc;
+                if ((uint)nc >= (uint)w) continue;
+
+                int nidx = baseRow + nc;
+                byte st = board[nidx];
+                if (st >= NumBase && st <= NumBase + 8)
+                    q.Enqueue(nidx);
+            }
+        }
+    }
+
+    private readonly struct Constraint
+    {
+        public readonly int[] Vars;
+        public readonly int Need;
+        public Constraint(int[] vars, int need) { Vars = vars; Need = need; }
+    }
+
+    private sealed class UnionFind
+    {
+        private readonly int[] parent;
+        private readonly byte[] rank;
+
+        public UnionFind(int n)
+        {
+            parent = new int[n];
+            rank = new byte[n];
+            for (int i = 0; i < n; i++) parent[i] = i;
+        }
+
+        public int Find(int x)
+        {
+            while (parent[x] != x)
+            {
+                parent[x] = parent[parent[x]];
+                x = parent[x];
+            }
+            return x;
+        }
+
+        public void Union(int a, int b)
+        {
+            a = Find(a);
+            b = Find(b);
+            if (a == b) return;
+
+            byte ra = rank[a], rb = rank[b];
+            if (ra < rb) parent[a] = b;
+            else if (ra > rb) parent[b] = a;
+            else { parent[b] = a; rank[a] = (byte)(ra + 1); }
+        }
+    }
+
+    private sealed class IntQueue
+    {
+        private int[] arr;
+        private int head;
+        private int tail;
+        private int count;
+
+        public int Count => count;
+
+        public IntQueue(int capacity)
+        {
+            arr = new int[Math.Max(4, capacity)];
+        }
+
+        public void Enqueue(int x)
+        {
+            if (count == arr.Length) Grow();
+            arr[tail] = x;
+            tail++;
+            if (tail == arr.Length) tail = 0;
+            count++;
+        }
+
+        public int Dequeue()
+        {
+            int x = arr[head];
+            head++;
+            if (head == arr.Length) head = 0;
+            count--;
+            return x;
+        }
+
+        private void Grow()
+        {
+            int[] n = new int[arr.Length * 2];
+            if (count != 0)
+            {
+                if (head < tail)
+                {
+                    Array.Copy(arr, head, n, 0, count);
+                }
+                else
+                {
+                    int right = arr.Length - head;
+                    Array.Copy(arr, head, n, 0, right);
+                    Array.Copy(arr, 0, n, right, tail);
+                }
+            }
+            arr = n;
+            head = 0;
+            tail = count;
+        }
+    }
+
+    private sealed class FastInput
+    {
+        private readonly Stream stream;
+        private readonly byte[] buf;
+        private int len;
+        private int pos;
+
+        public FastInput(Stream s, int bufferSize = 1 << 16)
+        {
+            stream = s;
+            buf = new byte[bufferSize];
+        }
+
+        private byte ReadByte()
+        {
+            if (pos >= len)
+            {
+                len = stream.Read(buf, 0, buf.Length);
+                pos = 0;
+                if (len <= 0) return 0;
+            }
+            return buf[pos++];
+        }
+
+        public int ReadInt()
+        {
+            byte b;
+            do
+            {
+                b = ReadByte();
+                if (b == 0) return 0;
+            } while (b <= (byte)' ');
+
+            int sign = 1;
+            if (b == (byte)'-')
+            {
+                sign = -1;
+                b = ReadByte();
+            }
+
+            int val = 0;
+            while (b >= (byte)'0' && b <= (byte)'9')
+            {
+                val = val * 10 + (b - (byte)'0');
+                b = ReadByte();
+            }
+            return val * sign;
+        }
+
+        // Reads a board row of exactly width cells; pads with spaces if the input line is shorter.
+        public void ReadRow(int width, byte[] row)
+        {
+            int i = 0;
+            while (true)
+            {
+                byte b = ReadByte();
+                if (b == 0) break;
+
+                if (b == (byte)'\r') continue;
+                if (b == (byte)'\n') break;
+
+                if (i < width) row[i++] = b;
+                // if longer than width, ignore extra characters until newline
+            }
+
+            for (; i < width; i++) row[i] = (byte)' ';
+        }
+    }
+}
+```

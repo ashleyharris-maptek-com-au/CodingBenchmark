@@ -1,0 +1,538 @@
+use std::env;
+use std::fs::File;
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
+use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+#[derive(Clone, Copy, Default)]
+struct Pt {
+    x: f32,
+    y: f32,
+    z: f32,
+}
+
+impl Pt {
+    #[inline]
+    fn dist2(self, c: Pt) -> f32 {
+        let dx = self.x - c.x;
+        let dy = self.y - c.y;
+        let dz = self.z - c.z;
+        dx * dx + dy * dy + dz * dz
+    }
+}
+
+// Simple fast RNG (xorshift64*). Good enough for initialization/sampling.
+struct FastRng {
+    s: u64,
+}
+
+impl FastRng {
+    fn new(seed: u64) -> Self {
+        let mut s = seed;
+        if s == 0 {
+            s = 0x9E3779B97F4A7C15;
+        }
+        Self { s }
+    }
+    #[inline]
+    fn next_u64(&mut self) -> u64 {
+        // xorshift64*
+        let mut x = self.s;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.s = x;
+        x.wrapping_mul(0x2545F4914F6CDD1D)
+    }
+    #[inline]
+    fn next_f64(&mut self) -> f64 {
+        // 53-bit mantissa
+        let x = self.next_u64() >> 11;
+        (x as f64) * (1.0 / ((1u64 << 53) as f64))
+    }
+    #[inline]
+    fn gen_usize(&mut self, upper: usize) -> usize {
+        if upper <= 1 {
+            0
+        } else {
+            (self.next_u64() % (upper as u64)) as usize
+        }
+    }
+}
+
+#[inline]
+fn read_f32_le(bytes: &[u8; 4]) -> f32 {
+    f32::from_le_bytes(*bytes)
+}
+
+#[inline]
+fn bytes_to_pt(b: &[u8; 12]) -> Pt {
+    let x = read_f32_le((&b[0..4]).try_into().unwrap());
+    let y = read_f32_le((&b[4..8]).try_into().unwrap());
+    let z = read_f32_le((&b[8..12]).try_into().unwrap());
+    Pt { x, y, z }
+}
+
+fn temp_points_path() -> io::Result<PathBuf> {
+    let mut p = env::temp_dir();
+    let pid = std::process::id();
+    let t = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    p.push(format!("rust_kmeans_points_{pid}_{t}.bin"));
+    Ok(p)
+}
+
+fn kmeanspp_init(sample: &[Pt], k: usize, rng: &mut FastRng) -> Vec<Pt> {
+    let n = sample.len();
+    if k == 0 || n == 0 {
+        return Vec::new();
+    }
+    if k >= n {
+        // Degenerate: just take all points and repeat last if needed.
+        let mut out = Vec::with_capacity(k);
+        out.extend_from_slice(sample);
+        while out.len() < k {
+            out.push(sample[n - 1]);
+        }
+        return out;
+    }
+
+    let mut centers = Vec::with_capacity(k);
+    centers.push(sample[rng.gen_usize(n)]);
+
+    // Track D^2 to nearest chosen center.
+    let mut d2 = vec![0f32; n];
+    for (i, &p) in sample.iter().enumerate() {
+        d2[i] = p.dist2(centers[0]).max(0.0);
+    }
+
+    for _ in 1..k {
+        let mut sum = 0f64;
+        for &v in &d2 {
+            sum += v as f64;
+        }
+        if !(sum > 0.0) {
+            // All identical (or numeric issues): pick random.
+            centers.push(sample[rng.gen_usize(n)]);
+            continue;
+        }
+        let target = rng.next_f64() * sum;
+        let mut acc = 0f64;
+        let mut idx = 0usize;
+        for (i, &v) in d2.iter().enumerate() {
+            acc += v as f64;
+            if acc >= target {
+                idx = i;
+                break;
+            }
+        }
+        let c = sample[idx];
+        centers.push(c);
+        for (i, &p) in sample.iter().enumerate() {
+            let nd2 = p.dist2(c).max(0.0);
+            if nd2 < d2[i] {
+                d2[i] = nd2;
+            }
+        }
+    }
+    centers
+}
+
+fn assign_naive(p: Pt, centers: &[Pt]) -> usize {
+    let mut best = 0usize;
+    let mut best_d = f32::INFINITY;
+    for (i, &c) in centers.iter().enumerate() {
+        let d = p.dist2(c);
+        if d < best_d {
+            best_d = d;
+            best = i;
+        }
+    }
+    best
+}
+
+struct HierIndex {
+    coarse: Vec<Pt>,
+    buckets: Vec<Vec<usize>>, // coarse -> fine indices
+}
+
+fn build_hier_index(fine: &[Pt], coarse_k: usize) -> HierIndex {
+    let k = fine.len();
+    let ck = coarse_k.max(1).min(k.max(1));
+    if ck == 1 || k <= 1 {
+        return HierIndex {
+            coarse: vec![if k == 0 { Pt::default() } else { fine[0] }],
+            buckets: vec![if k == 0 { Vec::new() } else { (0..k).collect() }],
+        };
+    }
+
+    // Initialize coarse centers by picking evenly spaced fine centers (deterministic).
+    let mut coarse = Vec::with_capacity(ck);
+    for i in 0..ck {
+        let idx = (i as u128 * (k as u128) / (ck as u128)) as usize;
+        coarse.push(fine[idx.min(k - 1)]);
+    }
+    let mut buckets: Vec<Vec<usize>> = (0..ck).map(|_| Vec::new()).collect();
+
+    for (fi, &fc) in fine.iter().enumerate() {
+        let mut best = 0usize;
+        let mut best_d = f32::INFINITY;
+        for (ci, &cc) in coarse.iter().enumerate() {
+            let d = fc.dist2(cc);
+            if d < best_d {
+                best_d = d;
+                best = ci;
+            }
+        }
+        buckets[best].push(fi);
+    }
+
+    // Ensure no empty buckets by moving one element from the largest bucket.
+    loop {
+        let empty = buckets.iter().position(|b| b.is_empty());
+        let Some(ei) = empty else { break };
+        let (li, _) = buckets
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.len().cmp(&b.len()))
+            .unwrap();
+        if buckets[li].is_empty() {
+            break;
+        }
+        let moved = buckets[li].pop().unwrap();
+        buckets[ei].push(moved);
+    }
+
+    // Recompute coarse as mean of assigned fine centers.
+    for ci in 0..ck {
+        let b = &buckets[ci];
+        if b.is_empty() {
+            continue;
+        }
+        let mut sx = 0f64;
+        let mut sy = 0f64;
+        let mut sz = 0f64;
+        for &fi in b {
+            let p = fine[fi];
+            sx += p.x as f64;
+            sy += p.y as f64;
+            sz += p.z as f64;
+        }
+        let inv = 1.0 / (b.len() as f64);
+        coarse[ci] = Pt {
+            x: (sx * inv) as f32,
+            y: (sy * inv) as f32,
+            z: (sz * inv) as f32,
+        };
+    }
+
+    HierIndex { coarse, buckets }
+}
+
+fn assign_hier(p: Pt, fine: &[Pt], hi: &HierIndex) -> usize {
+    // Find nearest coarse, then scan only its bucket.
+    let mut best_c = 0usize;
+    let mut best_cd = f32::INFINITY;
+    for (ci, &cc) in hi.coarse.iter().enumerate() {
+        let d = p.dist2(cc);
+        if d < best_cd {
+            best_cd = d;
+            best_c = ci;
+        }
+    }
+    let bucket = &hi.buckets[best_c];
+    if bucket.is_empty() {
+        return 0;
+    }
+    let mut best = bucket[0];
+    let mut best_d = p.dist2(fine[best]);
+    for &fi in &bucket[1..] {
+        let d = p.dist2(fine[fi]);
+        if d < best_d {
+            best_d = d;
+            best = fi;
+        }
+    }
+    best
+}
+
+fn pick_iters(n: u64, k: u64) -> usize {
+    // Conservative iteration budget for time; adjusted by scale.
+    let nk = n.saturating_mul(k);
+    let mut it: usize = if n <= 5_000_000 {
+        20
+    } else if n <= 50_000_000 {
+        10
+    } else if n <= 200_000_000 {
+        5
+    } else {
+        2
+    };
+    if k >= 5_000 {
+        it = it.saturating_sub(1).max(1);
+    }
+    if nk >= 50_000_000_000 {
+        it = 1;
+    }
+    it
+}
+
+fn main() -> io::Result<()> {
+    let stdin = io::stdin();
+    let mut reader = BufReader::with_capacity(1 << 20, stdin.lock());
+
+    // Header is ASCII text: "num_points num_clusters\n"
+    let mut header = Vec::with_capacity(64);
+    reader.read_until(b'\n', &mut header)?;
+    if header.is_empty() {
+        return Ok(());
+    }
+    let header_str = String::from_utf8_lossy(&header);
+    let mut it = header_str.split_whitespace();
+    let n_points: u64 = it.next().unwrap_or("0").parse().unwrap_or(0);
+    let k: usize = it.next().unwrap_or("0").parse().unwrap_or(0);
+
+    if n_points == 0 || k == 0 {
+        return Ok(());
+    }
+
+    let stdout = io::stdout();
+    let mut out = BufWriter::with_capacity(1 << 20, stdout.lock());
+
+    // Trivial special case: 1 cluster => all zeros, no need to store anything.
+    if k == 1 {
+        // Consume input bytes (points), stream output zeros.
+        let mut buf = [0u8; 12];
+        for _ in 0..n_points {
+            reader.read_exact(&mut buf)?;
+            out.write_all(&0u32.to_le_bytes())?;
+        }
+        out.flush()?;
+        return Ok(());
+    }
+
+    // Decide memory vs streaming.
+    let bytes_points = n_points.saturating_mul(12);
+    let in_mem = bytes_points <= 1_500_000_000 && n_points <= 20_000_000;
+
+    let seed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64
+        ^ ((n_points as u64) << 1)
+        ^ (k as u64).wrapping_mul(0x9E3779B97F4A7C15);
+    let mut rng = FastRng::new(seed);
+
+    if in_mem {
+        // Read all points.
+        let mut pts: Vec<Pt> = Vec::with_capacity(n_points as usize);
+        let mut buf = [0u8; 12];
+        for _ in 0..n_points {
+            reader.read_exact(&mut buf)?;
+            pts.push(bytes_to_pt(&buf));
+        }
+
+        // Init centers from a subsample (to keep kmeans++ cost bounded).
+        let max_sample = 200_000usize;
+        let sample_n = (pts.len()).min(max_sample).max(k.min(max_sample));
+        let mut sample = Vec::with_capacity(sample_n);
+        if pts.len() <= sample_n {
+            sample.extend_from_slice(&pts);
+        } else {
+            // Deterministic-ish stride sampling + a bit of randomness.
+            let stride = (pts.len() / sample_n).max(1);
+            for i in (0..pts.len()).step_by(stride).take(sample_n) {
+                sample.push(pts[i]);
+            }
+            while sample.len() < sample_n {
+                sample.push(pts[rng.gen_usize(pts.len())]);
+            }
+        }
+        let mut centers = kmeanspp_init(&sample, k, &mut rng);
+        let iters = pick_iters(n_points, k as u64);
+
+        let mut labels = vec![0u32; pts.len()];
+        let mut sums = vec![(0f64, 0f64, 0f64); k];
+        let mut counts = vec![0u64; k];
+
+        for _ in 0..iters {
+            for s in sums.iter_mut() {
+                *s = (0.0, 0.0, 0.0);
+            }
+            counts.fill(0);
+
+            for (i, &p) in pts.iter().enumerate() {
+                let ci = assign_naive(p, &centers);
+                labels[i] = ci as u32;
+                let (sx, sy, sz) = sums[ci];
+                sums[ci] = (
+                    sx + p.x as f64,
+                    sy + p.y as f64,
+                    sz + p.z as f64,
+                );
+                counts[ci] += 1;
+            }
+
+            let mut max_shift = 0f32;
+            for ci in 0..k {
+                if counts[ci] == 0 {
+                    centers[ci] = sample[rng.gen_usize(sample.len())];
+                    continue;
+                }
+                let inv = 1.0 / (counts[ci] as f64);
+                let newc = Pt {
+                    x: (sums[ci].0 * inv) as f32,
+                    y: (sums[ci].1 * inv) as f32,
+                    z: (sums[ci].2 * inv) as f32,
+                };
+                let shift = centers[ci].dist2(newc).sqrt();
+                if shift > max_shift {
+                    max_shift = shift;
+                }
+                centers[ci] = newc;
+            }
+
+            // Early stop when centers barely move (relative to typical float scale).
+            if max_shift <= 1e-4 {
+                break;
+            }
+        }
+
+        // Final output labels in binary u32.
+        for &lab in &labels {
+            out.write_all(&lab.to_le_bytes())?;
+        }
+        out.flush()?;
+        return Ok(());
+    }
+
+    // Streaming / out-of-core mode:
+    // - first pass: write all points to a temp file + reservoir sample for init
+    // - a few passes of (approx) k-means over the temp file
+    // - final pass: output labels to stdout
+    let sample_cap = (k.saturating_mul(50)).clamp(10_000, 300_000);
+    let mut sample: Vec<Pt> = Vec::with_capacity(sample_cap);
+
+    let tmp_path = temp_points_path()?;
+    let tmp_file = File::create(&tmp_path)?;
+    let mut tmp_w = BufWriter::with_capacity(1 << 20, tmp_file);
+
+    let mut buf = [0u8; 12];
+    for i in 0..n_points {
+        reader.read_exact(&mut buf)?;
+        tmp_w.write_all(&buf)?;
+        let p = bytes_to_pt(&buf);
+        let ii = i as u64;
+        if (sample.len() as u64) < (sample_cap as u64) {
+            sample.push(p);
+        } else {
+            // Reservoir replace with probability sample_cap/(ii+1)
+            let j = rng.next_u64() % (ii + 1);
+            if j < sample_cap as u64 {
+                sample[j as usize] = p;
+            }
+        }
+    }
+    tmp_w.flush()?;
+    drop(tmp_w);
+
+    // Initialize centers from sample; ensure exactly k.
+    let mut centers = kmeanspp_init(&sample, k, &mut rng);
+
+    // Decide whether to use hierarchical (coarse-to-fine) assignment.
+    let k_u64 = k as u64;
+    let nk = n_points.saturating_mul(k_u64);
+    let use_hier = k >= 2048 || nk >= 5_000_000_000;
+    let coarse_k = if use_hier {
+        let mut ck = (k as f64).sqrt().ceil() as usize;
+        ck = ck.clamp(8, 1024);
+        ck.min(k)
+    } else {
+        1
+    };
+
+    let iters = pick_iters(n_points, k_u64);
+
+    let mut sums_x = vec![0f64; k];
+    let mut sums_y = vec![0f64; k];
+    let mut sums_z = vec![0f64; k];
+    let mut counts = vec![0u64; k];
+
+    for _ in 0..iters {
+        sums_x.fill(0.0);
+        sums_y.fill(0.0);
+        sums_z.fill(0.0);
+        counts.fill(0);
+
+        let hi = if use_hier {
+            Some(build_hier_index(&centers, coarse_k))
+        } else {
+            None
+        };
+
+        let f = File::open(&tmp_path)?;
+        let mut r = BufReader::with_capacity(1 << 20, f);
+        for _ in 0..n_points {
+            r.read_exact(&mut buf)?;
+            let p = bytes_to_pt(&buf);
+            let ci = match &hi {
+                Some(h) => assign_hier(p, &centers, h),
+                None => assign_naive(p, &centers),
+            };
+            sums_x[ci] += p.x as f64;
+            sums_y[ci] += p.y as f64;
+            sums_z[ci] += p.z as f64;
+            counts[ci] += 1;
+        }
+
+        let mut max_shift = 0f32;
+        for ci in 0..k {
+            if counts[ci] == 0 {
+                // Re-seed from sample to keep exactly k active centers.
+                centers[ci] = sample[rng.gen_usize(sample.len())];
+                continue;
+            }
+            let inv = 1.0 / (counts[ci] as f64);
+            let newc = Pt {
+                x: (sums_x[ci] * inv) as f32,
+                y: (sums_y[ci] * inv) as f32,
+                z: (sums_z[ci] * inv) as f32,
+            };
+            let shift = centers[ci].dist2(newc).sqrt();
+            if shift > max_shift {
+                max_shift = shift;
+            }
+            centers[ci] = newc;
+        }
+
+        if max_shift <= 1e-4 {
+            break;
+        }
+    }
+
+    // Final labeling pass.
+    let hi = if use_hier {
+        Some(build_hier_index(&centers, coarse_k))
+    } else {
+        None
+    };
+    let f = File::open(&tmp_path)?;
+    let mut r = BufReader::with_capacity(1 << 20, f);
+    for _ in 0..n_points {
+        r.read_exact(&mut buf)?;
+        let p = bytes_to_pt(&buf);
+        let ci = match &hi {
+            Some(h) => assign_hier(p, &centers, h),
+            None => assign_naive(p, &centers),
+        };
+        out.write_all(&(ci as u32).to_le_bytes())?;
+    }
+    out.flush()?;
+
+    // Best-effort cleanup; ignore errors.
+    let _ = std::fs::remove_file(&tmp_path);
+
+    Ok(())
+}

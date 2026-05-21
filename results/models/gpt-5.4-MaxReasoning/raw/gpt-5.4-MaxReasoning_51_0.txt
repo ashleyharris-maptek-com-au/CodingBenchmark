@@ -1,0 +1,751 @@
+import math
+
+
+_AP_MEMORY = {
+    "prev_time": None,
+    "terrain_elev_ft": None,
+    "fused": {},
+    "integrators": {
+        "speed": 0.0,
+        "altitude": 0.0,
+        "heading": 0.0,
+    },
+}
+
+
+def _clamp(value, low, high):
+    return max(low, min(high, value))
+
+
+def _safe_float(value, default=0.0):
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return default
+    if math.isnan(value) or math.isinf(value):
+        return default
+    return value
+
+
+def _wrap360(angle_deg):
+    return _safe_float(angle_deg) % 360.0
+
+
+def _angle_diff(target_deg, current_deg):
+    return (_wrap360(target_deg) - _wrap360(current_deg) + 180.0) % 360.0 - 180.0
+
+
+def _blend_angle(prev_deg, new_deg, alpha):
+    return _wrap360(prev_deg + alpha * _angle_diff(new_deg, prev_deg))
+
+
+def _weighted_mean(values):
+    total_w = sum(weight for _, weight in values)
+    if total_w <= 1e-9:
+        return values[0][0]
+    return sum(value * weight for value, weight in values) / total_w
+
+
+def _weighted_mean_angle(values):
+    s = 0.0
+    c = 0.0
+    for angle_deg, weight in values:
+        rad = math.radians(angle_deg)
+        s += math.sin(rad) * weight
+        c += math.cos(rad) * weight
+    if abs(s) < 1e-9 and abs(c) < 1e-9:
+        return _wrap360(values[0][0])
+    return _wrap360(math.degrees(math.atan2(s, c)))
+
+
+def _fuse_scalar(candidates, prev=None, tol=10.0, max_rate=None, dt=0.05):
+    items = []
+    for value, valid, weight in candidates:
+        if value is None:
+            continue
+        value = _safe_float(value, None)
+        if value is None:
+            continue
+        base_weight = weight * (1.0 if valid else 0.35)
+        if base_weight <= 0.0:
+            continue
+        items.append((value, base_weight))
+    if not items:
+        return 0.0 if prev is None else prev
+
+    best_score = None
+    best_cluster = None
+    tol = max(1e-3, tol)
+    prev_ref = prev
+
+    for center, center_w in items:
+        cluster = []
+        score = center_w
+        for value, weight in items:
+            diff = abs(value - center)
+            if diff <= tol:
+                cluster.append((value, weight))
+                score += weight * (1.0 - 0.5 * diff / tol)
+            else:
+                score -= 0.12 * weight * min(diff / tol, 6.0)
+        if prev_ref is not None:
+            pdiff = abs(center - prev_ref)
+            score += 0.8 * max(0.0, 1.0 - pdiff / (3.0 * tol))
+            if max_rate is not None:
+                limit = max_rate * dt + 3.0 * tol
+                if pdiff > limit:
+                    score -= 2.0 + 0.2 * (pdiff - limit) / tol
+        if best_score is None or score > best_score:
+            best_score = score
+            best_cluster = cluster if cluster else [(center, center_w)]
+
+    value = _weighted_mean(best_cluster)
+    if prev_ref is not None and max_rate is not None:
+        limit = max_rate * dt + 2.0 * tol
+        value = prev_ref + _clamp(value - prev_ref, -limit, limit)
+    return value
+
+
+def _fuse_angle(candidates, prev=None, tol=8.0, max_rate=None, dt=0.05):
+    items = []
+    for value, valid, weight in candidates:
+        if value is None:
+            continue
+        value = _wrap360(value)
+        base_weight = weight * (1.0 if valid else 0.35)
+        if base_weight <= 0.0:
+            continue
+        items.append((value, base_weight))
+    if not items:
+        return 0.0 if prev is None else _wrap360(prev)
+
+    best_score = None
+    best_cluster = None
+    tol = max(1e-3, tol)
+    prev_ref = None if prev is None else _wrap360(prev)
+
+    for center, center_w in items:
+        cluster = []
+        score = center_w
+        for value, weight in items:
+            diff = abs(_angle_diff(value, center))
+            if diff <= tol:
+                cluster.append((value, weight))
+                score += weight * (1.0 - 0.5 * diff / tol)
+            else:
+                score -= 0.12 * weight * min(diff / tol, 6.0)
+        if prev_ref is not None:
+            pdiff = abs(_angle_diff(center, prev_ref))
+            score += 0.8 * max(0.0, 1.0 - pdiff / (3.0 * tol))
+            if max_rate is not None:
+                limit = max_rate * dt + 3.0 * tol
+                if pdiff > limit:
+                    score -= 2.0 + 0.2 * (pdiff - limit) / tol
+        if best_score is None or score > best_score:
+            best_score = score
+            best_cluster = cluster if cluster else [(center, center_w)]
+
+    value = _weighted_mean_angle(best_cluster)
+    if prev_ref is not None and max_rate is not None:
+        limit = max_rate * dt + 2.0 * tol
+        value = _wrap360(prev_ref + _clamp(_angle_diff(value, prev_ref), -limit, limit))
+    return value
+
+
+def _majority_truth(values):
+    true_count = sum(1 for value in values if bool(value))
+    return true_count >= max(1, (len(values) // 2) + 1)
+
+
+def _reset_memory():
+    _AP_MEMORY["prev_time"] = None
+    _AP_MEMORY["terrain_elev_ft"] = None
+    _AP_MEMORY["fused"] = {}
+    _AP_MEMORY["integrators"] = {
+        "speed": 0.0,
+        "altitude": 0.0,
+        "heading": 0.0,
+    }
+
+
+def autopilot_step(state: dict, dt: float) -> dict:
+    dt = _safe_float(dt, _safe_float(state.get("dt", 0.05), 0.05))
+    dt = _clamp(dt, 0.01, 0.2)
+
+    sim_time = _safe_float(state.get("sim_time_s"), 0.0)
+    prev_time = _AP_MEMORY["prev_time"]
+    if prev_time is None or sim_time < prev_time - 0.5 or sim_time - prev_time > 5.0:
+        _reset_memory()
+    _AP_MEMORY["prev_time"] = sim_time
+
+    mem = _AP_MEMORY["fused"]
+    ints = _AP_MEMORY["integrators"]
+
+    prev_alt = mem.get("altitude_ft")
+    prev_vs = mem.get("vs_fpm", _safe_float(state.get("vertical_speed_fpm"), 0.0))
+    inertial_alt = None if prev_alt is None else prev_alt + prev_vs * dt / 60.0
+
+    baro_alt = _fuse_scalar(
+        [
+            (state.get("baro_alt_1_ft"), state.get("baro_alt_1_valid", True), 1.0),
+            (state.get("baro_alt_2_ft"), state.get("baro_alt_2_valid", True), 1.0),
+            (state.get("baro_alt_3_ft"), state.get("baro_alt_3_valid", True), 1.0),
+        ],
+        prev=mem.get("baro_alt_ft"),
+        tol=120.0,
+        max_rate=450.0,
+        dt=dt,
+    )
+    pressure_alt = _fuse_scalar(
+        [
+            (state.get("adc_1_pressure_alt_ft"), state.get("adc_1_valid", True), 0.9),
+            (state.get("adc_2_pressure_alt_ft"), state.get("adc_2_valid", True), 0.9),
+            (state.get("adc_3_pressure_alt_ft"), state.get("adc_3_valid", True), 0.9),
+        ],
+        prev=mem.get("pressure_alt_ft"),
+        tol=120.0,
+        max_rate=450.0,
+        dt=dt,
+    )
+    gps_alt = _fuse_scalar(
+        [
+            (state.get("gps_1_alt_ft"), state.get("gps_1_valid", True), 0.75),
+            (state.get("gps_2_alt_ft"), state.get("gps_2_valid", True), 0.75),
+            (state.get("gps_3_alt_ft"), state.get("gps_3_valid", True), 0.75),
+        ],
+        prev=mem.get("gps_alt_ft"),
+        tol=250.0,
+        max_rate=600.0,
+        dt=dt,
+    )
+    radar_alt = _fuse_scalar(
+        [
+            (state.get("radar_alt_1_ft"), state.get("radar_alt_1_valid", True), 1.0),
+            (state.get("radar_alt_2_ft"), state.get("radar_alt_2_valid", True), 1.0),
+            (state.get("radar_alt_3_ft"), state.get("radar_alt_3_valid", True), 1.0),
+        ],
+        prev=mem.get("radar_alt_ft"),
+        tol=20.0,
+        max_rate=500.0,
+        dt=dt,
+    )
+    radar_alt = max(0.0, radar_alt)
+
+    gps_gs = _fuse_scalar(
+        [
+            (state.get("gps_1_gs_kt"), state.get("gps_1_valid", True), 0.9),
+            (state.get("gps_2_gs_kt"), state.get("gps_2_valid", True), 0.9),
+            (state.get("gps_3_gs_kt"), state.get("gps_3_valid", True), 0.9),
+        ],
+        prev=mem.get("gps_gs_kt"),
+        tol=6.0,
+        max_rate=35.0,
+        dt=dt,
+    )
+    irs_gs = _fuse_scalar(
+        [
+            (state.get("irs_1_gs_kt"), state.get("irs_1_valid", True), 0.9),
+            (state.get("irs_2_gs_kt"), state.get("irs_2_valid", True), 0.9),
+            (state.get("irs_3_gs_kt"), state.get("irs_3_valid", True), 0.9),
+            (state.get("ground_speed_kt"), True, 0.8),
+        ],
+        prev=mem.get("ground_speed_kt"),
+        tol=6.0,
+        max_rate=35.0,
+        dt=dt,
+    )
+
+    ias = _fuse_scalar(
+        [
+            (state.get("ias_1_kt"), state.get("ias_1_valid", True), 1.0),
+            (state.get("ias_2_kt"), state.get("ias_2_valid", True), 1.0),
+            (state.get("ias_3_kt"), state.get("ias_3_valid", True), 1.0),
+        ],
+        prev=mem.get("ias_kt"),
+        tol=6.0,
+        max_rate=45.0,
+        dt=dt,
+    )
+    mach = _fuse_scalar(
+        [
+            (state.get("mach_1"), True, 0.8),
+            (state.get("mach_2"), True, 0.8),
+            (state.get("mach_3"), True, 0.8),
+        ],
+        prev=mem.get("mach"),
+        tol=0.01,
+        max_rate=0.08,
+        dt=dt,
+    )
+    aoa = _fuse_scalar(
+        [
+            (state.get("aoa_1_deg"), state.get("aoa_1_valid", True), 1.0),
+            (state.get("aoa_2_deg"), state.get("aoa_2_valid", True), 1.0),
+            (state.get("aoa_3_deg"), state.get("aoa_3_valid", True), 1.0),
+        ],
+        prev=mem.get("aoa_deg"),
+        tol=1.5,
+        max_rate=40.0,
+        dt=dt,
+    )
+    pitch = _fuse_scalar(
+        [
+            (state.get("irs_1_pitch_deg"), state.get("irs_1_valid", True), 1.0),
+            (state.get("irs_2_pitch_deg"), state.get("irs_2_valid", True), 1.0),
+            (state.get("irs_3_pitch_deg"), state.get("irs_3_valid", True), 1.0),
+        ],
+        prev=mem.get("pitch_deg"),
+        tol=1.0,
+        max_rate=35.0,
+        dt=dt,
+    )
+    roll = _fuse_scalar(
+        [
+            (state.get("irs_1_roll_deg"), state.get("irs_1_valid", True), 1.0),
+            (state.get("irs_2_roll_deg"), state.get("irs_2_valid", True), 1.0),
+            (state.get("irs_3_roll_deg"), state.get("irs_3_valid", True), 1.0),
+        ],
+        prev=mem.get("roll_deg"),
+        tol=1.5,
+        max_rate=70.0,
+        dt=dt,
+    )
+    pitch_rate = _fuse_scalar(
+        [
+            (state.get("gyro_1_pitch_rate_dps"), state.get("gyro_1_valid", True), 1.0),
+            (state.get("gyro_2_pitch_rate_dps"), state.get("gyro_2_valid", True), 1.0),
+            (state.get("gyro_3_pitch_rate_dps"), state.get("gyro_3_valid", True), 1.0),
+        ],
+        prev=mem.get("pitch_rate_dps"),
+        tol=0.8,
+        max_rate=90.0,
+        dt=dt,
+    )
+    roll_rate = _fuse_scalar(
+        [
+            (state.get("gyro_1_roll_rate_dps"), state.get("gyro_1_valid", True), 1.0),
+            (state.get("gyro_2_roll_rate_dps"), state.get("gyro_2_valid", True), 1.0),
+            (state.get("gyro_3_roll_rate_dps"), state.get("gyro_3_valid", True), 1.0),
+        ],
+        prev=mem.get("roll_rate_dps"),
+        tol=1.2,
+        max_rate=140.0,
+        dt=dt,
+    )
+    yaw_rate = _fuse_scalar(
+        [
+            (state.get("gyro_1_yaw_rate_dps"), state.get("gyro_1_valid", True), 1.0),
+            (state.get("gyro_2_yaw_rate_dps"), state.get("gyro_2_valid", True), 1.0),
+            (state.get("gyro_3_yaw_rate_dps"), state.get("gyro_3_valid", True), 1.0),
+        ],
+        prev=mem.get("yaw_rate_dps"),
+        tol=0.8,
+        max_rate=90.0,
+        dt=dt,
+    )
+    vs = _fuse_scalar(
+        [
+            (state.get("irs_1_vs_fpm"), state.get("irs_1_valid", True), 1.0),
+            (state.get("irs_2_vs_fpm"), state.get("irs_2_valid", True), 1.0),
+            (state.get("irs_3_vs_fpm"), state.get("irs_3_valid", True), 1.0),
+            (state.get("vertical_speed_fpm"), True, 0.8),
+            (
+                None if prev_alt is None else (baro_alt - prev_alt) * 60.0 / dt,
+                True,
+                0.7,
+            ),
+        ],
+        prev=mem.get("vs_fpm"),
+        tol=250.0,
+        max_rate=12000.0,
+        dt=dt,
+    )
+    heading = _fuse_angle(
+        [
+            (state.get("irs_1_heading_deg"), state.get("irs_1_valid", True), 1.0),
+            (state.get("irs_2_heading_deg"), state.get("irs_2_valid", True), 1.0),
+            (state.get("irs_3_heading_deg"), state.get("irs_3_valid", True), 1.0),
+            (state.get("magnetic_heading_deg"), True, 0.9),
+            (
+                _wrap360(
+                    _safe_float(state.get("true_heading_deg"), 0.0)
+                    - _safe_float(state.get("magnetic_variation_deg"), 0.0)
+                ),
+                True,
+                0.7,
+            ),
+        ],
+        prev=mem.get("heading_deg"),
+        tol=5.0,
+        max_rate=25.0,
+        dt=dt,
+    )
+    track = _fuse_angle(
+        [
+            (state.get("gps_1_track_deg"), state.get("gps_1_valid", True), 1.0),
+            (state.get("gps_2_track_deg"), state.get("gps_2_valid", True), 1.0),
+            (state.get("gps_3_track_deg"), state.get("gps_3_valid", True), 1.0),
+            (state.get("irs_1_track_deg"), state.get("irs_1_valid", True), 0.9),
+            (state.get("irs_2_track_deg"), state.get("irs_2_valid", True), 0.9),
+            (state.get("irs_3_track_deg"), state.get("irs_3_valid", True), 0.9),
+            (state.get("track_deg"), True, 0.8),
+        ],
+        prev=mem.get("track_deg"),
+        tol=5.0,
+        max_rate=25.0,
+        dt=dt,
+    )
+
+    wow = _majority_truth(
+        [
+            state.get("weight_on_wheels_left", False),
+            state.get("weight_on_wheels_right", False),
+            state.get("weight_on_wheels_nose", False),
+        ]
+    )
+    gear_pos = (
+        _safe_float(state.get("gear_left_pos"), 1.0)
+        + _safe_float(state.get("gear_right_pos"), 1.0)
+        + _safe_float(state.get("gear_nose_pos"), 1.0)
+    ) / 3.0
+    flap_pos = 0.5 * (
+        _safe_float(state.get("flap_pos_left_deg"), 0.0)
+        + _safe_float(state.get("flap_pos_right_deg"), 0.0)
+    )
+
+    if radar_alt < 30.0 and gear_pos > 0.8 and ias < 90.0:
+        wow = True
+    if wow:
+        terrain_est = baro_alt - radar_alt
+        if _AP_MEMORY["terrain_elev_ft"] is None:
+            _AP_MEMORY["terrain_elev_ft"] = terrain_est
+        else:
+            _AP_MEMORY["terrain_elev_ft"] = (
+                0.9 * _AP_MEMORY["terrain_elev_ft"] + 0.1 * terrain_est
+            )
+    elif 0.0 < radar_alt < 2500.0:
+        terrain_est = baro_alt - radar_alt
+        if _AP_MEMORY["terrain_elev_ft"] is None:
+            _AP_MEMORY["terrain_elev_ft"] = terrain_est
+        else:
+            if abs(terrain_est - _AP_MEMORY["terrain_elev_ft"]) < 80.0:
+                _AP_MEMORY["terrain_elev_ft"] = (
+                    0.98 * _AP_MEMORY["terrain_elev_ft"] + 0.02 * terrain_est
+                )
+
+    radar_msl = None
+    if _AP_MEMORY["terrain_elev_ft"] is not None and 0.0 <= radar_alt < 2500.0:
+        radar_msl = _AP_MEMORY["terrain_elev_ft"] + radar_alt
+
+    altitude = _fuse_scalar(
+        [
+            (baro_alt, True, 1.2),
+            (pressure_alt, True, 1.1),
+            (gps_alt, True, 0.75),
+            (radar_msl, radar_msl is not None, 0.8),
+            (inertial_alt, inertial_alt is not None, 0.8),
+        ],
+        prev=mem.get("altitude_ft", baro_alt),
+        tol=120.0,
+        max_rate=500.0,
+        dt=dt,
+    )
+
+    gs = max(0.0, _fuse_scalar(
+        [
+            (gps_gs, True, 1.0),
+            (irs_gs, True, 1.0),
+        ],
+        prev=mem.get("ground_speed_kt", irs_gs),
+        tol=5.0,
+        max_rate=35.0,
+        dt=dt,
+    ))
+
+    mem.update(
+        {
+            "baro_alt_ft": baro_alt,
+            "pressure_alt_ft": pressure_alt,
+            "gps_alt_ft": gps_alt,
+            "radar_alt_ft": radar_alt,
+            "altitude_ft": altitude,
+            "vs_fpm": vs,
+            "ias_kt": ias,
+            "mach": mach,
+            "aoa_deg": aoa,
+            "pitch_deg": pitch,
+            "roll_deg": roll,
+            "pitch_rate_dps": pitch_rate,
+            "roll_rate_dps": roll_rate,
+            "yaw_rate_dps": yaw_rate,
+            "heading_deg": heading,
+            "track_deg": track,
+            "ground_speed_kt": gs,
+            "gps_gs_kt": gps_gs,
+        }
+    )
+
+    gross_weight = _safe_float(state.get("gross_weight_kg"), 65000.0)
+    turbulence = _clamp(_safe_float(state.get("turbulence_intensity"), 0.0), 0.0, 2.0)
+    icing = _clamp(_safe_float(state.get("icing_rate"), 0.0), 0.0, 2.0)
+
+    eng1_running = bool(state.get("engine_1_running", True))
+    eng2_running = bool(state.get("engine_2_running", True))
+    eng1_fire = bool(state.get("engine_1_fire", False))
+    eng2_fire = bool(state.get("engine_2_fire", False))
+    eng1_power = max(
+        _safe_float(state.get("engine_1_thrust_pct"), 0.0) / 100.0,
+        _safe_float(state.get("engine_1_n1_pct"), 0.0) / 110.0,
+    )
+    eng2_power = max(
+        _safe_float(state.get("engine_2_thrust_pct"), 0.0) / 100.0,
+        _safe_float(state.get("engine_2_n1_pct"), 0.0) / 110.0,
+    )
+    eng1_ok = (
+        not eng1_fire
+        and (_safe_float(state.get("engine_1_oil_press_psi"), 40.0) > 8.0)
+        and (eng1_running or eng1_power > 0.25)
+    )
+    eng2_ok = (
+        not eng2_fire
+        and (_safe_float(state.get("engine_2_oil_press_psi"), 40.0) > 8.0)
+        and (eng2_running or eng2_power > 0.25)
+    )
+    engine_out = eng1_ok != eng2_ok or abs(eng1_power - eng2_power) > 0.45
+
+    target_alt = _safe_float(state.get("target_alt_ft"), altitude)
+    target_hdg = _wrap360(state.get("target_hdg_deg", heading))
+    target_vs = _clamp(_safe_float(state.get("target_vs_fpm"), 0.0), -3000.0, 3000.0)
+    target_ias = _safe_float(state.get("target_ias_kt"), ias)
+
+    weight_factor = _clamp((gross_weight - 62000.0) / 18000.0, -0.6, 1.0)
+    if flap_pos >= 35.0:
+        safe_min_speed = 128.0
+        flap_vfe = 177.0
+    elif flap_pos >= 25.0:
+        safe_min_speed = 132.0
+        flap_vfe = 185.0
+    elif flap_pos >= 15.0:
+        safe_min_speed = 140.0
+        flap_vfe = 200.0
+    elif flap_pos >= 5.0:
+        safe_min_speed = 150.0
+        flap_vfe = 215.0
+    else:
+        safe_min_speed = 165.0
+        flap_vfe = 365.0
+    safe_min_speed += 8.0 * weight_factor + 8.0 * turbulence + 10.0 * icing
+
+    overspeed_limit = min(365.0, flap_vfe)
+    speed_target = _clamp(target_ias, safe_min_speed + 5.0, 320.0)
+    if wow and target_alt > altitude + 500.0:
+        speed_target = max(speed_target, 150.0)
+
+    climb_request = target_alt > altitude + 300.0
+    descent_request = target_alt < altitude - 300.0
+    approach_mode = (
+        not wow
+        and (
+            gear_pos > 0.5
+            or radar_alt < 2500.0
+            or (descent_request and target_alt < altitude + 2000.0)
+        )
+    )
+    flare_mode = approach_mode and radar_alt < 60.0
+    low_altitude = radar_alt < 1000.0
+    takeoff_mode = wow and climb_request
+
+    if takeoff_mode:
+        speed_target = max(speed_target, 145.0 + 5.0 * weight_factor)
+    if approach_mode:
+        approach_speed = safe_min_speed + 5.0 + min(15.0, 4.0 * turbulence + 0.12 * _safe_float(state.get("wind_speed_kt"), 0.0))
+        speed_target = min(speed_target, max(135.0, approach_speed))
+    if flare_mode:
+        speed_target = max(speed_target, safe_min_speed + 3.0)
+
+    low_speed = ias < safe_min_speed - 5.0 or aoa > (8.5 if flap_pos < 10.0 else 10.5)
+    critical_low_speed = ias < safe_min_speed - 15.0 or aoa > (11.5 if flap_pos < 10.0 else 13.0)
+    overspeed = ias > overspeed_limit - 5.0 or mach > 0.81
+    windshear = (
+        not wow
+        and radar_alt < 1500.0
+        and vs < -1200.0
+        and ias < speed_target - 12.0
+    )
+
+    if takeoff_mode:
+        flap_cmd = 15.0
+    elif flare_mode:
+        flap_cmd = 40.0 if ias < 140.0 else 30.0
+    elif approach_mode:
+        if ias < 136.0:
+            flap_cmd = 40.0
+        elif ias < 145.0:
+            flap_cmd = 30.0
+        elif ias < 160.0:
+            flap_cmd = 20.0
+        elif ias < 190.0:
+            flap_cmd = 10.0
+        else:
+            flap_cmd = 0.0
+    else:
+        if low_speed and not wow:
+            flap_cmd = 10.0
+        elif ias > 190.0:
+            flap_cmd = 0.0
+        else:
+            flap_cmd = 0.0 if altitude > 3000.0 else flap_pos
+
+    if flap_cmd > 0.0 and ias > flap_vfe - 8.0:
+        flap_cmd = max(0.0, flap_cmd - 10.0)
+
+    if wow:
+        gear_cmd = 1
+    elif flare_mode or radar_alt < 1200.0 or (approach_mode and ias < 200.0):
+        gear_cmd = 1
+    else:
+        gear_cmd = 0
+
+    if critical_low_speed or windshear:
+        speedbrake_cmd = 0.0
+    elif overspeed and not low_altitude and flap_cmd <= 10.0:
+        speedbrake_cmd = _clamp((ias - (overspeed_limit - 10.0)) / 25.0, 0.0, 0.6)
+    elif descent_request and ias > speed_target + 20.0 and not low_altitude and flap_cmd == 0.0:
+        speedbrake_cmd = _clamp((ias - speed_target) / 60.0, 0.0, 0.35)
+    else:
+        speedbrake_cmd = 0.0
+
+    speed_error = speed_target - ias
+    ints["speed"] = _clamp(ints["speed"] + speed_error * dt * 0.012, -0.35, 0.35)
+    if abs(speed_error) > 80.0:
+        ints["speed"] *= 0.96
+
+    base_throttle = 0.52 + 0.05 * weight_factor + 0.02 * turbulence
+    if climb_request:
+        base_throttle += 0.10
+    if descent_request:
+        base_throttle -= 0.08
+    if approach_mode:
+        base_throttle += 0.04
+    if takeoff_mode:
+        throttle_cmd = 1.0
+    else:
+        throttle_cmd = base_throttle + 0.008 * speed_error - 0.00005 * vs + ints["speed"]
+        throttle_cmd = _clamp(throttle_cmd, 0.0, 1.0)
+
+    if low_speed or windshear:
+        throttle_cmd = 1.0
+    if overspeed and not low_speed:
+        throttle_cmd = 0.0 if ias > overspeed_limit else min(throttle_cmd, 0.15)
+    if flare_mode and radar_alt < 30.0:
+        throttle_cmd = min(throttle_cmd, 0.10)
+
+    throttle_1 = throttle_cmd
+    throttle_2 = throttle_cmd
+    if not eng1_ok and eng2_ok:
+        throttle_1 = 0.0
+        throttle_2 = min(1.0, throttle_cmd + 0.15)
+    elif not eng2_ok and eng1_ok:
+        throttle_2 = 0.0
+        throttle_1 = min(1.0, throttle_cmd + 0.15)
+    elif eng1_fire:
+        throttle_1 = 0.0
+    elif eng2_fire:
+        throttle_2 = 0.0
+
+    alt_error = target_alt - altitude
+    capture_vs = _clamp(alt_error * 1.6, -2200.0, 2200.0)
+    if abs(alt_error) > 500.0:
+        desired_vs = _clamp(0.65 * target_vs + 0.35 * capture_vs, -2500.0, 2500.0)
+        if abs(target_vs) < 200.0:
+            desired_vs = capture_vs
+    else:
+        desired_vs = _clamp(capture_vs, -1200.0, 1200.0)
+
+    if takeoff_mode and ias < speed_target - 5.0:
+        desired_vs = max(desired_vs, 500.0)
+    if flare_mode:
+        desired_vs = -120.0 if radar_alt < 25.0 else -250.0
+    if low_speed and not flare_mode:
+        desired_vs = min(desired_vs, 500.0 if low_altitude else 0.0)
+    if windshear:
+        desired_vs = max(desired_vs, 800.0)
+
+    vs_error = desired_vs - vs
+    bank_limit = 25.0 - 5.0 * turbulence
+    if low_altitude:
+        bank_limit = min(bank_limit, 15.0)
+    if flare_mode or critical_low_speed or engine_out:
+        bank_limit = min(bank_limit, 10.0)
+    bank_limit = max(8.0, bank_limit)
+
+    heading_ref = track if wow and gs > 30.0 else heading
+    hdg_error = _angle_diff(target_hdg, heading_ref)
+    ints["heading"] = _clamp(ints["heading"] + hdg_error * dt * 0.01, -5.0, 5.0)
+    bank_target = _clamp(0.35 * hdg_error + 0.05 * ints["heading"], -bank_limit, bank_limit)
+    if windshear or critical_low_speed:
+        bank_target = _clamp(bank_target, -5.0, 5.0)
+    if flare_mode:
+        bank_target = _clamp(bank_target, -3.0, 3.0)
+
+    rotate_speed = 145.0 + 5.0 * weight_factor
+    if takeoff_mode and wow and ias > rotate_speed:
+        pitch_target = 10.0
+    else:
+        pitch_target = _clamp(0.0030 * vs_error + 0.0012 * alt_error, -8.0, 12.0)
+
+    if climb_request and not approach_mode:
+        pitch_target += 1.5
+    if descent_request and not approach_mode:
+        pitch_target -= 0.5
+    if flare_mode:
+        pitch_target = max(4.0, min(7.0, pitch + 0.8))
+    if overspeed and not low_speed:
+        pitch_target = max(pitch_target, 3.0)
+    if low_speed:
+        stall_push = max(0.0, safe_min_speed - ias) * (0.05 if low_altitude else 0.08)
+        stall_push += max(0.0, aoa - (9.5 if flap_pos < 10.0 else 11.5)) * 1.2
+        pitch_target -= stall_push
+    if windshear and not critical_low_speed:
+        pitch_target = max(pitch_target, 8.0)
+    pitch_target = _clamp(pitch_target, -10.0, 15.0)
+
+    elevator = 0.09 * (pitch_target - pitch) - 0.028 * pitch_rate + 0.00010 * vs_error
+    if wow and takeoff_mode and ias < rotate_speed - 3.0:
+        elevator = min(elevator, 0.05)
+    if flare_mode and radar_alt < 15.0:
+        elevator = max(elevator, 0.15)
+    elevator = _clamp(elevator, -1.0, 1.0)
+
+    aileron = 0.055 * (bank_target - roll) - 0.035 * roll_rate
+    if wow:
+        aileron = 0.04 * (0.0 - roll) - 0.04 * roll_rate
+    aileron = _clamp(aileron, -1.0, 1.0)
+
+    asymmetry = (throttle_2 - throttle_1) + 0.8 * (eng2_power - eng1_power)
+    rudder = -0.12 * yaw_rate + 0.40 * asymmetry - 0.01 * _safe_float(state.get("drift_angle_deg"), 0.0)
+    if wow and gs > 20.0:
+        rudder += 0.035 * _angle_diff(target_hdg, track)
+    rudder = _clamp(rudder, -1.0, 1.0)
+
+    if wow:
+        trim_cmd = 0.0
+    else:
+        trim_cmd = 0.22 * elevator
+        if abs(pitch_rate) > 2.0:
+            trim_cmd *= 0.5
+        if low_speed or flare_mode:
+            trim_cmd = min(trim_cmd, 0.12)
+        trim_cmd = _clamp(trim_cmd, -0.30, 0.30)
+
+    return {
+        "elevator": _clamp(elevator, -1.0, 1.0),
+        "aileron": _clamp(aileron, -1.0, 1.0),
+        "rudder": _clamp(rudder, -1.0, 1.0),
+        "throttle_1": _clamp(throttle_1, 0.0, 1.0),
+        "throttle_2": _clamp(throttle_2, 0.0, 1.0),
+        "elevator_trim": _clamp(trim_cmd, -1.0, 1.0),
+        "flaps": _clamp(flap_cmd, 0.0, 40.0),
+        "speedbrake": _clamp(speedbrake_cmd, 0.0, 1.0),
+        "gear": int(gear_cmd),
+    }

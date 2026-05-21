@@ -1,0 +1,768 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Numerics;
+
+public static class Program
+{
+    public static void Main()
+    {
+        var scanner = new FastScanner(Console.OpenStandardInput());
+
+        int width = scanner.NextInt();
+        if (width < 0) return;
+        int height = scanner.NextInt();
+        int numPieces = scanner.NextInt();
+
+        var ai = new TetrisAI(width, height, numPieces);
+
+        for (int i = 0; i < numPieces; i++)
+        {
+            if (!scanner.TryNextNonSpace(out int b)) break;
+            char pieceType = (char)b;
+            scanner.SkipTokenRemainder();
+
+            var (rotation, column) = ai.ChooseMove(pieceType);
+
+            Console.WriteLine(rotation.ToString() + " " + column.ToString());
+            Console.Out.Flush();
+
+            var result = scanner.NextResultToken(out int clearedByJudge);
+            if (result == ResultToken.Eof) break;
+
+            ai.ApplyMove(pieceType, rotation, column, clearedByJudge);
+            if (result == ResultToken.GameOver) break;
+        }
+    }
+
+    private enum ResultToken
+    {
+        Ok,
+        Cleared,
+        GameOver,
+        Eof
+    }
+
+    private sealed class FastScanner
+    {
+        private readonly Stream _stream;
+        private readonly byte[] _buffer = new byte[1 << 16];
+        private int _len;
+        private int _ptr;
+
+        public FastScanner(Stream stream) => _stream = stream;
+
+        public int NextInt()
+        {
+            if (!TryNextNonSpace(out int c)) return -1;
+            int sign = 1;
+            if (c == '-')
+            {
+                sign = -1;
+                c = Read();
+            }
+            int value = 0;
+            while (c > 32)
+            {
+                value = (value * 10) + (c - '0');
+                c = Read();
+            }
+            return value * sign;
+        }
+
+        public bool TryNextNonSpace(out int b)
+        {
+            int c;
+            do
+            {
+                c = Read();
+                if (c == -1)
+                {
+                    b = -1;
+                    return false;
+                }
+            } while (c <= 32);
+
+            b = c;
+            return true;
+        }
+
+        public void SkipTokenRemainder()
+        {
+            int c;
+            while (true)
+            {
+                c = Read();
+                if (c == -1 || c <= 32) return;
+            }
+        }
+
+        public ResultToken NextResultToken(out int cleared)
+        {
+            cleared = 0;
+            if (!TryNextNonSpace(out int c)) return ResultToken.Eof;
+
+            if (c == 'o') // ok
+            {
+                SkipTokenRemainder();
+                return ResultToken.Ok;
+            }
+
+            if (c == 'g') // gameover
+            {
+                SkipTokenRemainder();
+                return ResultToken.GameOver;
+            }
+
+            if (c == 'c') // cleared_N
+            {
+                int ch;
+                while (true)
+                {
+                    ch = Read();
+                    if (ch == -1 || ch <= 32) return ResultToken.Cleared; // unexpected but tolerate
+                    if (ch == '_') break;
+                }
+
+                int n = 0;
+                while (true)
+                {
+                    ch = Read();
+                    if (ch == -1 || ch <= 32) break;
+                    n = (n * 10) + (ch - '0');
+                }
+
+                cleared = n;
+                return ResultToken.Cleared;
+            }
+
+            // Unknown token; consume remainder to avoid desync.
+            SkipTokenRemainder();
+            return ResultToken.Ok;
+        }
+
+        private int Read()
+        {
+            if (_ptr >= _len)
+            {
+                _len = _stream.Read(_buffer, 0, _buffer.Length);
+                _ptr = 0;
+                if (_len <= 0) return -1;
+            }
+            return _buffer[_ptr++];
+        }
+    }
+
+    private sealed class TetrisAI
+    {
+        private readonly int _width;
+        private readonly int _height;
+        private readonly int _numPieces;
+        private readonly ulong _fullMask;
+
+        private readonly ulong[] _board;
+        private readonly ulong[] _scratchA;
+        private readonly ulong[] _scratchB;
+
+        private readonly int[] _heights;
+
+        private readonly Piece[] _pieces; // I,O,T,S,Z,J,L
+        private int _piecesPlayed;
+
+        public TetrisAI(int width, int height, int numPieces)
+        {
+            _width = width;
+            _height = height;
+            _numPieces = numPieces;
+
+            _fullMask = width >= 64 ? ulong.MaxValue : ((1UL << width) - 1UL);
+
+            _board = new ulong[height];
+            _scratchA = new ulong[height];
+            _scratchB = new ulong[height];
+            _heights = new int[width];
+
+            _pieces = BuildPieces();
+        }
+
+        public (int rotation, int column) ChooseMove(char pieceType)
+        {
+            Piece piece = GetPiece(pieceType);
+
+            int currentMaxHeight = GetBoardMaxHeight(_board);
+            double heightRatio = _height == 0 ? 1.0 : (double)currentMaxHeight / _height;
+            int area = _width * _height;
+
+            // Strategy selection:
+            // - Greedy in general (fast, stable for marathon).
+            // - 2-ply expectimax on small/low-risk boards early in the game.
+            bool useExpectimax =
+                _width <= 12 &&
+                _height <= 24 &&
+                area <= 288 &&
+                heightRatio < 0.50 &&
+                _piecesPlayed < 1500 &&
+                _numPieces <= 20000;
+
+            var weights = SelectWeights(heightRatio, area, transitions: useExpectimax ? TransitionMode.Basic : TransitionMode.Adaptive);
+
+            if (!useExpectimax)
+            {
+                var best = FindBestMoveGreedy(_board, piece, weights, _scratchA, out _, out _, out _);
+                return (best.rotation, best.column);
+            }
+
+            // Time-bounded 2-ply expectimax (uniform next-piece assumption).
+            // If the budget expires, fall back to greedy on the best-so-far.
+            var sw = Stopwatch.StartNew();
+            long deadlineTicks = sw.ElapsedTicks + (long)(Stopwatch.Frequency * 0.030); // ~30ms budget
+
+            double bestScore = double.NegativeInfinity;
+            int bestRotation = 0;
+            int bestColumn = 0;
+
+            foreach (int rotIndex in piece.UniqueRotationIndices)
+            {
+                Rotation rot = piece.Rotations4[rotIndex];
+                int maxCol = _width - rot.Width;
+                if (maxCol < 0) continue;
+
+                for (int col = 0; col <= maxCol; col++)
+                {
+                    if (sw.ElapsedTicks > deadlineTicks) goto DoneExpectimax;
+
+                    int landingY = FindLandingY(_board, rot, col);
+                    if (landingY < 0) continue;
+
+                    // Build the afterstate for this candidate in `_scratchB`.
+                    Array.Copy(_board, _scratchB, _height);
+                    PlaceInPlace(_scratchB, rot, col, landingY);
+                    int cleared = ClearLinesInPlace(_scratchB);
+
+                    var nowWeights = SelectWeights(heightRatio, area, transitions: TransitionMode.Off);
+                    double immediate = EvaluateBoard(_scratchB, cleared, nowWeights, landingY + rot.Height);
+
+                    // Expected best response for next piece types
+                    double expected = 0.0;
+                    for (int nextIndex = 0; nextIndex < _pieces.Length; nextIndex++)
+                    {
+                        var nextPiece = _pieces[nextIndex];
+                        var nextWeights = SelectWeights(
+                            heightRatio: Math.Min(1.0, (double)GetBoardMaxHeight(_scratchB) / Math.Max(1, _height)),
+                            area: area,
+                            transitions: TransitionMode.Off);
+
+                        var nextBest = FindBestMoveGreedy(_scratchB, nextPiece, nextWeights, _scratchA, out double nextBestScore, out _, out _);
+                        expected += nextBestScore;
+                    }
+                    expected /= _pieces.Length;
+
+                    double score = immediate + (0.85 * expected);
+                    if (score > bestScore)
+                    {
+                        bestScore = score;
+                        bestRotation = rotIndex;
+                        bestColumn = col;
+                    }
+                }
+            }
+
+        DoneExpectimax:
+            if (double.IsNegativeInfinity(bestScore))
+            {
+                var best = FindBestMoveGreedy(_board, piece, weights, _scratchA, out _, out _, out _);
+                return (best.rotation, best.column);
+            }
+            return (bestRotation, bestColumn);
+        }
+
+        public void ApplyMove(char pieceType, int rotation, int column, int clearedByJudge)
+        {
+            Piece piece = GetPiece(pieceType);
+            Rotation rot = piece.Rotations4[rotation & 3];
+
+            int landingY = FindLandingY(_board, rot, column);
+            if (landingY < 0) return;
+
+            PlaceInPlace(_board, rot, column, landingY);
+            int cleared = ClearLinesInPlace(_board);
+
+            // If the judge disagrees, we cannot reconstruct the true board state;
+            // continue with our internal model anyway to avoid stalling.
+            _ = clearedByJudge;
+            _ = cleared;
+
+            _piecesPlayed++;
+        }
+
+        private static int GetBoardMaxHeight(ulong[] board)
+        {
+            for (int y = board.Length - 1; y >= 0; y--)
+            {
+                if (board[y] != 0) return y + 1;
+            }
+            return 0;
+        }
+
+        private (int rotation, int column) FindBestMoveGreedy(
+            ulong[] board,
+            Piece piece,
+            Weights weights,
+            ulong[] scratch,
+            out double bestScore,
+            out int bestCleared,
+            out int bestLandingTop)
+        {
+            bestScore = double.NegativeInfinity;
+            bestCleared = 0;
+            bestLandingTop = 0;
+            int bestRotation = 0;
+            int bestColumn = 0;
+
+            foreach (int rotIndex in piece.UniqueRotationIndices)
+            {
+                Rotation rot = piece.Rotations4[rotIndex];
+                int maxCol = _width - rot.Width;
+                if (maxCol < 0) continue;
+
+                for (int col = 0; col <= maxCol; col++)
+                {
+                    int landingY = FindLandingY(board, rot, col);
+                    if (landingY < 0) continue;
+
+                    Array.Copy(board, scratch, _height);
+                    PlaceInPlace(scratch, rot, col, landingY);
+                    int cleared = ClearLinesInPlace(scratch);
+
+                    int landingTop = landingY + rot.Height;
+                    double score = EvaluateBoard(scratch, cleared, weights, landingTop);
+
+                    if (score > bestScore)
+                    {
+                        bestScore = score;
+                        bestRotation = rotIndex;
+                        bestColumn = col;
+                        bestCleared = cleared;
+                        bestLandingTop = landingTop;
+                    }
+                }
+            }
+
+            return (bestRotation, bestColumn);
+        }
+
+        private static int FindLandingY(ulong[] board, Rotation rot, int col)
+        {
+            int height = board.Length;
+            int y = height - rot.Height;
+            if (y < 0) return -1;
+
+            if (!CanPlaceAt(board, rot, col, y)) return -1;
+            while (y > 0 && CanPlaceAt(board, rot, col, y - 1)) y--;
+            return y;
+        }
+
+        private static bool CanPlaceAt(ulong[] board, Rotation rot, int col, int y)
+        {
+            for (int r = 0; r < rot.Height; r++)
+            {
+                ulong shifted = rot.Rows[r] << col;
+                if ((board[y + r] & shifted) != 0) return false;
+            }
+            return true;
+        }
+
+        private static void PlaceInPlace(ulong[] board, Rotation rot, int col, int y)
+        {
+            for (int r = 0; r < rot.Height; r++)
+            {
+                board[y + r] |= (rot.Rows[r] << col);
+            }
+        }
+
+        private int ClearLinesInPlace(ulong[] rows)
+        {
+            int write = 0;
+            int cleared = 0;
+            for (int read = 0; read < _height; read++)
+            {
+                if ((rows[read] & _fullMask) == _fullMask)
+                {
+                    cleared++;
+                }
+                else
+                {
+                    rows[write++] = rows[read];
+                }
+            }
+
+            for (; write < _height; write++) rows[write] = 0;
+            return cleared;
+        }
+
+        private double EvaluateBoard(ulong[] rows, int linesCleared, Weights w, int landingTop)
+        {
+            int holes = 0;
+            int aggregateHeight = 0;
+            int maxHeight = 0;
+
+            // heights + holes
+            for (int x = 0; x < _width; x++)
+            {
+                bool found = false;
+                int colHeight = 0;
+                for (int y = _height - 1; y >= 0; y--)
+                {
+                    bool filled = ((rows[y] >> x) & 1UL) != 0;
+                    if (filled)
+                    {
+                        if (!found)
+                        {
+                            found = true;
+                            colHeight = y + 1;
+                        }
+                    }
+                    else
+                    {
+                        if (found) holes++;
+                    }
+                }
+                _heights[x] = colHeight;
+                aggregateHeight += colHeight;
+                if (colHeight > maxHeight) maxHeight = colHeight;
+            }
+
+            int bumpiness = 0;
+            for (int x = 0; x < _width - 1; x++)
+                bumpiness += Abs(_heights[x] - _heights[x + 1]);
+
+            int wells = 0;
+            for (int x = 0; x < _width; x++)
+            {
+                int left = (x == 0) ? _height : _heights[x - 1];
+                int right = (x == _width - 1) ? _height : _heights[x + 1];
+                int minNeighbor = left < right ? left : right;
+                int depth = minNeighbor - _heights[x];
+                if (depth > 0)
+                    wells += depth * (depth + 1) / 2;
+            }
+
+            int rowTransitions = 0;
+            int colTransitions = 0;
+            if (w.UseTransitions)
+            {
+                rowTransitions = ComputeRowTransitions(rows);
+                colTransitions = ComputeColumnTransitions(rows);
+            }
+
+            // LandingTop helps break ties towards safer placements when near top.
+            double score =
+                (w.AggregateHeight * aggregateHeight) +
+                (w.Lines * linesCleared) +
+                (w.Holes * holes) +
+                (w.Bumpiness * bumpiness) +
+                (w.MaxHeight * maxHeight) +
+                (w.Wells * wells) +
+                (w.LandingTop * landingTop);
+
+            if (w.UseTransitions)
+                score += (w.RowTransitions * rowTransitions) + (w.ColumnTransitions * colTransitions);
+
+            return score;
+        }
+
+        private int ComputeRowTransitions(ulong[] rows)
+        {
+            // Uses bit trick when width is small; otherwise fall back to loop.
+            if (_width < 62)
+            {
+                ulong cmpMask = (1UL << (_width + 1)) - 1UL; // comparisons for bits 0..width
+                int total = 0;
+                for (int y = 0; y < _height; y++)
+                {
+                    ulong row = rows[y] & _fullMask;
+                    ulong extended = 1UL | (row << 1) | (1UL << (_width + 1));
+                    ulong diff = (extended ^ (extended >> 1)) & cmpMask;
+                    total += BitOperations.PopCount(diff);
+                }
+                return total;
+            }
+            else
+            {
+                int total = 0;
+                for (int y = 0; y < _height; y++)
+                {
+                    bool prev = true;
+                    ulong row = rows[y] & _fullMask;
+                    for (int x = 0; x < _width; x++)
+                    {
+                        bool filled = ((row >> x) & 1UL) != 0;
+                        if (filled != prev) total++;
+                        prev = filled;
+                    }
+                    if (!prev) total++;
+                }
+                return total;
+            }
+        }
+
+        private int ComputeColumnTransitions(ulong[] rows)
+        {
+            // For typical Tetris heights (<= 60), build per-column bitmasks and use popcount.
+            if (_height < 62)
+            {
+                ulong cmpMask = (1UL << (_height + 1)) - 1UL; // comparisons for bits 0..height
+                int total = 0;
+                for (int x = 0; x < _width; x++)
+                {
+                    ulong colBits = 0;
+                    for (int y = 0; y < _height; y++)
+                    {
+                        if (((rows[y] >> x) & 1UL) != 0)
+                            colBits |= 1UL << y;
+                    }
+                    ulong extended = 1UL | (colBits << 1) | (1UL << (_height + 1));
+                    ulong diff = (extended ^ (extended >> 1)) & cmpMask;
+                    total += BitOperations.PopCount(diff);
+                }
+                return total;
+            }
+            else
+            {
+                int total = 0;
+                for (int x = 0; x < _width; x++)
+                {
+                    bool prev = true;
+                    for (int y = 0; y < _height; y++)
+                    {
+                        bool filled = ((rows[y] >> x) & 1UL) != 0;
+                        if (filled != prev) total++;
+                        prev = filled;
+                    }
+                    if (!prev) total++;
+                }
+                return total;
+            }
+        }
+
+        private static int Abs(int v) => v < 0 ? -v : v;
+
+        private enum TransitionMode { Off, Basic, Adaptive }
+
+        private static Weights SelectWeights(double heightRatio, int area, TransitionMode transitions)
+        {
+            // Base weights (4-feature heuristic), then adapt by risk.
+            var w = new Weights
+            {
+                AggregateHeight = -0.510066,
+                Lines = 0.760666,
+                Holes = -0.35663,
+                Bumpiness = -0.184483,
+                MaxHeight = -0.05,
+                Wells = -0.03,
+                LandingTop = 0.0,
+                UseTransitions = false,
+                RowTransitions = -0.01,
+                ColumnTransitions = -0.01
+            };
+
+            if (heightRatio > 0.72)
+            {
+                w.AggregateHeight = -0.70;
+                w.Lines = 1.20;
+                w.Holes = -0.95;
+                w.Bumpiness = -0.28;
+                w.MaxHeight = -0.35;
+                w.Wells = -0.08;
+                w.LandingTop = -0.02;
+
+                if (transitions != TransitionMode.Off)
+                {
+                    w.UseTransitions = true;
+                    w.RowTransitions = -0.03;
+                    w.ColumnTransitions = -0.04;
+                }
+            }
+            else if (heightRatio > 0.55)
+            {
+                w.AggregateHeight = -0.60;
+                w.Lines = 0.95;
+                w.Holes = -0.55;
+                w.Bumpiness = -0.22;
+                w.MaxHeight = -0.18;
+                w.Wells = -0.05;
+                w.LandingTop = -0.01;
+
+                if (transitions == TransitionMode.Adaptive)
+                {
+                    w.UseTransitions = true;
+                    w.RowTransitions = -0.015;
+                    w.ColumnTransitions = -0.02;
+                }
+            }
+            else if (heightRatio < 0.25 && area <= 240)
+            {
+                // Early-game: slightly favor line clears and smoothness.
+                w.AggregateHeight = -0.45;
+                w.Lines = 0.85;
+                w.Holes = -0.38;
+                w.Bumpiness = -0.17;
+                w.MaxHeight = -0.02;
+                w.Wells = -0.02;
+            }
+
+            return w;
+        }
+
+        private struct Weights
+        {
+            public double AggregateHeight;
+            public double Lines;
+            public double Holes;
+            public double Bumpiness;
+            public double MaxHeight;
+            public double Wells;
+            public double LandingTop;
+
+            public bool UseTransitions;
+            public double RowTransitions;
+            public double ColumnTransitions;
+        }
+
+        private sealed class Piece
+        {
+            public readonly Rotation[] Rotations4; // index 0..3
+            public readonly int[] UniqueRotationIndices;
+
+            public Piece(Rotation[] rotations4, int[] uniqueRotationIndices)
+            {
+                Rotations4 = rotations4;
+                UniqueRotationIndices = uniqueRotationIndices;
+            }
+        }
+
+        private readonly struct Rotation
+        {
+            public readonly int Width;
+            public readonly int Height;
+            public readonly ulong[] Rows; // bottom-up
+
+            public Rotation(int width, int height, ulong[] rows)
+            {
+                Width = width;
+                Height = height;
+                Rows = rows;
+            }
+        }
+
+        private Piece GetPiece(char type)
+        {
+            return type switch
+            {
+                'I' => _pieces[0],
+                'O' => _pieces[1],
+                'T' => _pieces[2],
+                'S' => _pieces[3],
+                'Z' => _pieces[4],
+                'J' => _pieces[5],
+                'L' => _pieces[6],
+                _ => _pieces[2]
+            };
+        }
+
+        private static Piece[] BuildPieces()
+        {
+            // Rotation 0 is the "letter-like" spawn orientation:
+            // - I: horizontal
+            // - O: square
+            // - T: row of 3 with one above center
+            // - S: right-leaning
+            // - Z: left-leaning
+            // - J: row of 3 with one above left
+            // - L: row of 3 with one above right
+            return new[]
+            {
+                BuildPiece(new[]{ (0,0),(1,0),(2,0),(3,0) }), // I
+                BuildPiece(new[]{ (0,0),(1,0),(0,1),(1,1) }), // O
+                BuildPiece(new[]{ (0,0),(1,0),(2,0),(1,1) }), // T
+                BuildPiece(new[]{ (0,0),(1,0),(1,1),(2,1) }), // S
+                BuildPiece(new[]{ (1,0),(2,0),(0,1),(1,1) }), // Z
+                BuildPiece(new[]{ (0,0),(1,0),(2,0),(0,1) }), // J
+                BuildPiece(new[]{ (0,0),(1,0),(2,0),(2,1) }), // L
+            };
+        }
+
+        private static Piece BuildPiece((int x, int y)[] blocks)
+        {
+            var rots = new Rotation[4];
+            int[] xs = new int[4];
+            int[] ys = new int[4];
+            for (int i = 0; i < 4; i++)
+            {
+                xs[i] = blocks[i].x;
+                ys[i] = blocks[i].y;
+            }
+
+            for (int r = 0; r < 4; r++)
+            {
+                int minX = int.MaxValue, minY = int.MaxValue;
+                int maxX = int.MinValue, maxY = int.MinValue;
+                for (int i = 0; i < 4; i++)
+                {
+                    if (xs[i] < minX) minX = xs[i];
+                    if (ys[i] < minY) minY = ys[i];
+                    if (xs[i] > maxX) maxX = xs[i];
+                    if (ys[i] > maxY) maxY = ys[i];
+                }
+
+                int width = (maxX - minX) + 1;
+                int height = (maxY - minY) + 1;
+                ulong[] rows = new ulong[height];
+                for (int i = 0; i < 4; i++)
+                {
+                    int x = xs[i] - minX;
+                    int y = ys[i] - minY;
+                    rows[y] |= 1UL << x;
+                }
+                rots[r] = new Rotation(width, height, rows);
+
+                // Rotate clockwise: (x,y) -> (y, -x)
+                for (int i = 0; i < 4; i++)
+                {
+                    int x = xs[i];
+                    int y = ys[i];
+                    xs[i] = y;
+                    ys[i] = -x;
+                }
+            }
+
+            var unique = new List<int>(4);
+            for (int i = 0; i < 4; i++)
+            {
+                bool dup = false;
+                for (int j = 0; j < unique.Count; j++)
+                {
+                    if (RotationEquals(rots[i], rots[unique[j]]))
+                    {
+                        dup = true;
+                        break;
+                    }
+                }
+                if (!dup) unique.Add(i);
+            }
+
+            return new Piece(rots, unique.ToArray());
+        }
+
+        private static bool RotationEquals(in Rotation a, in Rotation b)
+        {
+            if (a.Width != b.Width || a.Height != b.Height) return false;
+            for (int i = 0; i < a.Height; i++)
+            {
+                if (a.Rows[i] != b.Rows[i]) return false;
+            }
+            return true;
+        }
+    }
+}

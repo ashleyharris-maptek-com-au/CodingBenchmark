@@ -1,0 +1,330 @@
+The following C# code implements a robust asteroid interception and deflection solver. It utilizes an N-body propagator with a symplectic Kick-Drift-Kick (KDK) integrator to account for the gravitational influence of all major solar system bodies (Sun, planets, Moon). 
+
+Key features of the solver:
+1.  **Universal Variables Lambert Solver:** Finds initial trajectory guesses between Earth and the Asteroid for both short-way and long-way orbits.
+2.  **N-Body Refinement:** A shooting-based refinement loop (Newton's method) that adjusts the launch velocity to account for perturbations from other planets, ensuring a precise intercept.
+3.  **Mid-Course Correction:** Calculates an additional correction burn at the flight midpoint to neutralize any remaining propagation errors and guarantee impact within the 1000km requirement.
+4.  **Optimization Loop:** Performs a high-volume randomized grid search (5000 attempts) over the launch and impact windows to maximize the asteroid's deflection at the predicted Earth collision time.
+5.  **Caching:** Pre-propagates planetary positions to allow for extremely fast trajectory evaluations during the search phase.
+
+```csharp
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+using System.Linq;
+using System.Threading;
+
+namespace AsteroidSolver
+{
+    public struct Vector3
+    {
+        public double X, Y, Z;
+        public Vector3(double x, double y, double z) { X = x; Y = y; Z = z; }
+        public static Vector3 operator +(Vector3 a, Vector3 b) => new Vector3(a.X + b.X, a.Y + b.Y, a.Z + b.Z);
+        public static Vector3 operator -(Vector3 a, Vector3 b) => new Vector3(a.X - b.X, a.Y - b.Y, a.Z - b.Z);
+        public static Vector3 operator *(Vector3 a, double b) => new Vector3(a.X * b, a.Y * b, a.Z * b);
+        public static Vector3 operator /(Vector3 a, double b) => new Vector3(a.X / b, a.Y / b, a.Z / b);
+        public double Length() => Math.Sqrt(X * X + Y * Y + Z * Z);
+        public double LengthSquared() => X * X + Y * Y + Z * Z;
+        public Vector3 Normalize() => this / Length();
+        public static double Dot(Vector3 a, Vector3 b) => a.X * b.X + a.Y * b.Y + a.Z * b.Z;
+        public static Vector3 Cross(Vector3 a, Vector3 b) => new Vector3(a.Y * b.Z - a.Z * b.Y, a.Z * b.X - a.X * b.Z, a.X * b.Y - a.Y * b.X);
+    }
+
+    public class Body
+    {
+        public string Name;
+        public double Mass;
+        public Vector3 Position;
+        public Vector3 Velocity;
+        public Vector3 Acceleration;
+        public Body Clone() => new Body { Name = Name, Mass = Mass, Position = Position, Velocity = Velocity };
+    }
+
+    public class State { public Vector3 Position; public Vector3 Velocity; }
+    public class Burn { public double Time; public Vector3 DV; }
+    public class Trajectory { public List<Burn> Burns = new List<Burn>(); public double Deflection; }
+
+    class Program
+    {
+        const double G = 6.67430e-11;
+        const double DayToSec = 86400.0;
+        const double EarthRadius = 6371000.0;
+
+        static int numBodies;
+        static double warningDays;
+        static double impactorMass;
+        static double deltaVBudget;
+        static double asteroidMass;
+        static long t0Unix;
+        static List<Body> initialBodies = new List<Body>();
+        static string bspPath;
+
+        static Dictionary<string, Vector3[]> cachedPositions;
+        static Dictionary<string, Vector3[]> cachedVelocities;
+        static int cacheSize;
+        static double cacheDt = 0.5; 
+
+        static void Main(string[] args)
+        {
+            Thread.CurrentThread.CurrentCulture = CultureInfo.InvariantCulture;
+            ReadInput();
+            if (initialBodies.Count == 0) return;
+
+            PrePropagate();
+            double tColl = FindCollisionTime();
+            var best = Search(tColl);
+
+            if (best != null)
+            {
+                Console.WriteLine(best.Burns.Count);
+                foreach (var b in best.Burns)
+                    Console.WriteLine($"{b.Time:F6} {b.DV.X:E14} {b.DV.Y:E14} {b.DV.Z:E14}");
+            }
+        }
+
+        static void ReadInput()
+        {
+            string line = Console.ReadLine();
+            if (string.IsNullOrEmpty(line)) return;
+            string[] parts = line.Split(new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length < 6) return;
+            numBodies = int.Parse(parts[0]);
+            warningDays = double.Parse(parts[1]);
+            impactorMass = double.Parse(parts[2]);
+            deltaVBudget = double.Parse(parts[3]);
+            asteroidMass = double.Parse(parts[4]);
+            t0Unix = long.Parse(parts[5]);
+
+            for (int i = 0; i < numBodies; i++)
+            {
+                parts = Console.ReadLine().Split(new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
+                initialBodies.Add(new Body
+                {
+                    Name = parts[0],
+                    Mass = double.Parse(parts[1]),
+                    Position = new Vector3(double.Parse(parts[2]), double.Parse(parts[3]), double.Parse(parts[4])),
+                    Velocity = new Vector3(double.Parse(parts[5]), double.Parse(parts[6]), double.Parse(parts[7]))
+                });
+            }
+            bspPath = Console.ReadLine();
+        }
+
+        static void PrePropagate()
+        {
+            cacheSize = (int)((warningDays + 365 * 3) / cacheDt) + 10;
+            cachedPositions = new Dictionary<string, Vector3[]>();
+            cachedVelocities = new Dictionary<string, Vector3[]>();
+            foreach (var b in initialBodies)
+            {
+                cachedPositions[b.Name] = new Vector3[cacheSize];
+                cachedVelocities[b.Name] = new Vector3[cacheSize];
+            }
+
+            var bodies = initialBodies.Select(b => b.Clone()).ToList();
+            double dt = DayToSec * cacheDt;
+            ComputeAccelerations(bodies);
+            for (int i = 0; i < cacheSize; i++)
+            {
+                foreach (var b in bodies)
+                {
+                    cachedPositions[b.Name][i] = b.Position;
+                    cachedVelocities[b.Name][i] = b.Velocity;
+                }
+                Step(bodies, dt);
+            }
+        }
+
+        static Vector3 GetPosition(string name, double tDays)
+        {
+            double t = Math.Max(0, Math.Min(tDays, (cacheSize - 1) * cacheDt));
+            int i = (int)(t / cacheDt);
+            double frac = (t / cacheDt) - i;
+            if (i >= cacheSize - 1) return cachedPositions[name][cacheSize - 1];
+            return cachedPositions[name][i] * (1.0 - frac) + cachedPositions[name][i + 1] * frac;
+        }
+
+        static Vector3 GetVelocity(string name, double tDays)
+        {
+            double t = Math.Max(0, Math.Min(tDays, (cacheSize - 1) * cacheDt));
+            int i = (int)(t / cacheDt);
+            double frac = (t / cacheDt) - i;
+            if (i >= cacheSize - 1) return cachedVelocities[name][cacheSize - 1];
+            return cachedVelocities[name][i] * (1.0 - frac) + cachedVelocities[name][i + 1] * frac;
+        }
+
+        static double FindCollisionTime()
+        {
+            double minDist = double.MaxValue;
+            double tColl = warningDays;
+            for (int i = 0; i < cacheSize; i++)
+            {
+                double d = (cachedPositions["Asteroid"][i] - cachedPositions["Earth"][i]).Length();
+                if (d < minDist) { minDist = d; tColl = i * cacheDt; }
+                if (d < EarthRadius) return i * cacheDt;
+            }
+            return tColl;
+        }
+
+        static Trajectory Search(double tColl)
+        {
+            Trajectory best = null;
+            double maxDeflection = -1;
+            var sun = initialBodies.OrderByDescending(b => b.Mass).First();
+            double mu = sun.Mass * G;
+
+            Random rnd = new Random(42);
+            for (int i = 0; i < 5000; i++)
+            {
+                double tLaunch = rnd.NextDouble() * warningDays;
+                double tImp = tLaunch + 30 + rnd.NextDouble() * (tColl - tLaunch - 35);
+                if (tImp > tColl - 2) tImp = tColl - 2;
+                if (tImp <= tLaunch + 10) continue;
+
+                var traj = Evaluate(tLaunch, tImp, tColl, mu, false);
+                if (traj != null && (best == null || traj.Deflection > maxDeflection)) { maxDeflection = traj.Deflection; best = traj; }
+                
+                traj = Evaluate(tLaunch, tImp, tColl, mu, true);
+                if (traj != null && (best == null || traj.Deflection > maxDeflection)) { maxDeflection = traj.Deflection; best = traj; }
+            }
+            return best;
+        }
+
+        static Trajectory Evaluate(double tLaunch, double tImp, double tColl, double mu, bool longWay)
+        {
+            Vector3 r1 = GetPosition("Earth", tLaunch);
+            Vector3 r2 = GetPosition("Asteroid", tImp);
+            Vector3 v1Earth = GetVelocity("Earth", tLaunch);
+
+            var lres = SolveLambertUniversal(r1, r2, (tImp - tLaunch) * DayToSec, mu, longWay);
+            Vector3 v1sc = RefineV1(r1, lres.v1, tLaunch, tImp, r2);
+
+            Vector3 dvLaunch = v1sc - v1Earth;
+            if (dvLaunch.Length() > deltaVBudget * 0.95) return null;
+
+            double tMid = (tLaunch + tImp) * 0.5;
+            var midState = PropagateSC(r1, v1sc, tLaunch, tMid);
+            Vector3 r2_at_imp = GetPosition("Asteroid", tImp);
+            Vector3 vMid_new = RefineV1(midState.Position, midState.Velocity, tMid, tImp, r2_at_imp);
+            Vector3 dvMid = vMid_new - midState.Velocity;
+
+            if (dvLaunch.Length() + dvMid.Length() > deltaVBudget) return null;
+
+            var endState = PropagateSC(midState.Position, vMid_new, tMid, tImp);
+            if ((endState.Position - r2_at_imp).Length() > 2000) return null;
+
+            Vector3 v2Ast = GetVelocity("Asteroid", tImp);
+            Vector3 vRel = endState.Velocity - v2Ast;
+            Vector3 dvAst = vRel * (impactorMass / (asteroidMass + impactorMass));
+            double deflection = dvAst.Length() * (tColl - tImp) * DayToSec;
+
+            var t = new Trajectory();
+            t.Burns.Add(new Burn { Time = tLaunch, DV = dvLaunch });
+            t.Burns.Add(new Burn { Time = tMid, DV = dvMid });
+            t.Burns.Add(new Burn { Time = tImp, DV = new Vector3(0,0,0) });
+            t.Deflection = deflection;
+            return t;
+        }
+
+        static Vector3 RefineV1(Vector3 r1, Vector3 v1guess, double tStart, double tEnd, Vector3 targetR)
+        {
+            Vector3 v1 = v1guess;
+            double dt = (tEnd - tStart) * DayToSec;
+            for (int i = 0; i < 4; i++)
+            {
+                var res = PropagateSC(r1, v1, tStart, tEnd, 24.0);
+                Vector3 err = res.Position - targetR;
+                if (err.Length() < 500) break;
+                v1 -= err / dt;
+            }
+            return v1;
+        }
+
+        static State PropagateSC(Vector3 r0, Vector3 v0, double tStart, double tEnd, double dtHours = 6.0)
+        {
+            Vector3 r = r0, v = v0;
+            double t = tStart, dt = dtHours * 3600.0;
+            while (t < tEnd)
+            {
+                if (t + dt / DayToSec > tEnd) dt = (tEnd - t) * DayToSec;
+                Vector3 a1 = GetAccelerationAt(r, t);
+                v += a1 * (dt * 0.5);
+                r += v * dt;
+                Vector3 a2 = GetAccelerationAt(r, t + dt / DayToSec);
+                v += a2 * (dt * 0.5);
+                t += dt / DayToSec;
+                if (dt < 1.0) break;
+            }
+            return new State { Position = r, Velocity = v };
+        }
+
+        static Vector3 GetAccelerationAt(Vector3 r, double tDays)
+        {
+            Vector3 acc = new Vector3(0, 0, 0);
+            foreach (var kvp in cachedPositions)
+            {
+                Vector3 bPos = GetPosition(kvp.Key, tDays);
+                double mass = initialBodies.First(b => b.Name == kvp.Key).Mass;
+                Vector3 diff = bPos - r;
+                double d2 = diff.LengthSquared();
+                if (d2 > 1e6) acc += diff * (G * mass / (d2 * Math.Sqrt(d2)));
+            }
+            return acc;
+        }
+
+        static (Vector3 v1, Vector3 v2) SolveLambertUniversal(Vector3 r1, Vector3 r2, double dt, double mu, bool longWay)
+        {
+            double r1m = r1.Length(), r2m = r2.Length();
+            double cos_dtheta = Vector3.Dot(r1, r2) / (r1m * r2m);
+            double dtheta = Math.Acos(Math.Max(-1, Math.Min(1, cos_dtheta)));
+            if (longWay) dtheta = 2 * Math.PI - dtheta;
+
+            double A = Math.Sin(dtheta) * Math.Sqrt(r1m * r2m / (1 - Math.Cos(dtheta)));
+            if (Math.Abs(dtheta) < 1e-7 || Math.Abs(A) < 1e-7) return ( (r2-r1)/dt, (r2-r1)/dt );
+
+            double psi = 0, psi_low = -4 * Math.PI * Math.PI, psi_high = 4 * Math.PI * Math.PI;
+            for (int i = 0; i < 40; i++)
+            {
+                double c2 = C2(psi), c3 = C3(psi);
+                double y = r1m + r2m + A * (psi * c3 - 1) / Math.Sqrt(c2);
+                if (A > 0 && y < 0) { psi_low += 0.1; psi = (psi_low + psi_high)*0.5; continue; }
+                double chi = Math.Sqrt(y / c2);
+                double t = (Math.Pow(chi, 3) * c3 + A * Math.Sqrt(y)) / Math.Sqrt(mu);
+                if (t < dt) psi_low = psi; else psi_high = psi;
+                psi = (psi_low + psi_high) * 0.5;
+            }
+            double final_c2 = C2(psi), final_c3 = C3(psi);
+            double fy = r1m + r2m + A * (psi * final_c3 - 1) / Math.Sqrt(final_c2);
+            double f = 1 - fy / r1m, g = A * Math.Sqrt(fy / mu), gdot = 1 - fy / r2m;
+            return ((r2 - r1 * f) / g, (r2 * gdot - r1) / g);
+        }
+
+        static double C2(double p) => p > 1e-6 ? (1 - Math.Cos(Math.Sqrt(p))) / p : (p < -1e-6 ? (Math.Cosh(Math.Sqrt(-p)) - 1) / (-p) : 0.5);
+        static double C3(double p) => p > 1e-6 ? (Math.Sqrt(p) - Math.Sin(Math.Sqrt(p))) / Math.Pow(p, 1.5) : (p < -1e-6 ? (Math.Sinh(Math.Sqrt(-p)) - Math.Sqrt(-p)) / Math.Pow(-p, 1.5) : 1.0/6.0);
+
+        static void ComputeAccelerations(List<Body> bodies)
+        {
+            for (int i = 0; i < bodies.Count; i++) bodies[i].Acceleration = new Vector3(0, 0, 0);
+            for (int i = 0; i < bodies.Count; i++)
+                for (int j = i + 1; j < bodies.Count; j++)
+                {
+                    Vector3 r = bodies[j].Position - bodies[i].Position;
+                    double d2 = r.LengthSquared();
+                    double f = G / (d2 * Math.Sqrt(d2));
+                    bodies[i].Acceleration += r * (bodies[j].Mass * f);
+                    bodies[j].Acceleration -= r * (bodies[i].Mass * f);
+                }
+        }
+
+        static void Step(List<Body> bodies, double dt)
+        {
+            double dt2 = dt * 0.5;
+            for (int i = 0; i < bodies.Count; i++) bodies[i].Velocity += bodies[i].Acceleration * dt2;
+            for (int i = 0; i < bodies.Count; i++) bodies[i].Position += bodies[i].Velocity * dt;
+            ComputeAccelerations(bodies);
+            for (int i = 0; i < bodies.Count; i++) bodies[i].Velocity += bodies[i].Acceleration * dt2;
+        }
+    }
+}
+```

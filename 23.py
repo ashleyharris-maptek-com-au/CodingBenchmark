@@ -17,7 +17,7 @@ from pathlib import Path
 
 # Import our native compiler helper
 from native_compiler import RustCompiler, CompilationError, ExecutionError, describe_this_pc
-from solver_utils import parse_freeform_response
+from solver_utils import parse_freeform_response, GradeCache
 
 title = "Lunar Lander Game"
 
@@ -38,6 +38,30 @@ MAX_SVG_CELLS = 200_000
 MAX_SVG_DIM = 900
 
 LAST_LANDER_STATS: Dict[Tuple[int, str], Dict] = {}
+_GRADE_CACHE = GradeCache("test23")
+
+
+def _grade_cache_key_parts(subPass: int, aiEngineName: str, code: str) -> tuple:
+  case = TEST_CASES[subPass]
+  return (
+    "test23-grade-v1",
+    f"model={aiEngineName}",
+    f"subpass={subPass}",
+    (f"case={case['width']}x{case['height']}|g={case['gravity']}|thrust={case['max_thrust']}|"
+     f"fuel={case['fuel']}|time={case['max_time']}|seed={RANDOM_SEED + subPass}"),
+    code,
+  )
+
+
+def _restore_cached_lander_stats(subPass: int, aiEngineName: str,
+                                 stats_record: Optional[Dict]) -> None:
+  stats_key = (subPass, aiEngineName)
+  if not stats_record:
+    LAST_LANDER_STATS.pop(stats_key, None)
+    return
+  restored_stats = dict(stats_record)
+  restored_stats["world"] = get_world(subPass)
+  LAST_LANDER_STATS[stats_key] = restored_stats
 
 
 class LunarLanderWorld:
@@ -784,24 +808,38 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
   max_distance = math.sqrt(world.width**2 + world.height**2)
 
   code = code
+  cache_parts = _grade_cache_key_parts(subPass, aiEngineName, code)
 
-  # Run simulation
-  landed, distance, end_reason, exec_time = run_lander_simulation(code, case, subPass, aiEngineName)
+  def compute_grade_record() -> Dict:
+    landed, distance, end_reason, exec_time = run_lander_simulation(code, case, subPass,
+                                                                    aiEngineName)
 
-  if landed:
-    score = 1.0
-  elif end_reason == "crashed":
-    score = 0
-  elif end_reason in ("timeout", "real_timeout"):
-    score = max(0.05, 0.3 * (1 - distance / max_distance))
-  else:
-    score = 0.0
+    if landed:
+      score = 1.0
+    elif end_reason == "crashed":
+      score = 0
+    elif end_reason in ("timeout", "real_timeout"):
+      score = max(0.05, 0.3 * (1 - distance / max_distance))
+    else:
+      score = 0.0
 
-  explanation = (f"[{description}] End: {end_reason}, "
-                 f"Distance: {distance:.1f}m, "
-                 f"Time: {exec_time:.2f}s")
+    explanation = (f"[{description}] End: {end_reason}, "
+                   f"Distance: {distance:.1f}m, "
+                   f"Time: {exec_time:.2f}s")
+    stats = LAST_LANDER_STATS.get((subPass, aiEngineName))
+    stats_record = None
+    if stats:
+      stats_record = dict(stats)
+      stats_record.pop("world", None)
+    return {
+      "score": score,
+      "explanation": explanation,
+      "stats": stats_record,
+    }
 
-  return score, explanation
+  record = _GRADE_CACHE.get_or_compute_json("grade_record", compute_grade_record, *cache_parts)
+  _restore_cached_lander_stats(subPass, aiEngineName, record.get("stats"))
+  return float(record.get("score", 0.0)), record.get("explanation", "No explanation")
 
 
 def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:

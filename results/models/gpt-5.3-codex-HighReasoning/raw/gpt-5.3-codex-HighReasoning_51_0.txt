@@ -1,0 +1,347 @@
+def autopilot_step(state: dict, dt: float) -> dict:
+    import math
+
+    # Persistent controller memory (function attribute to survive across calls)
+    if not hasattr(autopilot_step, "mem"):
+        autopilot_step.mem = {
+            "alt_i": 0.0,
+            "vs_i": 0.0,
+            "hdg_i": 0.0,
+            "spd_i": 0.0,
+            "yaw_i": 0.0,
+            "trim": 0.0,
+            "last_hdg_err": 0.0,
+            "last_roll_cmd": 0.0,
+            "last_alt": None,
+            "last_time": None,
+            "flare": False,
+        }
+    m = autopilot_step.mem
+
+    # Use provided dt when sane, else fallback
+    dt = state.get("dt", dt)
+    if dt is None or dt <= 1e-4 or dt > 1.0:
+        dt = 0.05
+
+    def clamp(x, lo, hi):
+        return lo if x < lo else hi if x > hi else x
+
+    def wrap180(deg):
+        x = (deg + 180.0) % 360.0 - 180.0
+        return x
+
+    def median(vals):
+        vals = sorted(vals)
+        n = len(vals)
+        if n == 0:
+            return None
+        if n % 2:
+            return vals[n // 2]
+        return 0.5 * (vals[n // 2 - 1] + vals[n // 2])
+
+    def robust_vote(candidates, fallback=None, outlier=3.0):
+        # candidates: list of (value, quality)
+        vals = [v for v, q in candidates if v is not None and math.isfinite(v)]
+        if not vals:
+            return fallback
+        med = median(vals)
+        kept = []
+        for v, q in candidates:
+            if v is None or not math.isfinite(v):
+                continue
+            if abs(v - med) <= outlier:
+                kept.append((v, q))
+        if not kept:
+            kept = [(v, q) for v, q in candidates if v is not None and math.isfinite(v)]
+        wsum = 0.0
+        s = 0.0
+        for v, q in kept:
+            w = max(0.05, q)
+            s += v * w
+            wsum += w
+        return s / wsum if wsum > 0 else med
+
+    def robust_angle_vote(candidates, fallback=0.0):
+        # candidates: list of (deg, quality)
+        vecx = 0.0
+        vecy = 0.0
+        total_w = 0.0
+        for d, q in candidates:
+            if d is None or not math.isfinite(d):
+                continue
+            w = max(0.05, q)
+            r = math.radians(d)
+            vecx += math.cos(r) * w
+            vecy += math.sin(r) * w
+            total_w += w
+        if total_w <= 0:
+            return fallback
+        return (math.degrees(math.atan2(vecy, vecx)) + 360.0) % 360.0
+
+    def triple(prefix, suffix="", valid_suffix="_valid"):
+        out = []
+        for i in (1, 2, 3):
+            k = f"{prefix}_{i}{suffix}"
+            vk = f"{prefix}_{i}{valid_suffix}"
+            v = state.get(k)
+            q = 1.0 if state.get(vk, True) else 0.35
+            out.append((v, q))
+        return out
+
+    # --- Sensor fusion ---
+    baro_alt = robust_vote(triple("baro_alt", "_ft"), fallback=state.get("target_alt_ft", 0.0), outlier=600.0)
+    radar_alt = robust_vote(triple("radar_alt", "_ft"), fallback=None, outlier=150.0)
+    ias = robust_vote(triple("ias", "_kt"), fallback=state.get("target_ias_kt", 250.0), outlier=25.0)
+    aoa = robust_vote(triple("aoa", "_deg"), fallback=4.0, outlier=4.0)
+
+    irs_vs = robust_vote([
+        (state.get("irs_1_vs_fpm"), 1.0 if state.get("irs_1_valid", True) else 0.35),
+        (state.get("irs_2_vs_fpm"), 1.0 if state.get("irs_2_valid", True) else 0.35),
+        (state.get("irs_3_vs_fpm"), 1.0 if state.get("irs_3_valid", True) else 0.35),
+    ], fallback=state.get("vertical_speed_fpm", 0.0), outlier=1200.0)
+
+    pitch = robust_vote([
+        (state.get("irs_1_pitch_deg"), 1.0 if state.get("irs_1_valid", True) else 0.35),
+        (state.get("irs_2_pitch_deg"), 1.0 if state.get("irs_2_valid", True) else 0.35),
+        (state.get("irs_3_pitch_deg"), 1.0 if state.get("irs_3_valid", True) else 0.35),
+    ], fallback=0.0, outlier=7.0)
+
+    roll = robust_vote([
+        (state.get("irs_1_roll_deg"), 1.0 if state.get("irs_1_valid", True) else 0.35),
+        (state.get("irs_2_roll_deg"), 1.0 if state.get("irs_2_valid", True) else 0.35),
+        (state.get("irs_3_roll_deg"), 1.0 if state.get("irs_3_valid", True) else 0.35),
+    ], fallback=0.0, outlier=8.0)
+
+    yaw_rate = robust_vote([
+        (state.get("gyro_1_yaw_rate_dps"), 1.0 if state.get("gyro_1_valid", True) else 0.35),
+        (state.get("gyro_2_yaw_rate_dps"), 1.0 if state.get("gyro_2_valid", True) else 0.35),
+        (state.get("gyro_3_yaw_rate_dps"), 1.0 if state.get("gyro_3_valid", True) else 0.35),
+    ], fallback=0.0, outlier=2.5)
+
+    # Heading fusion with fallback chain
+    hdg = robust_angle_vote([
+        (state.get("irs_1_heading_deg"), 1.0 if state.get("irs_1_valid", True) else 0.35),
+        (state.get("irs_2_heading_deg"), 1.0 if state.get("irs_2_valid", True) else 0.35),
+        (state.get("irs_3_heading_deg"), 1.0 if state.get("irs_3_valid", True) else 0.35),
+        (state.get("magnetic_heading_deg"), 0.7),
+        (state.get("true_heading_deg"), 0.6),
+    ], fallback=state.get("target_hdg_deg", 0.0))
+
+    gs = robust_vote([
+        (state.get("ground_speed_kt"), 0.8),
+        (state.get("gps_1_gs_kt"), 1.0 if state.get("gps_1_valid", True) else 0.35),
+        (state.get("gps_2_gs_kt"), 1.0 if state.get("gps_2_valid", True) else 0.35),
+        (state.get("gps_3_gs_kt"), 1.0 if state.get("gps_3_valid", True) else 0.35),
+    ], fallback=ias, outlier=40.0)
+
+    # Compute geometric VS from fused altitude as consistency check
+    geom_vs = None
+    if m["last_alt"] is not None:
+        geom_vs = (baro_alt - m["last_alt"]) * 60.0 / dt
+    m["last_alt"] = baro_alt
+
+    if geom_vs is not None and abs(geom_vs - irs_vs) > 2000:
+        vs = 0.7 * irs_vs + 0.3 * geom_vs
+    else:
+        vs = irs_vs if geom_vs is None else 0.6 * irs_vs + 0.4 * geom_vs
+
+    # --- Targets ---
+    ap_on = bool(state.get("ap_engaged", False))
+    at_on = bool(state.get("at_engaged", True))
+
+    target_alt = float(state.get("target_alt_ft", baro_alt))
+    target_hdg = float(state.get("target_hdg_deg", hdg)) % 360.0
+    target_ias = float(state.get("target_ias_kt", ias))
+    target_vs = float(state.get("target_vs_fpm", 0.0))
+
+    # If AP off, keep neutral AP commands and exit safely
+    if not ap_on:
+        return {
+            "elevator": 0.0,
+            "aileron": 0.0,
+            "rudder": clamp(-0.12 * yaw_rate, -0.3, 0.3),
+            "elevator_trim": clamp(m["trim"], -1.0, 1.0),
+            "throttle_1": clamp(state.get("throttle_1_pos", 0.5), 0.0, 1.0),
+            "throttle_2": clamp(state.get("throttle_2_pos", 0.5), 0.0, 1.0),
+        }
+
+    # --- Aircraft state / mode logic ---
+    wow = bool(state.get("weight_on_wheels_left", False) or state.get("weight_on_wheels_right", False) or state.get("weight_on_wheels_nose", False))
+    gear_down = bool(state.get("gear_handle_down", False) or state.get("gear_left_pos", 0) > 0.5 or state.get("gear_right_pos", 0) > 0.5)
+
+    # Prefer radar altitude for low-altitude operations
+    agl = radar_alt if radar_alt is not None and radar_alt > 0 else None
+    low_alt = (agl is not None and agl < 2500)
+
+    # Envelope limits
+    mach = robust_vote([(state.get("mach_1"), 1.0), (state.get("mach_2"), 1.0), (state.get("mach_3"), 1.0)], fallback=0.5, outlier=0.08)
+    high_speed = (ias > 350 or mach > 0.80)
+    overspeed = (ias > 362 or mach > 0.82)
+    low_speed = (ias < 145)
+    very_low_speed = (ias < 132)
+    high_aoa = (aoa > 11.5)
+
+    # --- Lateral control (heading -> bank -> aileron) ---
+    hdg_err = wrap180(target_hdg - hdg)
+    desired_bank = clamp(0.33 * hdg_err, -25.0, 25.0)
+    if low_alt:
+        desired_bank = clamp(desired_bank, -18.0, 18.0)
+
+    bank_err = desired_bank - roll
+    roll_rate = robust_vote([
+        (state.get("gyro_1_roll_rate_dps"), 1.0 if state.get("gyro_1_valid", True) else 0.35),
+        (state.get("gyro_2_roll_rate_dps"), 1.0 if state.get("gyro_2_valid", True) else 0.35),
+        (state.get("gyro_3_roll_rate_dps"), 1.0 if state.get("gyro_3_valid", True) else 0.35),
+    ], fallback=0.0, outlier=4.0)
+
+    aileron = 0.045 * bank_err - 0.03 * roll_rate
+    aileron = clamp(aileron, -1.0, 1.0)
+
+    # Yaw damper + turn coordination
+    yaw_damp = -0.11 * yaw_rate
+    rudder = yaw_damp + clamp(0.002 * roll, -0.08, 0.08)
+    rudder = clamp(rudder, -0.45, 0.45)
+
+    # --- Vertical / pitch control ---
+    alt_err = target_alt - baro_alt
+    # VS command from altitude error with capture logic
+    vs_cmd = clamp(alt_err * 2.2, -2200.0, 2200.0)
+    if abs(alt_err) < 500:
+        vs_cmd = clamp(alt_err * 1.2, -900.0, 900.0)
+    # Blend with explicit target_vs when provided
+    if abs(target_vs) > 1:
+        vs_cmd = 0.65 * vs_cmd + 0.35 * clamp(target_vs, -2500.0, 2500.0)
+
+    # Speed protection modifies VS demand
+    if very_low_speed or high_aoa:
+        vs_cmd = min(vs_cmd, -600.0)
+    elif low_speed:
+        vs_cmd = min(vs_cmd, 300.0)
+    if overspeed:
+        vs_cmd = max(vs_cmd, 1200.0)
+
+    vs_err = vs_cmd - vs
+    m["vs_i"] = clamp(m["vs_i"] + vs_err * dt * 0.00035, -0.35, 0.35)
+
+    # Convert VS loop to pitch command
+    pitch_cmd = clamp(0.0031 * vs_err + 2.3 * m["vs_i"], -8.0, 12.0)
+    if low_alt:
+        pitch_cmd = clamp(pitch_cmd, -6.0, 10.0)
+
+    # Additional attitude damping
+    pitch_rate = robust_vote([
+        (state.get("gyro_1_pitch_rate_dps"), 1.0 if state.get("gyro_1_valid", True) else 0.35),
+        (state.get("gyro_2_pitch_rate_dps"), 1.0 if state.get("gyro_2_valid", True) else 0.35),
+        (state.get("gyro_3_pitch_rate_dps"), 1.0 if state.get("gyro_3_valid", True) else 0.35),
+    ], fallback=0.0, outlier=3.0)
+
+    pitch_err = pitch_cmd - pitch
+    elevator = 0.075 * pitch_err - 0.032 * pitch_rate
+
+    # Stall / overspeed direct protections
+    if high_aoa:
+        elevator -= 0.25
+    if very_low_speed:
+        elevator -= 0.15
+    if overspeed:
+        elevator += 0.18
+
+    elevator = clamp(elevator, -1.0, 1.0)
+
+    # Auto-trim: slowly drive sustained elevator toward zero
+    trim_rate = 0.12 * elevator
+    if abs(elevator) < 0.03:
+        trim_rate *= 0.2
+    m["trim"] = clamp(m["trim"] + trim_rate * dt, -1.0, 1.0)
+
+    # --- Throttle / autothrust ---
+    thr1 = float(state.get("throttle_1_pos", 0.5))
+    thr2 = float(state.get("throttle_2_pos", 0.5))
+
+    if at_on:
+        spd_err = target_ias - ias
+        m["spd_i"] = clamp(m["spd_i"] + spd_err * dt * 0.004, -0.35, 0.35)
+        base_thr = 0.5 + 0.0065 * spd_err + 0.7 * m["spd_i"] + 0.00008 * max(vs_cmd, 0.0)
+
+        # Envelope protections dominate
+        if very_low_speed or high_aoa:
+            base_thr = max(base_thr, 0.92)
+        elif low_speed:
+            base_thr = max(base_thr, 0.78)
+        if overspeed:
+            base_thr = min(base_thr, 0.08)
+        elif high_speed:
+            base_thr = min(base_thr, 0.32)
+
+        base_thr = clamp(base_thr, 0.0, 1.0)
+
+        # Engine asymmetry compensation
+        e1_ok = bool(state.get("engine_1_running", True) and not state.get("engine_1_fire", False))
+        e2_ok = bool(state.get("engine_2_running", True) and not state.get("engine_2_fire", False))
+        n1_1 = state.get("engine_1_n1_pct", 0.0)
+        n1_2 = state.get("engine_2_n1_pct", 0.0)
+        asym = clamp((n1_1 - n1_2) / 100.0, -0.25, 0.25)
+
+        if e1_ok and e2_ok:
+            thr1 = clamp(base_thr - 0.08 * asym, 0.0, 1.0)
+            thr2 = clamp(base_thr + 0.08 * asym, 0.0, 1.0)
+        elif e1_ok and not e2_ok:
+            thr1 = clamp(max(base_thr, 0.6), 0.0, 1.0)
+            thr2 = 0.0
+            rudder += 0.22
+        elif e2_ok and not e1_ok:
+            thr1 = 0.0
+            thr2 = clamp(max(base_thr, 0.6), 0.0, 1.0)
+            rudder -= 0.22
+        else:
+            thr1 = thr2 = 0.0
+
+    rudder = clamp(rudder, -1.0, 1.0)
+
+    # --- Config controls (gear/flaps/speedbrake) ---
+    gear_cmd = 1 if (wow or (agl is not None and agl < 1200) or (abs(target_alt - baro_alt) < 400 and target_alt < 2500)) else 0
+
+    # Simple scheduled flaps by speed/phase
+    if wow:
+        flaps = 15
+    else:
+        if gear_cmd == 1 or (agl is not None and agl < 1800):
+            if ias < 135:
+                flaps = 30
+            elif ias < 155:
+                flaps = 20
+            elif ias < 185:
+                flaps = 10
+            else:
+                flaps = 5
+        else:
+            if ias < 170:
+                flaps = 5
+            else:
+                flaps = 0
+
+    # Speedbrake logic
+    speedbrake = 0.0
+    if wow and gs > 60:
+        speedbrake = 1.0
+    elif overspeed:
+        speedbrake = 0.55
+    elif high_speed and alt_err < -1500:
+        speedbrake = 0.25
+
+    # Avoid speedbrake with high thrust / low speed
+    if (thr1 + thr2) * 0.5 > 0.7 or ias < 165:
+        speedbrake = min(speedbrake, 0.1)
+
+    # Final command limits
+    return {
+        "elevator": clamp(elevator, -1.0, 1.0),
+        "aileron": clamp(aileron, -1.0, 1.0),
+        "rudder": clamp(rudder, -1.0, 1.0),
+        "throttle_1": clamp(thr1, 0.0, 1.0),
+        "throttle_2": clamp(thr2, 0.0, 1.0),
+        "elevator_trim": clamp(m["trim"], -1.0, 1.0),
+        "flaps": int(clamp(flaps, 0, 40)),
+        "speedbrake": clamp(speedbrake, 0.0, 1.0),
+        "gear": int(gear_cmd),
+    }

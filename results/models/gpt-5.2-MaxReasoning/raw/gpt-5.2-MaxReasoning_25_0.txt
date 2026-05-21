@@ -1,0 +1,496 @@
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+
+public static class Program
+{
+    private const double G = 6.67430e-11;          // m^3 kg^-1 s^-2
+    private const double DaySec = 86400.0;         // s
+    private const double EphemStepSec = 21600.0;   // 6 hours
+    private const double Softening = 1e6;          // m (prevents singularities near collisions)
+    private const double Softening2 = Softening * Softening;
+
+    public static void Main()
+    {
+        var tr = new TokenReader(Console.In);
+        if (!tr.HasMore)
+        {
+            // Degenerate: no input. Emit a valid empty-burn plan.
+            Console.WriteLine("1");
+            Console.WriteLine("0 0 0 0");
+            return;
+        }
+
+        int numBodies = tr.NextInt();
+        double warningDays = tr.NextDouble();
+        double impactorMass = tr.NextDouble();
+        double deltaVBudget = tr.NextDouble();
+        double asteroidMassInput = tr.NextDouble();
+        _ = tr.NextDouble(); // t0_unix_utc (unused; times are relative to t=0)
+
+        var names = new string[numBodies];
+        var masses = new double[numBodies];
+        var pos0 = new Vec3[numBodies];
+        var vel0 = new Vec3[numBodies];
+
+        for (int i = 0; i < numBodies; i++)
+        {
+            names[i] = tr.Next();
+            masses[i] = tr.NextDouble();
+            pos0[i] = new Vec3(tr.NextDouble(), tr.NextDouble(), tr.NextDouble());
+            vel0[i] = new Vec3(tr.NextDouble(), tr.NextDouble(), tr.NextDouble());
+        }
+
+        // Path to de421.bsp (present to match host sim; solver ignores it here).
+        if (tr.HasMore)
+        {
+            _ = tr.Next();
+        }
+
+        int idxEarth = FindBody(names, "Earth");
+        int idxAst = FindBody(names, "Asteroid");
+        int idxSun = FindBody(names, "Sun");
+        if (idxSun < 0) idxSun = IndexOfMax(masses);
+
+        if (idxEarth < 0 || idxAst < 0 || idxSun < 0 || warningDays <= 0 || deltaVBudget < 0)
+        {
+            // Fallback: output a do-nothing plan that is format-valid.
+            Console.WriteLine("2");
+            Console.WriteLine(FormatBurn(0.0, Vec3.Zero));
+            Console.WriteLine(FormatBurn(Math.Max(0.0, warningDays * 0.5), Vec3.Zero));
+            return;
+        }
+
+        // Trust the provided asteroid mass if present; otherwise fall back to body mass.
+        double asteroidMass = asteroidMassInput > 0 ? asteroidMassInput : masses[idxAst];
+
+        // Precompute ephemeris for all bodies at 6-hour intervals up to the warning time.
+        int steps = (int)Math.Ceiling((warningDays * DaySec) / EphemStepSec) + 3;
+        var ephemPos = new Vec3[steps * numBodies];
+        var ephemVel = new Vec3[steps * numBodies];
+        BuildEphemeris(pos0, vel0, masses, numBodies, steps, EphemStepSec, ephemPos, ephemVel);
+
+        // Quick Lambert-based search (heliocentric, 2-body approx w/ Sun mu).
+        double muSun = G * masses[idxSun];
+        if (!(muSun > 0))
+        {
+            Console.WriteLine("2");
+            Console.WriteLine(FormatBurn(0.0, Vec3.Zero));
+            Console.WriteLine(FormatBurn(Math.Max(0.0, warningDays * 0.5), Vec3.Zero));
+            return;
+        }
+
+        // Search grid sizes: bounded so runtime stays well under 5 minutes.
+        int maxLaunchSamples = 220;
+        int maxTofSamples = 180;
+        double minTofDays = Math.Max(1.0, Math.Min(30.0, warningDays * 0.02));
+
+        double launchStep = warningDays / Math.Max(1, maxLaunchSamples);
+        if (launchStep < 0.5) launchStep = 0.5;
+
+        Candidate best = default;
+        bool haveBest = false;
+
+        Candidate bestMinDv = default;
+        bool haveMinDv = false;
+
+        for (double tLaunch = 0.0; tLaunch <= warningDays + 1e-9; tLaunch += launchStep)
+        {
+            double maxTof = warningDays - tLaunch;
+            if (maxTof < minTofDays) continue;
+
+            double tofStep = maxTof / Math.Max(1, maxTofSamples);
+            if (tofStep < 0.5) tofStep = 0.5;
+
+            for (double tofDays = minTofDays; tofDays <= maxTof + 1e-9; tofDays += tofStep)
+            {
+                double tImpact = tLaunch + tofDays;
+
+                var earth1 = GetState(ephemPos, ephemVel, numBodies, idxEarth, tLaunch);
+                var sun1 = GetState(ephemPos, ephemVel, numBodies, idxSun, tLaunch);
+                var ast2 = GetState(ephemPos, ephemVel, numBodies, idxAst, tImpact);
+                var sun2 = GetState(ephemPos, ephemVel, numBodies, idxSun, tImpact);
+
+                Vec3 r1 = earth1.Pos - sun1.Pos;
+                Vec3 r2 = ast2.Pos - sun2.Pos;
+
+                double dtSec = tofDays * DaySec;
+
+                // Try both short and long path; pick the lower departure delta-v among the solutions found.
+                bool okS = TryLambert(r1, r2, dtSec, muSun, +1, out Vec3 v1s, out Vec3 v2s);
+                bool okL = TryLambert(r1, r2, dtSec, muSun, -1, out Vec3 v1l, out Vec3 v2l);
+                if (!okS && !okL) continue;
+
+                double dv = double.PositiveInfinity;
+                Vec3 v1 = Vec3.Zero;
+                Vec3 v2 = Vec3.Zero;
+
+                if (okS)
+                {
+                    dv = (v1s - (earth1.Vel - sun1.Vel)).Norm();
+                    v1 = v1s;
+                    v2 = v2s;
+                }
+                if (okL)
+                {
+                    double dvL = (v1l - (earth1.Vel - sun1.Vel)).Norm();
+                    if (dvL < dv)
+                    {
+                        dv = dvL;
+                        v1 = v1l;
+                        v2 = v2l;
+                    }
+                }
+
+                if (!haveMinDv || dv < bestMinDv.DvLaunch)
+                {
+                    bestMinDv = new Candidate(tLaunch, tImpact, v1, v2, dv);
+                    haveMinDv = true;
+                }
+
+                if (dv > deltaVBudget + 1e-9) continue;
+
+                // Heuristic: maximize (remaining time) * (asteroid delta-v magnitude from impact).
+                Vec3 vScBaryAtImpact = v2 + sun2.Vel;
+                Vec3 relV = vScBaryAtImpact - ast2.Vel;
+                double dvAst = (impactorMass / (asteroidMass + Math.Max(1e-9, impactorMass))) * relV.Norm();
+                double score = Math.Max(0.0, warningDays - tImpact) * dvAst;
+
+                var cand = new Candidate(tLaunch, tImpact, v1, v2, dv) { Score = score };
+                if (!haveBest || cand.Score > best.Score || (NearlyEqual(cand.Score, best.Score) && cand.DvLaunch < best.DvLaunch))
+                {
+                    best = cand;
+                    haveBest = true;
+                }
+            }
+        }
+
+        Candidate chosen = haveBest ? best : (haveMinDv ? bestMinDv : default);
+        double chosenLaunch = Clamp(chosen.Launch, 0.0, warningDays);
+        double chosenImpact = Clamp(chosen.Impact, chosenLaunch + 1e-6, warningDays);
+
+        // Compute launch burn in barycentric frame.
+        var earthL = GetState(ephemPos, ephemVel, numBodies, idxEarth, chosenLaunch);
+        var sunL = GetState(ephemPos, ephemVel, numBodies, idxSun, chosenLaunch);
+        Vec3 dvLaunch = chosen.V1Helio - (earthL.Vel - sunL.Vel); // == (sun+v1) - earth
+        dvLaunch = ClampMagnitude(dvLaunch, Math.Max(0.0, deltaVBudget));
+
+        // Optional mid-course correction: keep zero by default (budget is tight in many cases).
+        double tMid = Clamp(chosenLaunch + 0.5 * (chosenImpact - chosenLaunch), chosenLaunch, chosenImpact);
+        Vec3 dvMid = Vec3.Zero;
+
+        // Final approach burn at impact time (zero; impact is modeled by collision).
+        Vec3 dvFinal = Vec3.Zero;
+
+        // Emit plan: launch, mid-course, impact.
+        Console.WriteLine("3");
+        Console.WriteLine(FormatBurn(chosenLaunch, dvLaunch));
+        Console.WriteLine(FormatBurn(tMid, dvMid));
+        Console.WriteLine(FormatBurn(chosenImpact, dvFinal));
+    }
+
+    private static string FormatBurn(double tDays, Vec3 dv)
+    {
+        // Keep output parseable and stable across locales.
+        return string.Format(CultureInfo.InvariantCulture, "{0:R} {1:R} {2:R} {3:R}", tDays, dv.X, dv.Y, dv.Z);
+    }
+
+    private static int FindBody(string[] names, string wanted)
+    {
+        for (int i = 0; i < names.Length; i++)
+        {
+            if (string.Equals(names[i], wanted, StringComparison.OrdinalIgnoreCase))
+                return i;
+        }
+        return -1;
+    }
+
+    private static int IndexOfMax(double[] values)
+    {
+        int best = 0;
+        double bestV = values.Length > 0 ? values[0] : double.NegativeInfinity;
+        for (int i = 1; i < values.Length; i++)
+        {
+            if (values[i] > bestV)
+            {
+                bestV = values[i];
+                best = i;
+            }
+        }
+        return best;
+    }
+
+    private static double Clamp(double x, double lo, double hi) => x < lo ? lo : (x > hi ? hi : x);
+
+    private static bool NearlyEqual(double a, double b, double rel = 1e-12, double abs = 1e-12)
+    {
+        double diff = Math.Abs(a - b);
+        if (diff <= abs) return true;
+        return diff <= rel * Math.Max(Math.Abs(a), Math.Abs(b));
+    }
+
+    private static Vec3 ClampMagnitude(Vec3 v, double max)
+    {
+        double n = v.Norm();
+        if (!(n > max) || n <= 0) return v;
+        return v * (max / n);
+    }
+
+    private static void BuildEphemeris(
+        Vec3[] pos0, Vec3[] vel0, double[] masses, int nBodies, int steps, double dt,
+        Vec3[] outPos, Vec3[] outVel)
+    {
+        var pos = new Vec3[nBodies];
+        var vel = new Vec3[nBodies];
+        Array.Copy(pos0, pos, nBodies);
+        Array.Copy(vel0, vel, nBodies);
+
+        var acc = new Vec3[nBodies];
+        var accNew = new Vec3[nBodies];
+
+        // store step 0
+        for (int i = 0; i < nBodies; i++)
+        {
+            outPos[i] = pos[i];
+            outVel[i] = vel[i];
+        }
+
+        for (int step = 1; step < steps; step++)
+        {
+            ComputeAccelerations(pos, masses, acc);
+
+            double halfDt = 0.5 * dt;
+            for (int i = 0; i < nBodies; i++)
+            {
+                vel[i] = vel[i] + acc[i] * halfDt;
+            }
+
+            for (int i = 0; i < nBodies; i++)
+            {
+                pos[i] = pos[i] + vel[i] * dt;
+            }
+
+            ComputeAccelerations(pos, masses, accNew);
+            for (int i = 0; i < nBodies; i++)
+            {
+                vel[i] = vel[i] + accNew[i] * halfDt;
+            }
+
+            int baseIdx = step * nBodies;
+            for (int i = 0; i < nBodies; i++)
+            {
+                outPos[baseIdx + i] = pos[i];
+                outVel[baseIdx + i] = vel[i];
+            }
+        }
+    }
+
+    private static void ComputeAccelerations(Vec3[] pos, double[] masses, Vec3[] acc)
+    {
+        int n = pos.Length;
+        for (int i = 0; i < n; i++) acc[i] = Vec3.Zero;
+
+        for (int i = 0; i < n; i++)
+        {
+            for (int j = i + 1; j < n; j++)
+            {
+                Vec3 d = pos[j] - pos[i];
+                double r2 = d.Norm2() + Softening2;
+                double invR = 1.0 / Math.Sqrt(r2);
+                double invR3 = invR * invR * invR;
+                double s = G * invR3;
+                Vec3 a = d * s;
+
+                acc[i] = acc[i] + a * masses[j];
+                acc[j] = acc[j] - a * masses[i];
+            }
+        }
+    }
+
+    private static (Vec3 Pos, Vec3 Vel) GetState(Vec3[] ephemPos, Vec3[] ephemVel, int nBodies, int bodyIdx, double tDays)
+    {
+        double tSec = tDays * DaySec;
+        if (tSec < 0) tSec = 0;
+
+        double x = tSec / EphemStepSec;
+        int i0 = (int)Math.Floor(x);
+        double f = x - i0;
+
+        int steps = ephemPos.Length / nBodies;
+        if (i0 < 0) i0 = 0;
+        if (i0 >= steps - 1)
+        {
+            i0 = steps - 2;
+            f = 1.0;
+        }
+
+        int idx0 = i0 * nBodies + bodyIdx;
+        int idx1 = (i0 + 1) * nBodies + bodyIdx;
+        Vec3 p0 = ephemPos[idx0];
+        Vec3 p1 = ephemPos[idx1];
+        Vec3 v0 = ephemVel[idx0];
+        Vec3 v1 = ephemVel[idx1];
+        return (Lerp(p0, p1, f), Lerp(v0, v1, f));
+    }
+
+    private static Vec3 Lerp(Vec3 a, Vec3 b, double t) => a * (1.0 - t) + b * t;
+
+    // Vallado-style Lambert solver (universal variables, bisection). Single-rev; robust for most transfers.
+    private static bool TryLambert(Vec3 r1, Vec3 r2, double dt, double mu, int tm, out Vec3 v1, out Vec3 v2)
+    {
+        v1 = Vec3.Zero;
+        v2 = Vec3.Zero;
+        if (!(dt > 0) || !(mu > 0)) return false;
+
+        double r1n = r1.Norm();
+        double r2n = r2.Norm();
+        if (!(r1n > 0) || !(r2n > 0)) return false;
+
+        double cosDnu = Vec3.Dot(r1, r2) / (r1n * r2n);
+        if (cosDnu > 1) cosDnu = 1;
+        if (cosDnu < -1) cosDnu = -1;
+
+        double A = tm * Math.Sqrt(Math.Max(0.0, r1n * r2n * (1.0 + cosDnu)));
+        if (Math.Abs(A) < 1e-12) return false;
+
+        double psi = 0.0;
+        double psiLow = -4.0 * Math.PI * Math.PI;
+        double psiUp = 4.0 * Math.PI * Math.PI;
+        double c2 = 0.5;
+        double c3 = 1.0 / 6.0;
+        double sqrtMu = Math.Sqrt(mu);
+
+        const int maxIter = 50;
+        double tol = Math.Max(1e-4, 1e-9 * dt); // seconds
+
+        for (int iter = 0; iter < maxIter; iter++)
+        {
+            double y = r1n + r2n + A * (psi * c3 - 1.0) / Math.Sqrt(c2);
+
+            // Ensure y > 0 for sqrt(y). Simple readjustment recommended by Vallado users.
+            int guard = 0;
+            while (y < 0 && guard++ < 50)
+            {
+                psi += 0.1;
+                (c2, c3) = Stumpff(psi);
+                y = r1n + r2n + A * (psi * c3 - 1.0) / Math.Sqrt(c2);
+            }
+            if (y <= 0) return false;
+
+            double chi = Math.Sqrt(y / c2);
+            double chi3 = chi * chi * chi;
+            double dtNew = (chi3 * c3 + A * Math.Sqrt(y)) / sqrtMu;
+
+            if (Math.Abs(dtNew - dt) <= tol)
+            {
+                double f = 1.0 - y / r1n;
+                double g = A * Math.Sqrt(y / mu);
+                double gDot = 1.0 - y / r2n;
+                if (Math.Abs(g) < 1e-16) return false;
+
+                v1 = (r2 - r1 * f) / g;
+                v2 = (r2 * gDot - r1) / g;
+                return true;
+            }
+
+            if (dtNew <= dt) psiLow = psi;
+            else psiUp = psi;
+
+            psi = 0.5 * (psiLow + psiUp);
+            (c2, c3) = Stumpff(psi);
+        }
+
+        return false;
+    }
+
+    private static (double c2, double c3) Stumpff(double psi)
+    {
+        double apsi = Math.Abs(psi);
+        if (apsi < 1e-8)
+            return (0.5, 1.0 / 6.0);
+
+        if (psi > 0)
+        {
+            double s = Math.Sqrt(psi);
+            double c2 = (1.0 - Math.Cos(s)) / psi;
+            double c3 = (s - Math.Sin(s)) / (s * s * s);
+            return (c2, c3);
+        }
+        else
+        {
+            double s = Math.Sqrt(-psi);
+            double c2 = (Math.Cosh(s) - 1.0) / (-psi);
+            double c3 = (Math.Sinh(s) - s) / (s * s * s);
+            return (c2, c3);
+        }
+    }
+
+    private readonly struct Candidate
+    {
+        public Candidate(double launch, double impact, Vec3 v1Helio, Vec3 v2Helio, double dvLaunch)
+        {
+            Launch = launch;
+            Impact = impact;
+            V1Helio = v1Helio;
+            V2Helio = v2Helio;
+            DvLaunch = dvLaunch;
+            Score = double.NegativeInfinity;
+        }
+
+        public double Launch { get; }
+        public double Impact { get; }
+        public Vec3 V1Helio { get; }
+        public Vec3 V2Helio { get; }
+        public double DvLaunch { get; }
+        public double Score { get; init; }
+    }
+
+    private sealed class TokenReader
+    {
+        private readonly string[] _tokens;
+        private int _idx;
+
+        public TokenReader(TextReader reader)
+        {
+            string all = reader.ReadToEnd();
+            _tokens = all.Split((char[])null, StringSplitOptions.RemoveEmptyEntries);
+            _idx = 0;
+        }
+
+        public bool HasMore => _idx < _tokens.Length;
+
+        public string Next()
+        {
+            if (_idx >= _tokens.Length) throw new EndOfStreamException("Unexpected EOF while reading input.");
+            return _tokens[_idx++];
+        }
+
+        public int NextInt() => int.Parse(Next(), NumberStyles.Integer, CultureInfo.InvariantCulture);
+
+        public double NextDouble() => double.Parse(Next(), NumberStyles.Float, CultureInfo.InvariantCulture);
+    }
+
+    private readonly struct Vec3
+    {
+        public readonly double X;
+        public readonly double Y;
+        public readonly double Z;
+
+        public Vec3(double x, double y, double z) { X = x; Y = y; Z = z; }
+
+        public static Vec3 Zero => new Vec3(0, 0, 0);
+
+        public double Norm2() => X * X + Y * Y + Z * Z;
+        public double Norm() => Math.Sqrt(Norm2());
+
+        public static Vec3 operator +(Vec3 a, Vec3 b) => new Vec3(a.X + b.X, a.Y + b.Y, a.Z + b.Z);
+        public static Vec3 operator -(Vec3 a, Vec3 b) => new Vec3(a.X - b.X, a.Y - b.Y, a.Z - b.Z);
+        public static Vec3 operator *(Vec3 a, double s) => new Vec3(a.X * s, a.Y * s, a.Z * s);
+        public static Vec3 operator /(Vec3 a, double s) => new Vec3(a.X / s, a.Y / s, a.Z / s);
+
+        public static double Dot(Vec3 a, Vec3 b) => a.X * b.X + a.Y * b.Y + a.Z * b.Z;
+
+        public override string ToString() => string.Format(CultureInfo.InvariantCulture, "({0:R},{1:R},{2:R})", X, Y, Z);
+    }
+}

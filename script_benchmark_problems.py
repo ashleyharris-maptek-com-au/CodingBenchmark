@@ -14,7 +14,7 @@ import time
 from collections import deque
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from solver_utils import normalize_code_result
+from solver_utils import normalize_code_result, GradeCache
 from javascript_typescript_runner import (
   describe_javascript_runtime,
   describe_typescript_runtime,
@@ -25,6 +25,7 @@ from javascript_typescript_runner import (
 TIMEOUT_SECONDS = 45
 RANDOM_SEED = 560000
 _LAST_VIZ: Dict[Tuple[str, str, int, str], str] = {}
+_GRADE_CACHE = GradeCache("script_benchmark_problems")
 
 LANGUAGES = {
   "javascript": {
@@ -120,6 +121,28 @@ Return the complete runnable {language['label']} source code.
 """
 
 
+def _grade_cache_key_parts(problem: Dict[str, Any], language: Dict[str, Any], subPass: int,
+                           aiEngineName: str, code: str, case: Dict[str, Any]) -> tuple:
+  return (
+    "script-benchmark-grade-v1",
+    f"problem={problem['key']}",
+    f"language={language['name']}",
+    f"model={aiEngineName}",
+    f"subpass={subPass}",
+    json.dumps(case, sort_keys=True, separators=(",", ":")),
+    code,
+  )
+
+
+def _restore_cached_viz(problem: Dict[str, Any], language: Dict[str, Any], subPass: int,
+                        aiEngineName: str, viz: str) -> None:
+  viz_key = (problem["key"], language["name"], subPass, aiEngineName)
+  if viz:
+    _LAST_VIZ[viz_key] = viz
+  else:
+    _LAST_VIZ.pop(viz_key, None)
+
+
 def _grade_problem(problem: Dict[str, Any], language: Dict[str, Any], result: dict, subPass: int,
                    aiEngineName: str) -> tuple:
   result = normalize_code_result(result, language["code_key"])
@@ -134,25 +157,42 @@ def _grade_problem(problem: Dict[str, Any], language: Dict[str, Any], result: di
   case = problem["make_case"](subPass)
   input_data = json.dumps(case, separators=(",", ":"))
   code = result[language["code_key"]]
+  cache_parts = _grade_cache_key_parts(problem, language, subPass, aiEngineName, code, case)
 
-  run = language["execute"](code, aiEngineName, input_data=input_data, timeout=TIMEOUT_SECONDS)
-  if not run:
-    return 0.0, f"{run.error_stage}: {run.error_message()}"
+  def compute_grade_record() -> Dict[str, Any]:
+    run = language["execute"](code, aiEngineName, input_data=input_data, timeout=TIMEOUT_SECONDS)
+    if not run:
+      return {
+        "score": 0.0,
+        "explanation": f"{run.error_stage}: {run.error_message()}",
+        "viz": "",
+      }
 
-  try:
-    output = _parse_json_output(run.stdout)
-  except Exception as e:
-    sample = run.stdout.strip().replace("\n", " ")[:160]
-    return 0.0, f"Could not parse JSON output: {e}. Output: {sample}"
+    try:
+      output = _parse_json_output(run.stdout)
+    except Exception as e:
+      sample = run.stdout.strip().replace("\n", " ")[:160]
+      return {
+        "score": 0.0,
+        "explanation": f"Could not parse JSON output: {e}. Output: {sample}",
+        "viz": "",
+      }
 
-  start = time.time()
-  score, explanation, viz = problem["grade_output"](case, output)
-  grade_time = time.time() - start
-  _LAST_VIZ[(problem["key"], language["name"], subPass, aiEngineName)] = viz
-  timing = f"run {run.exec_time:.2f}s"
-  if grade_time > 1:
-    timing += f", grade {grade_time:.2f}s"
-  return score, f"{explanation} ({timing})"
+    start = time.time()
+    score, explanation, viz = problem["grade_output"](case, output)
+    grade_time = time.time() - start
+    timing = f"run {run.exec_time:.2f}s"
+    if grade_time > 1:
+      timing += f", grade {grade_time:.2f}s"
+    return {
+      "score": score,
+      "explanation": f"{explanation} ({timing})",
+      "viz": viz,
+    }
+
+  record = _GRADE_CACHE.get_or_compute_json("grade_record", compute_grade_record, *cache_parts)
+  _restore_cached_viz(problem, language, subPass, aiEngineName, str(record.get("viz", "") or ""))
+  return float(record.get("score", 0.0)), record.get("explanation", "No explanation")
 
 
 def _nice_report(problem: Dict[str, Any], language: Dict[str, Any], result: dict, subPass: int,

@@ -1,0 +1,335 @@
+use std::cmp::min;
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
+
+const SMALL_POINT_THRESHOLD: u64 = 2_000_000;
+const MEDIUM_POINT_THRESHOLD: u64 = 20_000_000;
+const SAMPLE_LIMIT: usize = 200_000;
+const SMALL_ITERS: usize = 12;
+const MEDIUM_ITERS: usize = 8;
+const LARGE_ITERS: usize = 4;
+const ASSIGN_CHUNK_POINTS: usize = 16_384;
+const TRAIN_CHUNK_POINTS: usize = 32_768;
+
+#[derive(Clone, Copy, Debug, Default)]
+struct Point3 {
+    x: f32,
+    y: f32,
+    z: f32,
+}
+
+impl Point3 {
+    fn dist2(self, other: Point3) -> f32 {
+        let dx = self.x - other.x;
+        let dy = self.y - other.y;
+        let dz = self.z - other.z;
+        dx * dx + dy * dy + dz * dz
+    }
+
+    fn add_to(self, sum: &mut [f64; 3]) {
+        sum[0] += self.x as f64;
+        sum[1] += self.y as f64;
+        sum[2] += self.z as f64;
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Strategy {
+    InMemory,
+    SampledMiniBatch,
+    Streaming,
+}
+
+fn main() -> io::Result<()> {
+    let stdin = io::stdin();
+    let mut reader = BufReader::new(stdin.lock());
+    let (num_points, num_clusters) = read_header(&mut reader)?;
+
+    if num_clusters == 0 {
+        return Ok(());
+    }
+
+    let strategy = choose_strategy(num_points, num_clusters);
+    let data = read_all_remaining(&mut reader)?;
+    let expected_bytes = num_points
+        .checked_mul(12)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "point count too large"))?;
+
+    if data.len() as u64 != expected_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            format!(
+                "expected {} bytes of point data, received {}",
+                expected_bytes,
+                data.len()
+            ),
+        ));
+    }
+
+    let centroids = match strategy {
+        Strategy::InMemory => solve_in_memory(&data, num_points as usize, num_clusters as usize),
+        Strategy::SampledMiniBatch => solve_sampled_minibatch(&data, num_points as usize, num_clusters as usize),
+        Strategy::Streaming => solve_streaming_style(&data, num_points as usize, num_clusters as usize),
+    };
+
+    write_assignments(&data, num_points as usize, &centroids)
+}
+
+fn choose_strategy(num_points: u64, num_clusters: u32) -> Strategy {
+    if num_points <= SMALL_POINT_THRESHOLD && num_clusters <= 256 {
+        Strategy::InMemory
+    } else if num_points <= MEDIUM_POINT_THRESHOLD && num_clusters <= 4_096 {
+        Strategy::SampledMiniBatch
+    } else {
+        Strategy::Streaming
+    }
+}
+
+fn read_header<R: BufRead>(reader: &mut R) -> io::Result<(u64, u32)> {
+    let mut header = Vec::with_capacity(64);
+    reader.read_until(b'\n', &mut header)?;
+    if header.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "missing header"));
+    }
+    let header_str = std::str::from_utf8(&header)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "header is not valid UTF-8"))?;
+    let mut parts = header_str.split_whitespace();
+    let num_points = parts
+        .next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing point count"))?
+        .parse::<u64>()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid point count"))?;
+    let num_clusters = parts
+        .next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing cluster count"))?
+        .parse::<u32>()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid cluster count"))?;
+    Ok((num_points, num_clusters))
+}
+
+fn read_all_remaining<R: Read>(reader: &mut R) -> io::Result<Vec<u8>> {
+    let mut data = Vec::new();
+    reader.read_to_end(&mut data)?;
+    Ok(data)
+}
+
+fn solve_in_memory(data: &[u8], num_points: usize, k: usize) -> Vec<Point3> {
+    let sample_size = min(num_points, SAMPLE_LIMIT.max(k));
+    let samples = uniform_sample(data, num_points, sample_size);
+    let mut centroids = init_kmeans_plus_plus(&samples, k);
+    if centroids.is_empty() {
+        centroids.push(Point3::default());
+    }
+
+    let mut assignments = vec![0usize; num_points];
+    for _ in 0..SMALL_ITERS {
+        let mut sums = vec![[0.0f64; 3]; k];
+        let mut counts = vec![0u32; k];
+        let mut changed = 0usize;
+
+        for (i, point) in iter_points(data).enumerate() {
+            let idx = nearest_centroid(point, &centroids);
+            if assignments[i] != idx {
+                assignments[i] = idx;
+                changed += 1;
+            }
+            point.add_to(&mut sums[idx]);
+            counts[idx] += 1;
+        }
+
+        recompute_centroids(&mut centroids, &sums, &counts, &samples);
+        if changed * 100 <= num_points.max(1) {
+            break;
+        }
+    }
+    centroids
+}
+
+fn solve_sampled_minibatch(data: &[u8], num_points: usize, k: usize) -> Vec<Point3> {
+    let sample_size = min(num_points, SAMPLE_LIMIT.max(k.saturating_mul(4)));
+    let samples = uniform_sample(data, num_points, sample_size);
+    let mut centroids = init_kmeans_plus_plus(&samples, k);
+    let mut counts = vec![1u32; centroids.len()];
+
+    for _ in 0..MEDIUM_ITERS {
+        for chunk in chunk_points(data, TRAIN_CHUNK_POINTS) {
+            for point in chunk {
+                let idx = nearest_centroid(point, &centroids);
+                counts[idx] = counts[idx].saturating_add(1);
+                let eta = 1.0f32 / (counts[idx] as f32).sqrt().max(1.0);
+                let c = &mut centroids[idx];
+                c.x += (point.x - c.x) * eta;
+                c.y += (point.y - c.y) * eta;
+                c.z += (point.z - c.z) * eta;
+            }
+        }
+        refill_empty_centroids(&mut centroids, &counts, &samples);
+    }
+    centroids
+}
+
+fn solve_streaming_style(data: &[u8], num_points: usize, k: usize) -> Vec<Point3> {
+    let sample_size = min(num_points, SAMPLE_LIMIT.max(k.saturating_mul(2)));
+    let samples = uniform_sample(data, num_points, sample_size);
+    let mut centroids = init_kmeans_plus_plus(&samples, k);
+    let mut counts = vec![1u64; centroids.len()];
+
+    for _ in 0..LARGE_ITERS {
+        for chunk in chunk_points(data, TRAIN_CHUNK_POINTS) {
+            for point in chunk {
+                let idx = nearest_centroid(point, &centroids);
+                counts[idx] = counts[idx].saturating_add(1);
+                let eta = 1.0f32 / (counts[idx] as f32).powf(0.6).max(1.0);
+                let c = &mut centroids[idx];
+                c.x += (point.x - c.x) * eta;
+                c.y += (point.y - c.y) * eta;
+                c.z += (point.z - c.z) * eta;
+            }
+        }
+        repair_empty_or_duplicate_centroids(&mut centroids, &counts, &samples);
+    }
+    centroids
+}
+
+fn write_assignments(data: &[u8], num_points: usize, centroids: &[Point3]) -> io::Result<()> {
+    let stdout = io::stdout();
+    let mut writer = BufWriter::new(stdout.lock());
+    let mut out = vec![0u8; ASSIGN_CHUNK_POINTS * 4];
+    let mut buffered = 0usize;
+
+    for i in 0..num_points {
+        let point = point_at(data, i);
+        let idx = nearest_centroid(point, centroids) as u32;
+        out[buffered..buffered + 4].copy_from_slice(&idx.to_le_bytes());
+        buffered += 4;
+        if buffered == out.len() {
+            writer.write_all(&out)?;
+            buffered = 0;
+        }
+    }
+
+    if buffered > 0 {
+        writer.write_all(&out[..buffered])?;
+    }
+    writer.flush()
+}
+
+fn iter_points(data: &[u8]) -> impl Iterator<Item = Point3> + '_ {
+    data.chunks_exact(12).map(bytes_to_point)
+}
+
+fn chunk_points(data: &[u8], points_per_chunk: usize) -> impl Iterator<Item = Vec<Point3>> + '_ {
+    let chunk_bytes = points_per_chunk * 12;
+    data.chunks(chunk_bytes)
+        .map(|chunk| chunk.chunks_exact(12).map(bytes_to_point).collect())
+}
+
+fn point_at(data: &[u8], index: usize) -> Point3 {
+    let start = index * 12;
+    bytes_to_point(&data[start..start + 12])
+}
+
+fn bytes_to_point(bytes: &[u8]) -> Point3 {
+    let x = f32::from_le_bytes(bytes[0..4].try_into().unwrap());
+    let y = f32::from_le_bytes(bytes[4..8].try_into().unwrap());
+    let z = f32::from_le_bytes(bytes[8..12].try_into().unwrap());
+    Point3 { x, y, z }
+}
+
+fn uniform_sample(data: &[u8], num_points: usize, sample_size: usize) -> Vec<Point3> {
+    if num_points == 0 || sample_size == 0 {
+        return Vec::new();
+    }
+    if sample_size >= num_points {
+        return iter_points(data).collect();
+    }
+
+    let mut sample = Vec::with_capacity(sample_size);
+    for i in 0..sample_size {
+        let idx = i * num_points / sample_size;
+        sample.push(point_at(data, idx));
+    }
+    sample
+}
+
+fn init_kmeans_plus_plus(samples: &[Point3], k: usize) -> Vec<Point3> {
+    if samples.is_empty() || k == 0 {
+        return Vec::new();
+    }
+
+    let mut centroids = Vec::with_capacity(k);
+    centroids.push(samples[0]);
+
+    while centroids.len() < k {
+        let mut best_point = samples[centroids.len() % samples.len()];
+        let mut best_dist = -1.0f32;
+
+        for &point in samples {
+            let dist = nearest_distance2(point, &centroids);
+            if dist > best_dist {
+                best_dist = dist;
+                best_point = point;
+            }
+        }
+
+        centroids.push(best_point);
+    }
+
+    centroids
+}
+
+fn nearest_centroid(point: Point3, centroids: &[Point3]) -> usize {
+    let mut best_idx = 0usize;
+    let mut best_dist = point.dist2(centroids[0]);
+    for (i, &c) in centroids.iter().enumerate().skip(1) {
+        let dist = point.dist2(c);
+        if dist < best_dist {
+            best_dist = dist;
+            best_idx = i;
+        }
+    }
+    best_idx
+}
+
+fn nearest_distance2(point: Point3, centroids: &[Point3]) -> f32 {
+    centroids
+        .iter()
+        .map(|&c| point.dist2(c))
+        .fold(f32::INFINITY, f32::min)
+}
+
+fn recompute_centroids(centroids: &mut [Point3], sums: &[[f64; 3]], counts: &[u32], fallback: &[Point3]) {
+    for i in 0..centroids.len() {
+        if counts[i] > 0 {
+            let inv = 1.0f32 / counts[i] as f32;
+            centroids[i] = Point3 {
+                x: (sums[i][0] as f32) * inv,
+                y: (sums[i][1] as f32) * inv,
+                z: (sums[i][2] as f32) * inv,
+            };
+        } else if !fallback.is_empty() {
+            centroids[i] = fallback[i % fallback.len()];
+        }
+    }
+}
+
+fn refill_empty_centroids(centroids: &mut [Point3], counts: &[u32], fallback: &[Point3]) {
+    for i in 0..centroids.len() {
+        if counts[i] <= 1 && !fallback.is_empty() {
+            centroids[i] = fallback[(i * 9973) % fallback.len()];
+        }
+    }
+}
+
+fn repair_empty_or_duplicate_centroids(centroids: &mut [Point3], counts: &[u64], fallback: &[Point3]) {
+    for i in 0..centroids.len() {
+        if counts[i] <= 1 && !fallback.is_empty() {
+            centroids[i] = fallback[(i * 7919) % fallback.len()];
+        }
+    }
+
+    for i in 1..centroids.len() {
+        if centroids[i].dist2(centroids[i - 1]) == 0.0 && !fallback.is_empty() {
+            centroids[i] = fallback[(i * 6151) % fallback.len()];
+        }
+    }
+}

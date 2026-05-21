@@ -1,0 +1,282 @@
+import math
+
+
+_MEM = {
+    "pos": None,
+    "vel": None,
+    "fuel_pct": None,
+}
+
+
+def _finite(x):
+    return isinstance(x, (int, float)) and math.isfinite(x)
+
+
+def _clip(x, lo, hi):
+    if not _finite(x):
+        return 0.0
+    return max(lo, min(hi, x))
+
+
+def _median(vals):
+    vals = sorted(v for v in vals if _finite(v))
+    if not vals:
+        return None
+    n = len(vals)
+    if n & 1:
+        return vals[n // 2]
+    return 0.5 * (vals[n // 2 - 1] + vals[n // 2])
+
+
+def _vec_norm(v):
+    return math.sqrt(sum(a * a for a in v))
+
+
+def _valid(state, key):
+    return bool(state.get(key, False))
+
+
+def _sensor_vec(state, prefix, kind):
+    vals = []
+    for ax in ("x", "y", "z"):
+        k = f"{prefix}_rel_{kind}_{ax}_{'m' if kind == 'pos' else 'ms'}"
+        vk = f"{prefix}_rel{'v' if kind == 'vel' else ''}_{ax}_valid"
+        if not _valid(state, vk):
+            return None
+        val = state.get(k)
+        if not _finite(val):
+            return None
+        vals.append(float(val))
+    return vals
+
+
+def _estimate_state(state, dt):
+    pos_candidates = []
+    vel_candidates = []
+
+    radar_p = _sensor_vec(state, "radar", "pos")
+    radar_v = _sensor_vec(state, "radar", "vel")
+    lidar_p = _sensor_vec(state, "lidar", "pos")
+    lidar_v = _sensor_vec(state, "lidar", "vel")
+
+    if radar_p is not None:
+        pos_candidates.append((radar_p, 1.0))
+    if lidar_p is not None:
+        pos_candidates.append((lidar_p, 1.4))
+    if radar_v is not None:
+        vel_candidates.append((radar_v, 1.0))
+    if lidar_v is not None:
+        vel_candidates.append((lidar_v, 1.4))
+
+    ranges = []
+    for i in (1, 2, 3):
+        if _valid(state, f"range_{i}_valid"):
+            r = state.get(f"range_{i}_m")
+            if _finite(r) and r > 0:
+                ranges.append(float(r))
+    if state.get("dock_camera_active") and _finite(state.get("dock_camera_range_m")):
+        cr = float(state["dock_camera_range_m"])
+        if cr > 0:
+            ranges.append(cr)
+    rng = _median(ranges)
+
+    if state.get("dock_camera_active") and _finite(state.get("dock_camera_range_m")):
+        if all(_valid(state, f"dock_camera_bearing_{a}_valid") for a in ("x", "y", "z")):
+            b = [float(state.get(f"dock_camera_bearing_{a}", 0.0)) for a in ("x", "y", "z")]
+            bn = _vec_norm(b)
+            if bn > 1e-6:
+                pos_candidates.append(([b[i] / bn * float(state["dock_camera_range_m"]) for i in range(3)], 1.7))
+
+    pos_meas = None
+    if pos_candidates:
+        sw = sum(w for _, w in pos_candidates)
+        pos_meas = [sum(v[i] * w for v, w in pos_candidates) / sw for i in range(3)]
+        pn = _vec_norm(pos_meas)
+        if rng is not None and pn > 1e-3 and abs(pn - rng) > max(8.0, 0.25 * rng):
+            # Preserve the reliable 3-D direction but let redundant range sensors fix scale.
+            pos_meas = [a * rng / pn for a in pos_meas]
+
+    vel_meas = None
+    if vel_candidates:
+        sw = sum(w for _, w in vel_candidates)
+        vel_meas = [sum(v[i] * w for v, w in vel_candidates) / sw for i in range(3)]
+
+    old_p = _MEM.get("pos")
+    old_v = _MEM.get("vel")
+    fuel_pct = state.get("fuel_remaining_pct")
+    if _finite(fuel_pct) and _MEM.get("fuel_pct") is not None and fuel_pct > _MEM["fuel_pct"] + 5.0:
+        old_p = old_v = None
+    _MEM["fuel_pct"] = fuel_pct if _finite(fuel_pct) else _MEM.get("fuel_pct")
+
+    if pos_meas is None and old_p is not None and old_v is not None:
+        pos_meas = [old_p[i] + old_v[i] * max(0.0, dt) for i in range(3)]
+    if pos_meas is None:
+        pos_meas = [0.0, -1000.0, 0.0]
+
+    if old_p is not None and old_v is not None:
+        pred = [old_p[i] + old_v[i] * max(0.0, dt) for i in range(3)]
+        innovation = _vec_norm([pos_meas[i] - pred[i] for i in range(3)])
+        if innovation > max(80.0, 0.6 * max(_vec_norm(pos_meas), 1.0)):
+            old_p = old_v = None
+
+    if vel_meas is None and old_p is not None and dt > 1e-3:
+        vel_meas = [(pos_meas[i] - old_p[i]) / dt for i in range(3)]
+    if vel_meas is None:
+        vel_meas = old_v[:] if old_v is not None else [0.0, 0.0, 0.0]
+
+    if old_p is None:
+        pos = pos_meas
+        vel = vel_meas
+    else:
+        pred = [old_p[i] + old_v[i] * max(0.0, dt) for i in range(3)]
+        a_pos = 0.70 if pos_candidates else 0.25
+        a_vel = 0.70 if vel_candidates else 0.25
+        pos = [(1.0 - a_pos) * pred[i] + a_pos * pos_meas[i] for i in range(3)]
+        vel = [(1.0 - a_vel) * old_v[i] + a_vel * vel_meas[i] for i in range(3)]
+
+    _MEM["pos"] = pos[:]
+    _MEM["vel"] = vel[:]
+    return pos, vel, rng
+
+
+def _mean_motion(state):
+    mu = 3.986004418e14
+    a = None
+    if _valid(state, "ground_semi_major_axis_m_valid"):
+        a = state.get("ground_semi_major_axis_m")
+    if not _finite(a) or a < 6.0e6:
+        if _valid(state, "ground_altitude_km_valid"):
+            alt = state.get("ground_altitude_km")
+            if _finite(alt):
+                a = 6371000.0 + 1000.0 * float(alt)
+    if not _finite(a) or a < 6.0e6:
+        a = 6771000.0
+    return math.sqrt(mu / (float(a) ** 3))
+
+
+def _gyro_rate(state, axis):
+    vals = []
+    for i in (1, 2, 3):
+        if _valid(state, f"gyro_{i}_{axis}_valid"):
+            v = state.get(f"gyro_{i}_{axis}_dps")
+            if _finite(v):
+                vals.append(float(v) * math.pi / 180.0)
+    m = _median(vals)
+    return m if m is not None else 0.0
+
+
+def autopilot_step(state: dict, dt: float) -> dict:
+    dt = _clip(dt, 0.0, 10.0)
+    pos, vel, scalar_range = _estimate_state(state, dt)
+    x, y, z = pos
+    vx, vy, vz = vel
+    r = max(_vec_norm(pos), scalar_range or 0.0, 1e-6)
+    n = _mean_motion(state)
+
+    fuel_pct = state.get("fuel_remaining_pct", 100.0)
+    low_fuel = _finite(fuel_pct) and fuel_pct < 15.0
+
+    # Desired closing speed is deliberately small near the port and modest far away.
+    target_speed = state.get("target_dock_speed_ms", 0.25)
+    if not _finite(target_speed) or target_speed <= 0:
+        target_speed = 0.25
+    if r > 1000.0:
+        vclose = 1.15
+    elif r > 200.0:
+        vclose = 0.65
+    elif r > 50.0:
+        vclose = 0.32
+    elif r > 10.0:
+        vclose = 0.16
+    else:
+        vclose = min(0.08, 0.45 * target_speed)
+    if low_fuel:
+        vclose *= 0.75
+
+    closing = -(x * vx + y * vy + z * vz) / r
+    ux, uy, uz = x / r, y / r, z / r
+
+    if r > 200.0:
+        # Far-field orbital phasing. Along-track thrust is intentionally inverted:
+        # behind the station (negative y), retrograde thrust lowers the orbit and
+        # increases the closing rate; ahead of it, prograde thrust raises the orbit.
+        desired_vy = _clip(-0.0016 * y, -vclose, vclose)
+        ty = -0.85 * (desired_vy - vy)
+        if abs(y) < 0.35 * r:
+            ty *= 0.45
+
+        # Keep radial and cross-track offsets bounded without spending much fuel.
+        tx = -0.0016 * x - 0.45 * vx
+        tz = -0.0022 * z - 0.55 * vz
+
+        # If range is already collapsing too quickly, brake along the relative
+        # velocity vector instead of continuing the transfer burn.
+        if closing > 1.35 * vclose:
+            tx += 0.75 * vx
+            ty += 0.75 * vy
+            tz += 0.75 * vz
+        limit = 0.45 if not low_fuel else 0.28
+    elif r > 50.0:
+        # Medium range: use CW feed-forward with a V-bar preference. This damps
+        # the orbital coupling but still avoids a wasteful straight radial chase.
+        des_v = [-vclose * ux, -vclose * uy, -vclose * uz]
+        ax = 0.010 * (-x) + 0.75 * (des_v[0] - vx) + 2.0 * n * vy + 3.0 * n * n * x
+        ay = 0.010 * (-y) + 0.75 * (des_v[1] - vy) - 2.0 * n * vx
+        az = 0.012 * (-z) + 0.80 * (des_v[2] - vz) + n * n * z
+        tx, ty, tz = ax, ay, az
+        if closing > 1.25 * vclose:
+            tx += 0.6 * vx
+            ty += 0.6 * vy
+            tz += 0.6 * vz
+        limit = 0.32 if not low_fuel else 0.22
+    else:
+        # Close to the target the linear approximation is good; command a soft
+        # velocity toward the port and damp any sideways motion.
+        des_v = [-vclose * ux, -vclose * uy, -vclose * uz]
+        if r < 10.0:
+            kp, kd, limit = 0.018, 0.95, 0.16
+        else:
+            kp, kd, limit = 0.024, 0.85, 0.24
+        tx = kp * (-x) + kd * (des_v[0] - vx)
+        ty = kp * (-y) + kd * (des_v[1] - vy)
+        tz = kp * (-z) + kd * (des_v[2] - vz)
+        if closing > vclose:
+            excess = closing - vclose
+            tx += excess * ux
+            ty += excess * uy
+            tz += excess * uz
+        if low_fuel:
+            limit *= 0.8
+
+    thrust_x = _clip(tx, -limit, limit)
+    thrust_y = _clip(ty, -limit, limit)
+    thrust_z = _clip(tz, -limit, limit)
+
+    # Do not chatter at docking speeds inside the capture box.
+    rel_speed = _vec_norm(vel)
+    if r < 2.0 and rel_speed < 0.3:
+        thrust_x = thrust_y = thrust_z = 0.0
+
+    roll_rate = _gyro_rate(state, "roll")
+    pitch_rate = _gyro_rate(state, "pitch")
+    yaw_rate = _gyro_rate(state, "yaw")
+    att_roll = -0.45 * roll_rate
+    att_pitch = -0.45 * pitch_rate
+    att_yaw = -0.45 * yaw_rate
+
+    if state.get("dock_camera_active"):
+        bx = state.get("dock_camera_bearing_x", 0.0)
+        by = state.get("dock_camera_bearing_y", 0.0)
+        if _valid(state, "dock_camera_bearing_x_valid") and _finite(bx):
+            att_yaw += 0.018 * _clip(float(bx), -1.0, 1.0)
+        if _valid(state, "dock_camera_bearing_y_valid") and _finite(by):
+            att_pitch -= 0.018 * _clip(float(by), -1.0, 1.0)
+
+    return {
+        "thrust_x": _clip(thrust_x, -1.0, 1.0),
+        "thrust_y": _clip(thrust_y, -1.0, 1.0),
+        "thrust_z": _clip(thrust_z, -1.0, 1.0),
+        "att_rate_roll": _clip(att_roll, -0.035, 0.035),
+        "att_rate_pitch": _clip(att_pitch, -0.035, 0.035),
+        "att_rate_yaw": _clip(att_yaw, -0.035, 0.035),
+    }

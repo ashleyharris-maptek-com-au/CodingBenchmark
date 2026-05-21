@@ -1,0 +1,713 @@
+// Adaptive 3D k-means clustering (exactly K clusters).
+//
+// Input (stdin):
+//   num_points num_clusters\n
+//   followed by num_points * 3 little-endian f32 values (x,y,z) as raw bytes.
+//
+// Output (stdout):
+//   num_points little-endian u32 cluster indices, one per point.
+//
+// Notes:
+// - For smaller inputs, runs multi-iteration Lloyd k-means in-memory.
+// - For larger inputs, uses streaming mini-batch ("online") updates.
+// - When data doesn't fit memory, spools points to a temp file in the current directory
+//   so it can do a second pass to emit labels using the final centroids.
+// - For extremely large inputs (too big to spool), emits labels in a single pass while
+//   updating centroids online.
+//
+// Compile: rustc -O --edition=2021 main.rs (or paste into a single file).
+
+use std::fs::File;
+use std::io::{self, Read, Write, BufWriter};
+use std::path::PathBuf;
+
+#[cfg(windows)]
+fn set_stdio_binary() {
+    use std::os::raw::c_int;
+    extern "C" {
+        fn __acrt_iob_func(idx: u32) -> *mut std::ffi::c_void;
+        fn _fileno(stream: *mut std::ffi::c_void) -> c_int;
+        fn _setmode(fd: c_int, mode: c_int) -> c_int;
+    }
+    const O_BINARY: c_int = 0x8000;
+    unsafe {
+        let stdin = __acrt_iob_func(0);
+        let stdout = __acrt_iob_func(1);
+        _setmode(_fileno(stdin), O_BINARY);
+        _setmode(_fileno(stdout), O_BINARY);
+    }
+}
+
+#[cfg(not(windows))]
+fn set_stdio_binary() {}
+
+#[derive(Copy, Clone, Default)]
+struct Point3 {
+    x: f32,
+    y: f32,
+    z: f32,
+}
+
+impl Point3 {
+    #[inline]
+    fn sanitize(mut self) -> Self {
+        if !self.x.is_finite() { self.x = 0.0; }
+        if !self.y.is_finite() { self.y = 0.0; }
+        if !self.z.is_finite() { self.z = 0.0; }
+        self
+    }
+
+    #[inline]
+    fn coord(&self, axis: usize) -> f32 {
+        match axis {
+            0 => self.x,
+            1 => self.y,
+            _ => self.z,
+        }
+    }
+}
+
+#[inline]
+fn dist2(a: &Point3, b: &Point3) -> f32 {
+    let dx = a.x - b.x;
+    let dy = a.y - b.y;
+    let dz = a.z - b.z;
+    dx * dx + dy * dy + dz * dz
+}
+
+struct FastInput<R: Read> {
+    reader: R,
+    buf: Vec<u8>,
+    pos: usize,
+    cap: usize,
+}
+
+impl<R: Read> FastInput<R> {
+    fn new(reader: R) -> Self {
+        Self {
+            reader,
+            buf: vec![0u8; 1 << 20],
+            pos: 0,
+            cap: 0,
+        }
+    }
+
+    #[inline]
+    fn refill(&mut self) -> bool {
+        self.pos = 0;
+        match self.reader.read(&mut self.buf) {
+            Ok(0) | Err(_) => {
+                self.cap = 0;
+                false
+            }
+            Ok(n) => {
+                self.cap = n;
+                true
+            }
+        }
+    }
+
+    #[inline]
+    fn read_byte(&mut self) -> Option<u8> {
+        if self.pos >= self.cap && !self.refill() {
+            return None;
+        }
+        let b = self.buf[self.pos];
+        self.pos += 1;
+        Some(b)
+    }
+
+    fn read_u64_ascii(&mut self) -> Option<u64> {
+        let mut b = self.read_byte()?;
+        while b.is_ascii_whitespace() {
+            b = self.read_byte()?;
+        }
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        let mut val: u64 = (b - b'0') as u64;
+        loop {
+            match self.read_byte() {
+                Some(c) if c.is_ascii_digit() => {
+                    val = val.saturating_mul(10).saturating_add((c - b'0') as u64);
+                }
+                Some(c) => {
+                    if !c.is_ascii_whitespace() {
+                        self.pos = self.pos.saturating_sub(1);
+                    }
+                    break;
+                }
+                None => break,
+            }
+        }
+        Some(val)
+    }
+
+    fn read_exact_into(&mut self, out: &mut [u8]) -> bool {
+        let mut filled = 0usize;
+        while filled < out.len() {
+            if self.pos >= self.cap && !self.refill() {
+                return false;
+            }
+            let avail = self.cap - self.pos;
+            let need = out.len() - filled;
+            let take = if avail < need { avail } else { need };
+            out[filled..filled + take].copy_from_slice(&self.buf[self.pos..self.pos + take]);
+            self.pos += take;
+            filled += take;
+        }
+        true
+    }
+
+    #[inline]
+    fn read_point3(&mut self, scratch: &mut [u8; 12]) -> Option<Point3> {
+        if !self.read_exact_into(scratch) {
+            return None;
+        }
+        let x = f32::from_le_bytes([scratch[0], scratch[1], scratch[2], scratch[3]]);
+        let y = f32::from_le_bytes([scratch[4], scratch[5], scratch[6], scratch[7]]);
+        let z = f32::from_le_bytes([scratch[8], scratch[9], scratch[10], scratch[11]]);
+        Some(Point3 { x, y, z }.sanitize())
+    }
+}
+
+#[derive(Clone, Copy)]
+struct KDNode {
+    idx: usize,          // centroid index
+    axis: u8,            // split axis (0,1,2)
+    left: Option<usize>, // node index
+    right: Option<usize>,
+}
+
+struct KDTree {
+    nodes: Vec<KDNode>,
+    root: Option<usize>,
+}
+
+impl KDTree {
+    fn build(centroids: &[Point3]) -> Self {
+        if centroids.is_empty() {
+            return Self { nodes: Vec::new(), root: None };
+        }
+        let mut indices: Vec<usize> = (0..centroids.len()).collect();
+        let mut nodes: Vec<KDNode> = Vec::with_capacity(centroids.len());
+        let root = Self::build_rec(&mut indices, 0, centroids, &mut nodes);
+        Self { nodes, root }
+    }
+
+    fn build_rec(indices: &mut [usize], depth: usize, centroids: &[Point3], nodes: &mut Vec<KDNode>) -> Option<usize> {
+        if indices.is_empty() {
+            return None;
+        }
+        let axis = depth % 3;
+        let mid = indices.len() / 2;
+        let (left, median, right) = indices.select_nth_unstable_by(mid, |a, b| {
+            centroids[*a].coord(axis).total_cmp(&centroids[*b].coord(axis))
+        });
+        let median_idx = *median;
+        let node_index = nodes.len();
+        nodes.push(KDNode { idx: median_idx, axis: axis as u8, left: None, right: None });
+        let left_child = Self::build_rec(left, depth + 1, centroids, nodes);
+        let right_child = Self::build_rec(right, depth + 1, centroids, nodes);
+        nodes[node_index].left = left_child;
+        nodes[node_index].right = right_child;
+        Some(node_index)
+    }
+
+    #[inline]
+    fn nearest(&self, query: &Point3, centroids: &[Point3]) -> usize {
+        let root = match self.root {
+            Some(r) => r,
+            None => return 0,
+        };
+        let mut best_idx = self.nodes[root].idx;
+        let mut best_dist = dist2(query, &centroids[best_idx]);
+        self.search(Some(root), query, centroids, &mut best_idx, &mut best_dist);
+        best_idx
+    }
+
+    fn search(
+        &self,
+        node: Option<usize>,
+        query: &Point3,
+        centroids: &[Point3],
+        best_idx: &mut usize,
+        best_dist2: &mut f32,
+    ) {
+        let node_idx = match node { Some(i) => i, None => return };
+        let n = self.nodes[node_idx];
+        let c = &centroids[n.idx];
+        let d2 = dist2(query, c);
+        if d2 < *best_dist2 {
+            *best_dist2 = d2;
+            *best_idx = n.idx;
+        }
+        let axis = n.axis as usize;
+        let diff = query.coord(axis) - c.coord(axis);
+        let (first, second) = if diff <= 0.0 { (n.left, n.right) } else { (n.right, n.left) };
+        self.search(first, query, centroids, best_idx, best_dist2);
+        if diff * diff < *best_dist2 {
+            self.search(second, query, centroids, best_idx, best_dist2);
+        }
+    }
+}
+
+#[inline]
+fn nearest_linear(p: &Point3, centroids: &[Point3]) -> usize {
+    let mut best = 0usize;
+    let mut best_d = f32::INFINITY;
+    for (i, c) in centroids.iter().enumerate() {
+        let d = dist2(p, c);
+        if d < best_d {
+            best_d = d;
+            best = i;
+        }
+    }
+    best
+}
+
+fn fix_empty_clusters(
+    points: &[Point3],
+    assignments: &mut [u32],
+    centroids: &[Point3],
+    counts: &mut [u64],
+    sum_x: &mut [f64],
+    sum_y: &mut [f64],
+    sum_z: &mut [f64],
+) {
+    let k = counts.len();
+    let mut empty: Vec<usize> = Vec::new();
+    for j in 0..k {
+        if counts[j] == 0 {
+            empty.push(j);
+        }
+    }
+    if empty.is_empty() {
+        return;
+    }
+
+    // Select farthest points (by current centroid distance) and reassign them to empty clusters.
+    // Avoid stealing the last point of a cluster where possible.
+    let mut dists: Vec<(f32, usize)> = Vec::with_capacity(points.len().min(empty.len().saturating_mul(16)).max(1024));
+
+    // Keep a small set of farthest candidates using insertion into a fixed-size array-like vector.
+    let cap = dists.capacity();
+    for (i, p) in points.iter().enumerate() {
+        let cidx = assignments[i] as usize;
+        let d2 = dist2(p, &centroids[cidx]);
+        if dists.len() < cap {
+            dists.push((d2, i));
+            if dists.len() == cap {
+                dists.sort_by(|a, b| b.0.total_cmp(&a.0));
+            }
+        } else if d2 > dists[dists.len() - 1].0 {
+            // Replace worst and re-insert (vector kept sorted descending).
+            let mut pos = dists.len() - 1;
+            dists[pos] = (d2, i);
+            while pos > 0 && dists[pos].0 > dists[pos - 1].0 {
+                dists.swap(pos, pos - 1);
+                pos -= 1;
+            }
+        }
+    }
+    if dists.is_empty() {
+        return;
+    }
+    if dists.len() < cap {
+        dists.sort_by(|a, b| b.0.total_cmp(&a.0));
+    }
+
+    let mut cand_pos = 0usize;
+    for &e in &empty {
+        // Find a candidate to steal.
+        while cand_pos < dists.len() {
+            let idx = dists[cand_pos].1;
+            let old = assignments[idx] as usize;
+            cand_pos += 1;
+            if old == e {
+                continue;
+            }
+            if counts[old] <= 1 {
+                continue;
+            }
+            // Steal this point.
+            let p = points[idx];
+            counts[old] -= 1;
+            sum_x[old] -= p.x as f64;
+            sum_y[old] -= p.y as f64;
+            sum_z[old] -= p.z as f64;
+
+            counts[e] += 1;
+            sum_x[e] += p.x as f64;
+            sum_y[e] += p.y as f64;
+            sum_z[e] += p.z as f64;
+
+            assignments[idx] = e as u32;
+            break;
+        }
+        // If we ran out of candidates (rare degenerate case), stop.
+        if counts[e] == 0 {
+            break;
+        }
+    }
+}
+
+fn lloyd_kmeans_in_memory(points: &[Point3], k: usize) -> Vec<u32> {
+    let n = points.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    if k == 0 {
+        return vec![0u32; n];
+    }
+
+    let k_eff = k.min(n);
+    let mut centroids: Vec<Point3> = Vec::with_capacity(k);
+    for i in 0..k_eff {
+        centroids.push(points[i]);
+    }
+    if k_eff < k {
+        // Pad remaining centroids (unavoidable empty clusters when k>n).
+        let pad = points[0];
+        while centroids.len() < k {
+            centroids.push(pad);
+        }
+    }
+
+    let mut assignments: Vec<u32> = vec![0u32; n];
+    let mut prev_move = f32::INFINITY;
+
+    // Adapt iterations to problem size.
+    let max_iter = if n <= 2_000_000 { 25 } else { 15 };
+    let tol = 1e-4f32;
+
+    for _iter in 0..max_iter {
+        let mut counts = vec![0u64; k];
+        let mut sum_x = vec![0f64; k];
+        let mut sum_y = vec![0f64; k];
+        let mut sum_z = vec![0f64; k];
+
+        let use_kd = k > 1024;
+        let kdtree = if use_kd { Some(KDTree::build(&centroids)) } else { None };
+
+        for (i, p) in points.iter().enumerate() {
+            let cid = if let Some(ref tree) = kdtree {
+                tree.nearest(p, &centroids)
+            } else {
+                nearest_linear(p, &centroids)
+            };
+            assignments[i] = cid as u32;
+            counts[cid] += 1;
+            sum_x[cid] += p.x as f64;
+            sum_y[cid] += p.y as f64;
+            sum_z[cid] += p.z as f64;
+        }
+
+        fix_empty_clusters(points, &mut assignments, &centroids, &mut counts, &mut sum_x, &mut sum_y, &mut sum_z);
+
+        let mut max_move = 0.0f32;
+        for j in 0..k {
+            if counts[j] > 0 {
+                let inv = 1.0f64 / counts[j] as f64;
+                let new_c = Point3 {
+                    x: (sum_x[j] * inv) as f32,
+                    y: (sum_y[j] * inv) as f32,
+                    z: (sum_z[j] * inv) as f32,
+                }.sanitize();
+                let mv = dist2(&centroids[j], &new_c).sqrt();
+                if mv > max_move {
+                    max_move = mv;
+                }
+                centroids[j] = new_c;
+            }
+        }
+
+        if max_move <= tol || (prev_move - max_move).abs() <= tol * 0.1 {
+            break;
+        }
+        prev_move = max_move;
+    }
+
+    // One last exact assignment pass for final centroids.
+    let use_kd = k > 1024;
+    let kdtree = if use_kd { Some(KDTree::build(&centroids)) } else { None };
+    for (i, p) in points.iter().enumerate() {
+        let cid = if let Some(ref tree) = kdtree {
+            tree.nearest(p, &centroids)
+        } else {
+            nearest_linear(p, &centroids)
+        };
+        assignments[i] = cid as u32;
+    }
+
+    // If n>=k, ensure every cluster appears at least once by forcing the first k points.
+    if n >= k {
+        for i in 0..k {
+            assignments[i] = i as u32;
+        }
+    }
+
+    assignments
+}
+
+fn mini_batch_update(
+    batch: &[Point3],
+    centroids: &mut [Point3],
+    counts: &mut [u64],
+    use_kd: bool,
+    out_labels: Option<&mut Vec<u32>>,
+    force_offset: Option<u64>,
+) {
+    let k = centroids.len();
+    if k == 0 || batch.is_empty() {
+        return;
+    }
+
+    let kdtree = if use_kd { Some(KDTree::build(centroids)) } else { None };
+
+    // Batch accumulators.
+    let mut bcount = vec![0u64; k];
+    let mut sum_x = vec![0f64; k];
+    let mut sum_y = vec![0f64; k];
+    let mut sum_z = vec![0f64; k];
+
+    let mut labels_opt = out_labels;
+    for (i, p) in batch.iter().enumerate() {
+        let global_i = force_offset.map(|off| off + i as u64);
+        let cid = if let Some(gi) = global_i {
+            if gi < k as u64 {
+                gi as usize
+            } else if let Some(ref tree) = kdtree {
+                tree.nearest(p, centroids)
+            } else {
+                nearest_linear(p, centroids)
+            }
+        } else if let Some(ref tree) = kdtree {
+            tree.nearest(p, centroids)
+        } else {
+            nearest_linear(p, centroids)
+        };
+
+        bcount[cid] += 1;
+        sum_x[cid] += p.x as f64;
+        sum_y[cid] += p.y as f64;
+        sum_z[cid] += p.z as f64;
+
+        if let Some(ref mut labels) = labels_opt {
+            labels.push(cid as u32);
+        }
+    }
+
+    // Update centroids with running mean.
+    for j in 0..k {
+        let bc = bcount[j];
+        if bc == 0 {
+            continue;
+        }
+        let old = counts[j] as f64;
+        let bc_f = bc as f64;
+        let total = old + bc_f;
+        let new_x = (centroids[j].x as f64 * old + sum_x[j]) / total;
+        let new_y = (centroids[j].y as f64 * old + sum_y[j]) / total;
+        let new_z = (centroids[j].z as f64 * old + sum_z[j]) / total;
+        centroids[j] = Point3 { x: new_x as f32, y: new_y as f32, z: new_z as f32 }.sanitize();
+        counts[j] = (old as u64).saturating_add(bc);
+    }
+}
+
+fn main() {
+    set_stdio_binary();
+
+    let stdin = io::stdin();
+    let mut input = FastInput::new(stdin.lock());
+
+    let num_points = match input.read_u64_ascii() {
+        Some(v) => v,
+        None => return,
+    };
+    let num_clusters = match input.read_u64_ascii() {
+        Some(v) => v as usize,
+        None => return,
+    };
+
+    let n = num_points;
+    let k = num_clusters;
+    if n == 0 {
+        return;
+    }
+
+    let stdout = io::stdout();
+    let mut out = BufWriter::with_capacity(1 << 20, stdout.lock());
+
+    if k == 0 {
+        // Undefined request; emit 0 for all points.
+        for _ in 0..n {
+            out.write_all(&0u32.to_le_bytes()).unwrap();
+        }
+        return;
+    }
+
+    // Heuristics: in-memory Lloyd vs two-pass (spool) vs one-pass streaming.
+    // Rough in-memory bytes: points (12*n) + labels (4*n) = 16*n.
+    const MEM_LIMIT: u64 = 700 * 1024 * 1024; // ~700MiB
+    const DISK_LIMIT: u64 = 120 * 1024 * 1024 * 1024; // ~120GiB
+
+    let mem_needed = n.saturating_mul(16);
+    let data_bytes = n.saturating_mul(12);
+
+    let can_in_memory = mem_needed <= MEM_LIMIT && n <= (usize::MAX as u64);
+    let can_spool = data_bytes <= DISK_LIMIT;
+
+    let mut scratch = [0u8; 12];
+
+    if can_in_memory {
+        let n_usize = n as usize;
+        let mut points: Vec<Point3> = Vec::with_capacity(n_usize);
+        for _ in 0..n_usize {
+            match input.read_point3(&mut scratch) {
+                Some(p) => points.push(p),
+                None => break,
+            }
+        }
+        let labels = lloyd_kmeans_in_memory(&points, k);
+        for lbl in labels {
+            out.write_all(&(lbl as u32).to_le_bytes()).unwrap();
+        }
+        return;
+    }
+
+    if can_spool {
+        // Two-pass: train centroids online while spooling to disk, then emit final labels.
+        let tmp_path = PathBuf::from("points.tmp");
+        let tmp_file = File::create(&tmp_path).unwrap();
+        let mut tmp_out = BufWriter::with_capacity(1 << 20, tmp_file);
+
+        let mut centroids: Vec<Point3> = Vec::with_capacity(k);
+        let mut counts: Vec<u64> = vec![0u64; k];
+        let use_kd = k > 1024;
+
+        // Batch sizing: bigger batch => fewer KD rebuilds, modest memory.
+        let batch_size: usize = if k >= 4096 { 1 << 20 } else { 1 << 18 }; // 1,048,576 or 262,144
+        let mut batch: Vec<Point3> = Vec::with_capacity(batch_size);
+
+        let mut i: u64 = 0;
+        while i < n {
+            if !input.read_exact_into(&mut scratch) {
+                break;
+            }
+            tmp_out.write_all(&scratch).unwrap();
+            let p = Point3 {
+                x: f32::from_le_bytes([scratch[0], scratch[1], scratch[2], scratch[3]]),
+                y: f32::from_le_bytes([scratch[4], scratch[5], scratch[6], scratch[7]]),
+                z: f32::from_le_bytes([scratch[8], scratch[9], scratch[10], scratch[11]]),
+            }.sanitize();
+
+            if (centroids.len() as u64) < k as u64 {
+                let idx = centroids.len();
+                centroids.push(p);
+                if idx < k {
+                    counts[idx] = 1;
+                }
+            } else {
+                batch.push(p);
+                if batch.len() >= batch_size {
+                    mini_batch_update(&batch, &mut centroids, &mut counts, use_kd, None, None);
+                    batch.clear();
+                }
+            }
+            i += 1;
+        }
+        if !batch.is_empty() {
+            mini_batch_update(&batch, &mut centroids, &mut counts, use_kd, None, None);
+            batch.clear();
+        }
+        tmp_out.flush().unwrap();
+        drop(tmp_out);
+
+        // If we had fewer than k points, pad centroids.
+        if centroids.is_empty() {
+            // No points read; nothing to output.
+            let _ = std::fs::remove_file(&tmp_path);
+            return;
+        }
+        while centroids.len() < k {
+            centroids.push(centroids[0]);
+        }
+
+        // Second pass: emit labels using final centroids.
+        let tmp_in = File::open(&tmp_path).unwrap();
+        let mut fin = FastInput::new(tmp_in);
+        let kdtree = if use_kd { Some(KDTree::build(&centroids)) } else { None };
+
+        let mut idx: u64 = 0;
+        let mut pbytes = [0u8; 12];
+        while idx < n {
+            if !fin.read_exact_into(&mut pbytes) {
+                break;
+            }
+            let p = Point3 {
+                x: f32::from_le_bytes([pbytes[0], pbytes[1], pbytes[2], pbytes[3]]),
+                y: f32::from_le_bytes([pbytes[4], pbytes[5], pbytes[6], pbytes[7]]),
+                z: f32::from_le_bytes([pbytes[8], pbytes[9], pbytes[10], pbytes[11]]),
+            }.sanitize();
+
+            let cid = if idx < k as u64 {
+                // Force at least one point per cluster when n>=k.
+                idx as usize
+            } else if let Some(ref tree) = kdtree {
+                tree.nearest(&p, &centroids)
+            } else {
+                nearest_linear(&p, &centroids)
+            };
+            out.write_all(&(cid as u32).to_le_bytes()).unwrap();
+            idx += 1;
+        }
+
+        let _ = std::fs::remove_file(&tmp_path);
+        return;
+    }
+
+    // One-pass streaming (no spool): output labels as we go, centroids updated online in batches.
+    let use_kd = k > 1024;
+    let batch_size: usize = if k >= 4096 { 1 << 19 } else { 1 << 17 }; // 524,288 or 131,072
+
+    let mut centroids: Vec<Point3> = Vec::with_capacity(k);
+    let mut counts: Vec<u64> = vec![0u64; k];
+    let mut batch: Vec<Point3> = Vec::with_capacity(batch_size);
+    let mut batch_labels: Vec<u32> = Vec::with_capacity(batch_size);
+
+    let mut idx: u64 = 0;
+    while idx < n {
+        match input.read_point3(&mut scratch) {
+            Some(p) => {
+                if (centroids.len() as u64) < k as u64 {
+                    let cidx = centroids.len();
+                    centroids.push(p);
+                    counts[cidx] = 1;
+                    out.write_all(&(cidx as u32).to_le_bytes()).unwrap();
+                } else {
+                    batch.push(p);
+                    if batch.len() >= batch_size {
+                        batch_labels.clear();
+                        mini_batch_update(&batch, &mut centroids, &mut counts, use_kd, Some(&mut batch_labels), Some(idx - batch.len() as u64));
+                        for lbl in batch_labels.iter() {
+                            out.write_all(&lbl.to_le_bytes()).unwrap();
+                        }
+                        batch.clear();
+                    }
+                }
+                idx += 1;
+            }
+            None => break,
+        }
+    }
+    if !batch.is_empty() {
+        batch_labels.clear();
+        let start = idx - batch.len() as u64;
+        mini_batch_update(&batch, &mut centroids, &mut counts, use_kd, Some(&mut batch_labels), Some(start));
+        for lbl in batch_labels.iter() {
+            out.write_all(&lbl.to_le_bytes()).unwrap();
+        }
+        batch.clear();
+    }
+}

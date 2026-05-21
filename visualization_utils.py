@@ -3,9 +3,96 @@
 Provides reusable components for rendering 3D objects in HTML reports.
 """
 
+import hashlib
 import json
 import uuid
 from typing import List, Tuple, Dict, Any
+
+try:
+  from LLMBenchCore import ResultPaths as rp
+except Exception:
+  rp = None
+
+_REPORT_PAYLOAD_INLINE_LIMIT_BYTES = 8 * 1024
+
+
+def _build_viz_payload_loader(viz_id: str, payload: Dict[str, Any]) -> str:
+  payload_json = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+  payload_bytes = len(payload_json.encode("utf-8"))
+  payload_key = f"{viz_id}_{hashlib.sha256(payload_json.encode('utf-8')).hexdigest()[:12]}"
+
+  inline_loader = f"""
+        const payloadKey = {json.dumps(payload_key)};
+        function loadPayload() {{
+            return Promise.resolve({payload_json});
+        }}
+  """
+
+  if rp is None or rp.get_current_model(
+  ) is None or payload_bytes <= _REPORT_PAYLOAD_INLINE_LIMIT_BYTES:
+    return inline_loader
+
+  try:
+    payload_path = rp.result_path(f"report_payloads/{payload_key}.js")
+    payload_href = rp.report_relpath(payload_path)
+    payload_script = ("window.__llmbenchVizPayloads=window.__llmbenchVizPayloads||{};" +
+                      f"window.__llmbenchVizPayloads[{json.dumps(payload_key)}]={payload_json};")
+    with open(payload_path, "w", encoding="utf-8", newline="") as handle:
+      handle.write(payload_script)
+    return f"""
+        const payloadKey = {json.dumps(payload_key)};
+        const payloadScriptSrc = {json.dumps(payload_href)};
+        let payloadLoadPromise = null;
+        function getPayloadSync() {{
+            return window.__llmbenchVizPayloads && window.__llmbenchVizPayloads[payloadKey];
+        }}
+        function loadPayload() {{
+            const existingPayload = getPayloadSync();
+            if (existingPayload) {{
+                return Promise.resolve(existingPayload);
+            }}
+            if (payloadLoadPromise) {{
+                return payloadLoadPromise;
+            }}
+            payloadLoadPromise = new Promise((resolve, reject) => {{
+                const scriptId = 'llmbench-payload-' + payloadKey;
+                const existingScript = document.getElementById(scriptId);
+                const onLoad = function() {{
+                    const loadedPayload = getPayloadSync();
+                    if (loadedPayload) {{
+                        resolve(loadedPayload);
+                    }} else {{
+                        reject(new Error('Visualization payload missing after script load: ' + payloadKey));
+                    }}
+                }};
+                const onError = function() {{
+                    reject(new Error('Failed to load visualization payload: ' + payloadScriptSrc));
+                }};
+                if (existingScript) {{
+                    window.setTimeout(function() {{
+                        const loadedPayload = getPayloadSync();
+                        if (loadedPayload) {{
+                            resolve(loadedPayload);
+                        }} else {{
+                            existingScript.addEventListener('load', onLoad, {{ once: true }});
+                            existingScript.addEventListener('error', onError, {{ once: true }});
+                        }}
+                    }}, 0);
+                    return;
+                }}
+                const script = document.createElement('script');
+                script.id = scriptId;
+                script.src = payloadScriptSrc;
+                script.async = true;
+                script.onload = onLoad;
+                script.onerror = onError;
+                document.head.appendChild(script);
+            }});
+            return payloadLoadPromise;
+        }}
+  """
+  except Exception:
+    return inline_loader
 
 
 def generate_threejs_csg_visualization(mesh_a: Dict,
@@ -384,10 +471,13 @@ def generate_threejs_maze_visualization(path,
     """
 
   maze_lines = maze_string.strip().split("\n")
-  maze_data = json.dumps(maze_lines)
-  path_data = json.dumps([list(p) for p in path]) if path else "null"
-  start_data = json.dumps(list(start) if start else None)
-  end_data = json.dumps(list(end) if end else None)
+  payload_loader_js = _build_viz_payload_loader(
+    viz_id, {
+      'maze': maze_lines,
+      'pathData': [list(p) for p in path] if path else None,
+      'startData': list(start) if start else None,
+      'endData': list(end) if end else None,
+    })
 
   path_len = len(path) if path else 0
   html = f"""
@@ -410,15 +500,12 @@ def generate_threejs_maze_visualization(path,
         const vizId = 'maze_{viz_id}';
         const mazeWidth = {width};
         const mazeHeight = {height};
-        const maze = {maze_data};
-        const pathData = {path_data};
-        const startData = {start_data};
-        const endData = {end_data};
+        {payload_loader_js}
         
         let scene, camera, renderer, controls, animationId, texture;
         let isActive = false;
         
-        function activate() {{
+        async function activate() {{
             if (isActive) return;
             isActive = true;
             
@@ -429,6 +516,20 @@ def generate_threejs_maze_visualization(path,
             // Clear placeholder
             const placeholder = container.querySelector('.viz-placeholder');
             if (placeholder) placeholder.style.display = 'none';
+            let payload;
+            try {{
+                payload = await loadPayload();
+            }} catch (err) {{
+                console.warn('Visualization payload failed to load:', err);
+                if (placeholder) placeholder.textContent = 'Visualization data failed to load';
+                isActive = false;
+                return;
+            }}
+            if (!isActive) return;
+            const maze = payload.maze;
+            const pathData = payload.pathData;
+            const startData = payload.startData;
+            const endData = payload.endData;
 
             const maxCanvas = 2048;
             const maxDim = Math.max(mazeWidth, mazeHeight);
@@ -690,9 +791,10 @@ def generate_threejs_tetrahedron_visualization(container_vertices: List[Tuple[fl
   # Generate unique ID for this visualization
   viz_id = f"tetra_viz_{hash(container_name) % 10000}"
 
-  # Convert data to JSON for JavaScript
-  container_data = json.dumps(container_vertices)
-  placements_data = json.dumps(placements)
+  payload_loader_js = _build_viz_payload_loader(viz_id, {
+    'containerVertices': container_vertices,
+    'placementsData': placements,
+  })
 
   html = f"""
     <div class="tetrahedron-visualization" style="margin: 15px 0;">
@@ -715,14 +817,13 @@ def generate_threejs_tetrahedron_visualization(container_vertices: List[Tuple[fl
     <script>
     (function() {{
         const vizId = '{viz_id}';
-        const containerVertices = {container_data};
-        const placementsData = {placements_data};
+        {payload_loader_js}
         const edgeLengthData = {edge_length};
         
         let scene, camera, renderer, animationId, sceneCenter;
         let isActive = false;
         
-        function activate() {{
+        async function activate() {{
             if (isActive) return;
             isActive = true;
             
@@ -733,6 +834,18 @@ def generate_threejs_tetrahedron_visualization(container_vertices: List[Tuple[fl
             // Clear placeholder
             const placeholder = container.querySelector('.viz-placeholder');
             if (placeholder) placeholder.style.display = 'none';
+            let payload;
+            try {{
+                payload = await loadPayload();
+            }} catch (err) {{
+                console.warn('Visualization payload failed to load:', err);
+                if (placeholder) placeholder.textContent = 'Visualization data failed to load';
+                isActive = false;
+                return;
+            }}
+            if (!isActive) return;
+            const containerVertices = payload.containerVertices;
+            const placementsData = payload.placementsData;
             
             // Scene setup
             scene = new THREE.Scene();
@@ -1421,8 +1534,10 @@ def generate_threejs_flight_path(path_points,
     return ""
 
   viz_id = str(uuid.uuid4())[:8]
-  pts_json = json.dumps(path_points)
-  rwy_json = json.dumps(runway) if runway else "null"
+  payload_loader_js = _build_viz_payload_loader(viz_id, {
+    'rawPts': path_points,
+    'runwayData': runway,
+  })
   n_pts = len(path_points)
 
   html = f"""
@@ -1470,13 +1585,14 @@ def generate_threejs_flight_path(path_points,
     <script>
     (function() {{
         const vizId = 'fp_{viz_id}';
-        const rawPts = {pts_json};
-        const runwayData = {rwy_json};
+        {payload_loader_js}
+        let rawPts = null;
+        let runwayData = null;
 
         let scene, camera, renderer, controls, animationId;
         let isActive = false;
 
-        function activate() {{
+        async function activate() {{
             if (isActive) return;
             isActive = true;
             if (typeof THREE === 'undefined') return;
@@ -1484,6 +1600,18 @@ def generate_threejs_flight_path(path_points,
             if (!container) return;
             const ph = container.querySelector('.viz-placeholder');
             if (ph) ph.style.display = 'none';
+            let payload;
+            try {{
+                payload = await loadPayload();
+            }} catch (err) {{
+                console.warn('Visualization payload failed to load:', err);
+                if (ph) ph.textContent = 'Visualization data failed to load';
+                isActive = false;
+                return;
+            }}
+            if (!isActive) return;
+            rawPts = payload.rawPts || [];
+            runwayData = payload.runwayData || null;
 
             let minX=Infinity,minY=Infinity,minZ=Infinity;
             let maxX=-Infinity,maxY=-Infinity,maxZ=-Infinity;
@@ -1700,8 +1828,10 @@ def generate_threejs_car_path(path_points,
     return ""
 
   viz_id = str(uuid.uuid4())[:8]
-  pts_json = json.dumps(path_points)
-  obs_json = json.dumps(obstacles or [])
+  payload_loader_js = _build_viz_payload_loader(viz_id, {
+    'rawPts': path_points,
+    'obstaclesData': obstacles or [],
+  })
   n_pts = len(path_points)
 
   html = f"""
@@ -1750,8 +1880,9 @@ def generate_threejs_car_path(path_points,
     <script>
     (function() {{
         const vizId = 'cp_{viz_id}';
-        const rawPts = {pts_json};
-        const obstaclesData = {obs_json};
+        {payload_loader_js}
+        let rawPts = [];
+        let obstaclesData = [];
         const roadWidth = {road_width};
         const laneWidth = {lane_width};
         const numLanes = {num_lanes};
@@ -1759,7 +1890,7 @@ def generate_threejs_car_path(path_points,
         let scene, camera, renderer, controls, animationId;
         let isActive = false;
 
-        function activate() {{
+        async function activate() {{
             if (isActive) return;
             isActive = true;
             if (typeof THREE === 'undefined') return;
@@ -1767,6 +1898,18 @@ def generate_threejs_car_path(path_points,
             if (!container) return;
             const ph = container.querySelector('.viz-placeholder');
             if (ph) ph.style.display = 'none';
+            let payload;
+            try {{
+                payload = await loadPayload();
+            }} catch (err) {{
+                console.warn('Visualization payload failed to load:', err);
+                if (ph) ph.textContent = 'Visualization data failed to load';
+                isActive = false;
+                return;
+            }}
+            if (!isActive) return;
+            rawPts = payload.rawPts || [];
+            obstaclesData = payload.obstaclesData || [];
 
             /* bounding box of car path */
             let minX = Infinity, maxX = -Infinity;
@@ -2029,7 +2172,7 @@ def generate_threejs_docking_viz(path_points,
     return ""
 
   viz_id = str(uuid.uuid4())[:8]
-  pts_json = json.dumps(path_points)
+  payload_loader_js = _build_viz_payload_loader(viz_id, {'rawPts': path_points})
   n_pts = len(path_points)
   outcome = "DOCKED" if docked else ("CRASH: " + crash_reason if crashed else "timeout")
   outcome_color = "#22cc22" if docked else ("#cc2222" if crashed else "#cc8800")
@@ -2081,7 +2224,8 @@ def generate_threejs_docking_viz(path_points,
     <script>
     (function() {{
         const vizId = 'dk_{viz_id}';
-        const rawPts = {pts_json};
+        {payload_loader_js}
+        let rawPts = [];
         const didDock = {'true' if docked else 'false'};
         const didCrash = {'true' if crashed else 'false'};
 
@@ -2189,7 +2333,7 @@ def generate_threejs_docking_viz(path_points,
             return station;
         }}
 
-        function activate() {{
+        async function activate() {{
             if (isActive) return;
             isActive = true;
             if (typeof THREE === 'undefined') return;
@@ -2197,6 +2341,17 @@ def generate_threejs_docking_viz(path_points,
             if (!container) return;
             const ph = container.querySelector('.viz-placeholder');
             if (ph) ph.style.display = 'none';
+            let payload;
+            try {{
+                payload = await loadPayload();
+            }} catch (err) {{
+                console.warn('Visualization payload failed to load:', err);
+                if (ph) ph.textContent = 'Visualization data failed to load';
+                isActive = false;
+                return;
+            }}
+            if (!isActive) return;
+            rawPts = payload.rawPts || [];
 
             /* Coordinate mapping: LVLH [x_rad, y_along, z_cross]
                → three.js: X = y_along, Y = x_rad (up), Z = z_cross */
@@ -2421,18 +2576,10 @@ def generate_threejs_docking_viz(path_points,
   return html
 
 
-def generate_threejs_boid_visualization(initial_boids: List,
-                                        gpu_frames: List,
-                                        ref_frames: List,
-                                        gpu_final: List,
-                                        ref_final: List,
-                                        n_total: int,
-                                        n_shown: int,
-                                        timesteps: int,
-                                        dt: float,
-                                        pos_tol: float,
-                                        score: float,
-                                        bound_size: float) -> str:
+def generate_threejs_boid_visualization(initial_boids: List, gpu_frames: List, ref_frames: List,
+                                        gpu_final: List, ref_final: List, n_total: int,
+                                        n_shown: int, timesteps: int, dt: float, pos_tol: float,
+                                        score: float, bound_size: float) -> str:
   """
   Generate HTML/JS for 3D boid flocking visualization with playback controls.
   Shows both GPU (orange) and CPU reference (cyan) boids for comparison.
@@ -2453,10 +2600,12 @@ def generate_threejs_boid_visualization(initial_boids: List,
   """
   viz_id = str(uuid.uuid4())[:8]
 
-  gpu_frames_json = json.dumps(gpu_frames)
-  ref_frames_json = json.dumps(ref_frames)
-  gpu_final_json = json.dumps(gpu_final)
-  ref_final_json = json.dumps(ref_final)
+  payload_loader_js = _build_viz_payload_loader(viz_id, {
+    'gpuFrames': gpu_frames,
+    'refFrames': ref_frames,
+    'gpuFinal': gpu_final,
+    'refFinal': ref_final,
+  })
   num_frames = max(len(gpu_frames), len(ref_frames))
 
   score_color = "#22c55e" if score >= 0.8 else "#eab308" if score >= 0.3 else "#ef4444"
@@ -2509,13 +2658,14 @@ def generate_threejs_boid_visualization(initial_boids: List,
   <script>
   (function() {{
     var vizId = '{viz_id}';
-    var gpuFrames = {gpu_frames_json};
-    var refFrames = {ref_frames_json};
-    var gpuFinal = {gpu_final_json};
-    var refFinal = {ref_final_json};
+    {payload_loader_js}
+    var gpuFrames = [];
+    var refFrames = [];
+    var gpuFinal = [];
+    var refFinal = [];
     var boundSize = {bound_size};
     var nShown = {n_shown};
-    var totalFrames = Math.max(gpuFrames.length, refFrames.length);
+    var totalFrames = 0;
 
     var scene, camera, renderer, controls, animationId;
     var isActive = false;
@@ -2572,7 +2722,7 @@ def generate_threejs_boid_visualization(initial_boids: List,
       if (label) label.textContent = 'Frame ' + (currentFrame + 1) + '/' + totalFrames;
     }}
 
-    function activate() {{
+    async function activate() {{
       if (isActive) return;
       isActive = true;
       if (typeof THREE === 'undefined') return;
@@ -2583,6 +2733,22 @@ def generate_threejs_boid_visualization(initial_boids: List,
       if (ph) ph.style.display = 'none';
       var ctrlDiv = document.getElementById('boid-controls-' + vizId);
       if (ctrlDiv) ctrlDiv.style.display = 'block';
+      var payload;
+      try {{
+        payload = await loadPayload();
+      }} catch (err) {{
+        console.warn('Visualization payload failed to load:', err);
+        if (ph) ph.textContent = 'Visualization data failed to load';
+        if (ctrlDiv) ctrlDiv.style.display = 'none';
+        isActive = false;
+        return;
+      }}
+      if (!isActive) return;
+      gpuFrames = payload.gpuFrames || [];
+      refFrames = payload.refFrames || [];
+      gpuFinal = payload.gpuFinal || [];
+      refFinal = payload.refFinal || [];
+      totalFrames = Math.max(gpuFrames.length, refFrames.length, 1);
 
       scene = new THREE.Scene();
       scene.background = new THREE.Color(0x111827);
@@ -2733,4 +2899,3 @@ def generate_threejs_boid_visualization(initial_boids: List,
   </script>
   """
   return html
-

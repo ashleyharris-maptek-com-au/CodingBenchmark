@@ -1,1 +1,608 @@
-{'__exception__': "Can't run here - we're trying to get this working in codex."}
+Below is a single-file Python implementation of autopilot_step that meets the requirements. It uses module-level persistent state for filtering and PID control, fuses redundant sensors, handles flicker/graceful degradation, performs lane keeping, speed control with traction-awareness, and basic obstacle avoidance/lane change logic.
+
+```python
+# Autopilot module-level persistent state
+_persist = {}
+
+def _init_persist():
+    global _persist
+    if _persist:
+        return
+    _persist = {
+        # simple EMAs and counters for sensors
+        "wheel_speeds_ema": [0.0, 0.0, 0.0, 0.0],  # m/s
+        "wheel_speeds_count": [0, 0, 0, 0],
+        "gps_speed_ema": 0.0,
+        "yaw_rate_ema_dps": 0.0,
+        "lane_offset_ema": 0.0,
+        "lane_offset_count": 0,
+        "obstacle_distance_ema": None,
+        "obstacle_detected_counter": 0,
+        # PID controllers
+        "steer_pid": {"Kp": 0.8, "Ki": 0.001, "Kd": 0.2, "i": 0.0, "prev_err": 0.0},
+        "speed_pid": {"Kp": 0.6, "Ki": 0.02, "Kd": 0.04, "i": 0.0, "prev_err": 0.0},
+        # last outputs (for maintaining if omitted)
+        "last_outputs": {"steering": 0.0, "throttle": 0.0, "brake": 0.0},
+        # reliability stats (simple)
+        "vision_reliability": [0.5, 0.5, 0.5],
+        "gyro_reliability": [0.8, 0.8, 0.8],
+        "wheel_reliability": [0.9, 0.9, 0.9, 0.9],
+        # lane change state
+        "lane_change": {"active": False, "start_time": 0.0, "target_lane": None},
+        # simulation time seen
+        "last_time": 0.0,
+    }
+
+# Helpers
+def _clamp(x, a, b):
+    return max(a, min(b, x))
+
+def _median(vals):
+    vals = sorted(vals)
+    n = len(vals)
+    if n == 0:
+        return None
+    mid = n // 2
+    if n % 2 == 1:
+        return vals[mid]
+    else:
+        return 0.5 * (vals[mid-1] + vals[mid])
+
+def _kmh_to_ms(v_kmh):
+    return v_kmh / 3.6
+
+def _ms_to_kmh(v_ms):
+    return v_ms * 3.6
+
+def _safe_get(state, key, default=None):
+    return state.get(key, default)
+
+def autopilot_step(state: dict, dt: float) -> dict:
+    """
+    Returns dict with keys: steering (-1..1), throttle (0..1), brake (0..1)
+    """
+
+    _init_persist()
+    p = _persist
+
+    if dt <= 0:
+        # fall back to small dt
+        dt = 0.05
+
+    # Update sim time
+    sim_time = state.get("sim_time_s", p["last_time"] + dt)
+    p["last_time"] = sim_time
+
+    # Constants
+    g = 9.81
+    lane_width = 3.5  # typical lane width (m)
+    max_steer_deg_for_norm = 30.0  # assume this maps to steering=±1
+    max_throttle = 1.0
+    max_brake = 1.0
+
+    # ---------- SENSOR FUSION ----------
+    # Wheel speeds (4 sensors)
+    wheel_keys = [("wheel_speed_fl_kmh","wheel_speed_fl_valid"),
+                  ("wheel_speed_fr_kmh","wheel_speed_fr_valid"),
+                  ("wheel_speed_rl_kmh","wheel_speed_rl_valid"),
+                  ("wheel_speed_rr_kmh","wheel_speed_rr_valid")]
+    wheel_speeds = []
+    for i, (k_speed, k_valid) in enumerate(wheel_keys):
+        v_kmh = _safe_get(state, k_speed, 0.0)
+        valid = bool(_safe_get(state, k_valid, False))
+        v_ms = _kmh_to_ms(v_kmh) if v_kmh is not None else 0.0
+        # If invalid, still consider if close to EMA (handles wrong valid flags)
+        ema = p["wheel_speeds_ema"][i]
+        if valid:
+            # update EMA
+            alpha = 0.4
+            if ema == 0.0 and p["wheel_speeds_count"][i] == 0:
+                p["wheel_speeds_ema"][i] = v_ms
+            else:
+                p["wheel_speeds_ema"][i] = alpha * v_ms + (1 - alpha) * ema
+            p["wheel_speeds_count"][i] += 1
+            wheel_speeds.append(p["wheel_speeds_ema"][i])
+            p["wheel_reliability"][i] = _clamp(p["wheel_reliability"][i] + 0.01, 0.1, 1.0)
+        else:
+            # if invalid but EMA exists, use EMA as fallback
+            if p["wheel_speeds_count"][i] > 0:
+                wheel_speeds.append(p["wheel_speeds_ema"][i])
+                # degrade reliability slowly
+                p["wheel_reliability"][i] = _clamp(p["wheel_reliability"][i] - 0.03, 0.0, 1.0)
+            else:
+                # no data
+                p["wheel_reliability"][i] = _clamp(p["wheel_reliability"][i] - 0.05, 0.0, 1.0)
+
+    # GPS speeds (2)
+    gps_speeds = []
+    for i in [1,2]:
+        key_v = f"gps_{i}_speed_kmh"
+        key_valid = f"gps_{i}_valid"
+        v_kmh = _safe_get(state, key_v, None)
+        valid = bool(_safe_get(state, key_valid, False))
+        if v_kmh is not None and valid:
+            v_ms = _kmh_to_ms(v_kmh)
+            alpha = 0.3
+            p["gps_speed_ema"] = alpha * v_ms + (1-alpha) * p["gps_speed_ema"]
+            gps_speeds.append(p["gps_speed_ema"])
+        elif v_kmh is not None:
+            # still accept occasionally but lower confidence
+            v_ms = _kmh_to_ms(v_kmh)
+            gps_speeds.append(v_ms)
+
+    # Vehicle speed direct sensors (2 keys)
+    v_directs = []
+    for i in [1,2]:
+        v_kmh = _safe_get(state, f"vehicle_speed_{i}_kmh", None)
+        if v_kmh is not None:
+            v_directs.append(_kmh_to_ms(v_kmh))
+
+    # Fuse speed: prefer median of all available trustworthy sources
+    speed_candidates = wheel_speeds + gps_speeds + v_directs
+    if len(speed_candidates) == 0:
+        v_veh = 0.0
+    else:
+        # median is robust to outliers
+        v_veh = _median(speed_candidates)
+        if v_veh is None:
+            v_veh = 0.0
+
+    # Gyroscopes yaw rate (dps)
+    gyro_vals = []
+    for i in [1,2,3]:
+        key_val = f"gyro_{i}_yaw_rate_dps"
+        key_valid = f"gyro_{i}_valid"
+        valid = bool(_safe_get(state, key_valid, False))
+        val = _safe_get(state, key_val, 0.0)
+        if valid:
+            gyro_vals.append(val)
+            p["gyro_reliability"][i-1] = _clamp(p["gyro_reliability"][i-1] + 0.01, 0.0, 1.0)
+        else:
+            # if invalid but close to EMA, consider
+            gyro_vals.append(val)  # include anyway; reliabilities will adapt
+            p["gyro_reliability"][i-1] = _clamp(p["gyro_reliability"][i-1] - 0.02, 0.0, 1.0)
+    # median yaw rate
+    if len(gyro_vals) > 0:
+        yaw_rate_dps = _median(gyro_vals)
+    else:
+        yaw_rate_dps = 0.0
+    # EMA yaw
+    alpha_yaw = 0.3
+    p["yaw_rate_ema_dps"] = alpha_yaw * yaw_rate_dps + (1-alpha_yaw) * p["yaw_rate_ema_dps"]
+
+    # Accelerometers lateral to support lane centering fallback
+    acc_lats = []
+    acc_long = []
+    for i in [1,2,3]:
+        key_valid = f"accel_{i}_valid"
+        valid = bool(_safe_get(state, key_valid, False))
+        if valid:
+            acc_lats.append(_safe_get(state, f"accel_{i}_lateral_ms2", 0.0))
+            acc_long.append(_safe_get(state, f"accel_{i}_longitudinal_ms2", 0.0))
+    avg_acc_lat = _median(acc_lats) if acc_lats else 0.0
+    avg_acc_long = _median(acc_long) if acc_long else 0.0
+
+    # Vision lane offsets and lines (3 systems)
+    lane_offsets = []
+    left_line_dists = []
+    right_line_dists = []
+    speed_limits = []
+    vision_obstacles = []
+    vision_valid_counts = 0
+    for i in [1,2,3]:
+        voff = _safe_get(state, f"vision_{i}_lane_offset_m", None)
+        vleft_valid = bool(_safe_get(state, f"vision_{i}_left_line_valid", False))
+        vright_valid = bool(_safe_get(state, f"vision_{i}_right_line_valid", False))
+        v_speed_limit_valid = bool(_safe_get(state, f"vision_{i}_speed_limit_valid", False))
+        if voff is not None and (vleft_valid or vright_valid or True):
+            # There's some vision info
+            lane_offsets.append(voff)
+            p["vision_reliability"][i-1] = _clamp(p["vision_reliability"][i-1] + 0.01, 0.0, 1.0)
+            vision_valid_counts += 1
+        else:
+            p["vision_reliability"][i-1] = _clamp(p["vision_reliability"][i-1] - 0.03, 0.0, 1.0)
+        # line distances
+        ld = _safe_get(state, f"vision_{i}_left_line_dist_m", None)
+        rd = _safe_get(state, f"vision_{i}_right_line_dist_m", None)
+        if ld is not None:
+            left_line_dists.append(ld)
+        if rd is not None:
+            right_line_dists.append(rd)
+        # speed limit
+        if v_speed_limit_valid:
+            sl = _safe_get(state, f"vision_{i}_speed_limit_kmh", None)
+            if sl is not None:
+                speed_limits.append(sl)
+        # obstacle
+        obst_valid = bool(_safe_get(state, f"vision_{i}_obstacle_valid", False))
+        obst_detected = bool(_safe_get(state, f"vision_{i}_obstacle_detected", False))
+        if obst_valid and obst_detected:
+            d = _safe_get(state, f"vision_{i}_obstacle_dist_m", None)
+            rel_spd_kmh = _safe_get(state, f"vision_{i}_obstacle_rel_speed_kmh", 0.0)
+            rel_spd_ms = _kmh_to_ms(rel_spd_kmh) if rel_spd_kmh is not None else 0.0
+            if d is not None:
+                vision_obstacles.append((d, rel_spd_ms, i))
+                # update obstacle EMA
+                if p["obstacle_distance_ema"] is None:
+                    p["obstacle_distance_ema"] = d
+                else:
+                    p["obstacle_distance_ema"] = 0.4 * d + 0.6 * p["obstacle_distance_ema"]
+                p["obstacle_detected_counter"] = p["obstacle_detected_counter"] + 1
+        else:
+            # decay obstacle counters
+            p["obstacle_detected_counter"] = max(0, p["obstacle_detected_counter"] - 1)
+
+    # Lidar beams: gather a dict angle->range
+    lidar_angles = ["+005","+015","+030","+045","+060","+090","-005","-015","-030","-045","-060","-090"]
+    lidar_ranges = {}
+    for a in lidar_angles:
+        key_r = f"lidar_{a}_deg_range_m"
+        key_v = f"lidar_{a}_deg_valid"
+        valid = bool(_safe_get(state, key_v, False))
+        r = _safe_get(state, key_r, None)
+        if valid and r is not None:
+            lidar_ranges[a] = r
+        elif r is not None:
+            # include even if invalid marker because flags can be wrong
+            lidar_ranges[a] = r
+
+    # Determine forward obstacle using lidar in forward sector (~ ±20 deg)
+    forward_beams = ["+005","+015","-005","-015"]
+    lidar_forward_ranges = [lidar_ranges[a] for a in forward_beams if a in lidar_ranges and lidar_ranges[a] is not None]
+    lidar_forward_min = min(lidar_forward_ranges) if lidar_forward_ranges else None
+
+    # Combine vision and lidar obstacles to single forward obstacle estimate
+    forward_obstacle_dist = None
+    forward_obstacle_rel_speed = 0.0
+    obstacle_source = None
+    # Use closest reliable obstacle
+    obst_candidates = []
+    for d, rel, idx in vision_obstacles:
+        if d is not None:
+            obst_candidates.append(("vision", d, rel))
+    if lidar_forward_min is not None:
+        obst_candidates.append(("lidar", lidar_forward_min, 0.0))
+    if obst_candidates:
+        obst_candidates.sort(key=lambda x: x[1])
+        forward_obstacle_dist = obst_candidates[0][1]
+        forward_obstacle_rel_speed = obst_candidates[0][2]
+        obstacle_source = obst_candidates[0][0]
+        # popularity filter
+        if p["obstacle_distance_ema"] is None:
+            p["obstacle_distance_ema"] = forward_obstacle_dist
+        else:
+            p["obstacle_distance_ema"] = 0.4 * forward_obstacle_dist + 0.6 * p["obstacle_distance_ema"]
+
+    # Lane center estimation: prefer vision median of lane_offsets
+    lane_offset = None
+    if lane_offsets:
+        lane_offset = _median(lane_offsets)
+        # update EMA
+        alpha_l = 0.3
+        if p["lane_offset_count"] == 0:
+            p["lane_offset_ema"] = lane_offset
+        else:
+            p["lane_offset_ema"] = alpha_l * lane_offset + (1-alpha_l) * p["lane_offset_ema"]
+        p["lane_offset_count"] += 1
+    else:
+        # fallback to lines distances if available
+        if left_line_dists and right_line_dists:
+            # if both sides present, center is average offset between them: assume vehicle at center between left and right
+            left = _median(left_line_dists)
+            right = _median(right_line_dists)
+            # if left and right are distances to lines from vehicle center, lane offset ~ (right-left)/2
+            lane_offset_est = 0.5 * ((left if left is not None else 0.0) - (right if right is not None else 0.0))
+            lane_offset = lane_offset_est
+            p["lane_offset_ema"] = 0.4 * lane_offset + 0.6 * p["lane_offset_ema"]
+        else:
+            # fallback to EMA
+            lane_offset = p["lane_offset_ema"]
+
+    if lane_offset is None:
+        lane_offset = 0.0
+
+    # Steering angle sensors (2)
+    steer_angles = []
+    for i in [1,2]:
+        key_v = f"steering_angle_{i}_deg"
+        key_valid = f"steering_angle_{i}_valid"
+        valid = bool(_safe_get(state, key_valid, False))
+        val = _safe_get(state, key_v, None)
+        if val is not None:
+            steer_angles.append(val)
+            # could use for calibration but not required here
+
+    # Brake pressure sensors
+    brake_pressures = []
+    for i in [1,2]:
+        key_v = f"brake_pressure_{i}_pct"
+        key_valid = f"brake_pressure_{i}_valid"
+        val = _safe_get(state, key_v, 0.0)
+        valid = bool(_safe_get(state, key_valid, False))
+        if valid:
+            brake_pressures.append(val)
+    # if both invalids, we can't rely on brake sensor; but we still command actuators
+
+    # Traction
+    mu = _safe_get(state, "estimated_mu", 1.0)
+    if mu is None:
+        mu = 1.0
+    mu = float(mu)
+    # scale factors for traction: lower mu => softer throttle/brake and reduced speed target
+    traction_scale = _clamp(mu, 0.05, 1.0)
+    # If very low mu, more conservative limits
+    if mu < 0.3:
+        conservative = True
+    else:
+        conservative = False
+
+    # Targets
+    target_speed_kmh = _safe_get(state, "target_speed_kmh", None)
+    if target_speed_kmh is None:
+        # fallback to speed limit or current speed
+        target_speed_kmh = _ms_to_kmh(v_veh)  # maintain current speed
+
+    target_speed_ms = _kmh_to_ms(target_speed_kmh)
+    # speed limits from vision
+    if speed_limits:
+        # choose most conservative (min)
+        speed_limit_kmh = min(speed_limits)
+        # only respect if reliable (we'll be cautious)
+        if speed_limit_kmh is not None:
+            target_speed_ms = min(target_speed_ms, _kmh_to_ms(speed_limit_kmh))
+
+    # adjust target for traction
+    target_speed_ms = target_speed_ms * (0.9 + 0.1 * traction_scale)  # slightly reduce on low mu
+
+    # Lane info
+    current_lane = _safe_get(state, "current_lane", 1)
+    desired_lane = _safe_get(state, "target_lane", current_lane)
+    # lane change request
+    lane_change_requested = (desired_lane != current_lane)
+
+    # ---------- DECISION MAKING: Obstacle handling ----------
+    # Determine stopping distance with conservative deceleration estimate
+    # decel capability depends on mu; assume max decel = mu * g * 0.8 (brakes not perfect)
+    max_decel = traction_scale * g * 0.8  # m/s^2
+    if max_decel < 0.5:
+        max_decel = 0.5
+    # stopping distance = v^2 / (2*a)
+    stopping_distance = (v_veh * v_veh) / (2.0 * max_decel + 1e-6)
+    obstacle_alert = False
+    emergency_brake = False
+    brake_strength = 0.0
+
+    if forward_obstacle_dist is not None:
+        # use a safety factor
+        safety_margin = 1.2 if not conservative else 1.5
+        if forward_obstacle_dist < stopping_distance * safety_margin + 2.0:
+            obstacle_alert = True
+        # if within very close threshold => emergency
+        if forward_obstacle_dist < max(5.0, 0.5 * v_veh + 1.0):
+            emergency_brake = True
+
+    # Also consider vision obstacle relative speed: approaching obstacle faster than it -> more urgent
+    if vision_obstacles and not emergency_brake:
+        # pick closest vision obstacle
+        closest = sorted(vision_obstacles, key=lambda x: x[0])[0]
+        d, rel_ms, idx = closest
+        # if rel_ms negative (we closing) and TTC small -> urgent
+        rel = rel_ms
+        if rel < -0.5:
+            ttc = d / max(-rel, 0.1)
+            if ttc < 3.0:
+                obstacle_alert = True
+                if ttc < 1.2:
+                    emergency_brake = True
+
+    # ---------- LANE CHANGE SAFETY CHECK ----------
+    can_change_left = True
+    can_change_right = True
+    # Determine lanes: assume lanes numbered left(0), mid(1), right(2)
+    dir_left = -1
+    dir_right = +1
+    # Check adjacent lane clear using lidar side beams and forward beams for that side
+    # Simple check: if any lidar beam on the side (±30, ±45) is less than threshold, it's occupied
+    side_threshold_close = max(15.0, v_veh*1.5 + 5.0)  # require further distance when faster
+    # left side beams: +030, +045, +060 (positive angles are to right; careful: given names include both signs)
+    # For our beam naming convention, positive angles are to the right. So left side beams are negative angles.
+    left_side_beams = ["-030","-045","-060","-090"]
+    right_side_beams = ["+030","+045","+060","+090"]
+    for a in left_side_beams:
+        if a in lidar_ranges and lidar_ranges[a] < side_threshold_close:
+            can_change_left = False
+    for a in right_side_beams:
+        if a in lidar_ranges and lidar_ranges[a] < side_threshold_close:
+            can_change_right = False
+
+    # Also check forward obstacle is in the target lane: if obstacle exists and adjacent lane does not, we may change
+    lane_change_candidate = False
+    lane_change_direction = 0
+    if lane_change_requested and not p["lane_change"]["active"]:
+        # decide direction
+        dir_needed = _clamp(desired_lane - current_lane, -1, 1)
+        if dir_needed < 0 and can_change_left:
+            lane_change_candidate = True
+            lane_change_direction = -1
+        elif dir_needed > 0 and can_change_right:
+            lane_change_candidate = True
+            lane_change_direction = +1
+    elif p["lane_change"]["active"]:
+        # continue active lane change until duration
+        lane_change_candidate = True
+        lane_change_direction = -1 if p["lane_change"]["target_lane"] < current_lane else 1
+
+    # Initiate lane change if obstacle alert and safe and different lane available
+    if obstacle_alert and lane_change_candidate and forward_obstacle_dist is not None and forward_obstacle_dist < 50.0:
+        # start lane change
+        if not p["lane_change"]["active"]:
+            p["lane_change"]["active"] = True
+            p["lane_change"]["start_time"] = sim_time
+            p["lane_change"]["target_lane"] = current_lane + lane_change_direction
+    # Ensure lane_change remains within bounds
+    if p["lane_change"]["active"]:
+        # If target lane is None (shouldn't), cancel
+        if p["lane_change"]["target_lane"] is None:
+            p["lane_change"]["active"] = False
+        else:
+            # simple timeout or complete when offset achieved
+            elapsed = sim_time - p["lane_change"]["start_time"]
+            # expected lane change takes about 3s
+            if elapsed > 5.0:
+                # abort
+                p["lane_change"]["active"] = False
+
+    # Determine lateral target offset: center of target lane
+    # Assume lane centers at lanes: -lane_width, 0, +lane_width relative to current lane? But current lane may not be centered to world.
+    # We'll treat lane_offset as vehicle lateral offset from current lane center (positive right). To change lane, set offset goal to +/- lane_width.
+    lateral_target = 0.0
+    if p["lane_change"]["active"]:
+        # If target lane > current_lane -> move right
+        delta_lane = p["lane_change"]["target_lane"] - current_lane
+        lateral_target = delta_lane * lane_width
+    else:
+        lateral_target = 0.0  # stay centered
+
+    # Combine lane_offset (vehicle offset from current lane center) and lateral_target -> error
+    lateral_error = lane_offset - lateral_target  # positive means vehicle is right of desired -> steer left
+    # heading contribution: use yaw_rate to damp/anticipate
+    yaw_rate = p["yaw_rate_ema_dps"]  # deg/s
+    # Convert yaw_rate to degrees per second to steering correction
+    heading_error_term = 0.02 * yaw_rate  # tuned factor
+
+    # ---------- CONTROL: Steering (PID) ----------
+    steer_pid = p["steer_pid"]
+    # Compute error for PID: lateral_error + heading_error_term (we want error in meters, heading term converts to meter-equivalent)
+    # Convert heading term to equivalent lateral offset at some lookahead distance L
+    lookahead = max(5.0, 1.5 * _clamp(v_veh, 0.5, 30.0))  # meters
+    heading_equiv = (yaw_rate * (3.14159/180.0)) * lookahead  # yaw_rate rad/s * lookahead = lateral rate approx
+    pid_err = lateral_error + heading_equiv * 0.5
+
+    # PID integrator anti-windup
+    steer_pid["i"] += pid_err * steer_pid["Ki"] * dt
+    steer_pid["i"] = _clamp(steer_pid["i"], -2.0, 2.0)
+    steer_der = (pid_err - steer_pid["prev_err"]) / dt if dt > 0 else 0.0
+    steer_pid_output_deg = steer_pid["Kp"] * pid_err + steer_pid["i"] + steer_pid["Kd"] * steer_der
+    steer_pid["prev_err"] = pid_err
+
+    # Map deg-ish output to normalized steering (-1..1)
+    # We treat steer_pid_output_deg as a commanded steering angle in degrees roughly. Clamp
+    steering_norm = _clamp(steer_pid_output_deg / max_steer_deg_for_norm, -1.0, 1.0)
+
+    # If low traction, reduce steering aggressiveness (smooth)
+    if mu < 0.4:
+        steering_norm *= (0.6 + 0.4 * traction_scale)
+
+    # If emergency brake active, prioritize straightening steering to maximize braking stability
+    if emergency_brake:
+        steering_norm = 0.0
+
+    # Integrate lane change steering bias: during active lane change, add lateral yaw to guide change
+    if p["lane_change"]["active"]:
+        # add a deliberate steer in direction of lane change
+        desired_delta = p["lane_change"]["target_lane"] - current_lane
+        steer_bias = 0.5 * _clamp(desired_delta, -1, 1)  # moderate bias
+        # ramp based on elapsed time
+        elapsed = sim_time - p["lane_change"]["start_time"]
+        ramp = _clamp(elapsed / 1.5, 0.0, 1.0)
+        steering_norm += steer_bias * ramp
+        steering_norm = _clamp(steering_norm, -1.0, 1.0)
+
+    # ---------- CONTROL: Speed (Throttle / Brake PID) ----------
+    speed_pid = p["speed_pid"]
+    speed_err = target_speed_ms - v_veh
+    # If obstacle ahead and within stopping distance, reduce target speed drastically
+    if forward_obstacle_dist is not None:
+        # compute safe speed to avoid collision: v_safe = sqrt(2 * max_decel * d)
+        if forward_obstacle_dist > 0.5:
+            v_safe = min(target_speed_ms, (2.0 * max_decel * forward_obstacle_dist) ** 0.5)
+            # be conservative and also factor relative speed
+            v_safe = min(v_safe, target_speed_ms)
+            if emergency_brake:
+                v_safe = 0.0
+            # make the desired speed obey safe speed
+            if v_safe < target_speed_ms:
+                # reduce desired speed to safe
+                target_speed_ms = v_safe * 0.9
+                speed_err = target_speed_ms - v_veh
+
+    # PID
+    speed_pid["i"] += speed_err * speed_pid["Ki"] * dt
+    speed_pid["i"] = _clamp(speed_pid["i"], -5.0, 5.0)
+    speed_der = (speed_err - speed_pid["prev_err"]) / dt if dt > 0 else 0.0
+    speed_pid_out = speed_pid["Kp"] * speed_err + speed_pid["i"] + speed_pid["Kd"] * speed_der
+    speed_pid["prev_err"] = speed_err
+
+    throttle_cmd = 0.0
+    brake_cmd = 0.0
+
+    if speed_err > 0.2:
+        # need throttle
+        throttle_cmd = _clamp(speed_pid_out, 0.0, max_throttle)
+        # scale throttle down by traction
+        throttle_cmd *= (0.6 + 0.4 * traction_scale)
+        # small brake fallback
+        brake_cmd = 0.0
+    else:
+        # need braking or maintain
+        # If error mild (~<0.2 m/s), coast
+        if speed_err > -0.3:
+            throttle_cmd = 0.0
+            brake_cmd = 0.0
+        else:
+            # request brake proportional to negative error and PID
+            raw_brake = _clamp(-speed_pid_out, 0.0, max_brake)
+            # limit deceleration by traction scale
+            brake_cmd = raw_brake * (0.5 + 0.5 * traction_scale)
+            throttle_cmd = 0.0
+
+    # Emergency brake override
+    if emergency_brake:
+        throttle_cmd = 0.0
+        # If traction extremely low, brake gently to avoid lock; else strong brake
+        if mu < 0.25:
+            brake_cmd = 0.6
+        else:
+            brake_cmd = 1.0
+
+    # If obstacle alert but lane change in progress and completed, reduce brake to allow lane change
+    if obstacle_alert and p["lane_change"]["active"]:
+        # moderate braking to slow but allow maneuver
+        brake_cmd = max(brake_cmd, 0.2)
+        throttle_cmd = 0.0
+
+    # Traction-based minimums: on low mu limit deceleration rate by smoothing brake command
+    if mu < 0.4:
+        # reduce instantaneous brake
+        brake_cmd = brake_cmd * (0.4 + 0.6 * traction_scale)
+        throttle_cmd = throttle_cmd * (0.4 + 0.6 * traction_scale)
+
+    # Handle throttle stuck / brake failure or sensor faults not directly detectable: if last outputs unchanged and sensors indicate not moving
+    # (This area intentionally conservative: if brake pressure sensors show high pressure but vehicle still moving, reduce throttle if any stuck)
+    if brake_pressures:
+        # if brake pressure is high but vehicle speed not reducing, consider brake failure but we cannot fix actuators; instead cut throttle
+        avg_brake_pct = sum(brake_pressures)/len(brake_pressures)
+        if avg_brake_pct > 70 and v_veh > 1.0:
+            throttle_cmd = 0.0
+            # increase brake command to max to try harder
+            brake_cmd = max(brake_cmd, 0.9)
+
+    # Final saturations
+    steering_norm = _clamp(steering_norm, -1.0, 1.0)
+    throttle_cmd = _clamp(throttle_cmd, 0.0, 1.0)
+    brake_cmd = _clamp(brake_cmd, 0.0, 1.0)
+
+    # Update last outputs
+    p["last_outputs"]["steering"] = steering_norm
+    p["last_outputs"]["throttle"] = throttle_cmd
+    p["last_outputs"]["brake"] = brake_cmd
+
+    return {"steering": steering_norm, "throttle": throttle_cmd, "brake": brake_cmd}
+```
+
+Notes:
+- The implementation uses median/voting for redundant sensors, EMAs to smooth flicker, simple PID controllers for steering and speed, and heuristics for obstacle detection and lane-change safety using vision and lidar.
+- Traction (estimated_mu) reduces aggressiveness and lowers target speed.
+- Graceful degradation: when sensors are missing or flagged invalid, EMAs and fallback sensors are used.
+- Lane-change logic is conservative: it only starts if adjacent lane lidar beams are clear and an obstacle ahead justifies it.
+- Tunable gains and thresholds are in the persistent state and constants; they can be tuned for your simulator.

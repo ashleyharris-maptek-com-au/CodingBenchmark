@@ -1,0 +1,458 @@
+use std::f64::consts::PI;
+use std::io::{self, Read, Write};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, Instant};
+
+struct FastInput<R: Read> {
+    reader: R,
+    buf: [u8; 1 << 16],
+    pos: usize,
+    len: usize,
+}
+
+impl<R: Read> FastInput<R> {
+    fn new(reader: R) -> Self {
+        Self {
+            reader,
+            buf: [0; 1 << 16],
+            pos: 0,
+            len: 0,
+        }
+    }
+
+    fn refill(&mut self) -> io::Result<bool> {
+        self.pos = 0;
+        self.len = self.reader.read(&mut self.buf)?;
+        Ok(self.len > 0)
+    }
+
+    fn next_byte(&mut self) -> io::Result<Option<u8>> {
+        if self.pos >= self.len && !self.refill()? {
+            return Ok(None);
+        }
+        let b = self.buf[self.pos];
+        self.pos += 1;
+        Ok(Some(b))
+    }
+
+    fn next_non_ws_byte(&mut self) -> io::Result<Option<u8>> {
+        loop {
+            match self.next_byte()? {
+                Some(b) if !b.is_ascii_whitespace() => return Ok(Some(b)),
+                Some(_) => continue,
+                None => return Ok(None),
+            }
+        }
+    }
+
+    fn next_token(&mut self) -> io::Result<Option<String>> {
+        let first = match self.next_non_ws_byte()? {
+            Some(b) => b,
+            None => return Ok(None),
+        };
+        let mut bytes = Vec::with_capacity(32);
+        bytes.push(first);
+        loop {
+            match self.next_byte()? {
+                Some(b) if !b.is_ascii_whitespace() => bytes.push(b),
+                Some(_) | None => break,
+            }
+        }
+        let s = String::from_utf8(bytes)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "non-utf8 token"))?;
+        Ok(Some(s))
+    }
+
+    fn next_f64(&mut self) -> io::Result<Option<f64>> {
+        match self.next_token()? {
+            Some(s) => {
+                let v = s
+                    .parse::<f64>()
+                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad float"))?;
+                Ok(Some(v))
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn next_usize(&mut self) -> io::Result<Option<usize>> {
+        match self.next_token()? {
+            Some(s) => {
+                let v = s
+                    .parse::<usize>()
+                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad usize"))?;
+                Ok(Some(v))
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn next_map_cell(&mut self) -> io::Result<Option<u8>> {
+        self.next_non_ws_byte()
+    }
+}
+
+#[derive(Clone, Copy)]
+struct State {
+    x: f64,
+    y: f64,
+    vx: f64,
+    vy: f64,
+    angle: f64,
+    angular_vel: f64,
+    fuel: f64,
+}
+
+#[derive(Clone, Copy)]
+struct Command {
+    thrust: f64,
+    turn: f64,
+}
+
+struct SharedCommand {
+    thrust_bits: AtomicU64,
+    turn_bits: AtomicU64,
+}
+
+impl SharedCommand {
+    fn new(cmd: Command) -> Self {
+        Self {
+            thrust_bits: AtomicU64::new(cmd.thrust.to_bits()),
+            turn_bits: AtomicU64::new(cmd.turn.to_bits()),
+        }
+    }
+
+    fn set(&self, cmd: Command) {
+        self.thrust_bits.store(cmd.thrust.to_bits(), Ordering::Relaxed);
+        self.turn_bits.store(cmd.turn.to_bits(), Ordering::Relaxed);
+    }
+
+    fn get(&self) -> Command {
+        Command {
+            thrust: f64::from_bits(self.thrust_bits.load(Ordering::Relaxed)),
+            turn: f64::from_bits(self.turn_bits.load(Ordering::Relaxed)),
+        }
+    }
+}
+
+struct Controller {
+    gravity: f64,
+    max_thrust: f64,
+    target_x: f64,
+    target_y: f64,
+    pad_left: f64,
+    pad_right: f64,
+}
+
+impl Controller {
+    fn compute(&self, s: State) -> Command {
+        if self.max_thrust <= 1e-9 || !self.max_thrust.is_finite() {
+            return Command {
+                thrust: 0.0,
+                turn: 0.0,
+            };
+        }
+
+        let pad_center = 0.5 * (self.pad_left + self.pad_right);
+        let pad_half = 0.5 * (self.pad_right - self.pad_left).abs().max(1.0);
+
+        let dx = pad_center - s.x;
+        let alt = self.target_y - s.y; // positive when above the landing area
+
+        let mut vx_limit = if alt > 80.0 {
+            12.0
+        } else if alt > 35.0 {
+            7.0
+        } else if alt > 15.0 {
+            3.5
+        } else {
+            1.2
+        };
+        let mut vx_target = (dx * 0.12).clamp(-vx_limit, vx_limit);
+
+        let mut vy_target = if alt > 120.0 {
+            18.0
+        } else if alt > 60.0 {
+            10.0
+        } else if alt > 25.0 {
+            6.0
+        } else if alt > 10.0 {
+            3.0
+        } else if alt > 4.0 {
+            1.2
+        } else {
+            0.2
+        };
+
+        // If we're low and horizontally far from the pad, briefly climb to buy time to translate.
+        if dx.abs() > (pad_half + 2.0) && alt < 20.0 {
+            vy_target = -1.5;
+            vx_limit = 5.0;
+            vx_target = (dx * 0.18).clamp(-vx_limit, vx_limit);
+        }
+
+        // Final settling near touchdown.
+        if alt < 2.0 {
+            vx_target = 0.0;
+            vy_target = 0.0;
+        }
+
+        let mut ax_des = 0.95 * (vx_target - s.vx);
+        let mut ay_des = 0.85 * (vy_target - s.vy);
+
+        let accel_cap = 0.9 * self.max_thrust;
+        ax_des = ax_des.clamp(-accel_cap, accel_cap);
+        ay_des = ay_des.clamp(-accel_cap, accel_cap);
+
+        // Net ay = gravity + thrust_y, so thrust_y = desired_net_ay - gravity.
+        let tx = ax_des;
+        let ty = ay_des - self.gravity;
+
+        let req = (tx * tx + ty * ty).sqrt();
+        let mut thrust = (req / self.max_thrust).clamp(0.0, 1.0);
+
+        // Keep enough vertical authority when descending too quickly.
+        let hover = (self.gravity / self.max_thrust).clamp(0.0, 1.0);
+        if s.vy > vy_target + 0.5 {
+            thrust = thrust.max(hover);
+        }
+
+        let mut target_angle = if req > 1e-9 { tx.atan2(-ty) } else { 0.0 };
+        let angle_limit = if alt < 8.0 {
+            0.35
+        } else if alt < 20.0 {
+            0.60
+        } else {
+            1.05
+        };
+        target_angle = target_angle.clamp(-angle_limit, angle_limit);
+
+        let ang_err = wrap_angle(target_angle - s.angle);
+        let mut turn = (1.8 * ang_err - 0.7 * s.angular_vel).clamp(-1.0, 1.0);
+
+        if !thrust.is_finite() {
+            thrust = hover;
+        }
+        if !turn.is_finite() {
+            turn = 0.0;
+        }
+
+        // If almost out of fuel, prioritize upright orientation for a controlled ballistic finish.
+        if s.fuel <= 0.05 {
+            thrust = 0.0;
+            turn = (1.8 * wrap_angle(-s.angle) - 0.8 * s.angular_vel).clamp(-1.0, 1.0);
+        }
+
+        Command { thrust, turn }
+    }
+}
+
+fn wrap_angle(mut a: f64) -> f64 {
+    while a > PI {
+        a -= 2.0 * PI;
+    }
+    while a < -PI {
+        a += 2.0 * PI;
+    }
+    a
+}
+
+fn parse_initial_and_run_controller(shared: Arc<SharedCommand>, done: Arc<AtomicBool>) {
+    let stdin = io::stdin();
+    let mut input = FastInput::new(stdin.lock());
+
+    let result = (|| -> io::Result<()> {
+        let width = input
+            .next_usize()?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "missing width"))?;
+        let height = input
+            .next_usize()?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "missing height"))?;
+        let gravity = input
+            .next_f64()?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "missing gravity"))?;
+        let max_thrust = input
+            .next_f64()?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "missing max_thrust"))?;
+        let _fuel = input
+            .next_f64()?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "missing fuel"))?;
+
+        let _start_x = input
+            .next_f64()?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "missing start_x"))?;
+        let _start_y = input
+            .next_f64()?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "missing start_y"))?;
+        let target_x = input
+            .next_f64()?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "missing target_x"))?;
+        let target_y = input
+            .next_f64()?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "missing target_y"))?;
+
+        let mut best_row_dist = f64::INFINITY;
+        let mut best_left = target_x.floor();
+        let mut best_right = target_x.ceil();
+        let mut any_landing = false;
+
+        for r in 0..height {
+            let mut row_min = usize::MAX;
+            let mut row_max = 0usize;
+            let mut has_l = false;
+
+            for c in 0..width {
+                let cell = input.next_map_cell()?.ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::UnexpectedEof, "truncated map")
+                })?;
+                if cell == b'L' {
+                    has_l = true;
+                    row_min = row_min.min(c);
+                    row_max = row_max.max(c);
+                }
+            }
+
+            if has_l {
+                any_landing = true;
+                let dist = (r as f64 - target_y).abs();
+                if dist < best_row_dist {
+                    best_row_dist = dist;
+                    best_left = row_min as f64;
+                    best_right = row_max as f64 + 1.0;
+                }
+            }
+        }
+
+        if !any_landing {
+            best_left = target_x - 2.0;
+            best_right = target_x + 2.0;
+        }
+
+        let controller = Controller {
+            gravity,
+            max_thrust,
+            target_x,
+            target_y,
+            pad_left: best_left,
+            pad_right: best_right,
+        };
+
+        shared.set(Command {
+            thrust: (gravity / max_thrust).clamp(0.0, 1.0),
+            turn: 0.0,
+        });
+
+        loop {
+            let x = match input.next_f64()? {
+                Some(v) => v,
+                None => break,
+            };
+            let y = match input.next_f64()? {
+                Some(v) => v,
+                None => break,
+            };
+            let vx = match input.next_f64()? {
+                Some(v) => v,
+                None => break,
+            };
+            let vy = match input.next_f64()? {
+                Some(v) => v,
+                None => break,
+            };
+            let angle = match input.next_f64()? {
+                Some(v) => v,
+                None => break,
+            };
+            let angular_vel = match input.next_f64()? {
+                Some(v) => v,
+                None => break,
+            };
+            let fuel = match input.next_f64()? {
+                Some(v) => v,
+                None => break,
+            };
+
+            let s = State {
+                x,
+                y,
+                vx,
+                vy,
+                angle,
+                angular_vel,
+                fuel,
+            };
+
+            let cmd = controller.compute(s);
+            shared.set(cmd);
+        }
+
+        Ok(())
+    })();
+
+    if result.is_err() {
+        shared.set(Command {
+            thrust: 0.0,
+            turn: 0.0,
+        });
+    }
+    done.store(true, Ordering::Release);
+}
+
+fn main() {
+    let shared = Arc::new(SharedCommand::new(Command {
+        thrust: 0.0,
+        turn: 0.0,
+    }));
+    let done = Arc::new(AtomicBool::new(false));
+
+    {
+        let shared_reader = Arc::clone(&shared);
+        let done_reader = Arc::clone(&done);
+        thread::spawn(move || parse_initial_and_run_controller(shared_reader, done_reader));
+    }
+
+    let mut out = io::stdout().lock();
+    let period = Duration::from_millis(40); // 25 Hz (>= 20 Hz requirement)
+    let mut next_tick = Instant::now();
+    let mut done_seen_at: Option<Instant> = None;
+
+    loop {
+        let cmd = shared.get();
+        let thrust = if cmd.thrust.is_finite() {
+            cmd.thrust.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let turn = if cmd.turn.is_finite() {
+            cmd.turn.clamp(-1.0, 1.0)
+        } else {
+            0.0
+        };
+
+        if writeln!(out, "{:.4} {:.4}", thrust, turn).is_err() {
+            break;
+        }
+        if out.flush().is_err() {
+            break;
+        }
+
+        if done.load(Ordering::Acquire) {
+            if done_seen_at.is_none() {
+                done_seen_at = Some(Instant::now());
+            }
+            if done_seen_at.unwrap().elapsed() > Duration::from_millis(300) {
+                break;
+            }
+        }
+
+        next_tick += period;
+        let now = Instant::now();
+        if next_tick > now {
+            thread::sleep(next_tick - now);
+        } else {
+            next_tick = now;
+        }
+    }
+}

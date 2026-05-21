@@ -1,0 +1,886 @@
+// CSG Union of two closed triangle meshes (watertight, manifold) using an adaptive strategy:
+//  - Fast path for disjoint/containment cases (AABB + BVH intersection + point-in-mesh).
+//  - Exact boolean via BSP-based CSG (Evan Wallace-style) for intersecting meshes at moderate size.
+//
+// Input:  VA FA VB FB, then vertices & triangle indices for mesh A, then mesh B.
+// Output: union mesh vertices and triangle indices.
+//
+// Build: MSVC /std:c++20
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstdint>
+#include <iomanip>
+#include <iostream>
+#include <limits>
+#include <memory>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
+#include <vector>
+
+namespace {
+
+struct Vec3 {
+  double x = 0, y = 0, z = 0;
+
+  Vec3() = default;
+  Vec3(double x_, double y_, double z_) : x(x_), y(y_), z(z_) {}
+
+  Vec3 operator+(const Vec3& o) const { return {x + o.x, y + o.y, z + o.z}; }
+  Vec3 operator-(const Vec3& o) const { return {x - o.x, y - o.y, z - o.z}; }
+  Vec3 operator*(double s) const { return {x * s, y * s, z * s}; }
+  Vec3 operator/(double s) const { return {x / s, y / s, z / s}; }
+};
+
+static inline Vec3 operator*(double s, const Vec3& v) { return v * s; }
+
+static inline double dot(const Vec3& a, const Vec3& b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+static inline Vec3 cross(const Vec3& a, const Vec3& b) {
+  return {a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x};
+}
+static inline double norm2(const Vec3& v) { return dot(v, v); }
+static inline double norm(const Vec3& v) { return std::sqrt(norm2(v)); }
+static inline Vec3 normalize(const Vec3& v) {
+  const double n = norm(v);
+  if (n == 0) return {0, 0, 0};
+  return v / n;
+}
+static inline Vec3 lerp(const Vec3& a, const Vec3& b, double t) { return a + (b - a) * t; }
+
+struct AABB {
+  Vec3 mn{std::numeric_limits<double>::infinity(),
+          std::numeric_limits<double>::infinity(),
+          std::numeric_limits<double>::infinity()};
+  Vec3 mx{-std::numeric_limits<double>::infinity(),
+          -std::numeric_limits<double>::infinity(),
+          -std::numeric_limits<double>::infinity()};
+
+  void expand(const Vec3& p) {
+    mn.x = std::min(mn.x, p.x);
+    mn.y = std::min(mn.y, p.y);
+    mn.z = std::min(mn.z, p.z);
+    mx.x = std::max(mx.x, p.x);
+    mx.y = std::max(mx.y, p.y);
+    mx.z = std::max(mx.z, p.z);
+  }
+
+  void expand(const AABB& b) {
+    expand(b.mn);
+    expand(b.mx);
+  }
+};
+
+static inline bool aabbIntersects(const AABB& a, const AABB& b) {
+  return (a.mn.x <= b.mx.x && a.mx.x >= b.mn.x) && (a.mn.y <= b.mx.y && a.mx.y >= b.mn.y) &&
+         (a.mn.z <= b.mx.z && a.mx.z >= b.mn.z);
+}
+
+static inline double aabbMeasure(const AABB& b) {
+  const double ex = std::max(0.0, b.mx.x - b.mn.x);
+  const double ey = std::max(0.0, b.mx.y - b.mn.y);
+  const double ez = std::max(0.0, b.mx.z - b.mn.z);
+  return ex * ex + ey * ey + ez * ez;
+}
+
+struct Face {
+  int a = 0, b = 0, c = 0;
+};
+
+static double signedMeshVolume(const std::vector<Vec3>& v, const std::vector<Face>& f) {
+  long double vol6 = 0.0L;
+  for (const auto& tri : f) {
+    const Vec3& p0 = v[tri.a];
+    const Vec3& p1 = v[tri.b];
+    const Vec3& p2 = v[tri.c];
+    const long double v6 = (long double)p0.x * ((long double)p1.y * (long double)p2.z - (long double)p1.z * (long double)p2.y) +
+                           (long double)p0.y * ((long double)p1.z * (long double)p2.x - (long double)p1.x * (long double)p2.z) +
+                           (long double)p0.z * ((long double)p1.x * (long double)p2.y - (long double)p1.y * (long double)p2.x);
+    vol6 += v6;
+  }
+  return (double)(vol6 / 6.0L);
+}
+
+static void ensurePositiveOrientation(std::vector<Vec3>& v, std::vector<Face>& f) {
+  const double vol = signedMeshVolume(v, f);
+  if (vol < 0) {
+    for (auto& tri : f) std::swap(tri.b, tri.c);
+  }
+}
+
+// =========================
+// BVH for triangle queries
+// =========================
+
+struct TriRef {
+  Face face{};
+  Vec3 centroid{};
+  AABB bounds{};
+};
+
+static AABB triAabb(const Vec3& p0, const Vec3& p1, const Vec3& p2) {
+  AABB b;
+  b.expand(p0);
+  b.expand(p1);
+  b.expand(p2);
+  return b;
+}
+
+struct BVHNode {
+  AABB bounds{};
+  int left = -1;
+  int right = -1;
+  int start = 0;
+  int count = 0;
+  bool leaf() const { return left < 0; }
+};
+
+struct BVH {
+  std::vector<BVHNode> nodes;
+  std::vector<TriRef> tris;  // reordered in build
+  int root = -1;
+};
+
+static int buildBvhRecursive(BVH& bvh, int start, int end) {
+  BVHNode node;
+  for (int i = start; i < end; ++i) node.bounds.expand(bvh.tris[i].bounds);
+
+  const int nodeIndex = (int)bvh.nodes.size();
+  bvh.nodes.push_back(node);
+
+  const int count = end - start;
+  constexpr int kLeafSize = 8;
+  if (count <= kLeafSize) {
+    bvh.nodes[nodeIndex].start = start;
+    bvh.nodes[nodeIndex].count = count;
+    return nodeIndex;
+  }
+
+  AABB cb;
+  for (int i = start; i < end; ++i) cb.expand(bvh.tris[i].centroid);
+  const Vec3 ext = cb.mx - cb.mn;
+  int axis = 0;
+  if (ext.y > ext.x && ext.y >= ext.z) axis = 1;
+  else if (ext.z > ext.x && ext.z >= ext.y) axis = 2;
+
+  const int mid = start + count / 2;
+  auto cmp = [axis](const TriRef& a, const TriRef& b) {
+    if (axis == 0) return a.centroid.x < b.centroid.x;
+    if (axis == 1) return a.centroid.y < b.centroid.y;
+    return a.centroid.z < b.centroid.z;
+  };
+  std::nth_element(bvh.tris.begin() + start, bvh.tris.begin() + mid, bvh.tris.begin() + end, cmp);
+
+  const int left = buildBvhRecursive(bvh, start, mid);
+  const int right = buildBvhRecursive(bvh, mid, end);
+
+  bvh.nodes[nodeIndex].left = left;
+  bvh.nodes[nodeIndex].right = right;
+  return nodeIndex;
+}
+
+static BVH buildBvh(const std::vector<Vec3>& vertices, const std::vector<Face>& faces) {
+  BVH bvh;
+  bvh.tris.reserve(faces.size());
+  for (const auto& f : faces) {
+    const Vec3& p0 = vertices[f.a];
+    const Vec3& p1 = vertices[f.b];
+    const Vec3& p2 = vertices[f.c];
+    TriRef tr;
+    tr.face = f;
+    tr.centroid = (p0 + p1 + p2) / 3.0;
+    tr.bounds = triAabb(p0, p1, p2);
+    bvh.tris.push_back(tr);
+  }
+  if (!bvh.tris.empty()) {
+    bvh.nodes.reserve(bvh.tris.size() * 2);
+    bvh.root = buildBvhRecursive(bvh, 0, (int)bvh.tris.size());
+  }
+  return bvh;
+}
+
+// Ray/AABB slab intersection: returns whether intersection exists with t in [tMin, tMax].
+static bool rayAabb(const Vec3& origin, const Vec3& dir, const AABB& b, double tMin, double tMax) {
+  for (int ax = 0; ax < 3; ++ax) {
+    const double o = (ax == 0) ? origin.x : (ax == 1) ? origin.y : origin.z;
+    const double d = (ax == 0) ? dir.x : (ax == 1) ? dir.y : dir.z;
+    const double mn = (ax == 0) ? b.mn.x : (ax == 1) ? b.mn.y : b.mn.z;
+    const double mx = (ax == 0) ? b.mx.x : (ax == 1) ? b.mx.y : b.mx.z;
+    if (std::abs(d) < 1e-30) {
+      if (o < mn || o > mx) return false;
+      continue;
+    }
+    double invD = 1.0 / d;
+    double t0 = (mn - o) * invD;
+    double t1 = (mx - o) * invD;
+    if (t0 > t1) std::swap(t0, t1);
+    tMin = std::max(tMin, t0);
+    tMax = std::min(tMax, t1);
+    if (tMin > tMax) return false;
+  }
+  return true;
+}
+
+// Möller–Trumbore ray/triangle intersection. Returns true and t if hit, for t >= 0.
+static bool rayTriangle(const Vec3& origin, const Vec3& dir, const Vec3& a, const Vec3& b, const Vec3& c, double eps,
+                        double& outT) {
+  const Vec3 e1 = b - a;
+  const Vec3 e2 = c - a;
+  const Vec3 pvec = cross(dir, e2);
+  const double det = dot(e1, pvec);
+  if (std::abs(det) < eps) return false;
+  const double invDet = 1.0 / det;
+  const Vec3 tvec = origin - a;
+  const double u = dot(tvec, pvec) * invDet;
+  if (u < -eps || u > 1.0 + eps) return false;
+  const Vec3 qvec = cross(tvec, e1);
+  const double v = dot(dir, qvec) * invDet;
+  if (v < -eps || u + v > 1.0 + eps) return false;
+  const double t = dot(e2, qvec) * invDet;
+  if (t < -eps) return false;
+  outT = t;
+  return true;
+}
+
+static bool segmentIntersectsTriangle(const Vec3& p, const Vec3& q, const Vec3& a, const Vec3& b, const Vec3& c, double eps) {
+  const Vec3 d = q - p;
+  double t = 0.0;
+  if (!rayTriangle(p, d, a, b, c, eps, t)) return false;
+  // param t is relative to direction d; for the segment, require t in [0,1]
+  return t >= -eps && t <= 1.0 + eps;
+}
+
+// 2D helpers for coplanar triangle-triangle intersection
+struct Vec2 {
+  double x = 0, y = 0;
+};
+static inline double cross2(const Vec2& a, const Vec2& b) { return a.x * b.y - a.y * b.x; }
+static inline Vec2 operator-(const Vec2& a, const Vec2& b) { return {a.x - b.x, a.y - b.y}; }
+static inline double orient2(const Vec2& a, const Vec2& b, const Vec2& c) { return cross2(b - a, c - a); }
+
+static bool onSegment2(const Vec2& a, const Vec2& b, const Vec2& p, double eps) {
+  const double minx = std::min(a.x, b.x) - eps, maxx = std::max(a.x, b.x) + eps;
+  const double miny = std::min(a.y, b.y) - eps, maxy = std::max(a.y, b.y) + eps;
+  if (p.x < minx || p.x > maxx || p.y < miny || p.y > maxy) return false;
+  return std::abs(orient2(a, b, p)) <= eps;
+}
+
+static bool segSeg2(const Vec2& a, const Vec2& b, const Vec2& c, const Vec2& d, double eps) {
+  const double o1 = orient2(a, b, c);
+  const double o2 = orient2(a, b, d);
+  const double o3 = orient2(c, d, a);
+  const double o4 = orient2(c, d, b);
+
+  auto sign = [eps](double v) -> int {
+    if (v > eps) return 1;
+    if (v < -eps) return -1;
+    return 0;
+  };
+  const int s1 = sign(o1), s2 = sign(o2), s3 = sign(o3), s4 = sign(o4);
+
+  if (s1 == 0 && onSegment2(a, b, c, eps)) return true;
+  if (s2 == 0 && onSegment2(a, b, d, eps)) return true;
+  if (s3 == 0 && onSegment2(c, d, a, eps)) return true;
+  if (s4 == 0 && onSegment2(c, d, b, eps)) return true;
+
+  return (s1 * s2 < 0) && (s3 * s4 < 0);
+}
+
+static bool pointInTri2(const Vec2& p, const Vec2& a, const Vec2& b, const Vec2& c, double eps) {
+  const double o1 = orient2(a, b, p);
+  const double o2 = orient2(b, c, p);
+  const double o3 = orient2(c, a, p);
+  const bool hasNeg = (o1 < -eps) || (o2 < -eps) || (o3 < -eps);
+  const bool hasPos = (o1 > eps) || (o2 > eps) || (o3 > eps);
+  return !(hasNeg && hasPos);
+}
+
+static bool triTriCoplanar2D(const Vec2& a0, const Vec2& a1, const Vec2& a2, const Vec2& b0, const Vec2& b1, const Vec2& b2,
+                             double eps) {
+  // edge-edge intersections
+  const std::array<Vec2, 3> A{a0, a1, a2};
+  const std::array<Vec2, 3> B{b0, b1, b2};
+  for (int i = 0; i < 3; ++i) {
+    const Vec2 a = A[i];
+    const Vec2 b = A[(i + 1) % 3];
+    for (int j = 0; j < 3; ++j) {
+      const Vec2 c = B[j];
+      const Vec2 d = B[(j + 1) % 3];
+      if (segSeg2(a, b, c, d, eps)) return true;
+    }
+  }
+  // containment
+  if (pointInTri2(a0, b0, b1, b2, eps)) return true;
+  if (pointInTri2(b0, a0, a1, a2, eps)) return true;
+  return false;
+}
+
+static bool triTriIntersect(const Vec3& a0, const Vec3& a1, const Vec3& a2, const Vec3& b0, const Vec3& b1, const Vec3& b2,
+                            double eps) {
+  const Vec3 nA = cross(a1 - a0, a2 - a0);
+  const Vec3 nB = cross(b1 - b0, b2 - b0);
+  const double nAlen = norm(nA);
+  const double nBlen = norm(nB);
+  if (nAlen == 0 || nBlen == 0) return false;
+
+  const double epsA = eps * nAlen;
+  const double epsB = eps * nBlen;
+
+  const double dB0 = dot(nA, b0 - a0);
+  const double dB1 = dot(nA, b1 - a0);
+  const double dB2 = dot(nA, b2 - a0);
+  const double minB = std::min({dB0, dB1, dB2});
+  const double maxB = std::max({dB0, dB1, dB2});
+  if (minB > epsA || maxB < -epsA) return false;
+
+  const double dA0 = dot(nB, a0 - b0);
+  const double dA1 = dot(nB, a1 - b0);
+  const double dA2 = dot(nB, a2 - b0);
+  const double minA = std::min({dA0, dA1, dA2});
+  const double maxA = std::max({dA0, dA1, dA2});
+  if (minA > epsB || maxA < -epsB) return false;
+
+  const Vec3 dir = cross(nA, nB);
+  const double dir2 = norm2(dir);
+  const double coplanarThresh = (eps * nAlen * nBlen) * (eps * nAlen * nBlen);
+  if (dir2 <= coplanarThresh) {
+    // Parallel: treat as coplanar if B's plane is close to A's plane.
+    const double dist = std::abs(dB0) / nAlen;
+    if (dist > eps * 10) return false;
+    // Project to 2D (drop dominant axis of nA)
+    const Vec3 an = nA;
+    const double ax = std::abs(an.x), ay = std::abs(an.y), az = std::abs(an.z);
+    int drop = 0;
+    if (ay >= ax && ay >= az) drop = 1;
+    else if (az >= ax && az >= ay) drop = 2;
+    auto proj = [drop](const Vec3& p) -> Vec2 {
+      if (drop == 0) return {p.y, p.z};
+      if (drop == 1) return {p.x, p.z};
+      return {p.x, p.y};
+    };
+    const Vec2 A0 = proj(a0), A1 = proj(a1), A2 = proj(a2);
+    const Vec2 B0 = proj(b0), B1 = proj(b1), B2 = proj(b2);
+    return triTriCoplanar2D(A0, A1, A2, B0, B1, B2, eps);
+  }
+
+  // Non-coplanar: check segment-triangle intersections (boundaries included).
+  const double segEps = eps;
+  const std::array<Vec3, 3> A{a0, a1, a2};
+  const std::array<Vec3, 3> B{b0, b1, b2};
+  for (int i = 0; i < 3; ++i) {
+    const Vec3 p = A[i];
+    const Vec3 q = A[(i + 1) % 3];
+    if (segmentIntersectsTriangle(p, q, b0, b1, b2, segEps)) return true;
+  }
+  for (int i = 0; i < 3; ++i) {
+    const Vec3 p = B[i];
+    const Vec3 q = B[(i + 1) % 3];
+    if (segmentIntersectsTriangle(p, q, a0, a1, a2, segEps)) return true;
+  }
+  return false;
+}
+
+static bool bvhAnyIntersection(const BVH& a, const std::vector<Vec3>& vA, const BVH& b, const std::vector<Vec3>& vB, double eps) {
+  if (a.root < 0 || b.root < 0) return false;
+  std::vector<std::pair<int, int>> stack;
+  stack.reserve(256);
+  stack.push_back({a.root, b.root});
+  while (!stack.empty()) {
+    const auto [ia, ib] = stack.back();
+    stack.pop_back();
+    const BVHNode& na = a.nodes[ia];
+    const BVHNode& nb = b.nodes[ib];
+    if (!aabbIntersects(na.bounds, nb.bounds)) continue;
+
+    if (na.leaf() && nb.leaf()) {
+      for (int i = 0; i < na.count; ++i) {
+        const Face fa = a.tris[na.start + i].face;
+        const Vec3& a0 = vA[fa.a];
+        const Vec3& a1 = vA[fa.b];
+        const Vec3& a2 = vA[fa.c];
+        for (int j = 0; j < nb.count; ++j) {
+          const Face fb = b.tris[nb.start + j].face;
+          const Vec3& b0 = vB[fb.a];
+          const Vec3& b1 = vB[fb.b];
+          const Vec3& b2 = vB[fb.c];
+          if (triTriIntersect(a0, a1, a2, b0, b1, b2, eps)) return true;
+        }
+      }
+      continue;
+    }
+
+    const double ma = aabbMeasure(na.bounds);
+    const double mb = aabbMeasure(nb.bounds);
+    const bool splitA = (!na.leaf() && (nb.leaf() || ma >= mb));
+    if (splitA) {
+      stack.push_back({na.left, ib});
+      stack.push_back({na.right, ib});
+    } else {
+      stack.push_back({ia, nb.left});
+      stack.push_back({ia, nb.right});
+    }
+  }
+  return false;
+}
+
+static int bvhCountRayHits(const BVH& bvh, const std::vector<Vec3>& verts, const Vec3& origin, const Vec3& dir, double eps) {
+  if (bvh.root < 0) return 0;
+  int hits = 0;
+  std::vector<int> stack;
+  stack.reserve(256);
+  stack.push_back(bvh.root);
+  while (!stack.empty()) {
+    const int idx = stack.back();
+    stack.pop_back();
+    const BVHNode& n = bvh.nodes[idx];
+    if (!rayAabb(origin, dir, n.bounds, 0.0, std::numeric_limits<double>::infinity())) continue;
+    if (n.leaf()) {
+      for (int i = 0; i < n.count; ++i) {
+        const Face f = bvh.tris[n.start + i].face;
+        const Vec3& a = verts[f.a];
+        const Vec3& b = verts[f.b];
+        const Vec3& c = verts[f.c];
+        double t = 0.0;
+        if (rayTriangle(origin, dir, a, b, c, eps, t)) {
+          // Ignore intersections "behind" the origin, plus extremely close hits.
+          if (t > eps) ++hits;
+        }
+      }
+    } else {
+      stack.push_back(n.left);
+      stack.push_back(n.right);
+    }
+  }
+  return hits;
+}
+
+static bool pointInsideMesh(const BVH& bvh, const std::vector<Vec3>& verts, const Vec3& p, double eps) {
+  // Use multiple directions to avoid degeneracies (ray through vertex/edge).
+  const std::array<Vec3, 3> dirs = {
+      normalize(Vec3{1.0, 0.231, 0.547}),
+      normalize(Vec3{-0.37, 1.0, 0.113}),
+      normalize(Vec3{0.19, 0.41, 1.0}),
+  };
+  int insideVotes = 0;
+  for (const Vec3& d : dirs) {
+    const Vec3 o = p + d * (eps * 50.0);
+    const int hits = bvhCountRayHits(bvh, verts, o, d, eps * 0.1);
+    if (hits & 1) ++insideVotes;
+  }
+  return insideVotes >= 2;
+}
+
+// =========================
+// BSP-based exact CSG union
+// =========================
+
+struct Plane {
+  Vec3 normal{};
+  double w = 0.0;
+
+  static inline double EPS = 1e-5;
+
+  static Plane fromPoints(const Vec3& a, const Vec3& b, const Vec3& c) {
+    const Vec3 n = normalize(cross(b - a, c - a));
+    return Plane{n, dot(n, a)};
+  }
+
+  void flip() {
+    normal = normal * -1.0;
+    w = -w;
+  }
+
+  int classifyPoint(const Vec3& p) const {
+    const double t = dot(normal, p) - w;
+    if (t < -EPS) return 2;  // BACK
+    if (t > EPS) return 1;   // FRONT
+    return 0;                // COPLANAR
+  }
+
+  struct Poly;
+  void splitPolygon(const Poly& polygon, std::vector<Poly>& coplanarFront, std::vector<Poly>& coplanarBack, std::vector<Poly>& front,
+                    std::vector<Poly>& back) const;
+};
+
+struct Plane::Poly {
+  std::vector<Vec3> vertices;
+  Plane plane;
+
+  Poly() = default;
+  explicit Poly(std::vector<Vec3> v, const Plane& p) : vertices(std::move(v)), plane(p) {}
+  explicit Poly(std::vector<Vec3> v) : vertices(std::move(v)), plane(Plane::fromPoints(vertices[0], vertices[1], vertices[2])) {}
+
+  void flip() {
+    std::reverse(vertices.begin(), vertices.end());
+    plane.flip();
+  }
+};
+
+void Plane::splitPolygon(const Poly& polygon, std::vector<Poly>& coplanarFront, std::vector<Poly>& coplanarBack, std::vector<Poly>& front,
+                         std::vector<Poly>& back) const {
+  constexpr int COPLANAR = 0;
+  constexpr int FRONT = 1;
+  constexpr int BACK = 2;
+  constexpr int SPANNING = 3;
+
+  int polygonType = 0;
+  std::vector<int> types;
+  types.reserve(polygon.vertices.size());
+  for (const Vec3& v : polygon.vertices) {
+    const int t = classifyPoint(v);
+    polygonType |= t;
+    types.push_back(t);
+  }
+
+  switch (polygonType) {
+    case COPLANAR: {
+      if (dot(normal, polygon.plane.normal) > 0) coplanarFront.push_back(polygon);
+      else coplanarBack.push_back(polygon);
+      break;
+    }
+    case FRONT: {
+      front.push_back(polygon);
+      break;
+    }
+    case BACK: {
+      back.push_back(polygon);
+      break;
+    }
+    case SPANNING: {
+      std::vector<Vec3> f, b;
+      const int n = (int)polygon.vertices.size();
+      f.reserve(n + 4);
+      b.reserve(n + 4);
+      for (int i = 0; i < n; ++i) {
+        const int j = (i + 1) % n;
+        const Vec3& vi = polygon.vertices[i];
+        const Vec3& vj = polygon.vertices[j];
+        const int ti = types[i];
+        const int tj = types[j];
+
+        if (ti != BACK) f.push_back(vi);
+        if (ti != FRONT) b.push_back(vi);
+
+        if ((ti | tj) == SPANNING) {
+          const Vec3 dv = vj - vi;
+          const double denom = dot(normal, dv);
+          if (std::abs(denom) > 1e-30) {
+            const double t = (w - dot(normal, vi)) / denom;
+            const Vec3 v = lerp(vi, vj, t);
+            f.push_back(v);
+            b.push_back(v);
+          }
+        }
+      }
+      if (f.size() >= 3) front.emplace_back(std::move(f), polygon.plane);
+      if (b.size() >= 3) back.emplace_back(std::move(b), polygon.plane);
+      break;
+    }
+    default: break;
+  }
+}
+
+struct BSPNode {
+  Plane plane{};
+  bool hasPlane = false;
+  std::vector<Plane::Poly> polygons;
+  std::unique_ptr<BSPNode> front;
+  std::unique_ptr<BSPNode> back;
+
+  BSPNode() = default;
+  explicit BSPNode(std::vector<Plane::Poly> polys) { build(std::move(polys)); }
+
+  void invert() {
+    for (auto& p : polygons) p.flip();
+    if (hasPlane) plane.flip();
+    if (front) front->invert();
+    if (back) back->invert();
+    std::swap(front, back);
+  }
+
+  std::vector<Plane::Poly> clipPolygons(const std::vector<Plane::Poly>& polys) const {
+    if (!hasPlane) return polys;
+    std::vector<Plane::Poly> f, b;
+    f.reserve(polys.size());
+    b.reserve(polys.size());
+    for (const auto& p : polys) plane.splitPolygon(p, f, b, f, b);
+    if (front) f = front->clipPolygons(f);
+    if (back) b = back->clipPolygons(b);
+    else b.clear();
+    f.insert(f.end(), std::make_move_iterator(b.begin()), std::make_move_iterator(b.end()));
+    return f;
+  }
+
+  void clipTo(const BSPNode& other) {
+    polygons = other.clipPolygons(polygons);
+    if (front) front->clipTo(other);
+    if (back) back->clipTo(other);
+  }
+
+  std::vector<Plane::Poly> allPolygons() const {
+    std::vector<Plane::Poly> out = polygons;
+    if (front) {
+      auto fp = front->allPolygons();
+      out.insert(out.end(), std::make_move_iterator(fp.begin()), std::make_move_iterator(fp.end()));
+    }
+    if (back) {
+      auto bp = back->allPolygons();
+      out.insert(out.end(), std::make_move_iterator(bp.begin()), std::make_move_iterator(bp.end()));
+    }
+    return out;
+  }
+
+  void build(std::vector<Plane::Poly> polys) {
+    if (polys.empty()) return;
+    if (!hasPlane) {
+      plane = polys[0].plane;
+      hasPlane = true;
+    }
+    std::vector<Plane::Poly> f, b;
+    f.reserve(polys.size());
+    b.reserve(polys.size());
+    for (auto& p : polys) plane.splitPolygon(p, polygons, polygons, f, b);
+    if (!f.empty()) {
+      if (!front) front = std::make_unique<BSPNode>();
+      front->build(std::move(f));
+    }
+    if (!b.empty()) {
+      if (!back) back = std::make_unique<BSPNode>();
+      back->build(std::move(b));
+    }
+  }
+};
+
+static std::vector<Plane::Poly> csgUnion(std::vector<Plane::Poly> aPolys, std::vector<Plane::Poly> bPolys) {
+  BSPNode a(std::move(aPolys));
+  BSPNode b(std::move(bPolys));
+  a.clipTo(b);
+  b.clipTo(a);
+  b.invert();
+  b.clipTo(a);
+  b.invert();
+  a.build(b.allPolygons());
+  return a.allPolygons();
+}
+
+// =========================
+// Output conversion + weld
+// =========================
+
+struct QuantKey {
+  std::int64_t x = 0, y = 0, z = 0;
+  bool operator==(const QuantKey& o) const { return x == o.x && y == o.y && z == o.z; }
+};
+
+struct QuantKeyHash {
+  std::size_t operator()(const QuantKey& k) const noexcept {
+    std::size_t h = 1469598103934665603ull;
+    auto mix = [&h](std::uint64_t v) {
+      h ^= (std::size_t)v;
+      h *= 1099511628211ull;
+    };
+    mix((std::uint64_t)k.x);
+    mix((std::uint64_t)k.y);
+    mix((std::uint64_t)k.z);
+    return h;
+  }
+};
+
+struct TriKey {
+  int a, b, c;
+  bool operator==(const TriKey& o) const { return a == o.a && b == o.b && c == o.c; }
+};
+struct TriKeyHash {
+  std::size_t operator()(const TriKey& t) const noexcept {
+    std::uint64_t x = (std::uint64_t)(std::uint32_t)t.a;
+    std::uint64_t y = (std::uint64_t)(std::uint32_t)t.b;
+    std::uint64_t z = (std::uint64_t)(std::uint32_t)t.c;
+    std::uint64_t h = x * 0x9E3779B185EBCA87ull;
+    h ^= y + 0x9E3779B185EBCA87ull + (h << 6) + (h >> 2);
+    h ^= z + 0x9E3779B185EBCA87ull + (h << 6) + (h >> 2);
+    return (std::size_t)h;
+  }
+};
+
+static void writeMeshFromPolys(const std::vector<Plane::Poly>& polys, double weldEps) {
+  std::vector<Vec3> outV;
+  std::vector<std::array<int, 3>> outF;
+
+  std::unordered_map<QuantKey, int, QuantKeyHash> vmap;
+  vmap.reserve(polys.size() * 4);
+
+  auto quantize = [weldEps](const Vec3& p) -> QuantKey {
+    const double inv = 1.0 / weldEps;
+    return QuantKey{(std::int64_t)std::llround(p.x * inv), (std::int64_t)std::llround(p.y * inv), (std::int64_t)std::llround(p.z * inv)};
+  };
+
+  auto addVertex = [&](const Vec3& p) -> int {
+    const QuantKey k = quantize(p);
+    auto it = vmap.find(k);
+    if (it != vmap.end()) return it->second;
+    const int idx = (int)outV.size();
+    outV.push_back(p);
+    vmap.emplace(k, idx);
+    return idx;
+  };
+
+  // Remove exact duplicate triangles after welding.
+  std::unordered_set<TriKey, TriKeyHash> seen;
+  seen.reserve(polys.size() * 2);
+
+  const double areaEps2 = weldEps * weldEps * 1e-4;
+
+  for (const auto& poly : polys) {
+    const int n = (int)poly.vertices.size();
+    if (n < 3) continue;
+    const Vec3 v0 = poly.vertices[0];
+    for (int i = 1; i + 1 < n; ++i) {
+      const Vec3 v1 = poly.vertices[i];
+      const Vec3 v2 = poly.vertices[i + 1];
+      const Vec3 cr = cross(v1 - v0, v2 - v0);
+      if (norm2(cr) <= areaEps2) continue;
+
+      int i0 = addVertex(v0);
+      int i1 = addVertex(v1);
+      int i2 = addVertex(v2);
+      if (i0 == i1 || i1 == i2 || i2 == i0) continue;
+
+      TriKey k{i0, i1, i2};
+      // Canonicalize by sorted indices to remove both duplicates and opposite-oriented duplicates.
+      std::array<int, 3> s{i0, i1, i2};
+      std::sort(s.begin(), s.end());
+      TriKey ks{s[0], s[1], s[2]};
+      if (seen.find(ks) != seen.end()) continue;
+      seen.insert(ks);
+
+      outF.push_back({i0, i1, i2});
+    }
+  }
+
+  std::cout << outV.size() << " " << outF.size() << "\n";
+  std::cout << std::setprecision(17);
+  for (const auto& p : outV) std::cout << p.x << " " << p.y << " " << p.z << "\n";
+  for (const auto& t : outF) std::cout << t[0] << " " << t[1] << " " << t[2] << "\n";
+}
+
+static void writeMeshConcat(const std::vector<Vec3>& vA, const std::vector<Face>& fA, const std::vector<Vec3>& vB, const std::vector<Face>& fB) {
+  std::vector<Vec3> v = vA;
+  v.insert(v.end(), vB.begin(), vB.end());
+  std::vector<std::array<int, 3>> f;
+  f.reserve(fA.size() + fB.size());
+  for (const auto& tri : fA) f.push_back({tri.a, tri.b, tri.c});
+  const int off = (int)vA.size();
+  for (const auto& tri : fB) f.push_back({tri.a + off, tri.b + off, tri.c + off});
+
+  std::cout << v.size() << " " << f.size() << "\n";
+  std::cout << std::setprecision(17);
+  for (const auto& p : v) std::cout << p.x << " " << p.y << " " << p.z << "\n";
+  for (const auto& t : f) std::cout << t[0] << " " << t[1] << " " << t[2] << "\n";
+}
+
+static void writeMeshSingle(const std::vector<Vec3>& v, const std::vector<Face>& f) {
+  std::cout << v.size() << " " << f.size() << "\n";
+  std::cout << std::setprecision(17);
+  for (const auto& p : v) std::cout << p.x << " " << p.y << " " << p.z << "\n";
+  for (const auto& tri : f) std::cout << tri.a << " " << tri.b << " " << tri.c << "\n";
+}
+
+}  // namespace
+
+int main() {
+  std::ios::sync_with_stdio(false);
+  std::cin.tie(nullptr);
+
+  std::size_t VA = 0, FA = 0, VB = 0, FB = 0;
+  if (!(std::cin >> VA >> FA >> VB >> FB)) return 0;
+
+  std::vector<Vec3> vA(VA), vB(VB);
+  std::vector<Face> fA(FA), fB(FB);
+
+  for (std::size_t i = 0; i < VA; ++i) std::cin >> vA[i].x >> vA[i].y >> vA[i].z;
+  for (std::size_t i = 0; i < FA; ++i) std::cin >> fA[i].a >> fA[i].b >> fA[i].c;
+  for (std::size_t i = 0; i < VB; ++i) std::cin >> vB[i].x >> vB[i].y >> vB[i].z;
+  for (std::size_t i = 0; i < FB; ++i) std::cin >> fB[i].a >> fB[i].b >> fB[i].c;
+
+  // Handle trivial cases
+  if (FA == 0) {
+    writeMeshSingle(vB, fB);
+    return 0;
+  }
+  if (FB == 0) {
+    writeMeshSingle(vA, fA);
+    return 0;
+  }
+
+  ensurePositiveOrientation(vA, fA);
+  ensurePositiveOrientation(vB, fB);
+
+  AABB boxAll;
+  AABB boxA, boxB;
+  for (const auto& p : vA) {
+    boxA.expand(p);
+    boxAll.expand(p);
+  }
+  for (const auto& p : vB) {
+    boxB.expand(p);
+    boxAll.expand(p);
+  }
+  const double diag = norm(boxAll.mx - boxAll.mn);
+  const double base = std::max(1.0, diag);
+  const double eps = std::max(1e-5, base * 1e-9);
+  Plane::EPS = eps;
+
+  // Adaptive strategy knobs
+  constexpr std::size_t kCsgFaceLimit = 50000;  // beyond this, try to avoid BSP CSG unless needed
+
+  // Very fast disjoint case (AABB disjoint => meshes disjoint)
+  if (!aabbIntersects(boxA, boxB)) {
+    writeMeshConcat(vA, fA, vB, fB);
+    return 0;
+  }
+
+  const std::size_t totalFaces = FA + FB;
+
+  // Build BVHs (also used for containment tests).
+  BVH bvhA = buildBvh(vA, fA);
+  BVH bvhB = buildBvh(vB, fB);
+
+  // Detect whether the boundary surfaces intersect at all.
+  bool intersects = bvhAnyIntersection(bvhA, vA, bvhB, vB, eps);
+
+  if (!intersects) {
+    // No surface intersection => either disjoint or full containment.
+    const bool bInsideA = pointInsideMesh(bvhA, vA, vB[0], eps);
+    if (bInsideA) {
+      writeMeshSingle(vA, fA);
+      return 0;
+    }
+    const bool aInsideB = pointInsideMesh(bvhB, vB, vA[0], eps);
+    if (aInsideB) {
+      writeMeshSingle(vB, fB);
+      return 0;
+    }
+    writeMeshConcat(vA, fA, vB, fB);
+    return 0;
+  }
+
+  // Intersecting meshes: compute exact union via BSP CSG (good up to moderate sizes).
+  // If the inputs are enormous, this can still be expensive, but remains exact.
+  if (totalFaces > kCsgFaceLimit) {
+    // Still attempt exact boolean. BVH intersection above prunes the common huge "no-intersection" cases.
+  }
+
+  std::vector<Plane::Poly> polysA;
+  polysA.reserve(fA.size());
+  for (const auto& t : fA) polysA.emplace_back(std::vector<Vec3>{vA[t.a], vA[t.b], vA[t.c]});
+
+  std::vector<Plane::Poly> polysB;
+  polysB.reserve(fB.size());
+  for (const auto& t : fB) polysB.emplace_back(std::vector<Vec3>{vB[t.a], vB[t.b], vB[t.c]});
+
+  const auto unionPolys = csgUnion(std::move(polysA), std::move(polysB));
+  const double weldEps = eps * 2.0;
+  writeMeshFromPolys(unionPolys, weldEps);
+  return 0;
+}

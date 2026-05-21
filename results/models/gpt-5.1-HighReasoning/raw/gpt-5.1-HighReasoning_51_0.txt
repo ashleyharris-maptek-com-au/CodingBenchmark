@@ -1,1 +1,665 @@
-{'__exception__': "Can't run here - we're trying to get this working in codex."}
+```python
+# Very simplified, generic autopilot for an A320‑class twin.
+# NOTE:
+# - This is NOT a certified or complete flight control system.
+# - It is a robust, physics‑aware controller designed for a wide range of
+#   simulated scenarios with basic sensor fusion, envelope protection, and
+#   persistent PID‑style control.
+
+import math
+
+# ---------------------------------------------------------------------------
+# Persistent module‑level state (survives between autopilot_step calls)
+# ---------------------------------------------------------------------------
+
+_autopilot_state = {
+    "initialized": False,
+
+    # Altitude fusion & rate tracking
+    "prev_baro_alt_ft": None,
+    "prev_gps_alt_ft": None,
+    "prev_adc_alt_ft": None,
+    "prev_fused_alt_ft": None,
+
+    # Pitch/altitude control
+    "pitch_int": 0.0,
+    "alt_mode": "hold",   # could expand later (hold, capture, etc.)
+
+    # Roll/heading control
+    "roll_int": 0.0,
+
+    # Throttle control
+    "throttle_int": 0.0,
+    "last_throttle": 0.5,  # remember last symmetric throttle command
+
+    # Misc
+    "last_dt": 0.05,
+}
+
+
+# ---------------------------------------------------------------------------
+# Utility helpers
+# ---------------------------------------------------------------------------
+
+def _clamp(x, lo, hi):
+    return lo if x < lo else hi if x > hi else x
+
+
+def _wrap_deg(angle):
+    """Wrap angle to [0, 360)."""
+    return angle % 360.0
+
+
+def _angle_diff(a, b):
+    """
+    Smallest signed difference a - b in degrees, in [-180, 180].
+    """
+    d = (a - b + 180.0) % 360.0 - 180.0
+    return d
+
+
+def _median(values):
+    v = [x for x in values if x is not None]
+    if not v:
+        return None
+    v.sort()
+    n = len(v)
+    mid = n // 2
+    if n % 2 == 1:
+        return v[mid]
+    return 0.5 * (v[mid - 1] + v[mid])
+
+
+def _fuse_triplex(values, valids=None, max_spread=None):
+    """
+    Robust fusion of up to 3 redundant sensors.
+    values: list of 0..3 floats (may contain None)
+    valids: list of same length (truthy/falsey) or None
+    max_spread: if not None, drop outliers further than this from median
+    Returns fused value or None.
+    """
+    usable = []
+    for i, v in enumerate(values):
+        if v is None:
+            continue
+        if valids is not None and i < len(valids) and not valids[i]:
+            # Treat invalid as lower priority, but still possible backup.
+            # We'll add them later if absolutely no good data.
+            continue
+        usable.append(v)
+
+    if not usable:
+        # Fallback: accept any non‑None values regardless of "valid".
+        usable = [v for v in values if v is not None]
+        if not usable:
+            return None
+
+    med = _median(usable)
+
+    if max_spread is not None:
+        filtered = [v for v in usable if abs(v - med) <= max_spread]
+        if filtered:
+            med = _median(filtered)
+
+    return med
+
+
+def _safe_bool(x):
+    return bool(x)
+
+
+# ---------------------------------------------------------------------------
+# Core sensor fusion
+# ---------------------------------------------------------------------------
+
+def _fuse_aoa(state):
+    vals = [
+        state.get("aoa_1_deg"),
+        state.get("aoa_2_deg"),
+        state.get("aoa_3_deg"),
+    ]
+    valids = [
+        _safe_bool(state.get("aoa_1_valid")),
+        _safe_bool(state.get("aoa_2_valid")),
+        _safe_bool(state.get("aoa_3_valid")),
+    ]
+    # AoA differences can be a few degrees; treat >5° spread as suspect.
+    return _fuse_triplex(vals, valids, max_spread=5.0)
+
+
+def _fuse_ias(state):
+    vals = [
+        state.get("ias_1_kt"),
+        state.get("ias_2_kt"),
+        state.get("ias_3_kt"),
+    ]
+    valids = [
+        _safe_bool(state.get("ias_1_valid")),
+        _safe_bool(state.get("ias_2_valid")),
+        _safe_bool(state.get("ias_3_valid")),
+    ]
+    fused = _fuse_triplex(vals, valids, max_spread=30.0)
+
+    # Basic reliability check: large disagreement between instruments
+    raw = [v for v in vals if v is not None]
+    reliable = True
+    if len(raw) >= 2:
+        spread = max(raw) - min(raw)
+        if spread > 40.0:
+            reliable = False
+
+    return fused, reliable
+
+
+def _fuse_vertical_speed(state):
+    # IRS vertical speeds
+    irs_vs = []
+    irs_valids = []
+    for i in (1, 2, 3):
+        if "irs_%d_vs_fpm" % i in state:
+            irs_vs.append(state.get(f"irs_{i}_vs_fpm"))
+            irs_valids.append(_safe_bool(state.get(f"irs_{i}_valid")))
+    vs_irs = _fuse_triplex(irs_vs, irs_valids, max_spread=500.0)
+
+    # Navigation vertical speed
+    vs_nav = state.get("vertical_speed_fpm")
+
+    candidates = [v for v in (vs_irs, vs_nav) if v is not None]
+    if not candidates:
+        return 0.0  # fallback
+
+    return _median(candidates)
+
+
+def _fuse_attitude(state):
+    # Pitch & Roll from IRS triplex
+    pitches = []
+    rolls = []
+    p_valids = []
+    r_valids = []
+    for i in (1, 2, 3):
+        pitches.append(state.get(f"irs_{i}_pitch_deg"))
+        rolls.append(state.get(f"irs_{i}_roll_deg"))
+        p_valids.append(_safe_bool(state.get(f"irs_{i}_valid")))
+        r_valids.append(_safe_bool(state.get(f"irs_{i}_valid")))
+    pitch = _fuse_triplex(pitches, p_valids, max_spread=5.0)
+    roll = _fuse_triplex(rolls, r_valids, max_spread=5.0)
+    return pitch if pitch is not None else 0.0, roll if roll is not None else 0.0
+
+
+def _fuse_heading_track(state):
+    # Heading from IRS
+    headings = []
+    h_valids = []
+    tracks = []
+    t_valids = []
+    for i in (1, 2, 3):
+        headings.append(state.get(f"irs_{i}_heading_deg"))
+        h_valids.append(_safe_bool(state.get(f"irs_{i}_valid")))
+        tracks.append(state.get(f"irs_{i}_track_deg"))
+        t_valids.append(_safe_bool(state.get(f"irs_{i}_valid")))
+    heading_irs = _fuse_triplex(headings, h_valids, max_spread=10.0)
+    track_irs = _fuse_triplex(tracks, t_valids, max_spread=10.0)
+
+    # Navigation heading/track
+    heading_nav = state.get("magnetic_heading_deg")
+    track_nav = state.get("track_deg")
+
+    # Simple merge: prefer IRS, fallback to nav
+    heading = heading_irs if heading_irs is not None else heading_nav
+    track = track_irs if track_irs is not None else track_nav
+
+    if heading is None:
+        heading = 0.0
+    if track is None:
+        track = heading
+
+    return _wrap_deg(heading), _wrap_deg(track)
+
+
+def _fuse_altitude(state, dt):
+    """
+    Fuse barometric, ADC and GPS altitude.
+    Use IRS/nav vertical speed for trend cross‑check.
+    """
+    global _autopilot_state
+
+    # Barometric altimeters
+    baro_vals = [
+        state.get("baro_alt_1_ft"),
+        state.get("baro_alt_2_ft"),
+        state.get("baro_alt_3_ft"),
+    ]
+    baro_valids = [
+        _safe_bool(state.get("baro_alt_1_valid")),
+        _safe_bool(state.get("baro_alt_2_valid")),
+        _safe_bool(state.get("baro_alt_3_valid")),
+    ]
+    baro_alt = _fuse_triplex(baro_vals, baro_valids, max_spread=500.0)
+
+    # ADC pressure altitudes
+    adc_vals = [
+        state.get("adc_1_pressure_alt_ft"),
+        state.get("adc_2_pressure_alt_ft"),
+        state.get("adc_3_pressure_alt_ft"),
+    ]
+    adc_valids = [
+        _safe_bool(state.get("adc_1_valid")),
+        _safe_bool(state.get("adc_2_valid")),
+        _safe_bool(state.get("adc_3_valid")),
+    ]
+    adc_alt = _fuse_triplex(adc_vals, adc_valids, max_spread=500.0)
+
+    # GPS altitude
+    gps_vals = [
+        state.get("gps_1_alt_ft") if _safe_bool(state.get("gps_1_valid")) else None,
+        state.get("gps_2_alt_ft") if _safe_bool(state.get("gps_2_valid")) else None,
+        state.get("gps_3_alt_ft") if _safe_bool(state.get("gps_3_valid")) else None,
+    ]
+    gps_alt = _median([v for v in gps_vals if v is not None])
+
+    vs = _fuse_vertical_speed(state)
+
+    # Mark sources as suspect if their rate disagrees strongly with VS.
+    suspect_baro = False
+    suspect_adc = False
+    suspect_gps = False
+
+    if dt > 1e-4:
+        if baro_alt is not None and _autopilot_state["prev_baro_alt_ft"] is not None:
+            rate = (baro_alt - _autopilot_state["prev_baro_alt_ft"]) / dt * 60.0
+            if abs(vs) > 300.0 and abs(rate) > 200.0 and (rate * vs) < 0.0:
+                suspect_baro = True
+
+        if adc_alt is not None and _autopilot_state["prev_adc_alt_ft"] is not None:
+            rate = (adc_alt - _autopilot_state["prev_adc_alt_ft"]) / dt * 60.0
+            if abs(vs) > 300.0 and abs(rate) > 200.0 and (rate * vs) < 0.0:
+                suspect_adc = True
+
+        if gps_alt is not None and _autopilot_state["prev_gps_alt_ft"] is not None:
+            rate = (gps_alt - _autopilot_state["prev_gps_alt_ft"]) / dt * 60.0
+            if abs(vs) > 300.0 and abs(rate) > 200.0 and (rate * vs) < 0.0:
+                suspect_gps = True
+
+    # Preference: baro -> ADC -> GPS, but avoid strongly suspect.
+    candidates = []
+    if baro_alt is not None:
+        candidates.append(("baro", baro_alt, suspect_baro))
+    if adc_alt is not None:
+        candidates.append(("adc", adc_alt, suspect_adc))
+    if gps_alt is not None:
+        candidates.append(("gps", gps_alt, suspect_gps))
+
+    fused_alt = None
+    for name, val, suspect in candidates:
+        if not suspect:
+            fused_alt = val
+            break
+
+    if fused_alt is None and candidates:
+        # All suspect; choose one whose implied rate best matches VS.
+        best = None
+        best_err = float("inf")
+        for name, val, suspect in candidates:
+            prev_key = f"prev_{name}_alt_ft"
+            prev = _autopilot_state.get(prev_key)
+            if prev is None or dt <= 1e-4:
+                err = 0.0  # can't judge; treat as equal
+            else:
+                rate = (val - prev) / dt * 60.0
+                err = abs(rate - vs)
+            if err < best_err:
+                best = val
+                best_err = err
+        fused_alt = best
+
+    if fused_alt is None:
+        fused_alt = gps_alt or baro_alt or adc_alt or 0.0
+
+    # Update history
+    _autopilot_state["prev_baro_alt_ft"] = baro_alt
+    _autopilot_state["prev_adc_alt_ft"] = adc_alt
+    _autopilot_state["prev_gps_alt_ft"] = gps_alt
+    _autopilot_state["prev_fused_alt_ft"] = fused_alt
+
+    return fused_alt, vs
+
+
+def _fuse_radar_alt(state):
+    vals = []
+    valids = []
+    for i in (1, 2, 3):
+        vals.append(state.get(f"radar_alt_{i}_ft"))
+        valids.append(_safe_bool(state.get(f"radar_alt_{i}_valid")))
+    return _fuse_triplex(vals, valids, max_spread=50.0)
+
+
+def _fuse_yaw_rate(state):
+    vals = []
+    valids = []
+    for i in (1, 2, 3):
+        valids.append(_safe_bool(state.get(f"gyro_{i}_valid")))
+        vals.append(state.get(f"gyro_{i}_yaw_rate_dps"))
+    return _fuse_triplex(vals, valids, max_spread=5.0) or 0.0
+
+
+def _fuse_roll_rate(state):
+    vals = []
+    valids = []
+    for i in (1, 2, 3):
+        valids.append(_safe_bool(state.get(f"gyro_{i}_valid")))
+        vals.append(state.get(f"gyro_{i}_roll_rate_dps"))
+    return _fuse_triplex(vals, valids, max_spread=5.0) or 0.0
+
+
+# ---------------------------------------------------------------------------
+# Envelope protection helpers
+# ---------------------------------------------------------------------------
+
+def _compute_minimum_speed(state, flaps_deg):
+    """
+    Crude minimum safe indicated speed vs configuration.
+    Very approximate schedule.
+    """
+    gw = state.get("gross_weight_kg", 60000.0)
+    weight_factor = math.sqrt(_clamp(gw / 60000.0, 0.7, 1.3))
+
+    if flaps_deg < 5.0:
+        base = 200.0
+    elif flaps_deg < 20.0:
+        base = 170.0
+    else:
+        base = 140.0
+
+    return base * weight_factor
+
+
+def _compute_max_speed_limits(state):
+    """
+    Returns (vne_kt, mach_limit).
+    """
+    VNE_KT = 365.0
+    MACH_MAX = 0.82
+    return VNE_KT, MACH_MAX
+
+
+# ---------------------------------------------------------------------------
+# Main autopilot function
+# ---------------------------------------------------------------------------
+
+def autopilot_step(state: dict, dt: float) -> dict:
+    global _autopilot_state
+
+    # Basic dt handling
+    if dt is None or dt <= 0.0:
+        dt = state.get("dt", 0.05) or 0.05
+    _autopilot_state["last_dt"] = dt
+
+    # Check essential power/hydraulics; if lost, do not command anything.
+    if state.get("bus_ess_voltage", 0.0) < 18.0:
+        return {}
+
+    if (state.get("hyd_a_press_psi", 0.0) < 1500.0 and
+        state.get("hyd_b_press_psi", 0.0) < 1500.0 and
+        state.get("hyd_c_press_psi", 0.0) < 1500.0):
+        return {}
+
+    ap_engaged = _safe_bool(state.get("ap_engaged"))
+    at_engaged = _safe_bool(state.get("at_engaged"))
+
+    # Determine ground/airborne
+    on_ground = (
+        _safe_bool(state.get("weight_on_wheels_left")) or
+        _safe_bool(state.get("weight_on_wheels_right")) or
+        _safe_bool(state.get("weight_on_wheels_nose"))
+    )
+
+    # Fused states
+    fused_alt_ft, vs_fpm = _fuse_altitude(state, dt)
+    radar_alt_ft = _fuse_radar_alt(state)
+    pitch_deg, roll_deg = _fuse_attitude(state)
+    heading_deg, track_deg = _fuse_heading_track(state)
+    ias_kt, ias_reliable = _fuse_ias(state)
+    aoa_deg = _fuse_aoa(state)
+    yaw_rate_dps = _fuse_yaw_rate(state)
+    roll_rate_dps = _fuse_roll_rate(state)
+    mach_vals = [state.get("mach_1"), state.get("mach_2"), state.get("mach_3")]
+    mach = _median([m for m in mach_vals if m is not None]) or 0.0
+    drift_angle_deg = state.get("drift_angle_deg")
+    if drift_angle_deg is None:
+        drift_angle_deg = _angle_diff(track_deg, heading_deg)
+
+    # Configuration
+    flap_left = state.get("flap_pos_left_deg", 0.0)
+    flap_right = state.get("flap_pos_right_deg", 0.0)
+    flaps_deg = 0.5 * (flap_left + flap_right)
+    gear_down = _safe_bool(state.get("gear_handle_down") or
+                           state.get("gear_left_locked") or
+                           state.get("gear_right_locked"))
+
+    # Engine data
+    e1_running = _safe_bool(state.get("engine_1_running"))
+    e2_running = _safe_bool(state.get("engine_2_running"))
+    e1_thrust = state.get("engine_1_thrust_pct", 0.0)
+    e2_thrust = state.get("engine_2_thrust_pct", 0.0)
+
+    # Targets
+    target_alt = state.get("target_alt_ft", fused_alt_ft)
+    target_hdg = _wrap_deg(state.get("target_hdg_deg", heading_deg))
+    target_ias = state.get("target_ias_kt", ias_kt or 250.0)
+    target_vs = state.get("target_vs_fpm", 0.0)
+
+    # Initial outputs: default to no change
+    cmd = {}
+
+    # -----------------------------------------------------------------------
+    # Autothrottle logic (can operate even if AP is off)
+    # -----------------------------------------------------------------------
+    VNE_KT, MACH_MAX = _compute_max_speed_limits(state)
+    min_safe_ias = _compute_minimum_speed(state, flaps_deg=flaps_deg)
+
+    stall_aoa = 14.0        # very approximate
+    aoa_margin = 10.0       # "alpha protection" threshold
+
+    near_stall = False
+    deep_stall = False
+    if aoa_deg is not None:
+        if aoa_deg > stall_aoa:
+            deep_stall = True
+        elif aoa_deg > aoa_margin:
+            near_stall = True
+
+    overspeed = False
+    if ias_kt is not None and ias_kt > VNE_KT:
+        overspeed = True
+    if mach is not None and mach > MACH_MAX:
+        overspeed = True
+
+    # Throttle base: keep current if AT not engaged
+    throttle_1 = state.get("throttle_1_pos", 0.5)
+    throttle_2 = state.get("throttle_2_pos", 0.5)
+
+    if at_engaged:
+        # Envelope protections override normal speed command
+        if deep_stall or near_stall:
+            # Full thrust to recover from stall
+            throttle_cmd = 1.0
+            _autopilot_state["throttle_int"] = 0.0
+        elif overspeed:
+            throttle_cmd = 0.0
+            _autopilot_state["throttle_int"] = 0.0
+        else:
+            # Normal speed control (IAS if reliable, otherwise hold last)
+            if ias_reliable and ias_kt is not None:
+                speed_err = _clamp(target_ias, min_safe_ias, VNE_KT - 10.0) - ias_kt
+                # Basic PI controller
+                Kp_t = 0.005
+                Ki_t = 0.002
+                _autopilot_state["throttle_int"] += speed_err * dt
+                # Prevent wind‑up
+                _autopilot_state["throttle_int"] = _clamp(_autopilot_state["throttle_int"], -1000.0, 1000.0)
+                throttle_cmd = (Kp_t * speed_err +
+                                Ki_t * _autopilot_state["throttle_int"] +
+                                _autopilot_state["last_throttle"])
+            else:
+                # Airspeed unreliable: hold last throttle, maybe bias slightly
+                throttle_cmd = _autopilot_state["last_throttle"]
+
+        # Clamp and rate limit
+        throttle_cmd = _clamp(throttle_cmd, 0.0, 1.0)
+        max_delta = 0.1 * dt  # smooth
+        throttle_cmd = _clamp(
+            throttle_cmd,
+            _autopilot_state["last_throttle"] - max_delta,
+            _autopilot_state["last_throttle"] + max_delta
+        )
+        _autopilot_state["last_throttle"] = throttle_cmd
+
+        # Engine‑out consideration: if engine not running, command idle on it
+        if not e1_running:
+            throttle_1 = 0.0
+            throttle_2 = throttle_cmd
+        elif not e2_running:
+            throttle_2 = 0.0
+            throttle_1 = throttle_cmd
+        else:
+            throttle_1 = throttle_cmd
+            throttle_2 = throttle_cmd
+
+        cmd["throttle_1"] = throttle_1
+        cmd["throttle_2"] = throttle_2
+
+    # -----------------------------------------------------------------------
+    # If AP not engaged, only autothrottle (above) acts.
+    # -----------------------------------------------------------------------
+    if not ap_engaged:
+        return cmd
+
+    # -----------------------------------------------------------------------
+    # Pitch / altitude control (with envelope protection)
+    # -----------------------------------------------------------------------
+
+    # Determine desired vertical speed from altitude error
+    alt_err = target_alt - fused_alt_ft
+
+    # If user commands explicit VS that will move toward target, use it as bias.
+    vs_cmd = target_vs
+    if vs_cmd == 0.0:
+        # Altitude hold / capture logic
+        K_alt_to_vs = 0.5   # fpm per ft
+        vs_cmd = _clamp(K_alt_to_vs * alt_err, -3000.0, 3000.0)
+
+    # Envelope overrides
+    pitch_target_deg = 0.0
+
+    # Ground / flare protection: if very low and descending fast, reduce sink
+    if not on_ground and radar_alt_ft is not None and radar_alt_ft < 100.0:
+        if vs_fpm < -700.0:
+            pitch_target_deg = max(pitch_target_deg, 5.0)
+
+    # Stall protection: command nose‑down
+    if deep_stall or near_stall:
+        # Strong nose‑down, ignore altitude
+        pitch_target_deg = min(pitch_target_deg, -5.0)
+        if deep_stall:
+            pitch_target_deg = -10.0
+
+    # Overspeed protection: pitch up
+    if overspeed:
+        pitch_target_deg = max(pitch_target_deg, 10.0)
+
+    # If no envelope conflict, use VS/altitude to define pitch target
+    if not (deep_stall or near_stall or overspeed):
+        # Simple VS‑to‑pitch mapping; about 3° pitch for 1000 fpm
+        K_vs_to_pitch = 0.003
+        vs_err = vs_cmd - vs_fpm
+        pitch_target_deg = K_vs_to_pitch * vs_err
+        # Limit pitch target
+        if gear_down or flaps_deg > 0.0:
+            pitch_limit = 12.0
+        else:
+            pitch_limit = 20.0
+        pitch_target_deg = _clamp(pitch_target_deg, -10.0, pitch_limit)
+
+    # Now inner loop: pitch attitude control -> elevator
+    pitch_error = pitch_target_deg - pitch_deg
+    Kp_pitch = 0.08
+    Ki_pitch = 0.02
+    _autopilot_state["pitch_int"] += pitch_error * dt
+    _autopilot_state["pitch_int"] = _clamp(_autopilot_state["pitch_int"], -50.0, 50.0)
+
+    elevator_cmd = Kp_pitch * pitch_error + Ki_pitch * _autopilot_state["pitch_int"]
+    elevator_cmd = _clamp(elevator_cmd, -1.0, 1.0)
+
+    # -----------------------------------------------------------------------
+    # Heading / roll control
+    # -----------------------------------------------------------------------
+    # Shortest heading error
+    hdg_error = _angle_diff(target_hdg, heading_deg)
+
+    # Outer loop: heading -> bank angle target
+    K_hdg_to_bank = 0.5  # deg bank per deg heading error
+    bank_target_deg = _clamp(K_hdg_to_bank * hdg_error, -25.0, 25.0)
+
+    # Inner loop: bank angle -> aileron
+    roll_error = bank_target_deg - roll_deg
+    Kp_roll = 0.08
+    Kd_roll = 0.02
+    aileron_cmd = Kp_roll * roll_error - Kd_roll * roll_rate_dps
+    aileron_cmd = _clamp(aileron_cmd, -1.0, 1.0)
+
+    # -----------------------------------------------------------------------
+    # Yaw / rudder: yaw damper + engine‑out + sideslip reduction
+    # -----------------------------------------------------------------------
+    Kp_sideslip = 0.02
+    Kd_yaw = 0.02
+    sideslip_approx = drift_angle_deg  # track - heading, approx beta
+    rudder_cmd = -Kp_sideslip * sideslip_approx - Kd_yaw * yaw_rate_dps
+
+    # Engine asymmetric thrust compensation
+    thrust_diff = (e1_thrust - e2_thrust) / 100.0  # normalize
+    K_engine_yaw = 0.3
+    rudder_cmd += K_engine_yaw * thrust_diff
+
+    rudder_cmd = _clamp(rudder_cmd, -0.5, 0.5)
+
+    # -----------------------------------------------------------------------
+    # Elevator trim: slowly trim out steady elevator deflection
+    # -----------------------------------------------------------------------
+    elevator_trim_cmd = 0.0
+    if not (deep_stall or overspeed) and not on_ground:
+        if abs(elevator_cmd) > 0.05 and abs(pitch_error) < 2.0 and abs(vs_fpm) < 300.0:
+            # Bias trim to reduce sustained elevator load
+            elevator_trim_cmd = 0.2 * elevator_cmd
+            elevator_trim_cmd = _clamp(elevator_trim_cmd, -0.2, 0.2)
+
+    # -----------------------------------------------------------------------
+    # Speedbrake: basic use in overspeed or steep descent near target
+    # -----------------------------------------------------------------------
+    speedbrake_cmd = None
+    if overspeed:
+        speedbrake_cmd = 1.0
+    else:
+        # If descending steeply and still far above target altitude, allow some brake
+        if alt_err < -2000.0 and vs_fpm < -2000.0 and ias_kt is not None and ias_kt > min_safe_ias + 20.0:
+            speedbrake_cmd = 0.5
+        else:
+            speedbrake_cmd = 0.0
+
+    # -----------------------------------------------------------------------
+    # Gear and flaps: leave under pilot control (no automatic changes)
+    # -----------------------------------------------------------------------
+
+    # Populate command dict
+    cmd["elevator"] = _clamp(elevator_cmd, -1.0, 1.0)
+    cmd["aileron"] = _clamp(aileron_cmd, -1.0, 1.0)
+    cmd["rudder"] = _clamp(rudder_cmd, -1.0, 1.0)
+    cmd["elevator_trim"] = _clamp(elevator_trim_cmd, -1.0, 1.0)
+
+    if speedbrake_cmd is not None:
+        cmd["speedbrake"] = _clamp(speedbrake_cmd, 0.0, 1.0)
+
+    # Do not touch flaps or gear unless explicitly desired; keep them pilot‑controlled.
+
+    return cmd
+```

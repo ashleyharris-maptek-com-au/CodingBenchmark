@@ -1,0 +1,780 @@
+use std::cmp::Ordering;
+use std::env;
+use std::fs::{remove_file, File};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
+use std::path::PathBuf;
+use std::process;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+const MEMORY_POINTS_THRESHOLD: u64 = 10_000_000;
+
+#[derive(Clone, Copy, Default)]
+struct Point {
+    x: f32,
+    y: f32,
+    z: f32,
+}
+
+#[derive(Clone, Copy)]
+struct SamplePoint {
+    point: Point,
+    index: u64,
+}
+
+#[derive(Clone, Copy, Default)]
+struct Sum3 {
+    x: f64,
+    y: f64,
+    z: f64,
+}
+
+#[derive(Clone, Copy)]
+enum Scale {
+    Small,
+    Medium,
+    Large,
+    Extreme,
+}
+
+struct TempStorage {
+    path: PathBuf,
+    num_points: u64,
+}
+
+enum Storage {
+    Memory(Vec<Point>),
+    Temp(TempStorage),
+}
+
+#[derive(Clone, Copy)]
+struct KdNode {
+    centroid_idx: usize,
+    axis: usize,
+    left: Option<usize>,
+    right: Option<usize>,
+}
+
+struct KdTree {
+    nodes: Vec<KdNode>,
+    root: Option<usize>,
+}
+
+enum SearchIndex {
+    Linear,
+    Tree(KdTree),
+}
+
+struct SplitMix64 {
+    state: u64,
+}
+
+impl SplitMix64 {
+    fn new(seed: u64) -> Self {
+        Self { state: seed }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.state = self.state.wrapping_add(0x9E3779B97F4A7C15);
+        let mut z = self.state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+        z ^ (z >> 31)
+    }
+
+    fn gen_range_u64(&mut self, upper: u64) -> u64 {
+        if upper <= 1 {
+            0
+        } else {
+            self.next_u64() % upper
+        }
+    }
+
+    fn gen_range_usize(&mut self, upper: usize) -> usize {
+        self.gen_range_u64(upper as u64) as usize
+    }
+
+    fn gen_f64(&mut self) -> f64 {
+        const SCALE: f64 = 1.0 / ((1u64 << 53) as f64);
+        ((self.next_u64() >> 11) as f64) * SCALE
+    }
+}
+
+impl Point {
+    fn new(x: f32, y: f32, z: f32) -> Self {
+        Self {
+            x: if x.is_finite() { x } else { 0.0 },
+            y: if y.is_finite() { y } else { 0.0 },
+            z: if z.is_finite() { z } else { 0.0 },
+        }
+    }
+}
+
+impl Storage {
+    fn for_each_chunk<F>(&self, chunk_points: usize, mut f: F) -> io::Result<()>
+    where
+        F: FnMut(u64, &[Point]) -> io::Result<()>,
+    {
+        let chunk_points = chunk_points.max(1);
+        match self {
+            Storage::Memory(points) => {
+                let mut start = 0usize;
+                while start < points.len() {
+                    let end = (start + chunk_points).min(points.len());
+                    f(start as u64, &points[start..end])?;
+                    start = end;
+                }
+                Ok(())
+            }
+            Storage::Temp(temp) => {
+                let file = File::open(&temp.path)?;
+                let mut reader = BufReader::with_capacity((chunk_points * 12).min(8 << 20), file);
+                let mut raw = vec![0u8; chunk_points * 12];
+                let mut decoded = vec![Point::default(); chunk_points];
+                let mut offset = 0u64;
+                while offset < temp.num_points {
+                    let take = ((temp.num_points - offset) as usize).min(chunk_points);
+                    let bytes = take * 12;
+                    reader.read_exact(&mut raw[..bytes])?;
+                    decode_points(&raw[..bytes], &mut decoded[..take]);
+                    f(offset, &decoded[..take])?;
+                    offset += take as u64;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+impl KdTree {
+    fn build(centroids: &[Point]) -> Self {
+        let mut indices: Vec<usize> = (0..centroids.len()).collect();
+        let mut nodes = Vec::with_capacity(centroids.len());
+        let root = Self::build_recursive(centroids, &mut indices[..], 0, &mut nodes);
+        Self { nodes, root }
+    }
+
+    fn build_recursive(
+        centroids: &[Point],
+        indices: &mut [usize],
+        depth: usize,
+        nodes: &mut Vec<KdNode>,
+    ) -> Option<usize> {
+        if indices.is_empty() {
+            return None;
+        }
+
+        let axis = depth % 3;
+        let mid = indices.len() / 2;
+        indices.select_nth_unstable_by(mid, |a, b| {
+            coord(centroids[*a], axis)
+                .partial_cmp(&coord(centroids[*b], axis))
+                .unwrap_or(Ordering::Equal)
+        });
+
+        let (left_slice, rest) = indices.split_at_mut(mid);
+        let (median_slice, right_slice) = rest.split_at_mut(1);
+        let node_index = nodes.len();
+        nodes.push(KdNode {
+            centroid_idx: median_slice[0],
+            axis,
+            left: None,
+            right: None,
+        });
+        let left = Self::build_recursive(centroids, left_slice, depth + 1, nodes);
+        let right = Self::build_recursive(centroids, right_slice, depth + 1, nodes);
+        nodes[node_index].left = left;
+        nodes[node_index].right = right;
+        Some(node_index)
+    }
+
+    fn nearest(&self, point: Point, centroids: &[Point]) -> usize {
+        let root = self.root.expect("kd-tree requires non-empty centroids");
+        let root_centroid = centroids[self.nodes[root].centroid_idx];
+        let mut best_idx = self.nodes[root].centroid_idx;
+        let mut best_dist = dist2(point, root_centroid);
+        self.search(root, point, centroids, &mut best_idx, &mut best_dist);
+        best_idx
+    }
+
+    fn search(
+        &self,
+        node_idx: usize,
+        point: Point,
+        centroids: &[Point],
+        best_idx: &mut usize,
+        best_dist: &mut f64,
+    ) {
+        let node = self.nodes[node_idx];
+        let centroid = centroids[node.centroid_idx];
+        let here = dist2(point, centroid);
+        if here < *best_dist {
+            *best_dist = here;
+            *best_idx = node.centroid_idx;
+        }
+
+        let axis = node.axis;
+        let diff = coord(point, axis) as f64 - coord(centroid, axis) as f64;
+        let (near, far) = if diff <= 0.0 {
+            (node.left, node.right)
+        } else {
+            (node.right, node.left)
+        };
+
+        if let Some(next) = near {
+            self.search(next, point, centroids, best_idx, best_dist);
+        }
+        if diff * diff < *best_dist {
+            if let Some(next) = far {
+                self.search(next, point, centroids, best_idx, best_dist);
+            }
+        }
+    }
+}
+
+impl SearchIndex {
+    fn new(centroids: &[Point]) -> Self {
+        if centroids.len() <= 64 {
+            Self::Linear
+        } else {
+            Self::Tree(KdTree::build(centroids))
+        }
+    }
+
+    fn nearest(&self, point: Point, centroids: &[Point]) -> usize {
+        match self {
+            SearchIndex::Linear => nearest_linear(point, centroids),
+            SearchIndex::Tree(tree) => tree.nearest(point, centroids),
+        }
+    }
+}
+
+fn main() -> io::Result<()> {
+    let stdin = io::stdin();
+    let mut reader = BufReader::with_capacity(1 << 20, stdin.lock());
+    let (num_points, num_clusters) = parse_header(&mut reader)?;
+
+    if num_points == 0 || num_clusters == 0 {
+        return Ok(());
+    }
+
+    let scale = choose_scale(num_points);
+    let keep_memory = num_points <= MEMORY_POINTS_THRESHOLD;
+    let sample_target = choose_sample_target(num_points, num_clusters);
+    let chunk_points = choose_chunk_points(scale);
+    let seed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64
+        ^ (process::id() as u64)
+        ^ num_points
+        ^ ((num_clusters as u64) << 32);
+    let mut rng = SplitMix64::new(seed);
+
+    let (storage, sample) = ingest_points(
+        &mut reader,
+        num_points,
+        sample_target,
+        keep_memory,
+        &mut rng,
+    )?;
+
+    let (mut centroids, anchors) = init_centroids(&sample, num_clusters, &mut rng);
+    let sample_points: Vec<Point> = sample.iter().map(|s| s.point).collect();
+    let sample_storage = Storage::Memory(sample_points);
+
+    let warmup_passes = choose_warmup_passes(scale, num_clusters);
+    if warmup_passes > 0 && !sample.is_empty() {
+        refine_centroids(
+            &sample_storage,
+            &mut centroids,
+            &sample,
+            warmup_passes,
+            chunk_points.min(65_536),
+            &mut rng,
+        )?;
+    }
+
+    let training_passes = choose_training_passes(scale, num_clusters, keep_memory);
+    if training_passes > 0 {
+        refine_centroids(
+            &storage,
+            &mut centroids,
+            &sample,
+            training_passes,
+            chunk_points,
+            &mut rng,
+        )?;
+    }
+
+    emit_assignments(&storage, &centroids, &anchors, chunk_points)?;
+
+    if let Storage::Temp(temp) = &storage {
+        let _ = remove_file(&temp.path);
+    }
+
+    Ok(())
+}
+
+fn parse_header<R: BufRead>(reader: &mut R) -> io::Result<(u64, usize)> {
+    let mut header = Vec::with_capacity(64);
+    let bytes = reader.read_until(b'\n', &mut header)?;
+    if bytes == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "missing header line",
+        ));
+    }
+
+    let header_str = std::str::from_utf8(&header)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "header is not UTF-8"))?;
+    let mut parts = header_str.split_whitespace();
+    let num_points = parts
+        .next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing point count"))?
+        .parse::<u64>()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid point count"))?;
+    let num_clusters = parts
+        .next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing cluster count"))?
+        .parse::<usize>()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid cluster count"))?;
+    Ok((num_points, num_clusters))
+}
+
+fn choose_scale(num_points: u64) -> Scale {
+    if num_points <= 10_000_000 {
+        Scale::Small
+    } else if num_points <= 100_000_000 {
+        Scale::Medium
+    } else if num_points <= 1_000_000_000 {
+        Scale::Large
+    } else {
+        Scale::Extreme
+    }
+}
+
+fn choose_sample_target(num_points: u64, num_clusters: usize) -> usize {
+    let mut target = if num_clusters <= 128 {
+        65_536usize
+    } else if num_clusters <= 2_048 {
+        num_clusters.saturating_mul(8).max(32_768)
+    } else {
+        num_clusters.saturating_mul(3).max(32_768)
+    };
+    target = target.min(131_072);
+    target = target.max(num_clusters.max(1));
+    target.min(saturating_u64_to_usize(num_points))
+}
+
+fn choose_chunk_points(scale: Scale) -> usize {
+    match scale {
+        Scale::Small => 32_768,
+        Scale::Medium => 65_536,
+        Scale::Large => 131_072,
+        Scale::Extreme => 262_144,
+    }
+}
+
+fn choose_warmup_passes(scale: Scale, num_clusters: usize) -> usize {
+    let base = match scale {
+        Scale::Small => 5,
+        Scale::Medium => 4,
+        Scale::Large => 3,
+        Scale::Extreme => 2,
+    };
+    if num_clusters > 4_096 {
+        base.min(2)
+    } else {
+        base
+    }
+}
+
+fn choose_training_passes(scale: Scale, num_clusters: usize, keep_memory: bool) -> usize {
+    let base = match scale {
+        Scale::Small => {
+            if keep_memory {
+                10
+            } else {
+                6
+            }
+        }
+        Scale::Medium => 5,
+        Scale::Large => 2,
+        Scale::Extreme => 1,
+    };
+    if num_clusters > 4_096 {
+        base.min(3)
+    } else {
+        base
+    }
+}
+
+fn ingest_points<R: Read>(
+    reader: &mut R,
+    num_points: u64,
+    sample_target: usize,
+    keep_memory: bool,
+    rng: &mut SplitMix64,
+) -> io::Result<(Storage, Vec<SamplePoint>)> {
+    let chunk_points = 65_536usize;
+    let mut raw = vec![0u8; chunk_points * 12];
+    let mut points = if keep_memory {
+        Vec::with_capacity(saturating_u64_to_usize(num_points))
+    } else {
+        Vec::new()
+    };
+    let mut temp_path = None;
+    let mut temp_writer = if keep_memory {
+        None
+    } else {
+        let path = make_temp_path();
+        let file = File::create(&path)?;
+        temp_path = Some(path);
+        Some(BufWriter::with_capacity(1 << 20, file))
+    };
+    let mut sample = Vec::with_capacity(sample_target);
+    let mut offset = 0u64;
+
+    while offset < num_points {
+        let take = ((num_points - offset) as usize).min(chunk_points);
+        let bytes = take * 12;
+        reader.read_exact(&mut raw[..bytes])?;
+        if let Some(writer) = temp_writer.as_mut() {
+            writer.write_all(&raw[..bytes])?;
+        }
+
+        for i in 0..take {
+            let base = i * 12;
+            let point = Point::new(
+                f32::from_le_bytes([
+                    raw[base],
+                    raw[base + 1],
+                    raw[base + 2],
+                    raw[base + 3],
+                ]),
+                f32::from_le_bytes([
+                    raw[base + 4],
+                    raw[base + 5],
+                    raw[base + 6],
+                    raw[base + 7],
+                ]),
+                f32::from_le_bytes([
+                    raw[base + 8],
+                    raw[base + 9],
+                    raw[base + 10],
+                    raw[base + 11],
+                ]),
+            );
+            if keep_memory {
+                points.push(point);
+            }
+            reservoir_push(
+                &mut sample,
+                sample_target,
+                SamplePoint {
+                    point,
+                    index: offset + i as u64,
+                },
+                offset + i as u64 + 1,
+                rng,
+            );
+        }
+
+        offset += take as u64;
+    }
+
+    if let Some(writer) = temp_writer.as_mut() {
+        writer.flush()?;
+    }
+
+    let storage = if keep_memory {
+        Storage::Memory(points)
+    } else {
+        Storage::Temp(TempStorage {
+            path: temp_path.expect("temp path must exist"),
+            num_points,
+        })
+    };
+
+    Ok((storage, sample))
+}
+
+fn init_centroids(
+    sample: &[SamplePoint],
+    num_clusters: usize,
+    rng: &mut SplitMix64,
+) -> (Vec<Point>, Vec<u64>) {
+    if sample.is_empty() {
+        return (
+            vec![Point::default(); num_clusters],
+            vec![0u64; num_clusters],
+        );
+    }
+
+    let mut centroids = Vec::with_capacity(num_clusters);
+    let mut anchors = Vec::with_capacity(num_clusters);
+    let mut chosen = vec![false; sample.len()];
+    let mut best_dist = vec![f64::INFINITY; sample.len()];
+
+    let first = rng.gen_range_usize(sample.len());
+    centroids.push(sample[first].point);
+    anchors.push(sample[first].index);
+    chosen[first] = true;
+
+    while centroids.len() < num_clusters && centroids.len() < sample.len() {
+        let newest = centroids[centroids.len() - 1];
+        let mut total = 0.0f64;
+        for (i, sample_point) in sample.iter().enumerate() {
+            let d = dist2(sample_point.point, newest);
+            if d < best_dist[i] {
+                best_dist[i] = d;
+            }
+            if !chosen[i] {
+                total += best_dist[i];
+            }
+        }
+
+        let next = if total > 0.0 {
+            let mut ticket = rng.gen_f64() * total;
+            let mut picked = None;
+            for i in 0..sample.len() {
+                if chosen[i] {
+                    continue;
+                }
+                ticket -= best_dist[i];
+                if ticket <= 0.0 {
+                    picked = Some(i);
+                    break;
+                }
+            }
+            picked.unwrap_or_else(|| first_unchosen(&chosen).unwrap_or(0))
+        } else {
+            first_unchosen(&chosen).unwrap_or(0)
+        };
+
+        chosen[next] = true;
+        centroids.push(sample[next].point);
+        anchors.push(sample[next].index);
+    }
+
+    while centroids.len() < num_clusters {
+        let fallback = sample[centroids.len() % sample.len()];
+        centroids.push(fallback.point);
+        anchors.push(fallback.index);
+    }
+
+    (centroids, anchors)
+}
+
+fn refine_centroids(
+    storage: &Storage,
+    centroids: &mut [Point],
+    sample: &[SamplePoint],
+    iterations: usize,
+    chunk_points: usize,
+    rng: &mut SplitMix64,
+) -> io::Result<()> {
+    if centroids.is_empty() {
+        return Ok(());
+    }
+
+    let mut previous_shift = f64::INFINITY;
+    for _ in 0..iterations {
+        let prev = centroids.to_vec();
+        let search = SearchIndex::new(&prev);
+        let mut sums = vec![Sum3::default(); centroids.len()];
+        let mut counts = vec![0u64; centroids.len()];
+
+        storage.for_each_chunk(chunk_points, |_, points| {
+            for &point in points {
+                let idx = search.nearest(point, &prev);
+                counts[idx] += 1;
+                sums[idx].x += point.x as f64;
+                sums[idx].y += point.y as f64;
+                sums[idx].z += point.z as f64;
+            }
+            Ok(())
+        })?;
+
+        let relative_shift = update_centroids(centroids, &prev, &sums, &counts, sample, rng);
+        if relative_shift <= 1e-5 || (previous_shift - relative_shift).abs() <= 1e-7 {
+            break;
+        }
+        previous_shift = relative_shift;
+    }
+
+    Ok(())
+}
+
+fn update_centroids(
+    centroids: &mut [Point],
+    prev: &[Point],
+    sums: &[Sum3],
+    counts: &[u64],
+    sample: &[SamplePoint],
+    rng: &mut SplitMix64,
+) -> f64 {
+    let empty_count = counts.iter().filter(|&&count| count == 0).count();
+    let replacements = pick_replacements(prev, sample, empty_count);
+    let mut replacement_iter = replacements.into_iter();
+
+    let mut shift_sum = 0.0f64;
+    let mut scale = 1.0f64;
+
+    for i in 0..centroids.len() {
+        let next = if counts[i] > 0 {
+            Point::new(
+                (sums[i].x / counts[i] as f64) as f32,
+                (sums[i].y / counts[i] as f64) as f32,
+                (sums[i].z / counts[i] as f64) as f32,
+            )
+        } else if let Some(point) = replacement_iter.next() {
+            point
+        } else {
+            prev[rng.gen_range_usize(prev.len())]
+        };
+
+        shift_sum += dist2(prev[i], next);
+        scale += magnitude1(prev[i]) + magnitude1(next);
+        centroids[i] = next;
+    }
+
+    shift_sum / scale
+}
+
+fn pick_replacements(centroids: &[Point], sample: &[SamplePoint], need: usize) -> Vec<Point> {
+    if need == 0 || sample.is_empty() {
+        return Vec::new();
+    }
+
+    let search = SearchIndex::new(centroids);
+    let mut ranked = Vec::with_capacity(sample.len());
+    for &sample_point in sample {
+        let idx = search.nearest(sample_point.point, centroids);
+        ranked.push((dist2(sample_point.point, centroids[idx]), sample_point.point));
+    }
+    ranked.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal));
+    ranked.into_iter().take(need).map(|(_, point)| point).collect()
+}
+
+fn emit_assignments(
+    storage: &Storage,
+    centroids: &[Point],
+    anchors: &[u64],
+    chunk_points: usize,
+) -> io::Result<()> {
+    let search = SearchIndex::new(centroids);
+    let stdout = io::stdout();
+    let mut writer = BufWriter::with_capacity(1 << 20, stdout.lock());
+    let mut output = vec![0u8; chunk_points.max(1) * 4];
+    let mut anchor_pairs: Vec<(u64, usize)> = anchors
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(cluster, index)| (index, cluster))
+        .collect();
+    anchor_pairs.sort_by_key(|&(index, _)| index);
+    let mut anchor_cursor = 0usize;
+
+    storage.for_each_chunk(chunk_points, |start, points| {
+        while anchor_cursor < anchor_pairs.len() && anchor_pairs[anchor_cursor].0 < start {
+            anchor_cursor += 1;
+        }
+
+        for (offset, &point) in points.iter().enumerate() {
+            let point_index = start + offset as u64;
+            let mut assignment = search.nearest(point, centroids);
+            if anchor_cursor < anchor_pairs.len() && anchor_pairs[anchor_cursor].0 == point_index {
+                assignment = anchor_pairs[anchor_cursor].1;
+                anchor_cursor += 1;
+            }
+            output[offset * 4..offset * 4 + 4].copy_from_slice(&(assignment as u32).to_le_bytes());
+        }
+
+        writer.write_all(&output[..points.len() * 4])?;
+        Ok(())
+    })?;
+
+    writer.flush()
+}
+
+fn reservoir_push(
+    sample: &mut Vec<SamplePoint>,
+    sample_target: usize,
+    point: SamplePoint,
+    seen: u64,
+    rng: &mut SplitMix64,
+) {
+    if sample_target == 0 {
+        return;
+    }
+    if sample.len() < sample_target {
+        sample.push(point);
+    } else {
+        let slot = rng.gen_range_u64(seen);
+        if (slot as usize) < sample_target {
+            sample[slot as usize] = point;
+        }
+    }
+}
+
+fn decode_points(raw: &[u8], out: &mut [Point]) {
+    for (i, point) in out.iter_mut().enumerate() {
+        let base = i * 12;
+        *point = Point::new(
+            f32::from_le_bytes([raw[base], raw[base + 1], raw[base + 2], raw[base + 3]]),
+            f32::from_le_bytes([raw[base + 4], raw[base + 5], raw[base + 6], raw[base + 7]]),
+            f32::from_le_bytes([raw[base + 8], raw[base + 9], raw[base + 10], raw[base + 11]]),
+        );
+    }
+}
+
+fn nearest_linear(point: Point, centroids: &[Point]) -> usize {
+    let mut best_idx = 0usize;
+    let mut best_dist = dist2(point, centroids[0]);
+    for (i, &centroid) in centroids.iter().enumerate().skip(1) {
+        let d = dist2(point, centroid);
+        if d < best_dist {
+            best_dist = d;
+            best_idx = i;
+        }
+    }
+    best_idx
+}
+
+fn dist2(a: Point, b: Point) -> f64 {
+    let dx = (a.x - b.x) as f64;
+    let dy = (a.y - b.y) as f64;
+    let dz = (a.z - b.z) as f64;
+    dx * dx + dy * dy + dz * dz
+}
+
+fn coord(point: Point, axis: usize) -> f32 {
+    match axis {
+        0 => point.x,
+        1 => point.y,
+        _ => point.z,
+    }
+}
+
+fn magnitude1(point: Point) -> f64 {
+    point.x.abs() as f64 + point.y.abs() as f64 + point.z.abs() as f64
+}
+
+fn first_unchosen(chosen: &[bool]) -> Option<usize> {
+    chosen.iter().position(|&flag| !flag)
+}
+
+fn saturating_u64_to_usize(value: u64) -> usize {
+    value.min(usize::MAX as u64) as usize
+}
+
+fn make_temp_path() -> PathBuf {
+    let mut path = env::temp_dir();
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    path.push(format!("adaptive_kmeans_{}_{}.bin", process::id(), stamp));
+    path
+}

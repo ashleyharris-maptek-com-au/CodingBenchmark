@@ -34,7 +34,7 @@ import tempfile
 
 # Import our native compiler helper
 from native_compiler import RustCompiler, CompilationError, ExecutionError
-from solver_utils import normalize_code_result
+from solver_utils import normalize_code_result, BaselineCache, GradeCache
 
 title = "3D Point Clustering (Rust)"
 
@@ -50,6 +50,10 @@ TIMEOUT_SECONDS = 30
 
 # Seed for reproducibility
 RANDOM_SEED = 26262626
+_DATA_CACHE = BaselineCache("test26_point_clouds")
+_GRADE_CACHE = GradeCache("test26")
+_POINT_STRUCT = struct.Struct('<fff')
+_WCSS_SAMPLE_SIZE = 100_000
 
 
 def generate_clustered_points(
@@ -245,8 +249,149 @@ TEST_CASES = [
   },
 ]
 
-# Cache for generated points (only for smaller cases)
-POINTS_CACHE = {}
+
+def _data_cache_key_parts(subpass: int) -> tuple:
+  case = TEST_CASES[subpass]
+  return (
+    "test26-data-v1",
+    f"subpass={subpass}",
+    f"points={case['num_points']}",
+    f"clusters={case['num_clusters']}",
+    f"seed={RANDOM_SEED + subpass}",
+    f"binary={int(case['use_binary'])}",
+  )
+
+
+def _grade_cache_key_parts(subPass: int, code: str) -> tuple:
+  case = TEST_CASES[subPass]
+  return (
+    "test26-grade-v1",
+    f"subpass={subPass}",
+    f"points={case['num_points']}",
+    f"clusters={case['num_clusters']}",
+    code,
+  )
+
+
+def _cached_input_path(subpass: int) -> Path:
+  cache_hash = _DATA_CACHE._hash_key(*_data_cache_key_parts(subpass))
+  return _DATA_CACHE.cache_dir / f"{cache_hash}_input.bin"
+
+
+def _expected_input_file_size(case: dict) -> int:
+  header = f"{case['num_points']} {case['num_clusters']}\n".encode()
+  return len(header) + case["num_points"] * _POINT_STRUCT.size
+
+
+def _cached_input_is_valid(input_path: Path, case: dict) -> bool:
+  if not input_path.exists():
+    return False
+  try:
+    return input_path.stat().st_size == _expected_input_file_size(case)
+  except Exception:
+    return False
+
+
+def _write_cached_input_file(input_path: Path, subpass: int) -> None:
+  case = TEST_CASES[subpass]
+  num_points = case["num_points"]
+  num_clusters = case["num_clusters"]
+  rng = random.Random(RANDOM_SEED + subpass)
+  centroids = []
+  space_size = 1000.0 * (num_clusters**0.33)
+  for _ in range(num_clusters):
+    centroids.append((rng.uniform(-space_size, space_size), rng.uniform(-space_size, space_size),
+                      rng.uniform(-space_size, space_size)))
+  cluster_std = space_size / (num_clusters**0.5) * 0.3
+
+  tmp_path = None
+  try:
+    with tempfile.NamedTemporaryFile(mode='wb',
+                                     dir=input_path.parent,
+                                     prefix=input_path.name + ".",
+                                     suffix=".tmp",
+                                     delete=False) as f:
+      tmp_path = Path(f.name)
+      f.write(f"{num_points} {num_clusters}\n".encode())
+      buffer = bytearray()
+      buffer_limit = 1 << 20
+      for _ in range(num_points):
+        c_idx = rng.randint(0, num_clusters - 1)
+        cx, cy, cz = centroids[c_idx]
+        x = cx + rng.gauss(0, cluster_std)
+        y = cy + rng.gauss(0, cluster_std)
+        z = cz + rng.gauss(0, cluster_std)
+        buffer.extend(_POINT_STRUCT.pack(x, y, z))
+        if len(buffer) >= buffer_limit:
+          f.write(buffer)
+          buffer.clear()
+      if buffer:
+        f.write(buffer)
+      f.flush()
+      try:
+        os.fsync(f.fileno())
+      except Exception:
+        pass
+    os.replace(tmp_path, input_path)
+  finally:
+    if tmp_path is not None:
+      try:
+        tmp_path.unlink(missing_ok=True)
+      except Exception:
+        pass
+
+
+def _ensure_cached_input_file(subpass: int) -> Path:
+  case = TEST_CASES[subpass]
+  input_path = _cached_input_path(subpass)
+  if _cached_input_is_valid(input_path, case):
+    return input_path
+
+  cache_hash = _DATA_CACHE._hash_key(*_data_cache_key_parts(subpass))
+  lock_path = _DATA_CACHE._lock_path(cache_hash, "input")
+  lock_token = _DATA_CACHE._acquire_lock(lock_path)
+  try:
+    if _cached_input_is_valid(input_path, case):
+      return input_path
+    _write_cached_input_file(input_path, subpass)
+    return input_path
+  finally:
+    _DATA_CACHE._release_lock(lock_path, lock_token)
+
+
+def _read_all_points_from_cached_input(input_path: Path,
+                                       num_points: int) -> List[Tuple[float, float, float]]:
+  points = []
+  with open(input_path, 'rb') as f:
+    f.readline()
+    for _ in range(num_points):
+      data = f.read(_POINT_STRUCT.size)
+      if len(data) < _POINT_STRUCT.size:
+        break
+      points.append(_POINT_STRUCT.unpack(data))
+  return points
+
+
+def _sample_points_from_cached_input(input_path: Path, num_points: int,
+                                     sample_size: int) -> List[Tuple[float, float, float]]:
+  if num_points <= 0 or sample_size <= 0:
+    return []
+
+  sample_size = min(sample_size, num_points)
+  points = []
+  with open(input_path, 'rb') as f:
+    f.readline()
+    data_offset = f.tell()
+    step = max(1, num_points // sample_size)
+    for idx in range(0, num_points, step):
+      f.seek(data_offset + idx * _POINT_STRUCT.size)
+      data = f.read(_POINT_STRUCT.size)
+      if len(data) < _POINT_STRUCT.size:
+        break
+      points.append(_POINT_STRUCT.unpack(data))
+      if len(points) >= sample_size:
+        break
+  return points
 
 
 def get_test_data(
@@ -256,17 +401,9 @@ def get_test_data(
   case = TEST_CASES[subpass]
   num_points = case["num_points"]
   num_clusters = case["num_clusters"]
-
-  # Only cache smaller cases
-  if num_points <= 1_000_000:
-    if subpass not in POINTS_CACHE:
-      points, centroids = generate_clustered_points(num_points, num_clusters, RANDOM_SEED + subpass)
-      POINTS_CACHE[subpass] = (points, centroids)
-    return POINTS_CACHE[subpass][0], POINTS_CACHE[subpass][1], num_points, num_clusters
-  else:
-    # Generate on demand for large cases
-    points, centroids = generate_clustered_points(num_points, num_clusters, RANDOM_SEED + subpass)
-    return points, centroids, num_points, num_clusters
+  input_path = _ensure_cached_input_file(subpass)
+  points = _read_all_points_from_cached_input(input_path, num_points)
+  return points, [], num_points, num_clusters
 
 
 def prepareSubpassPrompt(subPass: int) -> str:
@@ -373,26 +510,17 @@ def run_clustering(code: str, case: dict, subpass: int,
   num_points = case["num_points"]
   num_clusters = case["num_clusters"]
 
-  # Generate test data
-  points, _, _, _ = get_test_data(subpass)
+  cached_input = _ensure_cached_input_file(subpass)
 
   # Prepare input
   if case["use_binary"]:
-    # Use temporary files for binary I/O
-    with tempfile.NamedTemporaryFile(mode='wb', delete=False, suffix='.bin') as f:
-      input_file = f.name
-      # Write header as text first line, then binary
-      header = f"{num_points} {num_clusters}\n".encode()
-      f.write(header)
-      for x, y, z in points:
-        f.write(struct.pack('<fff', x, y, z))
-
-    output_file = input_file + '.out'
-
+    output_file = None
     start_time = time.time()
     try:
-      with open(input_file, 'rb') as fin:
-        with open(output_file, 'w') as fout:
+      with tempfile.NamedTemporaryFile(mode='wb', delete=False, suffix='.out') as f:
+        output_file = f.name
+      with open(cached_input, 'rb') as fin:
+        with open(output_file, 'wb') as fout:
           result = subprocess.run([str(exe_path)],
                                   stdin=fin,
                                   stdout=fout,
@@ -404,13 +532,7 @@ def run_clustering(code: str, case: dict, subpass: int,
         return [], f"Runtime error: {result.stderr.decode()[:500]}", exec_time
 
       # Parse output
-      with open(output_file, 'r') as f:
-        clusters = parse_text_output(f.read(), num_points)
-
-      # Cleanup
-      os.unlink(input_file)
-      if os.path.exists(output_file):
-        os.unlink(output_file)
+      clusters = read_clusters_binary(output_file, num_points)
 
       return clusters, "", exec_time
 
@@ -418,8 +540,15 @@ def run_clustering(code: str, case: dict, subpass: int,
       return [], "Timeout", TIMEOUT_SECONDS
     except Exception as e:
       return [], str(e), time.time() - start_time
+    finally:
+      if output_file and os.path.exists(output_file):
+        try:
+          os.unlink(output_file)
+        except Exception:
+          pass
   else:
     # Text mode for smaller cases
+    points, _, _, _ = get_test_data(subpass)
     input_data = format_text_input(num_points, num_clusters, points)
 
     start_time = time.time()
@@ -458,59 +587,78 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
   num_clusters = case["num_clusters"]
 
   code = result["rust_code"]
+  cache_parts = _grade_cache_key_parts(subPass, code)
 
-  # For very large cases, just check compilation
-  if num_points > 100_000_000:
-    compiler = RustCompiler(aiEngineName)
-    if not compiler.find_compiler():
-      return 0.0, f"[{description}] No Rust compiler"
-    try:
-      compiler.compile(code)
-      return 0.5, f"[{description}] Compiled (too large to run)"
-    except CompilationError as e:
-      return 0.0, f"[{description}] Compile error: {str(e)[:200]}"
+  def compute_grade_record() -> dict:
+    if num_points > 100_000_000:
+      compiler = RustCompiler(aiEngineName)
+      if not compiler.find_compiler():
+        return {
+          "score": 0.0,
+          "explanation": f"[{description}] No Rust compiler",
+        }
+      try:
+        compiler.compile(code)
+        return {
+          "score": 0.5,
+          "explanation": f"[{description}] Compiled (too large to run)",
+        }
+      except CompilationError as e:
+        return {
+          "score": 0.0,
+          "explanation": f"[{description}] Compile error: {str(e)[:200]}",
+        }
 
-  # Run clustering
-  clusters, error, exec_time = run_clustering(code, case, subPass, aiEngineName)
+    clusters, error, exec_time = run_clustering(code, case, subPass, aiEngineName)
 
-  if error:
-    return 0.0, f"[{description}] {error}"
+    if error:
+      return {
+        "score": 0.0,
+        "explanation": f"[{description}] {error}",
+      }
 
-  if len(clusters) != num_points:
-    return 0.0, f"[{description}] Wrong output count: {len(clusters)} vs {num_points}"
+    if len(clusters) != num_points:
+      return {
+        "score": 0.0,
+        "explanation": f"[{description}] Wrong output count: {len(clusters)} vs {num_points}",
+      }
 
-  # Validate cluster indices
-  invalid = sum(1 for c in clusters if c < 0 or c >= num_clusters)
-  if invalid > 0:
-    return 0.2, f"[{description}] {invalid} invalid cluster indices"
+    invalid = sum(1 for c in clusters if c < 0 or c >= num_clusters)
+    if invalid > 0:
+      return {
+        "score": 0.2,
+        "explanation": f"[{description}] {invalid} invalid cluster indices",
+      }
 
-  # Check all clusters used
-  used_clusters = len(set(clusters))
-  if used_clusters < num_clusters * 0.5:
-    score = 0.3 + 0.2 * (used_clusters / num_clusters)
-    return score, f"[{description}] Only {used_clusters}/{num_clusters} clusters used"
+    used_clusters = len(set(clusters))
+    if used_clusters < num_clusters * 0.5:
+      score = 0.3 + 0.2 * (used_clusters / num_clusters)
+      return {
+        "score": score,
+        "explanation": f"[{description}] Only {used_clusters}/{num_clusters} clusters used",
+      }
 
-  # Calculate WCSS for scoring (sample for large cases)
-  points, _, _, _ = get_test_data(subPass)
+    cached_input = _ensure_cached_input_file(subPass)
+    if num_points > 1_000_000:
+      sample_points = _sample_points_from_cached_input(cached_input, num_points, _WCSS_SAMPLE_SIZE)
+      step = max(1, num_points // min(_WCSS_SAMPLE_SIZE, num_points))
+      sample_clusters = [clusters[i] for i in range(0, num_points, step)][:len(sample_points)]
+      wcss = calculate_wcss(sample_points, sample_clusters, num_clusters)
+    else:
+      points = _read_all_points_from_cached_input(cached_input, num_points)
+      wcss = calculate_wcss(points, clusters, num_clusters)
 
-  if num_points > 1_000_000:
-    # Sample for WCSS calculation
-    sample_size = 100_000
-    step = num_points // sample_size
-    sample_points = [points[i] for i in range(0, num_points, step)][:sample_size]
-    sample_clusters = [clusters[i] for i in range(0, num_points, step)][:sample_size]
-    wcss = calculate_wcss(sample_points, sample_clusters, num_clusters)
-  else:
-    wcss = calculate_wcss(points, clusters, num_clusters)
+    cluster_coverage = used_clusters / num_clusters
+    score = 0.7 + 0.3 * min(1.0, cluster_coverage)
+    explanation = (f"[{description}] Clusters used: {used_clusters}/{num_clusters}, "
+                   f"WCSS: {wcss:.2e}, Time: {exec_time:.2f}s")
+    return {
+      "score": score,
+      "explanation": explanation,
+    }
 
-  # Score based on completion and cluster usage
-  cluster_coverage = used_clusters / num_clusters
-  score = 0.7 + 0.3 * min(1.0, cluster_coverage)
-
-  explanation = (f"[{description}] Clusters used: {used_clusters}/{num_clusters}, "
-                 f"WCSS: {wcss:.2e}, Time: {exec_time:.2f}s")
-
-  return score, explanation
+  record = _GRADE_CACHE.get_or_compute_json("grade_record", compute_grade_record, *cache_parts)
+  return float(record.get("score", 0.0)), record.get("explanation", "No explanation")
 
 
 def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:

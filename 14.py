@@ -20,7 +20,7 @@ import time
 from typing import List, Tuple, Set
 
 from native_compiler import CSharpCompiler, compile_and_run, describe_this_pc
-from solver_utils import BaselineCache, StreamingInputFile, get_ram_in_gb, normalize_code_result
+from solver_utils import GradeCache, BaselineCache, StreamingInputFile, get_ram_in_gb, normalize_code_result
 
 title = "Minesweeper Solver (C#)"
 
@@ -38,6 +38,28 @@ TIMEOUT_SECONDS = 30
 RANDOM_SEED = 33333
 
 _BASELINE_CACHE = BaselineCache("test14_minesweeper")
+_GRADE_CACHE = GradeCache("test14")
+
+
+def _grade_cache_key_parts(subPass: int, aiEngineName: str, code: str, board_input: str) -> tuple:
+  return (
+    "test14-grade-v1",
+    f"model={aiEngineName}",
+    f"subpass={subPass}",
+    board_input,
+    code,
+  )
+
+
+def _restore_cached_last_game(board: List[List[str]], game_record) -> None:
+  global lastGame
+  if not game_record:
+    lastGame = None
+    return
+  moves = [(int(move[0]), int(move[1])) for move in game_record.get("moves", [])]
+  correct = int(game_record.get("correct", 0))
+  incorrect = int(game_record.get("incorrect", 0))
+  lastGame = (board, moves, correct, incorrect)
 
 
 def generate_minesweeper_board(width: int, height: int, num_mines: int, reveal_ratio: float,
@@ -546,61 +568,81 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
   safe_cells = case["safe_cells"]()
   description = case["description"]
   code = result["csharp_code"]
+  board_input = format_input(board)
+  cache_parts = _grade_cache_key_parts(subPass, aiEngineName, code, board_input)
 
-  # Execute solver
-  moves, error, exec_time = execute_solver(code, board, subPass, aiEngineName)
+  def compute_grade_record() -> dict:
+    moves, error, exec_time = execute_solver(code, board, subPass, aiEngineName)
 
-  if error:
-    return 0.0, f"[{description}] {error}"
+    if error:
+      return {
+        "score": 0.0,
+        "explanation": f"[{description}] {error}",
+        "game": None,
+      }
 
-  # Validate solution
-  is_valid, validation_error, correct, incorrect = validate_solution(moves, board, safe_cells)
+    is_valid, validation_error, correct, incorrect = validate_solution(moves, board, safe_cells)
+    game_record = {
+      "moves": [list(move) for move in moves],
+      "correct": correct,
+      "incorrect": incorrect,
+    }
 
-  lastGame = (board, moves, correct, incorrect)
+    if not is_valid:
+      return {
+        "score": 0.0,
+        "explanation": f"[{description}] {validation_error}",
+        "game": game_record,
+      }
 
-  if not is_valid:
-    return 0.0, f"[{description}] {validation_error}"
+    ramInGb = get_ram_in_gb()
+    if ramInGb < 64 and subPass > 7:
+      return {
+        "score": 1.0,
+        "explanation": "Not enough RAM to safely grade answer - it was validated, assuming pass.",
+        "game": game_record,
+      }
 
-  ramInGb = get_ram_in_gb()
-  if ramInGb < 32 and subPass > 7:
-    return 1.0, "Not enough RAM to safely grade answer - it was validated, assuming pass."
+    baseline_safe = _get_cached_baseline_safe_cells(board)
+    baseline_count = len(baseline_safe)
+    total_safe = len(safe_cells)
 
-  # Get baseline
-  baseline_safe = _get_cached_baseline_safe_cells(board)
-  baseline_count = len(baseline_safe)
-  total_safe = len(safe_cells)
-
-  # Score based on how many safe cells found vs baseline
-  if baseline_count == 0:
-    # No baseline deductions possible
-    if correct > 0:
-      score = 1.0
-      quality = "found safe cells where baseline couldn't"
+    if baseline_count == 0:
+      if correct > 0:
+        score = 1.0
+        quality = "found safe cells where baseline couldn't"
+      else:
+        score = 0.5
+        quality = "no deductions (matches baseline)"
     else:
-      score = 0.5
-      quality = "no deductions (matches baseline)"
-  else:
-    ratio = correct / baseline_count
-    if ratio >= 1.0:
-      score = 1.0
-      quality = "excellent (≥ baseline)"
-    elif ratio >= 0.7:
-      score = 0.85
-      quality = "good (≥70% of baseline)"
-    elif ratio >= 0.4:
-      score = 0.7
-      quality = "acceptable (≥40% of baseline)"
-    elif correct > 0:
-      score = 0.5
-      quality = f"partial ({correct}/{baseline_count})"
-    else:
-      score = 0.3
-      quality = "no safe cells found"
+      ratio = correct / baseline_count
+      if ratio >= 1.0:
+        score = 1.0
+        quality = "excellent (≥ baseline)"
+      elif ratio >= 0.7:
+        score = 0.85
+        quality = "good (≥70% of baseline)"
+      elif ratio >= 0.4:
+        score = 0.7
+        quality = "acceptable (≥40% of baseline)"
+      elif correct > 0:
+        score = 0.5
+        quality = f"partial ({correct}/{baseline_count})"
+      else:
+        score = 0.3
+        quality = "no safe cells found"
 
-  explanation = (f"[{description}] Found: {correct} safe, Baseline: {baseline_count}, "
-                 f"Total safe: {total_safe}, Time: {exec_time:.1f}s - {quality}")
+    explanation = (f"[{description}] Found: {correct} safe, Baseline: {baseline_count}, "
+                   f"Total safe: {total_safe}, Time: {exec_time:.1f}s - {quality}")
+    return {
+      "score": score,
+      "explanation": explanation,
+      "game": game_record,
+    }
 
-  return score, explanation
+  record = _GRADE_CACHE.get_or_compute_json("grade_record", compute_grade_record, *cache_parts)
+  _restore_cached_last_game(board, record.get("game"))
+  return float(record.get("score", 0.0)), record.get("explanation", "No explanation")
 
 
 def setup() -> None:

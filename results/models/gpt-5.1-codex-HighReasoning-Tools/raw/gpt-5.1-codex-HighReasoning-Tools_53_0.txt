@@ -1,1 +1,318 @@
-{'__exception__': "Can't run here - we're trying to get this working in codex."}
+Below is a self-contained autopilot that fuses the redundant sensors, filters the relative state, reasons about the orbital regime, and then generates thrust/attitude commands consistent with the counter‑intuitive orbital mechanics noted in your brief (retrograde thrust to catch up when behind, etc.). Module-level memory provides persistence across calls so each of the 25 scenarios can be handled cohesively.
+
+```python
+import math
+from typing import Dict, Any, List, Optional, Tuple
+
+# --- Persistent controller memory (survives across autopilot_step calls) ---
+_CONTROLLER = {
+    "pos": [0.0, 0.0, 0.0],          # filtered LVLH position (m)
+    "vel": [0.0, 0.0, 0.0],          # filtered LVLH velocity (m/s)
+    "int_err": [0.0, 0.0, 0.0],      # integral of velocity error (for trim/uncommanded thrust)
+    "mean_motion": 0.001064,         # rad/s (≈400 km orbit)
+    "initialized": False,
+    "last_stage": None,
+}
+
+# --- Constants ---
+MU_EARTH = 3.986004418e14        # m^3/s^2
+ATT_RATE_LIMIT = 0.035           # rad/s
+LOS_EPS = 1e-6
+VEL_INT_CLAMP = 0.5
+DT_MIN = 0.02
+
+GAIN_POS = {
+    "far":   (0.0030, 0.0010, 0.0030),
+    "mid":   (0.0100, 0.0070, 0.0100),
+    "close": (0.0400, 0.0250, 0.0400),
+    "final": (0.0800, 0.0450, 0.0800),
+}
+
+GAIN_VEL = {
+    "far":   (0.180, 0.120, 0.180),
+    "mid":   (0.300, 0.240, 0.300),
+    "close": (0.550, 0.420, 0.550),
+    "final": (0.850, 0.650, 0.850),
+}
+
+GAIN_INT = {
+    "far":   (0.02, 0.02, 0.02),
+    "mid":   (0.05, 0.05, 0.05),
+    "close": (0.10, 0.10, 0.10),
+    "final": (0.15, 0.15, 0.15),
+}
+
+LOS_GAIN = {
+    "far": 0.25,
+    "mid": 0.45,
+    "close": 0.70,
+    "final": 1.10,
+}
+
+DESIRED_VY = {
+    "far":   0.0015,
+    "mid":   0.0100,
+    "close": 0.0400,
+    "final": 0.0200,
+}
+
+MAX_RANGE_SPEED = {
+    "far":   0.50,
+    "mid":   0.35,
+    "close": 0.15,
+    "final": 0.05,
+}
+
+def _clamp(val: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, val))
+
+def _avg_valid(pairs: List[Tuple[Optional[float], bool]]) -> Optional[float]:
+    vals = [v for v, ok in pairs if ok and v is not None]
+    return sum(vals) / len(vals) if vals else None
+
+def _vector_norm(vec: List[float]) -> float:
+    return math.sqrt(vec[0] ** 2 + vec[1] ** 2 + vec[2] ** 2)
+
+def _update_mean_motion(state: Dict[str, Any]) -> None:
+    sma = state.get("ground_semi_major_axis_m")
+    if sma and state.get("ground_semi_major_axis_m_valid"):
+        try:
+            n = math.sqrt(MU_EARTH / (sma ** 3))
+            if 8e-4 <= n <= 2e-3:
+                _CONTROLLER["mean_motion"] = n
+        except (TypeError, ValueError):
+            pass
+
+def _get_relative_measurements(state: Dict[str, Any]) -> Tuple[List[Optional[float]], List[Optional[float]]]:
+    pos_meas, vel_meas = [], []
+    for axis in ("x", "y", "z"):
+        pos_pairs = [
+            (state.get(f"lidar_rel_pos_{axis}_m"), bool(state.get(f"lidar_rel_{axis}_valid"))),
+            (state.get(f"radar_rel_pos_{axis}_m"), bool(state.get(f"radar_rel_{axis}_valid"))),
+        ]
+        vel_pairs = [
+            (state.get(f"lidar_rel_vel_{axis}_ms"), bool(state.get(f"lidar_relv_{axis}_valid"))),
+            (state.get(f"radar_rel_vel_{axis}_ms"), bool(state.get(f"radar_relv_{axis}_valid"))),
+        ]
+        pos_meas.append(_avg_valid(pos_pairs))
+        vel_meas.append(_avg_valid(vel_pairs))
+
+    # Blend docking camera bearings (when available) into position estimate
+    if state.get("dock_camera_active"):
+        cam_range = state.get("dock_camera_range_m")
+        if cam_range is not None and cam_range > 0.0:
+            cam_pairs = {
+                0: (state.get("dock_camera_bearing_x"), bool(state.get("dock_camera_bearing_x_valid"))),
+                1: (state.get("dock_camera_bearing_y"), bool(state.get("dock_camera_bearing_y_valid"))),
+                2: (state.get("dock_camera_bearing_z"), bool(state.get("dock_camera_bearing_z_valid"))),
+            }
+            for i in range(3):
+                val, ok = cam_pairs[i]
+                if ok and val is not None:
+                    cam_pos = val * cam_range
+                    if pos_meas[i] is None:
+                        pos_meas[i] = cam_pos
+                    else:
+                        pos_meas[i] = 0.7 * pos_meas[i] + 0.3 * cam_pos
+    return pos_meas, vel_meas
+
+def _estimate_range(state: Dict[str, Any], pos: List[float]) -> float:
+    ranges = []
+    if state.get("dock_camera_active"):
+        rng = state.get("dock_camera_range_m")
+        if rng:
+            ranges.append(rng)
+    for idx in (1, 2, 3):
+        valid = bool(state.get(f"range_{idx}_valid"))
+        rng = state.get(f"range_{idx}_m")
+        if valid and rng:
+            ranges.append(rng)
+    ranges.append(_vector_norm(pos))
+    return sum(ranges) / len(ranges)
+
+def _fuel_limited_thrust(state: Dict[str, Any]) -> float:
+    pct = state.get("fuel_remaining_pct")
+    if pct is None:
+        return 1.0
+    pct = _clamp(pct / 100.0, 0.0, 1.0)
+    return _clamp(0.35 + 0.65 * pct, 0.35, 1.0)
+
+def _get_attitude_angle(state: Dict[str, Any], axis: str) -> Optional[float]:
+    entries = []
+    for tracker in (1, 2):
+        ang = state.get(f"star_tracker_{tracker}_{axis}_deg")
+        valid = bool(state.get(f"star_tracker_{tracker}_{axis}_valid"))
+        entries.append((ang, valid))
+    value = _avg_valid(entries)
+    return math.radians(value) if value is not None else None
+
+def _get_gyro_rate(state: Dict[str, Any], axis: str) -> float:
+    entries = []
+    for gyro in (1, 2, 3):
+        rate = state.get(f"gyro_{gyro}_{axis}_dps")
+        valid = bool(state.get(f"gyro_{gyro}_{axis}_valid"))
+        if valid and rate is not None:
+            entries.append(rate)
+    if not entries:
+        return 0.0
+    return math.radians(sum(entries) / len(entries))
+
+def _attitude_controller(state: Dict[str, Any]) -> Tuple[float, float, float]:
+    angles = {
+        "roll": _get_attitude_angle(state, "roll"),
+        "pitch": _get_attitude_angle(state, "pitch"),
+        "yaw": _get_attitude_angle(state, "yaw"),
+    }
+    rates = {
+        "roll": _get_gyro_rate(state, "roll"),
+        "pitch": _get_gyro_rate(state, "pitch"),
+        "yaw": _get_gyro_rate(state, "yaw"),
+    }
+
+    cmds = {}
+    for axis in ("roll", "pitch", "yaw"):
+        ang = angles[axis]
+        rate = rates[axis]
+        cmd = 0.0
+        if ang is not None:
+            cmd += -0.35 * ang
+        cmd += -0.45 * rate
+        # Use docking camera bearings for fine pointing when active (<500 m)
+        if state.get("dock_camera_active") and state.get("dock_camera_range_m", 1e9) < 50.0:
+            if axis == "yaw":
+                bearing = state.get("dock_camera_bearing_z")
+                if bearing is not None and state.get("dock_camera_bearing_z_valid"):
+                    cmd += -0.20 * bearing
+            if axis == "pitch":
+                bearing = state.get("dock_camera_bearing_x")
+                if bearing is not None and state.get("dock_camera_bearing_x_valid"):
+                    cmd += -0.20 * bearing
+        cmds[axis] = _clamp(cmd, -ATT_RATE_LIMIT, ATT_RATE_LIMIT)
+    return cmds["roll"], cmds["pitch"], cmds["yaw"]
+
+def autopilot_step(state: Dict[str, Any], dt: float) -> Dict[str, float]:
+    dt = max(dt, DT_MIN)
+    _update_mean_motion(state)
+    pos_meas, vel_meas = _get_relative_measurements(state)
+    prev_pos = _CONTROLLER["pos"]
+    prev_vel = _CONTROLLER["vel"]
+
+    # Predict & filter position/velocity
+    predicted_pos = [prev_pos[i] + prev_vel[i] * dt for i in range(3)]
+    predicted_vel = prev_vel[:]
+    pos = [0.0, 0.0, 0.0]
+    vel = [0.0, 0.0, 0.0]
+
+    for i in range(3):
+        if pos_meas[i] is None:
+            pos[i] = predicted_pos[i]
+        else:
+            alpha = 0.35 if abs(pos_meas[i]) > 200.0 else 0.6
+            pos[i] = alpha * pos_meas[i] + (1.0 - alpha) * predicted_pos[i]
+        if vel_meas[i] is None:
+            vel[i] = predicted_vel[i]
+        else:
+            beta = 0.5 if abs(pos[i]) > 200.0 else 0.7
+            vel[i] = beta * vel_meas[i] + (1.0 - beta) * predicted_vel[i]
+
+    if not _CONTROLLER["initialized"]:
+        _CONTROLLER["initialized"] = True
+        _CONTROLLER["pos"] = pos[:]
+        _CONTROLLER["vel"] = vel[:]
+
+    distance = _estimate_range(state, pos)
+    stage = (
+        "far" if distance > 200.0 else
+        "mid" if distance > 50.0 else
+        "close" if distance > 10.0 else
+        "final"
+    )
+    _CONTROLLER["last_stage"] = stage
+    unit = [0.0, 0.0, 0.0]
+    if distance > LOS_EPS:
+        unit = [pos[i] / distance for i in range(3)]
+
+    desired_closure = -min(MAX_RANGE_SPEED[stage], 0.01 * distance + 0.05)
+    if stage == "final":
+        desired_closure = -0.05
+    los_speed = sum(vel[i] * unit[i] for i in range(3))
+    closure_error = los_speed - desired_closure
+    los_term = -LOS_GAIN[stage] * closure_error
+
+    desired_vel = [0.0, 0.0, 0.0]
+    desired_vel[1] = -DESIRED_VY[stage] * pos[1]  # proportional approach along-track
+
+    a_cmd = [0.0, 0.0, 0.0]
+    mean_motion = _CONTROLLER["mean_motion"]
+
+    for i in range(3):
+        # PD + integral on each axis (integral only when velocity data is trusted)
+        vel_error = vel[i] - desired_vel[i]
+        if vel_meas[i] is not None:
+            _CONTROLLER["int_err"][i] += vel_error * dt
+            _CONTROLLER["int_err"][i] = _clamp(_CONTROLLER["int_err"][i], -VEL_INT_CLAMP, VEL_INT_CLAMP)
+        pos_term = -GAIN_POS[stage][i] * pos[i]
+        vel_term = -GAIN_VEL[stage][i] * vel_error
+        int_term = -GAIN_INT[stage][i] * _CONTROLLER["int_err"][i]
+        a_cmd[i] = pos_term + vel_term + int_term
+
+    # Hill/CW coupling compensation
+    a_cmd[0] += 3.0 * (mean_motion ** 2) * pos[0] + 2.0 * mean_motion * vel[1]
+    a_cmd[1] += -2.0 * mean_motion * vel[0]
+
+    # Line-of-sight regulation
+    for i in range(3):
+        a_cmd[i] += los_term * unit[i]
+
+    # Far-field phasing bias: thrust retrograde when behind, prograde when ahead
+    if stage == "far":
+        y = pos[1]
+        vy = vel[1]
+        bias_mag = min(0.3, 0.0012 * abs(y) + 0.4 * max(0.0, -vy))
+        if y < -30.0:
+            a_cmd[1] += -bias_mag  # retrograde to drop orbit & catch up
+        elif y > 30.0:
+            a_cmd[1] += bias_mag   # prograde to raise orbit & let station catch up
+
+    # Brake if closing too fast in tight regimes
+    rel_speed = _vector_norm(vel)
+    speed_cap = 0.12 if stage in ("close", "final") else 0.4
+    if rel_speed > speed_cap:
+        brake_gain = 0.35 if stage in ("close", "final") else 0.15
+        for i in range(3):
+            a_cmd[i] += -brake_gain * vel[i]
+
+    # Low-fuel thrust limiting
+    thrust_limit = _fuel_limited_thrust(state)
+
+    thrust_cmds = []
+    for val in a_cmd:
+        val = _clamp(val, -1.0, 1.0)
+        if abs(val) > thrust_limit:
+            val = math.copysign(thrust_limit, val)
+        if abs(val) < 1e-3:
+            val = 0.0
+        thrust_cmds.append(val)
+
+    roll_cmd, pitch_cmd, yaw_cmd = _attitude_controller(state)
+
+    _CONTROLLER["pos"] = pos[:]
+    _CONTROLLER["vel"] = vel[:]
+
+    return {
+        "thrust_x": thrust_cmds[0],
+        "thrust_y": thrust_cmds[1],
+        "thrust_z": thrust_cmds[2],
+        "att_rate_roll": roll_cmd,
+        "att_rate_pitch": pitch_cmd,
+        "att_rate_yaw": yaw_cmd,
+    }
+```
+
+### Key Design Notes
+- **Sensor Fusion & Fault Tolerance:** Each axis blends lidar, radar, and docking-camera data; if all fail, the state propagates via last-known kinematics. Integral velocity error helps reject uncommanded thrust and steady-state biases from failing sensors.
+- **Orbital-Mechanics-Aware Guidance:** Stage-based logic (far/mid/close/final) shapes gains and desired closures. In the far field, the autopilot deliberately commands **retrograde thrust when behind** (negative `y`) to drop to a slightly lower orbit and naturally accelerate relative to the station—mirroring the critical orbital insight that thrusting toward the target can be counterproductive. Prograde thrust is used when ahead to rise and slow down.
+- **Clohessy–Wiltshire Compensation:** Mean motion (from ground updates when valid) feeds the Hill-frame coupling terms (`±2n⋅v`, `3n²x`) so the controller doesn’t fight the natural LVLH dynamics.
+- **Fuel & Final Approach Care:** Thrust commands are tapered as fuel dwindles, and approach speeds are limited to ≤0.1 m/s inside 10 m. Docking-camera bearings drive fine pointing and the attitude loop damps both angles and body rates within the ±0.035 rad/s limit.
+
+Drop the function into the simulator harness; module-level state will persist, letting the autopilot adapt across any of the 25 stress scenarios.

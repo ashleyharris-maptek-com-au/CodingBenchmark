@@ -248,6 +248,10 @@ class NativeCompiler(ABC):
   def _is_cached(self, source_hash: str) -> bool:
     """Check if compiled executable exists in cache."""
     exe_path = self._get_cached_exe_path(source_hash)
+    if getattr(self, '_compiler_type', None) == 'dotnet' and str(exe_path).endswith('.dll'):
+      runtimeconfig_path = exe_path.with_suffix('.runtimeconfig.json')
+      deps_path = exe_path.with_suffix('.deps.json')
+      return exe_path.exists() and runtimeconfig_path.exists() and deps_path.exists()
     return exe_path.exists()
 
   @abstractmethod
@@ -1016,7 +1020,9 @@ class CSharpCompiler(NativeCompiler):
     """Compile using .NET SDK."""
     # Create a temporary project
     project_dir = self.cache_dir / f"project_{source_hash}"
+    build_output_dir = self.cache_dir / f"dotnet_out_{source_hash}"
     ensure_dir(project_dir)
+    ensure_dir(build_output_dir)
 
     try:
       # Write source file
@@ -1040,7 +1046,7 @@ class CSharpCompiler(NativeCompiler):
       # Build
       result = subprocess.run(
         [self._compiler_path, 'build', '-c', 'Release', '-o',
-         str(self.cache_dir)],
+         str(build_output_dir)],
         cwd=str(project_dir),
         capture_output=True,
         text=True,
@@ -1051,11 +1057,20 @@ class CSharpCompiler(NativeCompiler):
         raise CompilationError(f"Compilation failed:\n{error_msg[:2000]}")
 
       # The output is Program.dll
-      dll_path = self.cache_dir / "Program.dll"
+      dll_path = build_output_dir / "Program.dll"
       if dll_path.exists():
         # Rename to our cached path
         target_path = exe_path
         shutil.copy2(dll_path, target_path)
+        runtimeconfig_src = build_output_dir / "Program.runtimeconfig.json"
+        if runtimeconfig_src.exists():
+          shutil.copy2(runtimeconfig_src, target_path.with_suffix('.runtimeconfig.json'))
+        deps_src = build_output_dir / "Program.deps.json"
+        if deps_src.exists():
+          shutil.copy2(deps_src, target_path.with_suffix('.deps.json'))
+        pdb_src = build_output_dir / "Program.pdb"
+        if pdb_src.exists():
+          shutil.copy2(pdb_src, target_path.with_suffix('.pdb'))
         return target_path
 
       raise CompilationError("Compilation produced no output")
@@ -1064,6 +1079,10 @@ class CSharpCompiler(NativeCompiler):
       # Clean up project dir
       try:
         shutil.rmtree(project_dir)
+      except Exception:
+        pass
+      try:
+        shutil.rmtree(build_output_dir)
       except Exception:
         pass
 

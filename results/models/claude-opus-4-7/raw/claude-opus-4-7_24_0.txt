@@ -1,0 +1,301 @@
+#include <iostream>
+#include <fstream>
+#include <thread>
+#include <atomic>
+#include <mutex>
+#include <chrono>
+#include <vector>
+#include <string>
+#include <sstream>
+#include <cmath>
+#include <cstdint>
+#include <algorithm>
+#include <limits>
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+struct State {
+    double x=0, y=0, z=0;
+    double vx=0, vy=0, vz=0;
+    double pitch=0, yaw=0, roll=0;
+    double pitch_rate=0, yaw_rate=0, roll_rate=0;
+    double fuel=0;
+};
+
+static std::atomic<bool> g_running{true};
+static std::mutex g_state_mutex;
+static State g_state;
+static std::atomic<bool> g_have_state{false};
+static std::atomic<long long> g_last_state_ms{0};
+
+static double clampd(double v, double lo, double hi) {
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
+}
+
+static double wrap_angle(double a) {
+    while (a > M_PI) a -= 2.0 * M_PI;
+    while (a < -M_PI) a += 2.0 * M_PI;
+    return a;
+}
+
+static long long now_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+static void reader_thread_func() {
+    std::string line;
+    while (g_running.load()) {
+        if (!std::getline(std::cin, line)) {
+            g_running.store(false);
+            return;
+        }
+        if (line.empty()) continue;
+        std::istringstream iss(line);
+        State s;
+        if (iss >> s.x >> s.y >> s.z
+                >> s.vx >> s.vy >> s.vz
+                >> s.pitch >> s.yaw >> s.roll
+                >> s.pitch_rate >> s.yaw_rate >> s.roll_rate
+                >> s.fuel) {
+            {
+                std::lock_guard<std::mutex> lock(g_state_mutex);
+                g_state = s;
+            }
+            g_last_state_ms.store(now_ms());
+            g_have_state.store(true);
+        }
+    }
+}
+
+int main() {
+    std::ios_base::sync_with_stdio(false);
+    std::cin.tie(nullptr);
+
+    double width=0, depth=0, height=0, gravity=1.62, max_thrust=5.0, fuel=100.0;
+    double sx=0, sy=0, sz=0, tx=0, ty=0, tz=0;
+
+    if (!(std::cin >> width >> depth >> height >> gravity >> max_thrust >> fuel)) return 0;
+    if (!(std::cin >> sx >> sy >> sz >> tx >> ty >> tz)) return 0;
+    std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+
+    std::string terrain_path;
+    std::getline(std::cin, terrain_path);
+
+    // Read the "STATE" marker line.
+    std::string state_marker;
+    std::getline(std::cin, state_marker);
+
+    // Background terrain loading (best-effort; the core controller does not require it).
+    int w_int = (int)width;
+    int d_int = (int)depth;
+    std::atomic<bool> terrain_loaded{false};
+    std::vector<uint16_t> ground_top;
+    std::thread terrain_thread([&]() {
+        try {
+            std::ifstream f(terrain_path, std::ios::binary);
+            if (!f) return;
+            size_t cells = (size_t)w_int * (size_t)d_int;
+            if (cells == 0) return;
+            ground_top.assign(cells, 0);
+            const size_t bufN = 1 << 16; // cells per chunk
+            std::vector<uint16_t> buf(bufN * 3);
+            size_t done = 0;
+            while (done < cells) {
+                size_t take = std::min(bufN, cells - done);
+                f.read((char*)buf.data(), (std::streamsize)(take * 6));
+                if (!f) break;
+                for (size_t i = 0; i < take; i++) {
+                    ground_top[done + i] = buf[i * 3 + 0];
+                }
+                done += take;
+            }
+            terrain_loaded.store(true);
+        } catch (...) {}
+    });
+    terrain_thread.detach();
+
+    // Estimate max thrust acceleration. We treat max_thrust as a maximum acceleration (m/s^2).
+    // If the value is too small to overcome gravity, scale to a sane default to avoid div issues.
+    double max_accel = max_thrust;
+    if (max_accel <= gravity * 1.05) max_accel = gravity * 1.5;
+
+    // Start reader thread.
+    std::thread reader(reader_thread_func);
+
+    // Control loop at ~25 Hz.
+    auto next_tick = std::chrono::steady_clock::now();
+    const auto tick_dur = std::chrono::milliseconds(40);
+
+    // Emit an initial line so the engine sees activity immediately.
+    std::cout << "0 0 0 0\n";
+    std::cout.flush();
+
+    bool was_landed = false;
+
+    while (g_running.load()) {
+        std::this_thread::sleep_until(next_tick);
+        next_tick += tick_dur;
+
+        if (!g_have_state.load()) {
+            std::cout << "0 0 0 0\n";
+            std::cout.flush();
+            continue;
+        }
+
+        State s;
+        {
+            std::lock_guard<std::mutex> lock(g_state_mutex);
+            s = g_state;
+        }
+
+        double dx = tx - s.x;
+        double dy = ty - s.y;
+        double dz = tz - s.z;
+        double horiz_dist = std::sqrt(dx*dx + dy*dy);
+        double altitude_above_target = s.z - tz; // positive when above
+
+        // Final landing override.
+        double speed = std::sqrt(s.vx*s.vx + s.vy*s.vy + s.vz*s.vz);
+        if (altitude_above_target < 0.3 && horiz_dist < 5.0 && speed < 2.5) {
+            std::cout << "0 0 0 0\n";
+            std::cout.flush();
+            was_landed = true;
+            continue;
+        }
+        if (was_landed) {
+            std::cout << "0 0 0 0\n";
+            std::cout.flush();
+            continue;
+        }
+
+        // -------- Horizontal guidance --------
+        // Sqrt braking profile: v_max = sqrt(2 * a_brake * d) with safety margin.
+        double brake_a_horiz = std::max(0.3, max_accel * 0.35);
+        double v_h_cap_brake = std::sqrt(2.0 * brake_a_horiz * std::max(0.5, horiz_dist)) * 0.8;
+        // Limit by altitude (don't fly fast horizontally when low).
+        double v_h_cap_alt = std::max(3.0, std::abs(altitude_above_target) * 0.7 + 2.0);
+        // Absolute cap relative to map size.
+        double map_size = std::max(width, depth);
+        double v_h_cap_abs = std::max(20.0, map_size * 0.05);
+        double v_h_max = std::min({v_h_cap_brake, v_h_cap_alt, v_h_cap_abs});
+        if (v_h_max < 0.5) v_h_max = 0.5;
+
+        double v_h_des_x = 0.0, v_h_des_y = 0.0;
+        if (horiz_dist > 0.2) {
+            double inv = 1.0 / horiz_dist;
+            v_h_des_x = dx * inv * v_h_max;
+            v_h_des_y = dy * inv * v_h_max;
+        }
+        // Decay desired horizontal velocity to zero close in.
+        if (horiz_dist < 2.0) {
+            v_h_des_x *= horiz_dist * 0.5;
+            v_h_des_y *= horiz_dist * 0.5;
+        }
+
+        double Kv_h = 1.2;
+        double a_horiz_x = Kv_h * (v_h_des_x - s.vx);
+        double a_horiz_y = Kv_h * (v_h_des_y - s.vy);
+
+        // Reserve thrust for gravity compensation.
+        double reserved = gravity * 1.3;
+        double max_h_accel = std::sqrt(std::max(0.01, max_accel*max_accel - reserved*reserved));
+        max_h_accel = std::min(max_h_accel, max_accel * 0.55);
+        double a_h_mag = std::sqrt(a_horiz_x*a_horiz_x + a_horiz_y*a_horiz_y);
+        if (a_h_mag > max_h_accel && a_h_mag > 1e-6) {
+            double k = max_h_accel / a_h_mag;
+            a_horiz_x *= k;
+            a_horiz_y *= k;
+        }
+
+        // -------- Vertical guidance --------
+        double v_h_now = std::sqrt(s.vx*s.vx + s.vy*s.vy);
+        double safe_hold_alt = std::max(20.0, v_h_now * 0.8 + 10.0);
+        bool far_horiz = horiz_dist > std::max(15.0, safe_hold_alt * 0.5);
+
+        double v_z_desired;
+        if (far_horiz) {
+            // Maintain altitude around safe_hold_alt above target.
+            double alt_err = altitude_above_target - safe_hold_alt;
+            v_z_desired = clampd(-0.5 * alt_err, -10.0, 5.0);
+        } else {
+            // Descending toward target with sqrt braking profile.
+            double brake_a_v = std::max(0.3, max_accel - gravity) * 0.5;
+            double v_z_brake = std::sqrt(2.0 * brake_a_v * std::max(0.05, altitude_above_target));
+            double v_z_cap = std::min(8.0, v_z_brake * 0.7);
+            if (altitude_above_target < 5.0) v_z_cap = std::min(v_z_cap, 1.5);
+            if (altitude_above_target < 1.5) v_z_cap = std::min(v_z_cap, 0.7);
+            if (altitude_above_target < 0.5) v_z_cap = std::min(v_z_cap, 0.4);
+            v_z_desired = -v_z_cap;
+        }
+
+        double Kv_z = 1.5;
+        double a_z_world = Kv_z * (v_z_desired - s.vz);
+        double a_z_thrust = a_z_world + gravity; // include gravity compensation
+        if (a_z_thrust < 0.0) a_z_thrust = 0.0;
+
+        // -------- Combine into thrust vector --------
+        double T_x = a_horiz_x;
+        double T_y = a_horiz_y;
+        double T_z = a_z_thrust;
+        double T_mag = std::sqrt(T_x*T_x + T_y*T_y + T_z*T_z);
+        double thrust_frac = clampd(T_mag / max_accel, 0.0, 1.0);
+
+        // Convert thrust direction to desired pitch/yaw.
+        // World-frame thrust direction with (pitch, yaw):
+        //   ( -cos(yaw)*sin(pitch), -sin(yaw)*sin(pitch), cos(pitch) ).
+        double desired_pitch = 0.0;
+        double desired_yaw = s.yaw;
+        double horiz_T = std::sqrt(T_x*T_x + T_y*T_y);
+        if (T_mag > 1e-4) {
+            desired_pitch = std::atan2(horiz_T, std::max(1e-6, T_z));
+            desired_pitch = clampd(desired_pitch, 0.0, 1.2);
+        }
+        if (horiz_T > 1e-3) {
+            desired_yaw = std::atan2(-T_y, -T_x);
+        }
+
+        double pitch_err = desired_pitch - s.pitch;
+        double yaw_err = wrap_angle(desired_yaw - s.yaw);
+
+        // If yaw is poorly aligned, dampen pitch and reduce horizontal thrust to avoid
+        // accelerating in the wrong direction while yawing.
+        double yaw_align = std::cos(yaw_err);
+        if (yaw_align < 0.5 && desired_pitch > 0.1) {
+            double scale = std::max(0.0, yaw_align);
+            desired_pitch *= scale;
+            pitch_err = desired_pitch - s.pitch;
+            double hover_frac = gravity / max_accel;
+            thrust_frac = clampd(std::max(hover_frac, thrust_frac * (0.4 + 0.6 * scale)), 0.0, 1.0);
+        }
+
+        // PD on rotation (target angular rate = 0).
+        double Kp_rot = 4.0;
+        double Kd_rot = 3.5;
+        double pitch_cmd = clampd(Kp_rot * pitch_err - Kd_rot * s.pitch_rate, -1.0, 1.0);
+        double yaw_cmd   = clampd(Kp_rot * yaw_err   - Kd_rot * s.yaw_rate,   -1.0, 1.0);
+        double roll_cmd  = clampd(-Kp_rot * s.roll   - Kd_rot * s.roll_rate, -1.0, 1.0);
+
+        // Very-low-fuel safety: only burn enough to keep descent gentle.
+        if (s.fuel < 1.0 && altitude_above_target > 1.0 && s.vz < -2.0) {
+            thrust_frac = std::min(1.0, (gravity + 2.0) / max_accel);
+        }
+
+        std::cout << thrust_frac << ' '
+                  << pitch_cmd << ' '
+                  << yaw_cmd << ' '
+                  << roll_cmd << '\n';
+        std::cout.flush();
+    }
+
+    g_running.store(false);
+    if (reader.joinable()) {
+        // Reader is likely blocked on stdin; detach so we can exit cleanly.
+        reader.detach();
+    }
+    return 0;
+}

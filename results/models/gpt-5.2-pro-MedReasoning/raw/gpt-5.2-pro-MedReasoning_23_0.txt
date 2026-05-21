@@ -1,0 +1,338 @@
+```rust
+use std::f64::consts::PI;
+use std::io::{self, Read, Write};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
+
+#[derive(Clone, Copy, Debug, Default)]
+struct State {
+    x: f64,
+    y: f64,
+    vx: f64,
+    vy: f64,
+    angle: f64,
+    angular_vel: f64,
+    fuel_remaining: f64,
+}
+
+fn clamp(x: f64, lo: f64, hi: f64) -> f64 {
+    if x < lo {
+        lo
+    } else if x > hi {
+        hi
+    } else {
+        x
+    }
+}
+
+fn wrap_pi(mut a: f64) -> f64 {
+    while a > PI {
+        a -= 2.0 * PI;
+    }
+    while a < -PI {
+        a += 2.0 * PI;
+    }
+    a
+}
+
+struct TokenReader<R: Read> {
+    r: R,
+    buf: [u8; 1 << 16],
+    pos: usize,
+    len: usize,
+}
+
+impl<R: Read> TokenReader<R> {
+    fn new(r: R) -> Self {
+        Self {
+            r,
+            buf: [0u8; 1 << 16],
+            pos: 0,
+            len: 0,
+        }
+    }
+
+    fn refill(&mut self) -> io::Result<bool> {
+        self.pos = 0;
+        self.len = self.r.read(&mut self.buf)?;
+        Ok(self.len != 0)
+    }
+
+    fn peek_byte(&mut self) -> io::Result<Option<u8>> {
+        if self.pos >= self.len {
+            if !self.refill()? {
+                return Ok(None);
+            }
+        }
+        Ok(Some(self.buf[self.pos]))
+    }
+
+    fn read_byte(&mut self) -> io::Result<Option<u8>> {
+        if self.pos >= self.len {
+            if !self.refill()? {
+                return Ok(None);
+            }
+        }
+        let b = self.buf[self.pos];
+        self.pos += 1;
+        Ok(Some(b))
+    }
+
+    fn skip_whitespace(&mut self) -> io::Result<()> {
+        loop {
+            let Some(b) = self.peek_byte()? else { return Ok(()); };
+            if !b.is_ascii_whitespace() {
+                return Ok(());
+            }
+            self.pos += 1;
+        }
+    }
+
+    /// Skips one token (non-whitespace run). Returns false on EOF before token.
+    fn skip_token(&mut self) -> io::Result<bool> {
+        self.skip_whitespace()?;
+        if self.peek_byte()?.is_none() {
+            return Ok(false);
+        }
+        while let Some(b) = self.peek_byte()? {
+            if b.is_ascii_whitespace() {
+                break;
+            }
+            self.pos += 1;
+        }
+        Ok(true)
+    }
+
+    fn read_token_into(&mut self, tmp: &mut Vec<u8>) -> io::Result<bool> {
+        tmp.clear();
+        self.skip_whitespace()?;
+        let Some(_) = self.peek_byte()? else { return Ok(false); };
+        while let Some(b) = self.peek_byte()? {
+            if b.is_ascii_whitespace() {
+                break;
+            }
+            tmp.push(b);
+            self.pos += 1;
+        }
+        Ok(true)
+    }
+
+    fn read_f64(&mut self, tmp: &mut Vec<u8>) -> io::Result<Option<f64>> {
+        if !self.read_token_into(tmp)? {
+            return Ok(None);
+        }
+        // Safety: token is ASCII digits/.-+eE, valid UTF-8.
+        let s = unsafe { std::str::from_utf8_unchecked(tmp) };
+        Ok(s.parse::<f64>().ok())
+    }
+
+    fn read_usize(&mut self, tmp: &mut Vec<u8>) -> io::Result<Option<usize>> {
+        if !self.read_token_into(tmp)? {
+            return Ok(None);
+        }
+        let s = unsafe { std::str::from_utf8_unchecked(tmp) };
+        Ok(s.parse::<usize>().ok())
+    }
+}
+
+fn compute_control(
+    st: State,
+    target_x: f64,
+    target_y: f64,
+    gravity: f64,
+    max_thrust: f64,
+) -> (f64, f64) {
+    // Position error (y positive is downward).
+    let ex = target_x - st.x;
+    let alt = target_y - st.y; // positive when above target/pad
+
+    // Phase-dependent speed limits.
+    let max_vx = if alt < 20.0 { 2.0 } else if alt < 80.0 { 6.0 } else { 15.0 };
+    let max_vy_down = if alt < 2.0 {
+        0.6
+    } else if alt < 6.0 {
+        1.4
+    } else if alt < 20.0 {
+        3.0
+    } else {
+        10.0
+    };
+
+    // Desired velocities (simple proportional guidance).
+    let v_des_x = clamp(ex * 0.35, -max_vx, max_vx);
+    let v_des_y = clamp(alt * 0.20, -2.0, max_vy_down);
+
+    // Convert desired velocity to desired net acceleration.
+    let tau = 0.55; // response time
+    let ax_des = (v_des_x - st.vx) / tau;
+    let ay_des = (v_des_y - st.vy) / tau;
+
+    // Thrust acceleration needed = desired net accel - gravity.
+    // Net ay = gravity + ay_thrust, so ay_thrust = ay_des - gravity.
+    let mut tx = ax_des;
+    let mut ty = ay_des - gravity;
+
+    // Don't waste fuel pushing downward; let gravity do that.
+    if ty > 0.0 {
+        ty = 0.0;
+    }
+
+    // If we want horizontal correction, keep a little upward bias so we don't free-fall while tilted.
+    if tx.abs() > 0.2 && ty > -0.15 {
+        ty = -0.15;
+    }
+
+    let mag = (tx * tx + ty * ty).sqrt();
+    let mut thrust = if mag < 1e-9 { 0.0 } else { mag / max_thrust };
+    thrust = clamp(thrust, 0.0, 1.0);
+
+    // Desired angle for thrust direction.
+    // Thrust direction for angle a is (sin(a), -cos(a)).
+    // Solve sin(a)=tx/mag, -cos(a)=ty/mag => a = atan2(tx, -ty)
+    let mut angle_des = if mag < 1e-9 { 0.0 } else { tx.atan2(-ty) };
+
+    // Limit tilt near ground to reduce lateral drift/crash risk.
+    let max_tilt = if alt < 15.0 { 0.35 } else if alt < 60.0 { 0.75 } else { 1.05 };
+    angle_des = clamp(angle_des, -max_tilt, max_tilt);
+
+    let ang_err = wrap_pi(angle_des - st.angle);
+
+    // Turn command is angular rate in [-1,1] rad/s.
+    let turn = clamp(4.2 * ang_err - 1.2 * st.angular_vel, -1.0, 1.0);
+
+    // Reduce thrust if we're badly misaligned (prevents wasting fuel sideways).
+    let align = clamp(1.0 - (ang_err.abs() / 1.2), 0.0, 1.0);
+    thrust *= 0.35 + 0.65 * align;
+
+    (thrust, turn)
+}
+
+fn main() -> io::Result<()> {
+    // Parse initial map/header in this thread, then drop stdin lock before spawning reader thread.
+    let (gravity, max_thrust, target_x, target_y, height) = {
+        let stdin = io::stdin();
+        let mut tr = TokenReader::new(stdin.lock());
+        let mut tmp = Vec::<u8>::with_capacity(64);
+
+        let _width = tr.read_usize(&mut tmp)?.unwrap_or(0);
+        let height = tr.read_usize(&mut tmp)?.unwrap_or(0);
+        let gravity = tr.read_f64(&mut tmp)?.unwrap_or(1.62);
+        let max_thrust = tr.read_f64(&mut tmp)?.unwrap_or(10.0);
+        let _fuel = tr.read_f64(&mut tmp)?.unwrap_or(0.0);
+
+        let _start_x = tr.read_f64(&mut tmp)?.unwrap_or(0.0);
+        let _start_y = tr.read_f64(&mut tmp)?.unwrap_or(0.0);
+        let target_x = tr.read_f64(&mut tmp)?.unwrap_or(0.0);
+        let target_y = tr.read_f64(&mut tmp)?.unwrap_or(0.0);
+
+        // Skip map rows efficiently without storing them (map can be huge).
+        for _ in 0..height {
+            // If EOF occurs here, just break; tests should provide a full map.
+            if !tr.skip_token()? {
+                break;
+            }
+        }
+
+        (gravity, max_thrust, target_x, target_y, height)
+    };
+
+    let shared = Arc::new((Mutex::new(None::<State>), Condvar::new()));
+    let shared_reader = shared.clone();
+
+    // Reader thread: continuously parses state updates and overwrites latest state.
+    thread::spawn(move || {
+        let stdin = io::stdin();
+        let mut tr = TokenReader::new(stdin.lock());
+        let mut tmp = Vec::<u8>::with_capacity(64);
+
+        loop {
+            let x = match tr.read_f64(&mut tmp) {
+                Ok(Some(v)) => v,
+                _ => break,
+            };
+            let y = match tr.read_f64(&mut tmp) {
+                Ok(Some(v)) => v,
+                _ => break,
+            };
+            let vx = match tr.read_f64(&mut tmp) {
+                Ok(Some(v)) => v,
+                _ => break,
+            };
+            let vy = match tr.read_f64(&mut tmp) {
+                Ok(Some(v)) => v,
+                _ => break,
+            };
+            let angle = match tr.read_f64(&mut tmp) {
+                Ok(Some(v)) => v,
+                _ => break,
+            };
+            let angular_vel = match tr.read_f64(&mut tmp) {
+                Ok(Some(v)) => v,
+                _ => break,
+            };
+            let fuel_remaining = match tr.read_f64(&mut tmp) {
+                Ok(Some(v)) => v,
+                _ => break,
+            };
+
+            let st = State {
+                x,
+                y,
+                vx,
+                vy,
+                angle,
+                angular_vel,
+                fuel_remaining,
+            };
+
+            let (lock, cv) = &*shared_reader;
+            let mut guard = lock.lock().unwrap();
+            *guard = Some(st);
+            cv.notify_all();
+        }
+    });
+
+    // Control loop: 20Hz output regardless of update rate.
+    let stdout = io::stdout();
+    let mut out = io::BufWriter::with_capacity(8 * 1024, stdout.lock());
+
+    let tick = Duration::from_millis(50); // 20 Hz
+    let mut next = Instant::now();
+
+    // If we don't have a state yet, still output safe zeros at 20Hz.
+    loop {
+        next += tick;
+
+        let st_opt = {
+            let (lock, _cv) = &*shared;
+            *lock.lock().unwrap()
+        };
+
+        let (thrust, turn) = if let Some(st) = st_opt {
+            // If fuel is basically gone, stop thrust (still keep turning for stability).
+            if st.fuel_remaining <= 0.0001 {
+                (0.0, 0.0)
+            } else {
+                compute_control(st, target_x, target_y, gravity, max_thrust)
+            }
+        } else {
+            (0.0, 0.0)
+        };
+
+        writeln!(out, "{:.4} {:.4}", thrust, turn)?;
+        out.flush()?; // ensure real-time delivery
+
+        let now = Instant::now();
+        if next > now {
+            thread::sleep(next - now);
+        } else {
+            // If we're behind, don't sleep; just continue and try to catch up.
+            next = now;
+        }
+
+        // (height is unused; referenced to avoid warnings if you expand logic later)
+        let _ = height;
+    }
+}
+```

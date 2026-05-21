@@ -1,0 +1,471 @@
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <limits>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+
+namespace {
+
+constexpr double kPi = 3.14159265358979323846264338327950288;
+
+template <typename T>
+T clampValue(T v, T lo, T hi) {
+    return std::max(lo, std::min(hi, v));
+}
+
+double wrapAngle(double a) {
+    while (a > kPi) a -= 2.0 * kPi;
+    while (a < -kPi) a += 2.0 * kPi;
+    return a;
+}
+
+struct Vec3 {
+    double x = 0.0;
+    double y = 0.0;
+    double z = 0.0;
+
+    Vec3() = default;
+    Vec3(double x_, double y_, double z_) : x(x_), y(y_), z(z_) {}
+
+    Vec3 operator+(const Vec3& o) const { return Vec3(x + o.x, y + o.y, z + o.z); }
+    Vec3 operator-(const Vec3& o) const { return Vec3(x - o.x, y - o.y, z - o.z); }
+    Vec3 operator*(double s) const { return Vec3(x * s, y * s, z * s); }
+    Vec3 operator/(double s) const { return Vec3(x / s, y / s, z / s); }
+};
+
+double norm2D(double x, double y) {
+    return std::sqrt(x * x + y * y);
+}
+
+double norm3D(const Vec3& v) {
+    return std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
+}
+
+struct World {
+    double width = 0.0;
+    double depth = 0.0;
+    double height = 0.0;
+    double gravity = 1.62;
+    double maxThrust = 0.0;
+    double fuel0 = 0.0;
+
+    Vec3 start;
+    Vec3 target;
+
+    double landingRadius = 5.0;
+};
+
+struct State {
+    double x = 0.0;
+    double y = 0.0;
+    double z = 0.0;
+
+    double vx = 0.0;
+    double vy = 0.0;
+    double vz = 0.0;
+
+    double pitch = 0.0;
+    double yaw = 0.0;
+    double roll = 0.0;
+
+    double pitchRate = 0.0;
+    double yawRate = 0.0;
+    double rollRate = 0.0;
+
+    double fuel = 0.0;
+
+    uint64_t seq = 0;
+    std::chrono::steady_clock::time_point stamp;
+};
+
+struct Command {
+    double thrust = 0.0;
+    double pitchCmd = 0.0;
+    double yawCmd = 0.0;
+    double rollCmd = 0.0;
+};
+
+struct TerrainSummary {
+    std::atomic<bool> ready{false};
+    std::atomic<double> maxTop{0.0};
+    std::atomic<double> targetA{0.0};
+    std::atomic<double> targetB{0.0};
+    std::atomic<double> targetC{0.0};
+    std::atomic<bool> targetFound{false};
+};
+
+class Controller {
+public:
+    explicit Controller(const World& w)
+        : world_(w) {
+        prev_.thrust = clampValue(world_.gravity / std::max(1e-6, world_.maxThrust), 0.0, 1.0);
+    }
+
+    Command hoverCommand() const {
+        Command c;
+        c.thrust = clampValue(world_.gravity / std::max(1e-6, world_.maxThrust), 0.0, 1.0);
+        c.pitchCmd = 0.0;
+        c.yawCmd = 0.0;
+        c.rollCmd = 0.0;
+        return c;
+    }
+
+    Command compute(const State& s, const TerrainSummary& terrain) {
+        const double g = world_.gravity;
+        const double maxT = std::max(1e-6, world_.maxThrust);
+
+        const double dx = world_.target.x - s.x;
+        const double dy = world_.target.y - s.y;
+        const double dxy = norm2D(dx, dy);
+        const double alt = s.z - world_.target.z;
+
+        const double maxTop = terrain.maxTop.load(std::memory_order_relaxed);
+        const bool terrainReady = terrain.ready.load(std::memory_order_relaxed);
+
+        const double safeMargin = std::max(8.0, 0.02 * world_.height);
+        double safeZ = std::max({world_.start.z + 20.0, world_.target.z + 20.0, maxTop + safeMargin});
+        safeZ = clampValue(safeZ, world_.target.z + 5.0, world_.height - 2.0);
+
+        const double R = world_.landingRadius;
+
+        double zRef;
+        if (!terrainReady) {
+            double provisional = std::max(world_.start.z, world_.target.z) + std::max(20.0, 0.1 * world_.height);
+            zRef = clampValue(provisional, world_.target.z + 5.0, world_.height - 2.0);
+        } else if (dxy > 6.0 * R) {
+            zRef = safeZ;
+        } else if (dxy > 2.0 * R) {
+            zRef = clampValue(world_.target.z + std::max(6.0, 0.40 * dxy), world_.target.z + 2.0, safeZ);
+        } else {
+            zRef = world_.target.z + 0.6;
+        }
+
+        const double dirNorm = std::max(1e-9, dxy);
+        const double dirX = dx / dirNorm;
+        const double dirY = dy / dirNorm;
+
+        double brakeA = std::max(0.9, 0.25 * (maxT - g));
+        if (brakeA < 0.9) brakeA = 0.9;
+
+        double speedCap;
+        if (dxy > 6.0 * R) {
+            speedCap = clampValue(0.06 * std::min(world_.width, world_.depth), 10.0, 120.0);
+        } else if (dxy > 2.0 * R) {
+            speedCap = 20.0;
+        } else {
+            speedCap = 4.0;
+        }
+
+        double vRefXY = std::min(speedCap, std::sqrt(std::max(0.0, 2.0 * brakeA * std::max(0.0, dxy - R))));
+        if (dxy < 0.5 * R) vRefXY = std::min(vRefXY, 1.0);
+
+        double vRefX = dirX * vRefXY;
+        double vRefY = dirY * vRefXY;
+
+        double vRefZ;
+        if (dxy > 2.0 * R) {
+            vRefZ = clampValue((zRef - s.z) * 0.60, -8.0, 8.0);
+        } else {
+            double desiredDown = clampValue(0.25 + 0.12 * std::max(0.0, alt), 0.2, 2.0);
+            if (dxy > 0.8 * R) desiredDown = std::min(desiredDown, 0.8);
+            if (alt < 1.2) desiredDown = std::min(desiredDown, 0.35);
+            vRefZ = (alt > 0.0) ? -desiredDown : 0.4;
+            if (norm2D(s.vx, s.vy) > 3.0) vRefZ = std::max(vRefZ, -0.3);
+        }
+
+        double kPxy = (dxy > 2.0 * R) ? 0.015 : 0.050;
+        double kVxy = (dxy > 2.0 * R) ? 0.80 : 1.20;
+
+        double ax = kVxy * (vRefX - s.vx) + kPxy * dx;
+        double ay = kVxy * (vRefY - s.vy) + kPxy * dy;
+
+        double kPz = 0.09;
+        double kVz = 1.40;
+        double az = kVz * (vRefZ - s.vz) + kPz * (zRef - s.z);
+
+        double aXYLim = std::max(0.8, 0.55 * maxT);
+        if (alt < 10.0) aXYLim *= 0.5;
+
+        const double axy = norm2D(ax, ay);
+        if (axy > aXYLim && axy > 1e-9) {
+            const double sxy = aXYLim / axy;
+            ax *= sxy;
+            ay *= sxy;
+        }
+
+        const double azUpLim = std::max(0.4, maxT - g - 0.2);
+        az = clampValue(az, -0.95 * g, azUpLim);
+
+        if (alt < 2.0) {
+            double neededUp = (-s.vz - 0.6) * 1.2;
+            if (neededUp > az) az = neededUp;
+            az = clampValue(az, -0.40 * g, azUpLim);
+        }
+
+        Vec3 thrustVec(ax, ay, az + g);
+        if (thrustVec.z < 0.05) thrustVec.z = 0.05;
+
+        double thrustMag = norm3D(thrustVec);
+        const double maxUsableThrust = 0.98 * maxT;
+        if (thrustMag > maxUsableThrust && thrustMag > 1e-9) {
+            const double scale = maxUsableThrust / thrustMag;
+            thrustVec = thrustVec * scale;
+            thrustMag = maxUsableThrust;
+        }
+
+        double thrust = clampValue(thrustMag / maxT, 0.0, 1.0);
+
+        const double h = norm2D(thrustVec.x, thrustVec.y);
+        double pitchDes = std::atan2(h, std::max(1e-6, thrustVec.z));
+        double yawDes = (h > 1e-9) ? std::atan2(-thrustVec.y, -thrustVec.x) : s.yaw;
+
+        if (dxy < R && alt < 5.0) {
+            pitchDes = std::min(pitchDes, 0.35);
+        }
+        pitchDes = clampValue(pitchDes, -0.5 * kPi + 0.01, 0.5 * kPi - 0.01);
+
+        double pitchErr = wrapAngle(pitchDes - s.pitch);
+        double yawErr = wrapAngle(yawDes - s.yaw);
+        double rollErr = wrapAngle(-s.roll);
+
+        double pitchCmd = clampValue(1.5 * pitchErr - 0.35 * s.pitchRate, -1.0, 1.0);
+        double yawCmd = clampValue(1.5 * yawErr - 0.35 * s.yawRate, -1.0, 1.0);
+        double rollCmd = clampValue(0.8 * rollErr - 0.30 * s.rollRate, -1.0, 1.0);
+
+        Command out;
+        out.thrust = thrust;
+        out.pitchCmd = pitchCmd;
+        out.yawCmd = yawCmd;
+        out.rollCmd = rollCmd;
+
+        if (!initialized_) {
+            initialized_ = true;
+            prev_ = out;
+            return out;
+        }
+
+        // Mild smoothing to reduce control jitter while keeping responsiveness.
+        out.thrust = 0.60 * prev_.thrust + 0.40 * out.thrust;
+        out.pitchCmd = 0.50 * prev_.pitchCmd + 0.50 * out.pitchCmd;
+        out.yawCmd = 0.50 * prev_.yawCmd + 0.50 * out.yawCmd;
+        out.rollCmd = 0.50 * prev_.rollCmd + 0.50 * out.rollCmd;
+
+        prev_ = out;
+        return out;
+    }
+
+private:
+    World world_;
+    bool initialized_ = false;
+    Command prev_;
+};
+
+void parseTerrainSummary(
+    const std::string& terrainPath,
+    int64_t width,
+    int64_t depth,
+    int targetX,
+    int targetY,
+    TerrainSummary* summary) {
+
+    std::ifstream in(terrainPath, std::ios::binary);
+    if (!in) {
+        summary->ready.store(true, std::memory_order_relaxed);
+        return;
+    }
+
+    const int64_t targetIndex = (targetX >= 0 && targetY >= 0)
+        ? static_cast<int64_t>(targetX) * depth + targetY
+        : -1;
+
+    const size_t kChunkSize = 6u * 1u * 1024u * 1024u; // 6MB (multiple of record size)
+    std::vector<unsigned char> buffer(kChunkSize + 6u);
+
+    size_t carry = 0;
+    int64_t idx = 0;
+    uint16_t maxTop = 0;
+
+    while (true) {
+        in.read(reinterpret_cast<char*>(buffer.data() + carry), static_cast<std::streamsize>(kChunkSize));
+        const size_t n = static_cast<size_t>(in.gcount());
+
+        if (n == 0 && carry == 0) break;
+
+        const size_t total = carry + n;
+        const size_t usable = (total / 6u) * 6u;
+
+        const unsigned char* p = buffer.data();
+        for (size_t i = 0; i < usable; i += 6u) {
+            const uint16_t a = static_cast<uint16_t>(p[i + 0] | (static_cast<uint16_t>(p[i + 1]) << 8));
+            const uint16_t b = static_cast<uint16_t>(p[i + 2] | (static_cast<uint16_t>(p[i + 3]) << 8));
+            const uint16_t c = static_cast<uint16_t>(p[i + 4] | (static_cast<uint16_t>(p[i + 5]) << 8));
+
+            const uint16_t top = (c > b) ? c : a;
+            if (top > maxTop) maxTop = top;
+
+            if (idx == targetIndex) {
+                summary->targetA.store(static_cast<double>(a), std::memory_order_relaxed);
+                summary->targetB.store(static_cast<double>(b), std::memory_order_relaxed);
+                summary->targetC.store(static_cast<double>(c), std::memory_order_relaxed);
+                summary->targetFound.store(true, std::memory_order_relaxed);
+            }
+
+            ++idx;
+        }
+
+        carry = total - usable;
+        if (carry > 0) {
+            std::memmove(buffer.data(), buffer.data() + usable, carry);
+        }
+
+        if (n == 0) break;
+    }
+
+    (void)width;
+    summary->maxTop.store(static_cast<double>(maxTop), std::memory_order_relaxed);
+    summary->ready.store(true, std::memory_order_relaxed);
+}
+
+} // namespace
+
+int main() {
+    std::ios::sync_with_stdio(false);
+    std::cin.tie(nullptr);
+
+    World world;
+
+    if (!(std::cin >> world.width >> world.depth >> world.height >> world.gravity >> world.maxThrust >> world.fuel0)) {
+        return 0;
+    }
+
+    if (!(std::cin >> world.start.x >> world.start.y >> world.start.z
+          >> world.target.x >> world.target.y >> world.target.z)) {
+        return 0;
+    }
+
+    world.landingRadius = std::max(5.0, std::min(world.width, world.depth) * 0.02);
+
+    std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+    std::string terrainPath;
+    if (!std::getline(std::cin, terrainPath)) {
+        return 0;
+    }
+
+    int64_t widthI = static_cast<int64_t>(std::llround(world.width));
+    int64_t depthI = static_cast<int64_t>(std::llround(world.depth));
+
+    int targetX = -1;
+    int targetY = -1;
+    if (widthI > 0 && depthI > 0) {
+        targetX = static_cast<int>(clampValue<int64_t>(static_cast<int64_t>(std::floor(world.target.x)), 0, widthI - 1));
+        targetY = static_cast<int>(clampValue<int64_t>(static_cast<int64_t>(std::floor(world.target.y)), 0, depthI - 1));
+    }
+
+    TerrainSummary terrain;
+    std::thread terrainThread(parseTerrainSummary, terrainPath, widthI, depthI, targetX, targetY, &terrain);
+    terrainThread.detach();
+
+    std::mutex stateMutex;
+    State latestState;
+    bool hasState = false;
+
+    std::atomic<bool> inputEnded{false};
+
+    std::thread reader([&]() {
+        uint64_t seq = 0;
+
+        for (;;) {
+            std::string first;
+            if (!(std::cin >> first)) break;
+
+            if (first == "STATE") {
+                continue;
+            }
+
+            char* endPtr = nullptr;
+            const double x = std::strtod(first.c_str(), &endPtr);
+            if (endPtr == first.c_str() || *endPtr != '\0') {
+                continue;
+            }
+
+            State s;
+            s.x = x;
+
+            if (!(std::cin >> s.y >> s.z
+                  >> s.vx >> s.vy >> s.vz
+                  >> s.pitch >> s.yaw >> s.roll
+                  >> s.pitchRate >> s.yawRate >> s.rollRate
+                  >> s.fuel)) {
+                break;
+            }
+
+            s.seq = ++seq;
+            s.stamp = std::chrono::steady_clock::now();
+
+            {
+                std::lock_guard<std::mutex> lock(stateMutex);
+                latestState = s;
+                hasState = true;
+            }
+        }
+
+        inputEnded.store(true, std::memory_order_relaxed);
+    });
+
+    Controller controller(world);
+
+    std::cout << std::fixed << std::setprecision(6);
+
+    auto nextTick = std::chrono::steady_clock::now();
+    const auto tick = std::chrono::milliseconds(40); // 25 Hz
+
+    std::chrono::steady_clock::time_point lastStateStamp = std::chrono::steady_clock::now();
+
+    for (;;) {
+        nextTick += tick;
+
+        State s;
+        bool gotState = false;
+        {
+            std::lock_guard<std::mutex> lock(stateMutex);
+            if (hasState) {
+                s = latestState;
+                gotState = true;
+                lastStateStamp = s.stamp;
+            }
+        }
+
+        Command cmd = gotState ? controller.compute(s, terrain) : controller.hoverCommand();
+
+        cmd.thrust = clampValue(cmd.thrust, 0.0, 1.0);
+        cmd.pitchCmd = clampValue(cmd.pitchCmd, -1.0, 1.0);
+        cmd.yawCmd = clampValue(cmd.yawCmd, -1.0, 1.0);
+        cmd.rollCmd = clampValue(cmd.rollCmd, -1.0, 1.0);
+
+        std::cout << cmd.thrust << ' ' << cmd.pitchCmd << ' ' << cmd.yawCmd << ' ' << cmd.rollCmd << '\n';
+        std::cout.flush();
+
+        const auto now = std::chrono::steady_clock::now();
+        const bool ended = inputEnded.load(std::memory_order_relaxed);
+        if (ended && (!gotState || now - lastStateStamp > std::chrono::milliseconds(700))) {
+            break;
+        }
+
+        std::this_thread::sleep_until(nextTick);
+    }
+
+    if (reader.joinable()) {
+        reader.join();
+    }
+
+    return 0;
+}

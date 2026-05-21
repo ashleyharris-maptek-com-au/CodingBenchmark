@@ -1,0 +1,375 @@
+import math
+from statistics import median
+
+
+_AP_STATE = {
+    "initialized": False,
+    "pitch_int": 0.0,
+    "roll_int": 0.0,
+    "yaw_int": 0.0,
+    "spd_int": 0.0,
+    "trim": 0.0,
+    "flare_bias": 0.0,
+    "last_alt": None,
+    "last_hdg_err": 0.0,
+    "last_pitch": 0.0,
+    "last_roll": 0.0,
+    "last_yaw": 0.0,
+    "last_vs_cmd": 0.0,
+}
+
+
+def autopilot_step(state: dict, dt: float) -> dict:
+    global _AP_STATE
+
+    dt = _clamp(dt if dt and dt > 0.001 else state.get("dt", 0.05), 0.02, 0.2)
+
+    fused = _fuse_state(state)
+    wow = fused["wow"]
+
+    if not _AP_STATE["initialized"]:
+        _AP_STATE["initialized"] = True
+        _AP_STATE["trim"] = _clamp(state.get("elevator_trim_deg", 0.0) / 10.0, -0.6, 0.6)
+
+    ias = fused["ias"]
+    alt = fused["alt"]
+    radar_alt = fused["radar_alt"]
+    pitch = fused["pitch"]
+    roll = fused["roll"]
+    heading = fused["heading"]
+    yaw_rate = fused["yaw_rate"]
+    roll_rate = fused["roll_rate"]
+    pitch_rate = fused["pitch_rate"]
+    vs = fused["vs"]
+    aoa = fused["aoa"]
+
+    target_alt = float(state.get("target_alt_ft", alt))
+    target_hdg = float(state.get("target_hdg_deg", heading))
+    target_ias = float(state.get("target_ias_kt", max(ias, 160.0)))
+    target_vs = float(state.get("target_vs_fpm", 0.0))
+
+    gross_weight = max(35000.0, float(state.get("gross_weight_kg", 65000.0)))
+    flap_actual = max(float(state.get("flap_pos_left_deg", 0.0)), float(state.get("flap_pos_right_deg", 0.0)))
+    gear_down_actual = bool(
+        state.get("gear_handle_down")
+        or state.get("gear_left_locked")
+        or state.get("gear_right_locked")
+        or state.get("gear_nose_locked")
+    )
+    fuel_total = float(state.get("fuel_total_kg", 0.0))
+
+    stall_margin = _stall_margin(flap_actual, gear_down_actual, gross_weight)
+    overspeed_margin = 350.0 if flap_actual > 1.0 else 360.0
+    low_altitude = radar_alt < 1500.0
+    landing_mode = low_altitude and target_alt < 1500.0
+    takeoff_mode = wow and target_alt > alt + 300.0
+
+    engine1_ok = bool(state.get("engine_1_running", True)) and not bool(state.get("engine_1_fire", False))
+    engine2_ok = bool(state.get("engine_2_running", True)) and not bool(state.get("engine_2_fire", False))
+    thrust1 = float(state.get("engine_1_thrust_pct", state.get("throttle_1_pos", 0.0) * 100.0)) / 100.0
+    thrust2 = float(state.get("engine_2_thrust_pct", state.get("throttle_2_pos", 0.0) * 100.0)) / 100.0
+
+    commands = {}
+
+    if wow:
+        commands["gear"] = 1
+        commands["speedbrake"] = 0.0
+        if takeoff_mode:
+            rotate_speed = stall_margin + 18.0
+            commands["flaps"] = 10
+            commands["throttle_1"] = 1.0 if engine1_ok else 0.0
+            commands["throttle_2"] = 1.0 if engine2_ok else 0.0
+            rudder = _clamp((thrust2 - thrust1) * 0.9 - yaw_rate * 0.08, -1.0, 1.0)
+            commands["rudder"] = rudder
+            if ias > rotate_speed:
+                pitch_cmd = 10.0
+                elevator = _clamp((pitch_cmd - pitch) * 0.09 - pitch_rate * 0.035, -0.2, 0.85)
+                _AP_STATE["trim"] = _clamp(_AP_STATE["trim"] + 0.03 * dt, -0.2, 0.5)
+                commands["elevator"] = elevator
+                commands["elevator_trim"] = _AP_STATE["trim"]
+            else:
+                commands["elevator"] = 0.0
+            return commands
+        commands["throttle_1"] = 0.0 if not engine1_ok else state.get("throttle_1_pos", 0.0)
+        commands["throttle_2"] = 0.0 if not engine2_ok else state.get("throttle_2_pos", 0.0)
+        commands["rudder"] = _clamp(-yaw_rate * 0.1, -0.4, 0.4)
+        return commands
+
+    min_safe_speed = stall_margin + (10.0 if low_altitude else 18.0)
+    target_ias = _clamp(target_ias, min_safe_speed, overspeed_margin - 5.0)
+
+    alt_error = target_alt - alt
+    if landing_mode:
+        if radar_alt > 600.0:
+            vs_cmd = _clamp(-700.0 - max(0.0, ias - 145.0) * 8.0, -900.0, -400.0)
+        elif radar_alt > 120.0:
+            vs_cmd = _clamp(-500.0 - max(0.0, ias - 138.0) * 6.0, -700.0, -250.0)
+        else:
+            flare_target = max(2.0, min(7.0, 0.04 * radar_alt + 1.5))
+            _AP_STATE["flare_bias"] = _clamp(_AP_STATE["flare_bias"] + (flare_target - pitch) * 0.06 * dt, -0.2, 0.5)
+            vs_cmd = _clamp(-120.0 - radar_alt * 1.2, -250.0, -40.0)
+        target_ias = max(min_safe_speed + 3.0, min(target_ias, stall_margin + 22.0))
+    else:
+        capture_band = 1200.0 if abs(alt_error) > 4000.0 else 600.0
+        alt_to_vs = _clamp(alt_error * 1.8, -2200.0, 2200.0)
+        if abs(alt_error) < capture_band:
+            alt_to_vs *= abs(alt_error) / max(capture_band, 1.0)
+        if abs(target_vs) > 50.0:
+            alt_to_vs = _clamp(target_vs, -2500.0, 2500.0)
+        vs_cmd = alt_to_vs
+
+    if ias < min_safe_speed:
+        vs_cmd = min(vs_cmd, -200.0 + (ias - min_safe_speed) * 60.0)
+    if ias > overspeed_margin:
+        vs_cmd = min(vs_cmd, -1200.0)
+
+    climb_limit = _climb_limit(ias, min_safe_speed, gross_weight)
+    vs_cmd = _clamp(vs_cmd, -3000.0, climb_limit)
+    _AP_STATE["last_vs_cmd"] = vs_cmd
+
+    hdg_error = _wrap180(target_hdg - heading)
+    max_bank = 12.0 if landing_mode else 25.0
+    if radar_alt < 500.0:
+        max_bank = min(max_bank, 15.0)
+    bank_cmd = _clamp(hdg_error * 0.35 + fused["track_error"] * 0.1, -max_bank, max_bank)
+    if abs(hdg_error) < 3.0:
+        bank_cmd *= abs(hdg_error) / 3.0
+
+    roll_error = bank_cmd - roll
+    _AP_STATE["roll_int"] = _clamp(_AP_STATE["roll_int"] + roll_error * dt * 0.03, -0.25, 0.25)
+    aileron = _clamp(roll_error * 0.045 - roll_rate * 0.06 + _AP_STATE["roll_int"], -1.0, 1.0)
+
+    slip_term = fused["lateral_g"] * 0.7 + fused["drift"] * 0.015
+    rudder = _clamp(-yaw_rate * 0.09 - slip_term + (thrust2 - thrust1) * 0.75, -1.0, 1.0)
+
+    vs_error = vs_cmd - vs
+    pitch_cmd = _clamp(vs_error * 0.0055 + _speed_hold_pitch_bias(ias, target_ias), -12.0, 16.0)
+
+    if landing_mode and radar_alt < 120.0:
+        pitch_cmd = max(pitch_cmd, 2.5 + _AP_STATE["flare_bias"] * 10.0)
+    if ias < min_safe_speed:
+        pitch_cmd = min(pitch_cmd, 4.0)
+    if ias > overspeed_margin:
+        pitch_cmd = min(pitch_cmd, -2.0)
+    if aoa > 10.0:
+        pitch_cmd = min(pitch_cmd, 1.5)
+    if aoa > 13.0:
+        pitch_cmd = min(pitch_cmd, -4.0)
+
+    pitch_error = pitch_cmd - pitch
+    _AP_STATE["pitch_int"] = _clamp(_AP_STATE["pitch_int"] + pitch_error * dt * 0.025, -0.3, 0.3)
+    elevator = _clamp(pitch_error * 0.09 - pitch_rate * 0.05 + _AP_STATE["pitch_int"], -1.0, 1.0)
+
+    trim_rate = 0.0
+    if abs(elevator) < 0.25 and abs(pitch_error) < 2.5:
+        trim_rate = pitch_error * 0.015
+    elif abs(elevator) > 0.65:
+        trim_rate = elevator * 0.01
+    if aoa > 12.0:
+        trim_rate = min(trim_rate, -0.03)
+    _AP_STATE["trim"] = _clamp(_AP_STATE["trim"] + trim_rate * dt * 8.0, -1.0, 1.0)
+
+    speed_error = target_ias - ias
+    _AP_STATE["spd_int"] = _clamp(_AP_STATE["spd_int"] + speed_error * dt * 0.004, -0.25, 0.35)
+    base_throttle = 0.5 + speed_error * 0.006 + _AP_STATE["spd_int"] + max(0.0, vs_cmd) / 5000.0
+    if landing_mode:
+        base_throttle = 0.42 + speed_error * 0.012 + _AP_STATE["spd_int"] * 0.4
+    if fuel_total < 1200.0:
+        base_throttle = min(base_throttle, 0.78)
+    if ias < min_safe_speed - 5.0:
+        base_throttle = max(base_throttle, 0.92)
+    if ias > overspeed_margin:
+        base_throttle = min(base_throttle, 0.05)
+
+    throttle1 = _clamp(base_throttle, 0.0, 1.0) if engine1_ok else 0.0
+    throttle2 = _clamp(base_throttle, 0.0, 1.0) if engine2_ok else 0.0
+    if engine1_ok and not engine2_ok:
+        throttle1 = max(throttle1, 0.75)
+    if engine2_ok and not engine1_ok:
+        throttle2 = max(throttle2, 0.75)
+
+    if landing_mode:
+        if radar_alt < 25.0:
+            throttle1 = min(throttle1, 0.08) if engine1_ok else 0.0
+            throttle2 = min(throttle2, 0.08) if engine2_ok else 0.0
+            commands["speedbrake"] = 1.0 if radar_alt < 10.0 else 0.2
+        else:
+            commands["speedbrake"] = 0.0
+        commands["flaps"] = 30 if radar_alt > 80.0 else 40
+        commands["gear"] = 1
+    else:
+        if alt > 2500.0 and ias > min_safe_speed + 25.0:
+            commands["flaps"] = 0
+        elif alt > 1200.0 and ias > min_safe_speed + 10.0:
+            commands["flaps"] = 5
+        else:
+            commands["flaps"] = 10 if ias < 190.0 else 0
+        commands["gear"] = 1 if (alt < 1200.0 and target_alt < 2000.0) else 0
+        commands["speedbrake"] = 0.6 if ias > overspeed_margin + 8.0 else 0.0
+
+    if not engine1_ok and not engine2_ok:
+        throttle1 = 0.0
+        throttle2 = 0.0
+        pitch_cmd = -3.0
+        elevator = _clamp((pitch_cmd - pitch) * 0.08 - pitch_rate * 0.04, -1.0, 1.0)
+        commands["gear"] = 1 if radar_alt < 2500.0 else commands.get("gear", 0)
+        commands["flaps"] = 10 if ias < 180.0 else 0
+
+    commands["elevator"] = elevator
+    commands["aileron"] = aileron
+    commands["rudder"] = rudder
+    commands["throttle_1"] = throttle1
+    commands["throttle_2"] = throttle2
+    commands["elevator_trim"] = _AP_STATE["trim"]
+
+    _AP_STATE["last_alt"] = alt
+    _AP_STATE["last_pitch"] = pitch
+    _AP_STATE["last_roll"] = roll
+    _AP_STATE["last_yaw"] = yaw_rate
+    _AP_STATE["last_hdg_err"] = hdg_error
+
+    return commands
+
+
+def _fuse_state(state: dict) -> dict:
+    alt = _fuse_triplet(state, "baro_alt_{}_ft", "baro_alt_{}_valid", fallback=state.get("adc_1_pressure_alt_ft", 0.0))
+    radar_alt = _fuse_triplet(state, "radar_alt_{}_ft", "radar_alt_{}_valid", fallback=max(0.0, alt))
+    ias = _fuse_triplet(state, "ias_{}_kt", "ias_{}_valid", fallback=state.get("target_ias_kt", 180.0))
+    aoa = _fuse_triplet(state, "aoa_{}_deg", "aoa_{}_valid", fallback=4.0)
+    pitch = _fuse_triplet(state, "irs_{}_pitch_deg", "irs_{}_valid", fallback=0.0)
+    roll = _fuse_triplet(state, "irs_{}_roll_deg", "irs_{}_valid", fallback=0.0)
+    vs = _fuse_triplet(state, "irs_{}_vs_fpm", "irs_{}_valid", fallback=state.get("vertical_speed_fpm", 0.0))
+    heading = _fuse_heading(
+        [
+            _sensor_value(state, f"irs_{i}_heading_deg", f"irs_{i}_valid")
+            for i in (1, 2, 3)
+        ],
+        fallback=state.get("magnetic_heading_deg", state.get("true_heading_deg", 0.0)),
+    )
+    track = _fuse_heading(
+        [
+            _sensor_value(state, f"gps_{i}_track_deg", f"gps_{i}_valid")
+            for i in (1, 2, 3)
+        ]
+        + [
+            _sensor_value(state, f"irs_{i}_track_deg", f"irs_{i}_valid")
+            for i in (1, 2, 3)
+        ],
+        fallback=state.get("track_deg", heading),
+    )
+    yaw_rate = _fuse_triplet(state, "gyro_{}_yaw_rate_dps", "gyro_{}_valid", fallback=0.0)
+    roll_rate = _fuse_triplet(state, "gyro_{}_roll_rate_dps", "gyro_{}_valid", fallback=0.0)
+    pitch_rate = _fuse_triplet(state, "gyro_{}_pitch_rate_dps", "gyro_{}_valid", fallback=0.0)
+    lateral_g = _fuse_triplet(state, "accel_{}_y_g", "accel_{}_valid", fallback=0.0)
+
+    gps_alt = _fuse_heading([], fallback=0.0)
+    gps_alts = []
+    for i in (1, 2, 3):
+        valid = bool(state.get(f"gps_{i}_valid", False))
+        if valid:
+            gps_alts.append(float(state.get(f"gps_{i}_alt_ft", alt)))
+    if gps_alts:
+        gps_alt = median(gps_alts)
+
+    if radar_alt < 2500.0:
+        alt = 0.75 * alt + 0.25 * max(radar_alt, 0.0)
+    if gps_alts and abs(gps_alt - alt) > 1200.0 and radar_alt > 2500.0:
+        alt = 0.7 * alt + 0.3 * gps_alt
+
+    wow = any(
+        bool(state.get(k, False))
+        for k in ("weight_on_wheels_left", "weight_on_wheels_right", "weight_on_wheels_nose")
+    )
+
+    return {
+        "alt": alt,
+        "radar_alt": max(0.0, radar_alt),
+        "ias": max(30.0, ias),
+        "aoa": aoa,
+        "pitch": pitch,
+        "roll": roll,
+        "heading": heading,
+        "track_error": _wrap180(track - heading),
+        "drift": _wrap180(track - heading),
+        "vs": vs,
+        "yaw_rate": yaw_rate,
+        "roll_rate": roll_rate,
+        "pitch_rate": pitch_rate,
+        "lateral_g": lateral_g,
+        "wow": wow,
+    }
+
+
+def _sensor_value(state: dict, value_key: str, valid_key: str):
+    if not bool(state.get(valid_key, False)):
+        return None
+    value = state.get(value_key, None)
+    return None if value is None else float(value)
+
+
+def _fuse_triplet(state: dict, value_pattern: str, valid_pattern: str, fallback: float = 0.0) -> float:
+    values = []
+    for i in (1, 2, 3):
+        if bool(state.get(valid_pattern.format(i), False)):
+            value = state.get(value_pattern.format(i), None)
+            if value is not None and math.isfinite(float(value)):
+                values.append(float(value))
+    if not values:
+        return float(fallback)
+    if len(values) == 1:
+        return values[0]
+    if len(values) == 2:
+        return 0.5 * (values[0] + values[1])
+
+    best = None
+    best_score = None
+    for v in values:
+        score = sum(abs(v - o) for o in values)
+        if best_score is None or score < best_score:
+            best_score = score
+            best = v
+    clustered = [v for v in values if abs(v - best) <= max(3.0, 0.08 * abs(best))]
+    return median(clustered if clustered else values)
+
+
+def _fuse_heading(values, fallback: float = 0.0) -> float:
+    usable = [v for v in values if v is not None and math.isfinite(v)]
+    if not usable:
+        return float(fallback) % 360.0
+    x = sum(math.cos(math.radians(v)) for v in usable)
+    y = sum(math.sin(math.radians(v)) for v in usable)
+    if abs(x) < 1e-6 and abs(y) < 1e-6:
+        return float(fallback) % 360.0
+    return math.degrees(math.atan2(y, x)) % 360.0
+
+
+def _stall_margin(flap_deg: float, gear_down: bool, gross_weight_kg: float) -> float:
+    base = 128.0 + max(0.0, gross_weight_kg - 62000.0) / 7000.0 * 6.0
+    if flap_deg >= 30.0:
+        base -= 28.0
+    elif flap_deg >= 10.0:
+        base -= 18.0
+    elif flap_deg >= 1.0:
+        base -= 8.0
+    if gear_down:
+        base -= 3.0
+    return _clamp(base, 95.0, 145.0)
+
+
+def _climb_limit(ias: float, min_safe_speed: float, gross_weight_kg: float) -> float:
+    margin = max(0.0, ias - min_safe_speed)
+    weight_penalty = max(0.0, gross_weight_kg - 65000.0) / 1000.0 * 35.0
+    return _clamp(700.0 + margin * 14.0 - weight_penalty, 300.0, 2600.0)
+
+
+def _speed_hold_pitch_bias(ias: float, target_ias: float) -> float:
+    speed_error = target_ias - ias
+    return _clamp(-speed_error * 0.045, -6.0, 6.0)
+
+
+def _wrap180(angle: float) -> float:
+    return (angle + 180.0) % 360.0 - 180.0
+
+
+def _clamp(value: float, lo: float, hi: float) -> float:
+    return lo if value < lo else hi if value > hi else value

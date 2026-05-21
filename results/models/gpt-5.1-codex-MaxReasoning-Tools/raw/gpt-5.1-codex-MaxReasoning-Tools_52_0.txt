@@ -1,1 +1,450 @@
-{'__exception__': "Can't run here - we're trying to get this working in codex."}
+```python
+import math
+
+# Persistent controller memory (module-level for streaming scenarios)
+_CONTROLLER_MEMORY = None
+
+def _init_memory():
+    return {
+        "speed_filtered": 0.0,
+        "lane_offset_filtered": 0.0,
+        "yaw_rate_filtered": 0.0,
+        "front_range_filtered": 200.0,
+        "speed_integral": 0.0,
+        "lane_integral": 0.0,
+        "prev_steer": 0.0,
+        "prev_throttle": 0.0,
+        "prev_brake": 0.0,
+        "brake_fault_timer": 0.0,
+        "throttle_fault_timer": 0.0,
+        "steer_fault_timer": 0.0,
+        "brake_fault": False,
+        "throttle_fault": False,
+        "steer_authority": 1.0,
+        "last_speed": 0.0,
+        "last_lane_offset": 0.0,
+        "last_yaw_rate": 0.0,
+        "last_mu": 0.9,
+        "last_curvature": 0.0,
+        "last_speed_limit": None
+    }
+
+def _clamp(val, low, high):
+    return max(low, min(high, val))
+
+def _median(values):
+    if not values:
+        return None
+    values = sorted(values)
+    n = len(values)
+    mid = n // 2
+    if n % 2:
+        return values[mid]
+    return 0.5 * (values[mid - 1] + values[mid])
+
+def _collect_values(state, specs, min_value=None, max_value=None):
+    primary, secondary = [], []
+    for value_key, valid_key in specs:
+        val = state.get(value_key)
+        if val is None or not isinstance(val, (int, float)):
+            continue
+        if min_value is not None and val < min_value:
+            continue
+        if max_value is not None and val > max_value:
+            continue
+        if valid_key is None:
+            primary.append(val)
+        else:
+            if bool(state.get(valid_key)):
+                primary.append(val)
+            else:
+                secondary.append(val)
+    return primary if primary else secondary
+
+def _lowpass(mem, key, measurement, dt, tau, default=None):
+    if measurement is None and key in mem:
+        return mem[key]
+    if measurement is None:
+        return mem.get(key, default)
+    prev = mem.get(key, measurement if default is None else default)
+    alpha = dt / (tau + dt)
+    filtered = prev + alpha * (measurement - prev)
+    mem[key] = filtered
+    return filtered
+
+def _fuse_speed(state):
+    values = []
+    wheel_specs = [
+        ("wheel_speed_fl_kmh", "wheel_speed_fl_valid"),
+        ("wheel_speed_fr_kmh", "wheel_speed_fr_valid"),
+        ("wheel_speed_rl_kmh", "wheel_speed_rl_valid"),
+        ("wheel_speed_rr_kmh", "wheel_speed_rr_valid"),
+    ]
+    veh_specs = [
+        ("vehicle_speed_1_kmh", None),
+        ("vehicle_speed_2_kmh", None),
+    ]
+    gps_specs = [
+        ("gps_1_speed_kmh", "gps_1_valid"),
+        ("gps_2_speed_kmh", "gps_2_valid"),
+    ]
+    for spec in (wheel_specs, veh_specs, gps_specs):
+        vals = _collect_values(state, spec, 0.0, 320.0)
+        if vals:
+            values.extend(vals)
+    return _median(values)
+
+def _fuse_yaw_rate(state):
+    gyro_specs = [
+        ("gyro_1_yaw_rate_dps", "gyro_1_valid"),
+        ("gyro_2_yaw_rate_dps", "gyro_2_valid"),
+        ("gyro_3_yaw_rate_dps", "gyro_3_valid"),
+    ]
+    vals = _collect_values(state, gyro_specs, -500.0, 500.0)
+    return _median(vals)
+
+def _fuse_accel(state, axis):
+    specs = [
+        (f"accel_1_{axis}_ms2", "accel_1_valid"),
+        (f"accel_2_{axis}_ms2", "accel_2_valid"),
+        (f"accel_3_{axis}_ms2", "accel_3_valid"),
+    ]
+    return _median(_collect_values(state, specs, -30.0, 30.0))
+
+def _fuse_speed_limit(state, memory):
+    specs = [
+        ("vision_1_speed_limit_kmh", "vision_1_speed_limit_valid"),
+        ("vision_2_speed_limit_kmh", "vision_2_speed_limit_valid"),
+        ("vision_3_speed_limit_kmh", "vision_3_speed_limit_valid"),
+    ]
+    vals = _collect_values(state, specs, 10.0, 160.0)
+    if not vals:
+        return memory.get("last_speed_limit")
+    limit = min(vals)  # obey the lowest posted limit seen
+    memory["last_speed_limit"] = limit
+    return limit
+
+def _fuse_lane_offset(state, memory):
+    offsets_primary, offsets_secondary = [], []
+    for i in range(1, 4):
+        key = f"vision_{i}_lane_offset_m"
+        offset = state.get(key)
+        if offset is None or not isinstance(offset, (int, float)):
+            continue
+        if abs(offset) > 6.0:
+            continue
+        left_valid = bool(state.get(f"vision_{i}_left_line_valid"))
+        right_valid = bool(state.get(f"vision_{i}_right_line_valid"))
+        valid = left_valid or right_valid
+        (offsets_primary if valid else offsets_secondary).append(offset)
+    if offsets_primary:
+        lane = _median(offsets_primary)
+    elif offsets_secondary:
+        lane = _median(offsets_secondary)
+    else:
+        lane = memory.get("last_lane_offset")
+    if lane is not None:
+        memory["last_lane_offset"] = lane
+    return lane
+
+def _fuse_curvature(state, memory):
+    values = []
+    for i in range(1, 3 + 1):
+        curv = state.get(f"vision_{i}_road_curvature_1pm")
+        if curv is None or not isinstance(curv, (int, float)):
+            continue
+        if abs(curv) > 2000:  # unrealistically sharp
+            continue
+        left_valid = bool(state.get(f"vision_{i}_left_line_valid"))
+        right_valid = bool(state.get(f"vision_{i}_right_line_valid"))
+        if left_valid or right_valid:
+            values.append(curv)
+    if not values:
+        curv = memory.get("last_curvature", 0.0)
+    else:
+        curv = _median(values)
+        memory["last_curvature"] = curv
+    # Provided as "per meter" * 1e6 (1/pm). Convert back to 1/m.
+    return curv / 1_000_000.0
+
+def _lidar_distance(state, angle_token):
+    dist = state.get(f"lidar_{angle_token}_deg_range_m")
+    if dist is None or not isinstance(dist, (int, float)) or dist <= 0.5:
+        return None, False
+    if dist > 250.0:  # clamp unrealistic echoes
+        dist = 250.0
+    valid = bool(state.get(f"lidar_{angle_token}_deg_valid"))
+    return dist, valid
+
+def _front_obstacle_distance(state):
+    angles = ["+005", "-005", "+015", "-015", "+030", "-030", "+045", "-045"]
+    primary, secondary = [], []
+    for angle in angles:
+        dist, valid = _lidar_distance(state, angle)
+        if dist is None:
+            continue
+        (primary if valid else secondary).append(dist)
+    candidates = primary if primary else secondary
+    return min(candidates) if candidates else None
+
+def _side_clearance(state, direction):
+    if direction > 0:  # move right -> look at negative angles
+        angles = ["-030", "-045", "-060", "-090"]
+    else:  # move left
+        angles = ["+030", "+045", "+060", "+090"]
+    primary, secondary = [], []
+    for angle in angles:
+        dist, valid = _lidar_distance(state, angle)
+        if dist is None:
+            continue
+        (primary if valid else secondary).append(dist)
+    candidates = primary if primary else secondary
+    if not candidates:
+        return None
+    return min(candidates)
+
+def autopilot_step(state: dict, dt: float) -> dict:
+    """Compute steering/throttle/brake for a multi-lane freeway autopilot with sensor fusion."""
+    global _CONTROLLER_MEMORY
+    if _CONTROLLER_MEMORY is None:
+        _CONTROLLER_MEMORY = _init_memory()
+    mem = _CONTROLLER_MEMORY
+
+    dt = float(dt if dt is not None else state.get("dt", 0.05))
+    dt = _clamp(dt, 0.01, 0.2)
+
+    # --- Sensor fusion ---
+    speed_raw = _fuse_speed(state)
+    if speed_raw is None:
+        speed_raw = mem.get("speed_filtered", mem.get("last_speed", 0.0))
+    speed_kmh = _lowpass(mem, "speed_filtered", speed_raw, dt, tau=0.5, default=0.0)
+    mem["last_speed"] = speed_kmh
+    speed_mps = speed_kmh / 3.6
+
+    yaw_raw = _fuse_yaw_rate(state)
+    if yaw_raw is None:
+        yaw_raw = mem.get("yaw_rate_filtered", mem.get("last_yaw_rate", 0.0))
+    yaw_rate_dps = _lowpass(mem, "yaw_rate_filtered", yaw_raw, dt, tau=0.2, default=0.0)
+    mem["last_yaw_rate"] = yaw_rate_dps
+    yaw_rate_rad = math.radians(yaw_rate_dps)
+
+    accel_long = _fuse_accel(state, "longitudinal")
+    accel_lat = _fuse_accel(state, "lateral")
+
+    lane_offset_raw = _fuse_lane_offset(state, mem)
+    if lane_offset_raw is None:
+        lane_offset_raw = mem.get("lane_offset_filtered", mem.get("last_lane_offset", 0.0))
+    lane_offset_m = _lowpass(mem, "lane_offset_filtered", lane_offset_raw, dt, tau=0.3, default=0.0)
+
+    curvature = _fuse_curvature(state, mem)
+
+    speed_limit = _fuse_speed_limit(state, mem)
+
+    # Traction estimate
+    mu = state.get("estimated_mu")
+    if mu is None or not isinstance(mu, (int, float)) or mu <= 0.05:
+        mu = mem.get("last_mu", 0.9)
+    rain = state.get("rain_sensor")
+    temp_c = state.get("temperature_c")
+    if rain:
+        mu *= 0.85
+    if temp_c is not None and temp_c < 2.0:
+        mu *= 0.8
+    mu = _clamp(mu, 0.15, 1.2)
+    mem["last_mu"] = mu
+
+    # Obstacle detection
+    lidar_front = _front_obstacle_distance(state)
+    if lidar_front is None:
+        lidar_front = mem.get("front_range_filtered", 200.0)
+    front_range_m = _lowpass(mem, "front_range_filtered", lidar_front, dt, tau=0.4, default=200.0)
+
+    vision_obstacles = []
+    for i in range(1, 4):
+        if not bool(state.get(f"vision_{i}_obstacle_detected")):
+            continue
+        if not bool(state.get(f"vision_{i}_obstacle_valid")):
+            continue
+        dist = state.get(f"vision_{i}_obstacle_dist_m")
+        if dist is None or not isinstance(dist, (int, float)) or dist <= 0.5:
+            continue
+        rel = state.get(f"vision_{i}_obstacle_rel_speed_kmh")
+        vision_obstacles.append((dist, rel))
+    if vision_obstacles:
+        vis_dist = min(d for d, _ in vision_obstacles)
+        front_range_m = min(front_range_m, vis_dist)
+
+    # --- Lane planning ---
+    lane_width = 3.7
+    current_lane = int(state.get("current_lane", 1))
+    target_lane = int(state.get("target_lane", current_lane))
+    lane_delta = _clamp(target_lane - current_lane, -1, 1)
+
+    desired_lane_offset = 0.0
+    lane_change_active = lane_delta != 0
+    if lane_change_active:
+        side_clear = _side_clearance(state, lane_delta)
+        lane_clear = True
+        if side_clear is not None:
+            lane_clear = side_clear > 12.0
+        else:
+            lane_clear = speed_kmh < 30.0  # only change with poor sensing at low speed
+        if lane_clear:
+            desired_lane_offset = lane_delta * lane_width
+        else:
+            desired_lane_offset = 0.0  # wait, hold center
+            lane_change_active = False
+    else:
+        desired_lane_offset = 0.0
+
+    lane_error = _clamp(desired_lane_offset - lane_offset_m, -5.0, 5.0)
+    mem["lane_integral"] += lane_error * dt
+    mem["lane_integral"] = _clamp(mem["lane_integral"], -4.0, 4.0)
+
+    # Steering control
+    lane_kp = 0.35
+    lane_ki = 0.05
+    lane_kd = 0.12
+    curvature_ff = _clamp(curvature * speed_mps * 0.6, -0.35, 0.35)
+    crosswind_comp = 0.0
+    if accel_lat is not None:
+        crosswind_comp = _clamp(-accel_lat * 0.04, -0.2, 0.2)
+
+    steer_cmd = (
+        lane_kp * lane_error
+        + lane_ki * mem["lane_integral"]
+        - lane_kd * yaw_rate_rad
+        + curvature_ff
+        + crosswind_comp
+    )
+
+    # Steering authority reduction during low-mu or detected jam
+    steer_limit = _clamp(mu * 0.9, 0.25, 1.0) * mem.get("steer_authority", 1.0)
+    steer_cmd = _clamp(steer_cmd, -steer_limit, steer_limit)
+
+    # Steering rate limit
+    max_delta = 0.45 * dt / 0.05  # normalized per timestep
+    delta = _clamp(steer_cmd - mem["prev_steer"], -max_delta, max_delta)
+    steer_cmd = mem["prev_steer"] + delta
+    steer_cmd = _clamp(steer_cmd, -1.0, 1.0)
+    mem["prev_steer"] = steer_cmd
+
+    # Monitor steering fault (actual sensors vs command)
+    steering_vals = _collect_values(
+        state,
+        [
+            ("steering_angle_1_deg", "steering_angle_1_valid"),
+            ("steering_angle_2_deg", "steering_angle_2_valid"),
+        ],
+        -45.0,
+        45.0,
+    )
+    actual_steer_deg = _median(steering_vals) if steering_vals else None
+    if actual_steer_deg is not None:
+        expected_deg = steer_cmd * 15.0
+        if abs(actual_steer_deg - expected_deg) > 8.0:
+            mem["steer_fault_timer"] += dt
+        else:
+            mem["steer_fault_timer"] = max(0.0, mem["steer_fault_timer"] - dt)
+        if mem["steer_fault_timer"] > 0.6:
+            mem["steer_authority"] = 0.6
+        else:
+            mem["steer_authority"] = min(1.0, mem["steer_authority"] + 0.02)
+    else:
+        mem["steer_authority"] = max(0.5, mem.get("steer_authority", 1.0))
+
+    # --- Speed planning ---
+    target_speed = state.get("target_speed_kmh", 110.0)
+    if speed_limit is not None:
+        target_speed = min(target_speed, speed_limit - 2.0)
+    traction_cap = 160.0 * mu
+    base_desired_speed = min(target_speed, traction_cap)
+    if lane_change_active:
+        base_desired_speed = min(base_desired_speed, 110.0)
+
+    # Curve speed limit
+    if abs(curvature) > 1e-6:
+        max_lat_accel = max(2.0, mu * 7.0)
+        curve_speed = math.sqrt(max_lat_accel / abs(curvature)) * 3.6
+        base_desired_speed = min(base_desired_speed, curve_speed)
+
+    # Obstacle-based speed cap
+    buffer = 8.0
+    time_gap = 1.5 + (0.5 if mu < 0.5 else 0.0)
+    if front_range_m is not None:
+        allowed = max(0.0, (front_range_m - buffer) / max(time_gap, 0.5)) * 3.6
+        base_desired_speed = min(base_desired_speed, allowed)
+        if front_range_m < 15.0:
+            base_desired_speed = min(base_desired_speed, 0.0)
+
+    # Emergency override
+    emergency_brake = front_range_m < 8.0
+
+    # --- Fault detection ---
+    if mem["prev_brake"] > 0.5 and accel_long is not None and accel_long > -0.3:
+        mem["brake_fault_timer"] += dt
+    else:
+        mem["brake_fault_timer"] = max(0.0, mem["brake_fault_timer"] - dt)
+    mem["brake_fault"] = mem["brake_fault_timer"] > 0.8
+
+    if mem["prev_throttle"] < 0.05 and accel_long is not None and accel_long > 0.3:
+        mem["throttle_fault_timer"] += dt
+    else:
+        mem["throttle_fault_timer"] = max(0.0, mem["throttle_fault_timer"] - dt)
+    mem["throttle_fault"] = mem["throttle_fault_timer"] > 0.8
+
+    if mem["brake_fault"]:
+        base_desired_speed = min(base_desired_speed, 40.0)
+    if mem["throttle_fault"]:
+        base_desired_speed = min(base_desired_speed, 60.0)
+
+    if mem["steer_authority"] < 0.8:
+        base_desired_speed = min(base_desired_speed, 70.0)
+
+    desired_speed = max(0.0, base_desired_speed)
+
+    # --- Speed control PID ---
+    speed_error = (desired_speed - speed_kmh) / 3.6  # convert to m/s
+    mem["speed_integral"] += speed_error * dt
+    mem["speed_integral"] = _clamp(mem["speed_integral"], -5.0, 5.0)
+
+    kP = 0.8
+    kI = 0.3
+    accel_cmd = kP * speed_error + kI * mem["speed_integral"]
+
+    max_accel = 3.0 * mu + 0.3
+    max_decel = 6.0 * mu + 1.0
+    throttle_cmd = 0.0
+    brake_cmd = 0.0
+
+    if accel_cmd >= 0:
+        throttle_cmd = _clamp(accel_cmd / max_accel, 0.0, 1.0)
+        brake_cmd = 0.0
+    else:
+        brake_cmd = _clamp(-accel_cmd / max_decel, 0.0, 1.0)
+        throttle_cmd = 0.0
+
+    if emergency_brake:
+        throttle_cmd = 0.0
+        brake_cmd = 1.0
+
+    if mem["brake_fault"]:
+        brake_cmd = min(brake_cmd, 0.2)
+        throttle_cmd = min(throttle_cmd, 0.2)
+
+    if mem["throttle_fault"]:
+        throttle_cmd = 0.0
+        brake_cmd = max(brake_cmd, 0.3 + 0.4 * _clamp((speed_kmh - 20.0) / 80.0, 0.0, 1.0))
+
+    throttle_cmd = _clamp(throttle_cmd, 0.0, 1.0)
+    brake_cmd = _clamp(brake_cmd, 0.0, 1.0)
+
+    mem["prev_throttle"] = throttle_cmd
+    mem["prev_brake"] = brake_cmd
+
+    return {
+        "steering": float(steer_cmd),
+        "throttle": float(throttle_cmd),
+        "brake": float(brake_cmd),
+    }
+```

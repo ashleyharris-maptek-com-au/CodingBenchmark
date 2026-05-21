@@ -1,1 +1,629 @@
-{'__exception__': "Can't run here - we're trying to get this working in codex."}
+Summary:
+- Builds a supporting convex hull (incremental QuickHull with plane tolerances tied to container scale) from the supplied vertices; if the points are degenerate, it falls back to the axis-aligned bounding box, so the solver always has a valid container.
+- Pre-computes the tetrahedron’s centroid-based local coordinates, per-axis extents, and circumradius; each hull face stores the worst-case dot product (“support margin”) so checking whether a tetra fits reduces to simple plane tests on the center.
+- Packs tetrahedra via multi-phase, volume-aware grid sampling (spacing automatically inflated for gigantic containers) plus a capped Poisson-style random refinement. A spatial hash with strict sphere-based guards enforces non-overlap. The whole loop is watchdogged by a 28 s timer to satisfy the performance requirement.
+
+C++20 source (MSVC-friendly, no non-standard headers):
+
+```cpp
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <iomanip>
+#include <iostream>
+#include <limits>
+#include <random>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
+#include <vector>
+
+struct Vec3 {
+    double x, y, z;
+    Vec3() : x(0), y(0), z(0) {}
+    Vec3(double xv, double yv, double zv) : x(xv), y(yv), z(zv) {}
+    Vec3 operator+(const Vec3 &o) const { return Vec3(x + o.x, y + o.y, z + o.z); }
+    Vec3 operator-(const Vec3 &o) const { return Vec3(x - o.x, y - o.y, z - o.z); }
+    Vec3 operator*(double s) const { return Vec3(x * s, y * s, z * s); }
+};
+
+inline Vec3 operator*(double s, const Vec3 &v) { return Vec3(v.x * s, v.y * s, v.z * s); }
+inline double dot(const Vec3 &a, const Vec3 &b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+inline Vec3 cross(const Vec3 &a, const Vec3 &b) {
+    return Vec3(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x);
+}
+inline double norm2(const Vec3 &v) { return dot(v, v); }
+inline double norm(const Vec3 &v) { return std::sqrt(norm2(v)); }
+
+struct Face {
+    int a = 0, b = 0, c = 0;
+    Vec3 normal{};
+    double offset = 0.0;
+    double supportMargin = 0.0;
+    bool removed = false;
+};
+
+struct TetraGeometry {
+    std::vector<Vec3> localVertices;
+    Vec3 extentMin{};
+    Vec3 extentMax{};
+    double circumRadius = 0.0;
+    double minCenterDistance = 0.0;
+    explicit TetraGeometry(double edge) {
+        const double sqrt3 = std::sqrt(3.0);
+        const double sqrtTwoThirds = std::sqrt(2.0 / 3.0);
+        Vec3 v0(0.0, 0.0, 0.0);
+        Vec3 v1(edge, 0.0, 0.0);
+        Vec3 v2(0.5 * edge, 0.5 * sqrt3 * edge, 0.0);
+        Vec3 v3(0.5 * edge, (sqrt3 / 6.0) * edge, sqrtTwoThirds * edge);
+        Vec3 centroid = (v0 + v1 + v2 + v3) * 0.25;
+        localVertices = {v0 - centroid, v1 - centroid, v2 - centroid, v3 - centroid};
+        extentMin = localVertices[0];
+        extentMax = localVertices[0];
+        for (const auto &v : localVertices) {
+            extentMin.x = std::min(extentMin.x, v.x);
+            extentMin.y = std::min(extentMin.y, v.y);
+            extentMin.z = std::min(extentMin.z, v.z);
+            extentMax.x = std::max(extentMax.x, v.x);
+            extentMax.y = std::max(extentMax.y, v.y);
+            extentMax.z = std::max(extentMax.z, v.z);
+            circumRadius = std::max(circumRadius, norm(v));
+        }
+        double gap = 2.0 * circumRadius;
+        minCenterDistance = gap * 1.0001;
+    }
+};
+
+class ConvexHullBuilder {
+public:
+    ConvexHullBuilder(const std::vector<Vec3> &pts, double tol)
+        : points(pts), tolerance(std::max(1e-9, tol)) {}
+    bool build(std::vector<Face> &outFaces) {
+        if (points.size() < 4) return false;
+        if (!initialize()) return false;
+        std::vector<char> skip(points.size(), false);
+        for (int idx : baseIndices) {
+            if (idx >= 0 && idx < static_cast<int>(skip.size())) skip[idx] = true;
+        }
+        for (size_t i = 0; i < points.size(); ++i) {
+            if (skip[i]) continue;
+            if (!expandWithPoint(static_cast<int>(i))) return false;
+        }
+        outFaces.clear();
+        for (const auto &face : faces) {
+            if (!face.removed) outFaces.push_back(face);
+        }
+        return !outFaces.empty();
+    }
+
+private:
+    const std::vector<Vec3> &points;
+    double tolerance;
+    Vec3 innerPoint{};
+    std::vector<Face> faces;
+    std::vector<char> visibleMark;
+    std::unordered_map<uint64_t, int> edgeOwner;
+    std::array<int, 4> baseIndices{0, 1, 2, 3};
+
+    bool initialize() {
+        int n = static_cast<int>(points.size());
+        int i0 = 0;
+        for (int i = 1; i < n; ++i) {
+            const Vec3 &p = points[i];
+            const Vec3 &q = points[i0];
+            if (p.x < q.x || (p.x == q.x && (p.y < q.y || (p.y == q.y && p.z < q.z)))) {
+                i0 = i;
+            }
+        }
+        int i1 = -1;
+        double bestDist = 0.0;
+        for (int i = 0; i < n; ++i) {
+            if (i == i0) continue;
+            double d = norm2(points[i] - points[i0]);
+            if (d > bestDist) {
+                bestDist = d;
+                i1 = i;
+            }
+        }
+        if (i1 == -1 || bestDist < tolerance * tolerance) return false;
+        Vec3 base = points[i1] - points[i0];
+        int i2 = -1;
+        double bestArea = 0.0;
+        for (int i = 0; i < n; ++i) {
+            if (i == i0 || i == i1) continue;
+            Vec3 diff = points[i] - points[i0];
+            double area = norm(cross(base, diff));
+            if (area > bestArea) {
+                bestArea = area;
+                i2 = i;
+            }
+       
+        }
+        if (i2 == -1 || bestArea < tolerance) return false;
+        Vec3 normal = cross(base, points[i2] - points[i0]);
+        double len = norm(normal);
+        if (len < tolerance) return false;
+        Vec3 unitNormal = normal * (1.0 / len);
+        int i3 = -1;
+        double bestHeight = 0.0;
+        for (int i = 0; i < n; ++i) {
+            if (i == i0 || i == i1 || i == i2) continue;
+            double height = std::fabs(dot(unitNormal, points[i] - points[i0]));
+            if (height > bestHeight) {
+                bestHeight = height;
+                i3 = i;
+            }
+        }
+        if (i3 == -1 || bestHeight < tolerance) return false;
+        faces.clear();
+        visibleMark.clear();
+        edgeOwner.clear();
+        faces.reserve(64);
+        visibleMark.reserve(64);
+        innerPoint = (points[i0] + points[i1] + points[i2] + points[i3]) * 0.25;
+        baseIndices = {i0, i1, i2, i3};
+        return addFace(i0, i1, i2) && addFace(i0, i2, i3) &&
+               addFace(i0, i3, i1) && addFace(i1, i3, i2);
+    }
+
+    bool addFace(int a, int b, int c) {
+        Vec3 pa = points[a];
+        Vec3 pb = points[b];
+        Vec3 pc = points[c];
+        Vec3 normal = cross(pb - pa, pc - pa);
+        double len = norm(normal);
+        if (len < tolerance) return false;
+        normal = normal * (1.0 / len);
+        double offset = -dot(normal, pa);
+        double orient = dot(normal, innerPoint) + offset;
+        if (orient > 0.0) {
+            std::swap(b, c);
+            pb = points[b];
+            pc = points[c];
+            normal = cross(pb - pa, pc - pa);
+            len = norm(normal);
+            if (len < tolerance) return false;
+            normal = normal * (1.0 / len);
+            offset = -dot(normal, pa);
+        }
+        Face face;
+        face.a = a;
+        face.b = b;
+        face.c = c;
+        face.normal = normal;
+        face.offset = offset;
+        face.removed = false;
+        face.supportMargin = 0.0;
+        int idx = static_cast<int>(faces.size());
+        faces.push_back(face);
+        visibleMark.push_back(false);
+        auto keyAB = edgeKey(a, b);
+        auto keyBC = edgeKey(b, c);
+        auto keyCA = edgeKey(c, a);
+        edgeOwner[keyAB] = idx;
+        edgeOwner[keyBC] = idx;
+        edgeOwner[keyCA] = idx;
+        return true;
+    }
+
+    bool expandWithPoint(int pIdx) {
+        bool outside = false;
+        std::vector<int> visible;
+        visible.reserve(32);
+        for (int i = 0; i < static_cast<int>(faces.size()); ++i) {
+            if (faces[i].removed) continue;
+            double dist = planeDistance(faces[i], points[pIdx]);
+            if (dist > tolerance) {
+                outside = true;
+                visible.push_back(i);
+                visibleMark[i] = true;
+            }
+        }
+        if (!outside) {
+            for (int idx : visible) visibleMark[idx] = false;
+            return true;
+        }
+        std::vector<std::pair<int, int>> horizon;
+        horizon.reserve(visible.size() * 3);
+        std::unordered_set<uint64_t> horizonSet;
+        horizonSet.reserve(visible.size() * 3 + 3);
+        auto addHorizonEdge = [&](int u, int v) {
+            uint64_t opp = edgeKey(v, u);
+            auto it = edgeOwner.find(opp);
+            int neighbor = (it == edgeOwner.end()) ? -1 : it->second;
+            bool neighborVisible = false;
+            if (neighbor != -1 && neighbor < static_cast<int>(faces.size())) {
+                neighborVisible = !faces[neighbor].removed && visibleMark[neighbor];
+            }
+            if (neighbor == -1 || !neighborVisible) {
+                uint64_t own = edgeKey(u, v);
+                if (horizonSet.insert(own).second) horizon.emplace_back(u, v);
+            }
+        };
+        for (int idx : visible) {
+            Face &face = faces[idx];
+            addHorizonEdge(face.a, face.b);
+            addHorizonEdge(face.b, face.c);
+            addHorizonEdge(face.c, face.a);
+        }
+        auto eraseEdge = [&](int faceIdx, int u, int v) {
+            uint64_t key = edgeKey(u, v);
+            auto it = edgeOwner.find(key);
+            if (it != edgeOwner.end() && it->second == faceIdx) edgeOwner.erase(it);
+        };
+        for (int idx : visible) {
+            Face &face = faces[idx];
+            eraseEdge(idx, face.a, face.b);
+            eraseEdge(idx, face.b, face.c);
+            eraseEdge(idx, face.c, face.a);
+            face.removed = true;
+            visibleMark[idx] = false;
+        }
+        for (const auto &edge : horizon) {
+            if (!addFace(edge.first, edge.second, pIdx)) return false;
+        }
+        return true;
+    }
+
+    double planeDistance(const Face &face, const Vec3 &p) const {
+        return dot(face.normal, p) + face.offset;
+    }
+    uint64_t edgeKey(int u, int v) const {
+        return (static_cast<uint64_t>(static_cast<uint32_t>(u)) << 32) ^
+               static_cast<uint64_t>(static_cast<uint32_t>(v));
+    }
+};
+
+struct ContainerInfo {
+    Vec3 minCorner{};
+    Vec3 maxCorner{};
+    bool hasHull = false;
+    double tolerance = 1e-7;
+    std::vector<Face> faces;
+};
+
+struct CellKey {
+    int64_t x;
+    int64_t y;
+    int64_t z;
+    bool operator==(const CellKey &o) const {
+        return x == o.x && y == o.y && z == o.z;
+    }
+};
+
+struct CellKeyHash {
+    std::size_t operator()(const CellKey &key) const noexcept {
+        std::size_t hx = std::hash<int64_t>{}(key.x);
+        std::size_t hy = std::hash<int64_t>{}(key.y);
+        std::size_t hz = std::hash<int64_t>{}(key.z);
+        return hx ^ (hy << 1) ^ (hz << 2);
+    }
+};
+
+struct SpatialHash {
+    double cellSize;
+    Vec3 origin;
+    int range;
+    const std::vector<Vec3> *positions;
+    std::unordered_map<CellKey, std::vector<int>, CellKeyHash> buckets;
+    SpatialHash(double cs, const Vec3 &org, const std::vector<Vec3> *pos)
+        : cellSize(cs > 0 ? cs : 1.0),
+          origin(org),
+          range(2),
+          positions(pos) {
+        buckets.reserve(4096);
+    }
+    CellKey keyFromPoint(const Vec3 &p) const {
+        return CellKey{
+            static_cast<int64_t>(std::floor((p.x - origin.x) / cellSize)),
+            static_cast<int64_t>(std::floor((p.y - origin.y) / cellSize)),
+            static_cast<int64_t>(std::floor((p.z - origin.z) / cellSize))};
+    }
+    bool hasConflict(const Vec3 &p, double minDistSq) const {
+        CellKey base = keyFromPoint(p);
+        for (int dx = -range; dx <= range; ++dx) {
+            for (int dy = -range; dy <= range; ++dy) {
+                for (int dz = -range; dz <= range; ++dz) {
+                    CellKey key{base.x + dx, base.y + dy, base.z + dz};
+                    auto it = buckets.find(key);
+                    if (it == buckets.end()) continue;
+                    for (int idx : it->second) {
+                        const Vec3 &q = (*positions)[static_cast<size_t>(idx)];
+                        Vec3 diff(p.x - q.x, p.y - q.y, p.z - q.z);
+                        double distSq = diff.x * diff.x + diff.y * diff.y + diff.z * diff.z;
+                        if (distSq < minDistSq) return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+    void insert(int idx, const Vec3 &p) {
+        buckets[keyFromPoint(p)].push_back(idx);
+    }
+};
+
+struct Phase {
+    double spacing;
+    Vec3 offsetFrac;
+};
+
+double estimateGridCount(const Vec3 &minCorner, const Vec3 &maxCorner, double spacing) {
+    if (spacing <= 0.0) return 0.0;
+    auto axisCount = [&](double len) -> double {
+        if (len <= 0.0) return 1.0;
+        return std::ceil(len / spacing) + 1.0;
+    };
+    double lenX = std::max(0.0, maxCorner.x - minCorner.x);
+    double lenY = std::max(0.0, maxCorner.y - minCorner.y);
+    double lenZ = std::max(0.0, maxCorner.z - minCorner.z);
+    long double count = axisCount(lenX) * axisCount(lenY) * axisCount(lenZ);
+    if (count > 5e7L) count = 5e7L;
+    return static_cast<double>(count);
+}
+
+int main() {
+    std::ios::sync_with_stdio(false);
+    std::cin.tie(nullptr);
+
+    int V = 0;
+    double edgeLength = 1.0;
+    if (!(std::cin >> V >> edgeLength)) {
+        std::cout << 0 << '\n';
+        return 0;
+    }
+    std::vector<Vec3> vertices;
+    vertices.reserve(std::max(0, V));
+    Vec3 minCorner(std::numeric_limits<double>::max(),
+                   std::numeric_limits<double>::max(),
+                   std::numeric_limits<double>::max());
+    Vec3 maxCorner(std::numeric_limits<double>::lowest(),
+                   std::numeric_limits<double>::lowest(),
+                   std::numeric_limits<double>::lowest());
+    for (int i = 0; i < V; ++i) {
+        double x, y, z;
+        std::cin >> x >> y >> z;
+        vertices.emplace_back(x, y, z);
+        minCorner.x = std::min(minCorner.x, x);
+        minCorner.y = std::min(minCorner.y, y);
+        minCorner.z = std::min(minCorner.z, z);
+        maxCorner.x = std::max(maxCorner.x, x);
+        maxCorner.y = std::max(maxCorner.y, y);
+        maxCorner.z = std::max(maxCorner.z, z);
+    }
+    if (vertices.empty()) {
+        std::cout << 0 << '\n';
+        return 0;
+    }
+
+    const auto startTime = std::chrono::steady_clock::now();
+    auto timeExceeded = [&](size_t &counter) -> bool {
+        ++counter;
+        if ((counter & 0x3FFFu) == 0) {
+            double elapsed =
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - startTime).count();
+            if (elapsed > 28.0) return true;
+        }
+        return false;
+    };
+
+    TetraGeometry tetra(edgeLength);
+
+    ContainerInfo container;
+    container.minCorner = minCorner;
+    container.maxCorner = maxCorner;
+    double diag = norm(maxCorner - minCorner);
+    container.tolerance = std::max(1e-9, diag * 1e-9);
+    std::vector<Face> hullFaces;
+    bool haveHull = false;
+    if (vertices.size() >= 4) {
+        ConvexHullBuilder builder(vertices, container.tolerance);
+        haveHull = builder.build(hullFaces);
+    }
+    if (haveHull) {
+        container.hasHull = true;
+        container.faces = std::move(hullFaces);
+    } else {
+        container.hasHull = false;
+        container.faces.clear();
+    }
+    if (container.hasHull) {
+        for (auto &face : container.faces) {
+            double maxDot = -std::numeric_limits<double>::infinity();
+            for (const auto &lv : tetra.localVertices) {
+                maxDot = std::max(maxDot, dot(face.normal, lv));
+            }
+            face.supportMargin = maxDot;
+            face.removed = false;
+        }
+    }
+
+    Vec3 domainMin(container.minCorner.x - tetra.extentMin.x,
+                   container.minCorner.y - tetra.extentMin.y,
+                   container.minCorner.z - tetra.extentMin.z);
+    Vec3 domainMax(container.maxCorner.x - tetra.extentMax.x,
+                   container.maxCorner.y - tetra.extentMax.y,
+                   container.maxCorner.z - tetra.extentMax.z);
+
+    bool feasible = true;
+    auto adjustAxis = [&](double &mn, double &mx) {
+        if (mn > mx) {
+            if (mn - mx <= 1e-9) {
+                double mid = 0.5 * (mn + mx);
+                mn = mx = mid;
+            } else {
+                feasible = false;
+            }
+        }
+    };
+    adjustAxis(domainMin.x, domainMax.x);
+    adjustAxis(domainMin.y, domainMax.y);
+    adjustAxis(domainMin.z, domainMax.z);
+    if (!feasible) {
+        std::cout << 0 << '\n';
+        return 0;
+    }
+
+    double minCenterDist = tetra.minCenterDistance;
+    double minDistSq = minCenterDist * minCenterDist;
+    const double COARSE_LIMIT = 250000.0;
+    const double TOTAL_LIMIT = 1500000.0;
+
+    auto approxCount = [&](double spacing) {
+        return estimateGridCount(domainMin, domainMax, spacing);
+    };
+
+    double baseSpacing = minCenterDist;
+    double approx = approxCount(baseSpacing);
+    if (approx > COARSE_LIMIT && baseSpacing > 0.0) {
+        double scale = std::cbrt(approx / COARSE_LIMIT);
+        baseSpacing *= scale;
+    }
+
+    std::vector<Phase> phases;
+    double totalEstimate = 0.0;
+    auto fracWrap = [](double v) {
+        double r = std::fmod(v, 1.0);
+        if (r < 0.0) r += 1.0;
+        return r;
+    };
+    auto tryAddPhase = [&](double spacing, Vec3 frac) {
+        double est = approxCount(spacing);
+        if (spacing <= 0.0 || est <= 0.0) return;
+        if (phases.empty() || totalEstimate + est <= TOTAL_LIMIT) {
+            frac.x = fracWrap(frac.x);
+            frac.y = fracWrap(frac.y);
+            frac.z = fracWrap(frac.z);
+            phases.push_back(Phase{spacing, frac});
+            totalEstimate += est;
+        }
+    };
+    std::array<Vec3, 3> coarseFractions = {Vec3{0.0, 0.0, 0.0},
+                                           Vec3{0.5, 0.5, 0.5},
+                                           Vec3{0.25, 0.75, 0.4}};
+    for (const auto &frac : coarseFractions) {
+        tryAddPhase(baseSpacing, frac);
+    }
+    double fineSpacing = std::max(minCenterDist, baseSpacing * 0.8);
+    if (fineSpacing + 1e-12 < baseSpacing) {
+        std::array<Vec3, 2> fineFractions = {Vec3{0.12, 0.33, 0.66},
+                                             Vec3{0.62, 0.18, 0.84}};
+        for (const auto &frac : fineFractions) {
+            tryAddPhase(fineSpacing, frac);
+        }
+        double finerSpacing = std::max(minCenterDist, fineSpacing * 0.8);
+        if (finerSpacing + 1e-12 < fineSpacing) {
+            tryAddPhase(finerSpacing, Vec3{0.3, 0.7, 0.5});
+        }
+    }
+    if (phases.empty()) {
+        phases.push_back(Phase{std::max(minCenterDist, baseSpacing), Vec3{0.0, 0.0, 0.0}});
+    }
+
+    std::vector<Vec3> centers;
+    centers.reserve(128);
+    Vec3 hashOrigin(domainMin.x - minCenterDist * 2.0,
+                    domainMin.y - minCenterDist * 2.0,
+                    domainMin.z - minCenterDist * 2.0);
+    SpatialHash hash(minCenterDist, hashOrigin, &centers);
+
+    const double eps = std::max(1e-7, container.tolerance * 4.0);
+    auto axisFits = [&](const Vec3 &c) -> bool {
+        if (c.x + tetra.extentMin.x < container.minCorner.x - eps) return false;
+        if (c.x + tetra.extentMax.x > container.maxCorner.x + eps) return false;
+        if (c.y + tetra.extentMin.y < container.minCorner.y - eps) return false;
+        if (c.y + tetra.extentMax.y > container.maxCorner.y + eps) return false;
+        if (c.z + tetra.extentMin.z < container.minCorner.z - eps) return false;
+        if (c.z + tetra.extentMax.z > container.maxCorner.z + eps) return false;
+        return true;
+    };
+    auto insideHull = [&](const Vec3 &c) -> bool {
+        if (!container.hasHull) return true;
+        for (const auto &face : container.faces) {
+            double distCenter = dot(face.normal, c) + face.offset;
+            if (distCenter > eps) return false;
+            if (distCenter + face.supportMargin > eps) return false;
+        }
+        return true;
+    };
+
+    auto tryPlace = [&](const Vec3 &center) -> bool {
+        if (!axisFits(center)) return false;
+        if (!insideHull(center)) return false;
+        if (hash.hasConflict(center, minDistSq)) return false;
+        centers.push_back(center);
+        hash.insert(static_cast<int>(centers.size() - 1), center);
+        return true;
+    };
+
+    size_t timeCounter = 0;
+    bool timeUp = false;
+
+    for (const auto &phase : phases) {
+        if (timeUp) break;
+        double step = phase.spacing;
+        if (step <= 0.0) continue;
+        Vec3 offset(phase.offsetFrac.x * step,
+                    phase.offsetFrac.y * step,
+                    phase.offsetFrac.z * step);
+        auto prepStart = [&](double minVal, double offsetComp) {
+            double start = minVal + offsetComp;
+            while (start - step >= minVal - 1e-9) start -= step;
+            return start;
+        };
+        double startX = prepStart(domainMin.x, offset.x);
+        double startY = prepStart(domainMin.y, offset.y);
+        double startZ = prepStart(domainMin.z, offset.z);
+        for (double x = startX; x <= domainMax.x + eps; x += step) {
+            if (x < domainMin.x - eps) continue;
+            if (timeUp) break;
+            for (double y = startY; y <= domainMax.y + eps; y += step) {
+                if (y < domainMin.y - eps) continue;
+                if (timeUp) break;
+                for (double z = startZ; z <= domainMax.z + eps; z += step) {
+                    if (z < domainMin.z - eps) continue;
+                    Vec3 candidate(x, y, z);
+                    tryPlace(candidate);
+                    if (timeExceeded(timeCounter)) {
+                        timeUp = true;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    if (!timeUp) {
+        double approxCells = approxCount(baseSpacing);
+        size_t randomAttempts = static_cast<size_t>(
+            std::min<double>(150000.0, std::max<double>(5000.0, approxCells * 0.4)));
+        std::mt19937_64 rng(0x5f3759dfULL);
+        std::uniform_real_distribution<double> uni(0.0, 1.0);
+        auto randCoord = [&](double minVal, double maxVal) {
+            double span = std::max(0.0, maxVal - minVal);
+            return minVal + span * uni(rng);
+        };
+        for (size_t i = 0; i < randomAttempts; ++i) {
+            Vec3 candidate(randCoord(domainMin.x, domainMax.x),
+                           randCoord(domainMin.y, domainMax.y),
+                           randCoord(domainMin.z, domainMax.z));
+            tryPlace(candidate);
+            if (timeExceeded(timeCounter)) {
+                timeUp = true;
+                break;
+            }
+        }
+    }
+
+    std::cout << centers.size() << '\n';
+    std::cout << std::fixed << std::setprecision(6);
+    for (const auto &c : centers) {
+        std::cout << c.x << ' ' << c.y << ' ' << c.z << " 0.000000 0.000000 0.000000\n";
+    }
+    return 0;
+}
+```
+
+This program stays within the standard library, honors the MSVC C++20 toolchain, adapts sampling density to container volume, enforces collision-free placement through a tight spatial hash, and exits early if the watchdog senses the 30 s budget would be exceeded.

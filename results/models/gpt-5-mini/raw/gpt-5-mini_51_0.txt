@@ -1,1 +1,485 @@
-{'__exception__': "Can't run here - we're trying to get this working in codex."}
+Below is a single-file Python autopilot implementation meeting the requested function signature. It uses simple-but-robust sensor fusion across redundants (median-based with trend checks), basic PID loops for altitude/vertical-speed, heading/roll, and speed/throttle, and includes yaw-damper / asymmetric-thrust compensation, flaps/gear logic, and slow trim adjustment. Module-level state (integrators and previous values) persists across calls.
+
+This is an inherently simplified autopilot compared to a real A320 system, but is designed to be resilient to failing sensors (including ones that don't flag invalid) and to operate across a wide variety of scenarios.
+
+Copy this code into your simulator environment. The function uses only Python stdlib math and persists internal state in module-level variables.
+
+```python
+import math
+from typing import Dict
+
+# =========================
+# Module-level persistent state
+# =========================
+_persist = {
+    "ias_int": 0.0,
+    "alt_int": 0.0,
+    "hdg_int": 0.0,
+    "pitch_trim": 0.0,
+    "prev_alt": None,
+    "prev_time": None,
+    "prev_hdg_error": 0.0,
+    "prev_vs_error": 0.0,
+    "prev_ias_error": 0.0,
+    "prev_roll_rate": 0.0,
+    "yaw_int": 0.0,
+}
+
+# Helper utilities
+def clamp(x, lo, hi):
+    return max(lo, min(hi, x))
+
+def median(values):
+    vals = sorted([v for v in values if v is not None and not (isinstance(v, float) and math.isnan(v))])
+    if not vals:
+        return None
+    n = len(vals)
+    if n % 2 == 1:
+        return vals[n // 2]
+    else:
+        return 0.5 * (vals[n // 2 - 1] + vals[n // 2])
+
+def circular_mean_angle_deg(angles):
+    # angles list may contain None
+    s = 0.0
+    c = 0.0
+    count = 0
+    for a in angles:
+        if a is None:
+            continue
+        rad = math.radians(a)
+        s += math.sin(rad)
+        c += math.cos(rad)
+        count += 1
+    if count == 0:
+        return None
+    mean = math.degrees(math.atan2(s / count, c / count))
+    return (mean + 360.0) % 360.0
+
+def shortest_angle_diff_deg(target, current):
+    diff = (target - current + 180) % 360 - 180
+    return diff
+
+def choose_best_airspeed(state):
+    # Prefer validated IAS instruments; fall back to TAS or Mach-derived rough estimate.
+    candidates = []
+    # ias_1_kt etc exist
+    for i in (1, 2, 3):
+        key_ias = f"ias_{i}_kt"
+        key_valid = f"ias_{i}_valid"
+        v = state.get(key_ias, None)
+        valid_flag = state.get(key_valid, None)
+        # don't trust valid flag fully; still accept reading
+        if v is not None and not (isinstance(v, float) and math.isnan(v)):
+            candidates.append(v)
+    # if none found, try tas
+    if not candidates:
+        for i in (1, 2, 3):
+            t = state.get(f"tas_{i}_kt", None)
+            if t is not None:
+                candidates.append(t)
+    # still none: try mach->approx TAS: TAS ~ Mach * a (speed of sound ~ 661.5 kt at sea level -> adjust by OAT crudely)
+    if not candidates:
+        machs = [state.get("mach_1"), state.get("mach_2"), state.get("mach_3")]
+        mach = median([m for m in machs if m is not None])
+        if mach is not None:
+            # approximate speed of sound in knots using ISA roughly: a = 38.967 * sqrt(T Kelvin)
+            # Convert given oat_c to Kelvin
+            oat = state.get("oat_c")
+            if oat is None:
+                oat = state.get("adc_1_oat_c") or state.get("adc_2_oat_c") or state.get("adc_3_oat_c") or 15.0
+            a_m_s = 20.0468 * math.sqrt(273.15 + oat)  # knots conversion integrated (approx)
+            # better: use 661.5 * sqrt(T/288.15)
+            a_kt = 661.5 * math.sqrt((273.15 + oat) / 288.15)
+            candidates.append(mach * a_kt)
+    return median(candidates)
+
+def choose_best_altitude(state):
+    # Use radar if low altitude (<2500 ft) and radar readings consistent.
+    radars = []
+    for i in (1, 2, 3):
+        k = f"radar_alt_{i}_ft"
+        v = state.get(k)
+        if v is not None:
+            radars.append(v)
+    radar_med = median(radars) if radars else None
+    # baro altimeters (already in ft)
+    baros = []
+    for i in (1, 2, 3):
+        baro_key = f"baro_alt_{i}_ft"
+        v = state.get(baro_key)
+        if v is not None:
+            baros.append(v)
+    baro_med = median(baros) if baros else None
+    # gps alt
+    gps_alts = []
+    for i in (1, 2, 3):
+        v = state.get(f"gps_{i}_alt_ft")
+        if v is not None:
+            gps_alts.append(v)
+    gps_med = median(gps_alts) if gps_alts else None
+
+    # prefer radar when low and available and consistent
+    if radar_med is not None:
+        # if radar values are consistent (i.e., count>=2 and spread small), trust radar below 2500ft
+        if len(radars) >= 2:
+            spread = max(radars) - min(radars)
+        else:
+            spread = 0
+        if radar_med < 2500 + 200 and spread < 200:
+            return radar_med
+
+    # otherwise prefer baro median, but if baros disagree strongly, compare to GPS trend
+    if baro_med is not None and gps_med is not None:
+        # if baro and gps disagree by a lot, attempt to detect trend from prev_alt (persist)
+        prev_alt = _persist.get("prev_alt")
+        if abs(baro_med - gps_med) > 250:
+            # check vertical speed from available sources and pick consistent one
+            vs_fpm = state.get("vertical_speed_fpm")
+            # if gps shows dropping and baro shows climbing, prefer baro if vs small; else prefer gps
+            if vs_fpm is not None:
+                if vs_fpm < -200 and gps_med < baro_med:
+                    chosen = gps_med
+                elif vs_fpm > 200 and baro_med < gps_med:
+                    chosen = baro_med
+                else:
+                    # fallback to baro
+                    chosen = baro_med
+            else:
+                chosen = baro_med
+            _persist["prev_alt"] = chosen
+            return chosen
+    # otherwise prefer baro if present
+    if baro_med is not None:
+        _persist["prev_alt"] = baro_med
+        return baro_med
+    # fallback gps
+    if gps_med is not None:
+        _persist["prev_alt"] = gps_med
+        return gps_med
+    # fallback radar
+    if radar_med is not None:
+        _persist["prev_alt"] = radar_med
+        return radar_med
+    return None
+
+def choose_best_heading(state):
+    # Use IRS headings first (multiple). Fall back to true_heading or magnetic_heading.
+    irs_heads = []
+    for i in (1, 2, 3):
+        v = state.get(f"irs_{i}_heading_deg")
+        if v is not None:
+            irs_heads.append(v)
+    if irs_heads:
+        return circular_mean_angle_deg(irs_heads)
+    # gps tracks
+    gps_tracks = []
+    for i in (1, 2, 3):
+        v = state.get(f"gps_{i}_track_deg")
+        if v is not None:
+            gps_tracks.append(v)
+    if gps_tracks:
+        return circular_mean_angle_deg(gps_tracks)
+    # fallbacks
+    th = state.get("true_heading_deg")
+    if th is not None:
+        return th
+    mh = state.get("magnetic_heading_deg")
+    return mh
+
+# Main autopilot step
+def autopilot_step(state: Dict, dt: float) -> Dict:
+    """
+    state: dictionary as specified
+    dt: timestep (passed also in state['dt'])
+    returns: dict of control commands
+    """
+    # Basic guarding
+    if dt <= 0:
+        dt = 0.05
+
+    # If autopilot not engaged, do nothing (preserve current controls)
+    ap_eng = bool(state.get("ap_engaged"))
+    at_eng = bool(state.get("at_engaged"))
+
+    # Fetch targets
+    target_alt = state.get("target_alt_ft")
+    target_hdg = state.get("target_hdg_deg")
+    target_ias = state.get("target_ias_kt")
+    target_vs = state.get("target_vs_fpm")
+
+    # Sensor fusion
+    fused_ias = choose_best_airspeed(state) or state.get("ground_speed_kt") or 250.0
+    fused_alt = choose_best_altitude(state) or 10000.0
+    fused_hdg = choose_best_heading(state) or state.get("magnetic_heading_deg") or 0.0
+    # fused pitch/roll from IRS
+    pitch_vals = []
+    roll_vals = []
+    for i in (1, 2, 3):
+        pitch_vals.append(state.get(f"irs_{i}_pitch_deg"))
+        roll_vals.append(state.get(f"irs_{i}_roll_deg"))
+    fused_pitch = median([p for p in pitch_vals if p is not None])
+    fused_roll = median([r for r in roll_vals if r is not None])
+    # fallback to flight_path_angle/attitude approximations
+    if fused_pitch is None:
+        fused_pitch = state.get("flight_path_angle_deg", 0.0)
+    if fused_roll is None:
+        fused_roll = 0.0
+
+    # Rates
+    yaw_rates = []
+    for i in (1, 2, 3):
+        yaw_rates.append(state.get(f"gyro_{i}_yaw_rate_dps"))
+    fused_yaw_rate = median([y for y in yaw_rates if y is not None]) or 0.0
+    roll_rates = []
+    for i in (1, 2, 3):
+        roll_rates.append(state.get(f"gyro_{i}_roll_rate_dps"))
+    fused_roll_rate = median([r for r in roll_rates if r is not None]) or 0.0
+
+    # Engines
+    eng1_running = bool(state.get("engine_1_running"))
+    eng2_running = bool(state.get("engine_2_running"))
+    thrust1 = state.get("engine_1_thrust_pct", 0.0) or 0.0
+    thrust2 = state.get("engine_2_thrust_pct", 0.0) or 0.0
+    avg_thrust = 0.5 * (thrust1 + thrust2)
+
+    # Current throttle positions (0..1)
+    cur_th1 = clamp(state.get("throttle_1_pos", thrust1 / 100.0 if thrust1 <= 1.0 else thrust1 / 100.0), 0.0, 1.0)
+    cur_th2 = clamp(state.get("throttle_2_pos", thrust2 / 100.0 if thrust2 <= 1.0 else thrust2 / 100.0), 0.0, 1.0)
+    cur_th = 0.5 * (cur_th1 + cur_th2)
+
+    # Vertical speed
+    vs_fpm = state.get("vertical_speed_fpm")
+    if vs_fpm is None:
+        # estimate from change in fused_alt if possible
+        prev_alt = _persist.get("prev_alt")
+        if prev_alt is not None and fused_alt is not None and dt:
+            vs_fpm = (fused_alt - prev_alt) / dt * 60.0
+        else:
+            vs_fpm = 0.0
+
+    # Update persistent prev_alt
+    _persist["prev_alt"] = fused_alt
+
+    # Control outputs (to compute)
+    out = {}
+
+    # If autopilot not engaged, do not modify controls (maintain). But still implement basic yaw damper via rudder to avoid big yaw if AT engaged?
+    if not ap_eng:
+        # If autothr engaged, manage throttle to achieve target airspeed modestly (open-loop)
+        if at_eng and target_ias is not None:
+            # simple integrator for throttle
+            kp_t = 0.003  # small gain: throttle change per kt
+            ki_t = 0.0005
+            ias_err = target_ias - fused_ias
+            _persist["ias_int"] += ias_err * dt
+            th_cmd = clamp(cur_th + kp_t * ias_err + ki_t * _persist["ias_int"], 0.0, 1.0)
+            out["throttle_1"] = th_cmd
+            out["throttle_2"] = th_cmd
+        return out
+
+    # =========================
+    # Heading / Aileron control
+    # =========================
+    if target_hdg is None:
+        target_hdg = fused_hdg
+    hdg_err = shortest_angle_diff_deg(target_hdg, fused_hdg)
+    # Roll command proportional to heading error, limited by bank limits
+    # Convert hdg error (deg) to desired roll (deg)
+    max_bank = 25.0  # degrees
+    roll_cmd_deg = clamp(0.6 * hdg_err, -max_bank, max_bank)
+    # roll rate damper into aileron
+    # Map desired roll to aileron -1..1 approximately linear mapping
+    # assume aileron deflection roughly corresponds to ±30 deg roll command -> aileron ±1
+    aileron_cmd = clamp(roll_cmd_deg / 30.0 - 0.02 * fused_roll_rate, -1.0, 1.0)
+    out["aileron"] = aileron_cmd
+
+    # =========================
+    # Yaw/Rudder: yaw damper + asymmetric thrust compensation
+    # =========================
+    # Basic yaw damper: damp yaw rate to near zero unless commanded
+    yaw_damper_gain = 0.01
+    rudder_from_yrate = -yaw_damper_gain * fused_yaw_rate
+    # Asymmetric thrust compensation: rudder to counter differential thrust (left-right)
+    thrust_diff = (thrust1 - thrust2) / 100.0  # thrust % converted to 0..1 approx
+    asym_gain = 0.6  # need notable rudder for big asymmetry
+    rudder_asym = clamp(-asym_gain * thrust_diff, -1.0, 1.0)
+    rudder_cmd = clamp(rudder_from_yrate + rudder_asym, -1.0, 1.0)
+    out["rudder"] = rudder_cmd
+
+    # =========================
+    # Altitude / Pitch / Elevator control
+    # =========================
+    # Determine whether altitude hold or vertical speed control
+    # If a target_vs is provided, follow that; else use altitude hold to reach target_alt
+    if target_vs is not None:
+        vs_error = target_vs - vs_fpm
+        # PID on vertical speed to elevator command (relative to trim)
+        kp_vs = 0.0009
+        kd_vs = 0.0006
+        ki_vs = 0.00002
+        _persist["alt_int"] += vs_error * dt
+        elevator_cmd = clamp(kp_vs * vs_error + kd_vs * (vs_error - _persist["prev_vs_error"]) / max(dt, 1e-6) + ki_vs * _persist["alt_int"], -1.0, 1.0)
+        _persist["prev_vs_error"] = vs_error
+    elif target_alt is not None:
+        alt_error = target_alt - fused_alt
+        # convert altitude error to a target vertical speed (simple law): 1000ft error -> 500 fpm
+        vs_target = clamp(alt_error * 0.5, -3000.0, 3000.0)
+        vs_error = vs_target - vs_fpm
+        kp_vs = 0.0008
+        kd_vs = 0.0005
+        ki_vs = 0.00002
+        _persist["alt_int"] += vs_error * dt
+        elevator_cmd = clamp(kp_vs * vs_error + kd_vs * (vs_error - _persist["prev_vs_error"]) / max(dt, 1e-6) + ki_vs * _persist["alt_int"], -1.0, 1.0)
+        _persist["prev_vs_error"] = vs_error
+    else:
+        # speed-only: trim to maintain neutral elevator (zero)
+        elevator_cmd = 0.0
+
+    # Limit elevator reductions near stall: if AoA high (from sensors), push nose down
+    aoa_vals = []
+    for i in (1, 2, 3):
+        a = state.get(f"aoa_{i}_deg")
+        if a is not None:
+            aoa_vals.append(a)
+    fused_aoa = median(aoa_vals) if aoa_vals else None
+    stall_margin = 14.0  # deg AoA approximated
+    if fused_aoa is not None:
+        if fused_aoa > stall_margin:
+            # strong nose-down command
+            elevator_cmd = min(elevator_cmd, -0.6)
+        elif fused_aoa > stall_margin - 3.0:
+            elevator_cmd = min(elevator_cmd, -0.3)
+
+    out["elevator"] = elevator_cmd
+
+    # =========================
+    # Elevator trim: slowly integrate so trim offset ends up supporting the required elevator
+    # =========================
+    # Aim to drive elevator_cmd toward 0 by adjusting trim slowly
+    trim_rate = 0.02  # trim units per second
+    desired_trim_change = -0.5 * elevator_cmd  # if elevator demands nose-up positive, increase trim to relieve
+    # integrate trim gradually:
+    current_trim = _persist.get("pitch_trim", state.get("elevator_trim_deg", 0.0) if state.get("elevator_trim_deg") is not None else 0.0)
+    # move trim fractionally toward desired change (scale to -1..1)
+    trim_target = clamp(current_trim + desired_trim_change * 0.02, -1.0, 1.0)
+    # move at rate
+    trim_delta = clamp(trim_target - current_trim, -trim_rate * dt, trim_rate * dt)
+    current_trim = clamp(current_trim + trim_delta, -1.0, 1.0)
+    _persist["pitch_trim"] = current_trim
+    out["elevator_trim"] = current_trim
+
+    # =========================
+    # Throttle / Autothrust
+    # =========================
+    # AT commands throttle to maintain target_ias; otherwise maintain current thrust or set to climb thrust if large alt error
+    kp_t = 0.0045
+    ki_t = 0.0006
+    kd_t = 0.0015
+    # If target_ias not provided, try speed needed for climb/descent from alt error
+    if target_ias is None:
+        # set target_ias to safe speed depending on flap positions/altitude
+        # get flaps current
+        flap_left = state.get("flap_pos_left_deg") or 0.0
+        flap_right = state.get("flap_pos_right_deg") or 0.0
+        flaps_deg = 0.5 * (flap_left + flap_right)
+        if flaps_deg > 0:
+            target_ias = clamp(140.0 + (40.0 - flaps_deg) * 2.0, 120.0, 200.0)
+        else:
+            # cruise speed nominal
+            target_ias = 250.0
+
+    ias_err = target_ias - fused_ias
+    # anti-overspeed/underspeed: if too close to Vne high speed, throttle back aggressively
+    VNE = 365.0
+    if fused_ias > VNE - 10:
+        th_cmd_sym = 0.0
+        _persist["ias_int"] = 0.0
+    else:
+        # Integrate only if autothrust engaged to avoid windup
+        if at_eng:
+            _persist["ias_int"] += ias_err * dt
+        # feed-forward for climb demand if alt error large
+        alt_error = (target_alt - fused_alt) if target_alt is not None else 0.0
+        alt_climb_ff = clamp(alt_error / 1000.0 * 0.02, -0.1, 0.1)
+        th_cmd_sym = clamp(cur_th + kp_t * ias_err + ki_t * _persist["ias_int"] * 0.0005 + kd_t * (ias_err - _persist["prev_ias_error"]) / max(dt, 1e-6) * 0.0005 + alt_climb_ff, 0.0, 1.0)
+    _persist["prev_ias_error"] = ias_err
+
+    # If one engine failed, bias throttle commands to running engine only
+    if not eng1_running and eng2_running:
+        out["throttle_1"] = 0.0
+        out["throttle_2"] = th_cmd_sym
+    elif eng1_running and not eng2_running:
+        out["throttle_1"] = th_cmd_sym
+        out["throttle_2"] = 0.0
+    else:
+        out["throttle_1"] = th_cmd_sym
+        out["throttle_2"] = th_cmd_sym
+
+    # =========================
+    # Flaps: simple schedule based on target IAS and weight
+    # =========================
+    gross_weight = state.get("gross_weight_kg") or 70000.0
+    flaps_cmd = 0.0
+    if fused_ias < 140.0:
+        # landing or approach
+        # If below 1000ft and low speed, set full flaps progressively
+        if fused_alt is not None and fused_alt < 1000.0:
+            flaps_cmd = 40.0
+        else:
+            flaps_cmd = 20.0
+    elif fused_ias < 180.0:
+        flaps_cmd = 10.0
+    else:
+        flaps_cmd = 0.0
+    # Some logic to retract if speed high
+    if fused_ias > 220.0:
+        flaps_cmd = 0.0
+    out["flaps"] = clamp(round(flaps_cmd / 1.0) * 1.0, 0.0, 40.0)
+
+    # =========================
+    # Speedbrake: use for descent or overspeed only
+    # =========================
+    speedbrake_cmd = 0.0
+    # deploy if descending aggressively and below target speed or if big overspeed
+    if fused_ias > (target_ias or 250.0) + 15 and (fused_alt is not None and target_alt is not None and fused_alt - target_alt < 5000):
+        speedbrake_cmd = clamp((fused_ias - (target_ias or 250.0)) / 50.0, 0.0, 1.0)
+    # also if autothrust disengaged and desired to descend faster
+    out["speedbrake"] = speedbrake_cmd
+
+    # =========================
+    # Gear logic: down if low altitude and slow and flaps extended
+    # =========================
+    gear_cmd = 0
+    if fused_alt is not None and fused_alt < 1000.0 and fused_ias < 180.0 and out.get("flaps", 0) >= 10.0:
+        gear_cmd = 1
+    else:
+        gear_cmd = 0
+    out["gear"] = gear_cmd
+
+    # Final safety clamps and ensure keys present as required
+    # Ensure numeric types and ranges
+    out["aileron"] = float(clamp(out.get("aileron", 0.0), -1.0, 1.0))
+    out["elevator"] = float(clamp(out.get("elevator", 0.0), -1.0, 1.0))
+    out["rudder"] = float(clamp(out.get("rudder", 0.0), -1.0, 1.0))
+    out["throttle_1"] = float(clamp(out.get("throttle_1", cur_th), 0.0, 1.0))
+    out["throttle_2"] = float(clamp(out.get("throttle_2", cur_th), 0.0, 1.0))
+    out["elevator_trim"] = float(clamp(out.get("elevator_trim", _persist["pitch_trim"]), -1.0, 1.0))
+    out["flaps"] = float(clamp(out.get("flaps", 0.0), 0.0, 40.0))
+    out["speedbrake"] = float(clamp(out.get("speedbrake", 0.0), 0.0, 1.0))
+    out["gear"] = int(clamp(out.get("gear", 0), 0, 1))
+
+    return out
+```
+
+Notes and rationale
+
+- Sensor fusion is conservative: medians reduce impact of a single bad sensor, radar is preferred at low height, GPS trend vs baro is considered if big disagreements, yaw/roll/pitch from IRS are median-filtered.
+- PID constants are intentionally modest to avoid oscillation at 20 Hz. Integrators are small and anti-windup is partially implemented by clamping/conditional integration.
+- Stall protection uses AoA sensors when available; even if AoA flags are wrong, the median of three helps reject a single faulty AoA.
+- Asymmetric thrust is compensated by a rudder term proportional to thrust differential.
+- Vne is honored (throttle returns to idle if indicated speed approaches Vne).
+- If autopilot is disengaged, the function doesn't overwrite flight controls except autothrust when AT engaged (to avoid sudden changes).
+- Module-level _persist stores integrators, trim and previous values across calls.
+
+This is intentionally a single-file autopilot rather than an exact Airbus FBW model. Tuning (PID gains, deadbands, actuator mappings) may need adjustments to match your simulator's aerodynamic sensitivity.

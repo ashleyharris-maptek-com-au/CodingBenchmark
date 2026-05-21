@@ -1,0 +1,231 @@
+use std::io::{self, BufRead, BufWriter, Write};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
+
+#[derive(Clone, Copy, Default)]
+struct State {
+    x: f64,
+    y: f64,
+    vx: f64,
+    vy: f64,
+    angle: f64,
+    angular_vel: f64,
+    fuel: f64,
+    updated: bool,
+}
+
+fn read_line_into(reader: &mut impl BufRead, buf: &mut String) -> bool {
+    buf.clear();
+    match reader.read_line(buf) {
+        Ok(0) => false,
+        Ok(_) => true,
+        Err(_) => false,
+    }
+}
+
+fn parse_floats(s: &str) -> Vec<f64> {
+    s.split_whitespace().filter_map(|x| x.parse().ok()).collect()
+}
+
+fn main() {
+    // ---- Read map header on the main thread, then spawn reader for telemetry ----
+    let stdin = io::stdin();
+    let mut lock = stdin.lock();
+    let mut buf = String::new();
+
+    // Line 1: width height gravity max_thrust fuel
+    if !read_line_into(&mut lock, &mut buf) {
+        return;
+    }
+    let header = parse_floats(&buf);
+    if header.len() < 5 {
+        return;
+    }
+    let _width = header[0] as usize;
+    let height = header[1] as usize;
+    let gravity = header[2];
+    let max_thrust = header[3].max(0.001);
+    let _fuel_total = header[4];
+
+    // Line 2: start_x start_y target_x target_y
+    if !read_line_into(&mut lock, &mut buf) {
+        return;
+    }
+    let pos = parse_floats(&buf);
+    if pos.len() < 4 {
+        return;
+    }
+    let _start_x = pos[0];
+    let _start_y = pos[1];
+    let target_x = pos[2];
+    let target_y = pos[3];
+
+    // Read & discard map rows (memory efficient for huge maps).
+    for _ in 0..height {
+        if !read_line_into(&mut lock, &mut buf) {
+            break;
+        }
+    }
+    drop(lock);
+
+    // ---- Shared state between reader thread and writer (main) thread ----
+    let state = Arc::new(Mutex::new(State::default()));
+    let reader_state = state.clone();
+
+    // Reader thread: drains stdin so the engine's io buffer never fills.
+    thread::spawn(move || {
+        let stdin = io::stdin();
+        let mut lock = stdin.lock();
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match lock.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {
+                    let nums = parse_floats(&line);
+                    if nums.len() >= 7 {
+                        if let Ok(mut s) = reader_state.lock() {
+                            s.x = nums[0];
+                            s.y = nums[1];
+                            s.vx = nums[2];
+                            s.vy = nums[3];
+                            s.angle = nums[4];
+                            s.angular_vel = nums[5];
+                            s.fuel = nums[6];
+                            s.updated = true;
+                        }
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    // ---- Writer loop: ~30Hz commands ----
+    let stdout = io::stdout();
+    let mut out = BufWriter::new(stdout.lock());
+
+    // Send an initial "no-op" command quickly so the engine has something.
+    let _ = writeln!(out, "0.0000 0.0000");
+    let _ = out.flush();
+
+    let dt = Duration::from_millis(33); // ~30Hz
+
+    loop {
+        let snapshot = match state.lock() {
+            Ok(g) => *g,
+            Err(_) => State::default(),
+        };
+
+        let (thrust, turn) = if snapshot.updated {
+            control(&snapshot, target_x, target_y, gravity, max_thrust)
+        } else {
+            (0.0, 0.0)
+        };
+
+        if writeln!(out, "{:.4} {:.4}", thrust, turn).is_err() {
+            return;
+        }
+        if out.flush().is_err() {
+            return;
+        }
+
+        thread::sleep(dt);
+    }
+}
+
+// Compute (thrust, turn) for the lander.
+//
+// Coordinate conventions:
+//   - y increases downward; gravity is +g (downward).
+//   - angle 0 means lander faces "up" (negative y); positive angle is clockwise on screen.
+//   - lander facing direction in world coords: (sin angle, -cos angle).
+//   - thrust force direction: same as facing direction.
+//
+// Strategy:
+//   1. Pick a desired horizontal velocity that brings us to rest above the target.
+//   2. Pick a desired vertical velocity (safe descent profile) based on altitude.
+//   3. Convert those into a required acceleration vector, subtract gravity to get
+//      the required thrust vector, then convert to (thrust magnitude, tilt angle).
+//   4. Drive the actual angle toward the desired angle via the turn output.
+fn control(s: &State, tx: f64, ty: f64, g: f64, max_t: f64) -> (f64, f64) {
+    let dx = tx - s.x;
+    let dy = ty - s.y; // altitude above target if positive (target below us)
+
+    // ---- Horizontal velocity target ----
+    // Brake-from-rest profile: v = sqrt(2 * a * d), with a ~ 3 m/s^2.
+    let brake_accel = 3.0_f64;
+    let desired_vx_mag = (2.0 * brake_accel * dx.abs()).sqrt();
+    let mut desired_vx = dx.signum() * desired_vx_mag.min(25.0);
+    if dx.abs() < 0.4 {
+        // Close enough horizontally: just damp vx and gently center.
+        desired_vx = dx * 2.0;
+    }
+    let ax_des = ((desired_vx - s.vx) * 2.0).clamp(-20.0, 20.0);
+
+    // ---- Vertical velocity target ----
+    let altitude = dy;
+    let mut safe_vy = if altitude > 200.0 {
+        20.0
+    } else if altitude > 60.0 {
+        12.0
+    } else if altitude > 25.0 {
+        6.0
+    } else if altitude > 10.0 {
+        3.0
+    } else if altitude > 4.0 {
+        1.5
+    } else if altitude > 1.0 {
+        0.7
+    } else if altitude > -0.3 {
+        0.25
+    } else {
+        // Below target: climb back up gently.
+        -0.6
+    };
+
+    // If we still have significant horizontal error, slow vertical descent so we
+    // don't overshoot vertically before we're above the pad.
+    if dx.abs() > 3.0 && altitude < 30.0 {
+        safe_vy = safe_vy.min(1.2);
+    }
+
+    let mut ay_des = ((safe_vy - s.vy) * 2.5).clamp(-30.0, 30.0);
+    // Never command a thrust vector that points downward (keep cos positive).
+    ay_des = ay_des.min(g - 0.3);
+
+    // ---- Required thrust vector ----
+    // net_a = thrust_a + (0, g) ; thrust direction = (sin a, -cos a) * T
+    // Solve: T sin a = ax_des, T cos a = g - ay_des
+    let thrust_x = ax_des;
+    let thrust_y_up = g - ay_des; // positive component pointing "up"
+
+    let t_mag = (thrust_x * thrust_x + thrust_y_up * thrust_y_up).sqrt();
+    let mut angle_des = thrust_x.atan2(thrust_y_up);
+
+    // ---- Limit tilt based on altitude ----
+    let max_tilt = if altitude < 2.0 {
+        0.12
+    } else if altitude < 8.0 {
+        0.3
+    } else if altitude < 25.0 {
+        0.55
+    } else {
+        1.0
+    };
+    if angle_des > max_tilt {
+        angle_des = max_tilt;
+    } else if angle_des < -max_tilt {
+        angle_des = -max_tilt;
+    }
+
+    let thrust_frac = (t_mag / max_t).clamp(0.0, 1.0);
+
+    // ---- Angular control: drive angle toward angle_des ----
+    let angle_err = angle_des - s.angle;
+    let desired_ang_vel = (angle_err * 4.0).clamp(-3.0, 3.0);
+    let turn = (desired_ang_vel - s.angular_vel).clamp(-1.0, 1.0);
+
+    (thrust_frac, turn)
+}

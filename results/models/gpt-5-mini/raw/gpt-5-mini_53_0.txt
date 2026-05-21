@@ -1,1 +1,375 @@
-{'__exception__': "Can't run here - we're trying to get this working in codex."}
+Below is a single-file, stateful Python autopilot that follows the instructions and attempts to handle the wide variety of scenarios described. It:
+
+- Fuses radar/lidar/camera/ranges with persistence and simple filtering.
+- Uses orbital-mechanics-aware behavior: long-range along-track (y) logic uses retrograde/prograde heuristics, medium-range uses gentle V-bar style control, close-range uses linear PD control (Clohessy–Wiltshire-like).
+- Limits thrust output to [-1,1] and maps desired acceleration to normalized thruster command using an estimated spacecraft mass and 220 N max per axis.
+- Produces safe small attitude rates (±0.035 rad/s) and uses camera bearings to help aim in the final approach.
+- Is robust to sensor failures by choosing the best available sensor(s) and falling back to estimates from previous calls.
+
+Paste this module into your autopilot environment. Module-level variables persist between calls as required.
+
+```python
+# Autopilot module: persistent state across calls
+# Call autopilot_step(state: dict, dt: float) -> dict
+
+# Persistent estimator and controller state
+_est = {
+    "pos": None,    # np-like list [x,y,z] meters in LVLH
+    "vel": None,    # [vx,vy,vz] m/s
+    "last_dt": None,
+    "pos_integrator": [0.0, 0.0, 0.0],  # small integrators if needed
+    "last_cmd": {"thrust_x": 0.0, "thrust_y": 0.0, "thrust_z": 0.0},
+}
+
+def _get_bool(v):
+    return bool(v)
+
+def _safe_get(state, key, default=0.0):
+    return state.get(key, default)
+
+def _choose_rel_pos_vel(state):
+    """Assemble best estimate of relative pos and vel in LVLH from sensors.
+       Priority: lidar > radar > camera (bearing+range) > ranges triangulation fallback > previous.
+    """
+    pos = None
+    vel = None
+    # Lidar positions
+    lidar_pos_valid = (_get_bool(state.get("lidar_rel_x_valid")) and
+                       _get_bool(state.get("lidar_rel_y_valid")) and
+                       _get_bool(state.get("lidar_rel_z_valid")))
+    lidar_vel_valid = (_get_bool(state.get("lidar_relv_x_valid")) and
+                       _get_bool(state.get("lidar_relv_y_valid")) and
+                       _get_bool(state.get("lidar_relv_z_valid")))
+    if lidar_pos_valid:
+        pos = [
+            float(state.get("lidar_rel_pos_x_m", 0.0)),
+            float(state.get("lidar_rel_pos_y_m", 0.0)),
+            float(state.get("lidar_rel_pos_z_m", 0.0)),
+        ]
+    if lidar_vel_valid:
+        vel = [
+            float(state.get("lidar_rel_vel_x_ms", 0.0)),
+            float(state.get("lidar_rel_vel_y_ms", 0.0)),
+            float(state.get("lidar_rel_vel_z_ms", 0.0)),
+        ]
+
+    # Radar fallback
+    if pos is None:
+        radar_pos_valid = (_get_bool(state.get("radar_rel_x_valid")) and
+                           _get_bool(state.get("radar_rel_y_valid")) and
+                           _get_bool(state.get("radar_rel_z_valid")))
+        if radar_pos_valid:
+            pos = [
+                float(state.get("radar_rel_pos_x_m", 0.0)),
+                float(state.get("radar_rel_pos_y_m", 0.0)),
+                float(state.get("radar_rel_pos_z_m", 0.0)),
+            ]
+    if vel is None:
+        radar_vel_valid = (_get_bool(state.get("radar_relv_x_valid")) and
+                           _get_bool(state.get("radar_relv_y_valid")) and
+                           _get_bool(state.get("radar_relv_z_valid")))
+        if radar_vel_valid:
+            vel = [
+                float(state.get("radar_rel_vel_x_ms", 0.0)),
+                float(state.get("radar_rel_vel_y_ms", 0.0)),
+                float(state.get("radar_rel_vel_z_ms", 0.0)),
+            ]
+
+    # Docking camera (bearing + range) can provide pos when active
+    cam_active = _get_bool(state.get("dock_camera_active"))
+    if cam_active and float(state.get("dock_camera_range_m", 0.0)) > 0.0:
+        # camera bearing may be unit vector or small-angle offsets; treat as vector:
+        bx = float(state.get("dock_camera_bearing_x", 0.0))
+        by = float(state.get("dock_camera_bearing_y", 0.0))
+        bz = float(state.get("dock_camera_bearing_z", 0.0))
+        br_valid = (_get_bool(state.get("dock_camera_bearing_x_valid")) and
+                    _get_bool(state.get("dock_camera_bearing_y_valid")) and
+                    _get_bool(state.get("dock_camera_bearing_z_valid")))
+        if br_valid:
+            rng = float(state.get("dock_camera_range_m", 0.0))
+            # If camera gives unit bearing, multiply; if small-angle offsets, this is still a useful direction
+            cam_pos = [bx * rng, by * rng, bz * rng]
+            # Camera typically close-range; prefer it if within 500 m
+            if rng <= 500.0:
+                pos = cam_pos if pos is None else pos  # prefer lidar/radar but camera can help if none
+    # Range finders: scalar only; if exactly one valid and we have a bearing, can compute
+    # Otherwise ignore complex triangulation; use scalar as fallback magnitude if no components exist
+    if pos is None:
+        # Use range 1 if available as a rough radial distance (not ideal)
+        range_candidates = []
+        for i in (1,2,3):
+            valid = _get_bool(state.get(f"range_{i}_valid"))
+            if valid:
+                range_candidates.append(float(state.get(f"range_{i}_m", 0.0)))
+        if range_candidates:
+            r = sum(range_candidates)/len(range_candidates)
+            # If we have previous estimate, project along that direction, else put it on y-axis behind
+            if _est["pos"] is not None:
+                prev = _est["pos"]
+                # Keep direction of previous estimate but adjust magnitude
+                import math
+                mag = math.sqrt(max(1e-6, prev[0]*prev[0] + prev[1]*prev[1] + prev[2]*prev[2]))
+                dirv = [prev[0]/mag, prev[1]/mag, prev[2]/mag]
+                pos = [dirv[0]*r, dirv[1]*r, dirv[2]*r]
+            else:
+                # assume behind along -y direction
+                pos = [0.0, -r, 0.0]
+
+    # If no vel available, try finite difference from previous pos
+    if vel is None:
+        if _est["pos"] is not None and pos is not None and _est["last_dt"] is not None and _est["last_dt"] > 0:
+            dt = _est["last_dt"]
+            vel = [(pos[i] - _est["pos"][i]) / dt for i in range(3)]
+        else:
+            vel = [0.0, 0.0, 0.0]
+
+    # Sensor smoothing: simple complementary filter with previous
+    alpha = 0.6
+    if _est["pos"] is None:
+        filt_pos = pos
+    else:
+        filt_pos = [alpha*_est["pos"][i] + (1-alpha)*pos[i] for i in range(3)]
+    if _est["vel"] is None:
+        filt_vel = vel
+    else:
+        filt_vel = [alpha*_est["vel"][i] + (1-alpha)*vel[i] for i in range(3)]
+
+    return filt_pos, filt_vel
+
+def _clamp(x, lo, hi):
+    return max(lo, min(hi, x))
+
+def autopilot_step(state: dict, dt: float) -> dict:
+    """
+    Inputs as specified. Returns thrust_x,y,z in [-1,1] and att_rate_roll/pitch/yaw in rad/s.
+    """
+    # Update estimator
+    if dt is None or dt <= 0:
+        dt = _est["last_dt"] if _est["last_dt"] is not None else 0.1
+    _est["last_dt"] = dt
+
+    pos, vel = _choose_rel_pos_vel(state)
+    _est["pos"] = pos
+    _est["vel"] = vel
+
+    # magnitude
+    import math
+    r = math.sqrt(pos[0]*pos[0] + pos[1]*pos[1] + pos[2]*pos[2])
+    v_rel = math.sqrt(vel[0]*vel[0] + vel[1]*vel[1] + vel[2]*vel[2])
+
+    # craft control based on range regimes
+    # spacecraft mass estimate
+    fuel_kg = float(state.get("fuel_remaining_kg", 0.0)) if state.get("fuel_remaining_kg") is not None else 0.0
+    base_dry_mass = 2000.0  # assumed dry mass kg
+    mass = base_dry_mass + fuel_kg
+    max_force_per_axis = 220.0  # N
+    max_accel = max_force_per_axis / max(1.0, mass)  # m/s2
+
+    # Gains by regime:
+    # Far >200m: along-track "orbital" logic. Use Kp_y small so we don't burn too much.
+    # Medium 50-200: gentle PD
+    # Close <50: linear PD (CW regime)
+    thrust_cmd = [0.0, 0.0, 0.0]  # normalized -1..1 for x(radial), y(along), z(cross)
+
+    # Safety: if within success window, zero thrust
+    success = (r < 2.0 and v_rel < 0.3)
+    if success:
+        # hold station-keeping (zero small commands)
+        thrust_cmd = [0.0, 0.0, 0.0]
+    else:
+        # Determine if we are behind or ahead: y negative = behind (common)
+        y = pos[1]
+        vy = vel[1]
+        x = pos[0]
+        vx = vel[0]
+        z = pos[2]
+        vz = vel[2]
+
+        # Stage selection
+        if r > 200.0:
+            # FAR: orbital-aware along-track targeting: retrograde if behind (y<0), prograde if ahead (y>0)
+            # Use proportional mapping: thrust_y = Kp*y + Kd*vy (y in meters -> normalized thrust)
+            # Choose Kp such that ~1 at couple hundred meters: Kp_y = 0.003 -> 200m -> 0.6
+            Kp_y = 0.003
+            Kd_y = 0.6 / max(1.0, 2.0)  # scaled
+            ty = Kp_y * y + 0.4 * vy  # vy influences braking/acceleration sign
+            # Note sign: y negative -> ty negative -> retrograde -> catch up
+            # small radial/cross corrections only
+            Kp_x = 0.002
+            Kd_x = 0.2
+            tx = _clamp(Kp_x * x + Kd_x * vx, -0.4, 0.4)
+            Kp_z = 0.002
+            Kd_z = 0.2
+            tz = _clamp(Kp_z * z + Kd_z * vz, -0.4, 0.4)
+
+            thrust_cmd = [_clamp(tx, -1.0, 1.0), _clamp(ty, -1.0, 1.0), _clamp(tz, -1.0, 1.0)]
+
+            # Limit thrust when very far to conserve fuel
+            conserve = 0.6 if fuel_kg < 50.0 else 1.0
+            thrust_cmd = [c * conserve for c in thrust_cmd]
+
+        elif r > 50.0:
+            # MEDIUM: V-bar approach: primary control along-track, gentle radial/cross corrections
+            # PD controller in along-track space with limits
+            Kp_y = 0.02  # (unit produces about 1 at 50m => 1)
+            Kd_y = 0.8
+            desired_y_acc = -Kp_y * pos[1] - Kd_y * vel[1]
+            # Map to normalized thrust
+            ty = desired_y_acc / max_accel if max_accel > 0 else 0.0
+            # radial & cross small corrections
+            Kp_x = 0.03
+            Kd_x = 0.5
+            desired_x_acc = -Kp_x * pos[0] - Kd_x * vel[0]
+            tx = desired_x_acc / max_accel if max_accel > 0 else 0.0
+            Kp_z = 0.03
+            Kd_z = 0.5
+            desired_z_acc = -Kp_z * pos[2] - Kd_z * vel[2]
+            tz = desired_z_acc / max_accel if max_accel > 0 else 0.0
+
+            # Limit thrust magnitude for gentle approach
+            thrust_cmd = [_clamp(tx, -0.6, 0.6), _clamp(ty, -0.8, 0.8), _clamp(tz, -0.6, 0.6)]
+
+            # If we are closing too fast on the station regardless of sign, apply braking
+            closing_speed_along = vel[1]
+            # If approaching (> allowed), add braking opposite v
+            allowed_speed = 0.5 if r > 100.0 else 0.3
+            if abs(closing_speed_along) > allowed_speed:
+                # Apply additional throttle opposite velocity direction (in normalized terms)
+                brake = -0.6 * math.copysign(1.0, closing_speed_along)
+                # Add to ty (but do not flip sign of intended orbital strategy)
+                ty_new = thrust_cmd[1] + brake
+                thrust_cmd[1] = _clamp(ty_new, -1.0, 1.0)
+
+            # Conserve fuel if low
+            if fuel_kg < 30.0:
+                thrust_cmd = [c * 0.6 for c in thrust_cmd]
+
+        else:
+            # CLOSE: linear CW regime (<50m). PD on position to drive to zero.
+            # Use stronger Kp but still gentle final approach
+            Kp = 0.12  # roughly yields acc ~6 m/s2 at 50m? but limited by max_accel scaling
+            Kd = 1.2
+            desired_acc_x = -Kp * pos[0] - Kd * vel[0]
+            desired_acc_y = -Kp * pos[1] - Kd * vel[1]
+            desired_acc_z = -Kp * pos[2] - Kd * vel[2]
+
+            tx = desired_acc_x / max_accel if max_accel > 0 else 0.0
+            ty = desired_acc_y / max_accel if max_accel > 0 else 0.0
+            tz = desired_acc_z / max_accel if max_accel > 0 else 0.0
+
+            # Very close (<10m): gentle, limit to small thrust and prioritize safety
+            if r < 10.0:
+                max_lim = 0.25
+                # final speed caps
+                if v_rel > 0.1:
+                    # apply braking proportional to approach vector
+                    bx = -0.6 * math.copysign(1.0, vel[0]) if abs(vel[0]) > 0.02 else 0.0
+                    by = -0.9 * math.copysign(1.0, vel[1]) if abs(vel[1]) > 0.02 else 0.0
+                    bz = -0.6 * math.copysign(1.0, vel[2]) if abs(vel[2]) > 0.02 else 0.0
+                    tx += bx
+                    ty += by
+                    tz += bz
+            else:
+                max_lim = 0.6
+
+            thrust_cmd = [_clamp(tx, -max_lim, max_lim),
+                          _clamp(ty, -max_lim, max_lim),
+                          _clamp(tz, -max_lim, max_lim)]
+
+            # If camera bearing available and close, align to center by small lateral thruster corrections
+            cam_active = _get_bool(state.get("dock_camera_active"))
+            if cam_active and float(state.get("dock_camera_range_m", 0.0)) <= 500.0:
+                # Use camera bearing to nudge attitude/thrust pointing
+                bx = float(state.get("dock_camera_bearing_x", 0.0))
+                by = float(state.get("dock_camera_bearing_y", 0.0))
+                bz = float(state.get("dock_camera_bearing_z", 0.0))
+                # small corrections proportional to bearing components to center the target
+                thrust_cmd[0] += _clamp(-0.6 * bx, -0.1, 0.1)
+                thrust_cmd[2] += _clamp(-0.6 * bz, -0.1, 0.1)
+                thrust_cmd[1] += _clamp(-0.6 * by, -0.1, 0.1)
+
+            # Fuel conservation if very low
+            if fuel_kg < 20.0:
+                thrust_cmd = [c * 0.5 for c in thrust_cmd]
+
+    # Small deadband to avoid thruster chattering; also handle uncommanded small thrust scenarios
+    deadband = 0.010
+    for i in range(3):
+        if abs(thrust_cmd[i]) < deadband:
+            thrust_cmd[i] = 0.0
+
+    # Rate limit changes to avoid sudden jumps (simple first-order filter)
+    rate_tau = 0.2  # seconds smoothing
+    last = _est["last_cmd"]
+    if last is None:
+        last = {"thrust_x":0.0,"thrust_y":0.0,"thrust_z":0.0}
+    alpha = dt / max(rate_tau, dt)
+    thrust_x = (1.0 - alpha) * last["thrust_x"] + alpha * _clamp(thrust_cmd[0], -1.0, 1.0)
+    thrust_y = (1.0 - alpha) * last["thrust_y"] + alpha * _clamp(thrust_cmd[1], -1.0, 1.0)
+    thrust_z = (1.0 - alpha) * last["thrust_z"] + alpha * _clamp(thrust_cmd[2], -1.0, 1.0)
+    _est["last_cmd"] = {"thrust_x": thrust_x, "thrust_y": thrust_y, "thrust_z": thrust_z}
+
+    # Attitude rate control: try to keep zero angular rates normally, but use camera bearing to rotate towards docking port when close
+    # Use star trackers if available to get absolute orientation (not fully implemented). We simply aim to null angular errors.
+    att_rate_roll = 0.0
+    att_rate_pitch = 0.0
+    att_rate_yaw = 0.0
+    # If camera gives angular offset (bearing), use it to set small attitude rates to center the port
+    cam_active = _get_bool(state.get("dock_camera_active"))
+    if cam_active and float(state.get("dock_camera_range_m", 0.0)) <= 500.0:
+        bx = float(state.get("dock_camera_bearing_x", 0.0))
+        by = float(state.get("dock_camera_bearing_y", 0.0))
+        # Bearing likely small angular offsets; map to rates
+        gain_att = 0.03  # rad/s per unit of bearing
+        att_rate_pitch = _clamp(-gain_att * by, -0.035, 0.035)
+        att_rate_yaw = _clamp(-gain_att * bx, -0.035, 0.035)
+        att_rate_roll = 0.0
+    else:
+        # Small damping from gyros if available to zero rates
+        # Average gyros if valid
+        gyro_vals = []
+        for i in (1,2,3):
+            p_key = f"gyro_{i}_pitch_dps"
+            y_key = f"gyro_{i}_yaw_dps"
+            r_key = f"gyro_{i}_roll_dps"
+            # validity flags
+            pv = _get_bool(state.get(f"gyro_{i}_pitch_valid"))
+            yv = _get_bool(state.get(f"gyro_{i}_yaw_valid"))
+            rv = _get_bool(state.get(f"gyro_{i}_roll_valid"))
+            try:
+                if pv:
+                    gyro_vals.append(("p", float(state.get(p_key,0.0))))
+                if yv:
+                    gyro_vals.append(("y", float(state.get(y_key,0.0))))
+                if rv:
+                    gyro_vals.append(("r", float(state.get(r_key,0.0))))
+            except Exception:
+                pass
+        # We will simply command zero rates; small bias correction omitted. Keep within limits.
+        att_rate_roll = 0.0
+        att_rate_pitch = 0.0
+        att_rate_yaw = 0.0
+
+    # Final safety clamp
+    thrust_x = _clamp(thrust_x, -1.0, 1.0)
+    thrust_y = _clamp(thrust_y, -1.0, 1.0)
+    thrust_z = _clamp(thrust_z, -1.0, 1.0)
+    att_rate_roll = _clamp(att_rate_roll, -0.035, 0.035)
+    att_rate_pitch = _clamp(att_rate_pitch, -0.035, 0.035)
+    att_rate_yaw = _clamp(att_rate_yaw, -0.035, 0.035)
+
+    return {
+        "thrust_x": float(thrust_x),
+        "thrust_y": float(thrust_y),
+        "thrust_z": float(thrust_z),
+        "att_rate_roll": float(att_rate_roll),
+        "att_rate_pitch": float(att_rate_pitch),
+        "att_rate_yaw": float(att_rate_yaw),
+    }
+```
+
+Notes and caveats:
+- This autopilot is designed to be robust rather than optimal. It uses sensor prioritization, filtering, and conservative gains to survive multiple failure modes.
+- The along-track strategy intentionally uses sign conventions consistent with the provided "critical orbital mechanics insight": if you are behind (y < 0) the autopilot produces retrograde (negative thrust_y) command to lower orbit and speed up along-track catch-up.
+- The simple mass model (dry mass + reported fuel) maps desired accelerations to normalized thruster commands. If the environment uses different thruster layouts/forces, tune `max_force_per_axis` and `base_dry_mass`.
+- Many advanced failure detections / Kalman filters / explicit orbital maneuvers are intentionally simplified to keep the autopilot compact and predictable across all 25 scenarios. You can refine gains or add more sophisticated estimation as needed.
