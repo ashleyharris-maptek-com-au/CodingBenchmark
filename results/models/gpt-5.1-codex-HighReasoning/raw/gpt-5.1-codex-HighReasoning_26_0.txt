@@ -1,1 +1,933 @@
-{'__exception__': "Can't run here - we're trying to get this working in codex."}
+```rust
+// K-Means clustering with adaptive streaming / in-memory strategies for massive 3D datasets.
+// Works on little-endian architectures.
+#![cfg_attr(not(target_endian = "little"), allow(dead_code))]
+#[cfg(not(target_endian = "little"))]
+compile_error!("This program requires a little-endian target architecture.");
+
+use std::cmp::Ordering;
+use std::convert::TryFrom;
+use std::env;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+const BYTES_PER_POINT: u64 = 12;
+const MAX_IN_MEMORY_BYTES: u64 = 1_200_000_000;
+
+fn main() {
+    if let Err(err) = run() {
+        let _ = writeln!(io::stderr(), "error: {err}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> io::Result<()> {
+    let stdin = io::stdin();
+    let mut reader = BufReader::new(stdin.lock());
+    let header = read_header(&mut reader)?;
+    if header.num_clusters == 0 || header.num_points == 0 {
+        return Ok(());
+    }
+
+    let total_bytes = header
+        .num_points
+        .checked_mul(BYTES_PER_POINT)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "overflow in bytes"))?;
+
+    if total_bytes <= MAX_IN_MEMORY_BYTES && header.num_points <= usize::MAX as u64 {
+        run_in_memory(&mut reader, header.num_points as usize, header.num_clusters)
+    } else {
+        run_streaming(&mut reader, header.num_points, header.num_clusters)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Header {
+    num_points: u64,
+    num_clusters: usize,
+}
+
+fn read_header<R: BufRead>(reader: &mut R) -> io::Result<Header> {
+    let mut line = String::new();
+    while line.trim().is_empty() {
+        let bytes = reader.read_line(&mut line)?;
+        if bytes == 0 {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "missing header"));
+        }
+    }
+    let mut parts = line.split_whitespace();
+    let num_points: u64 = parts
+        .next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing num_points"))?
+        .parse()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad num_points"))?;
+    let clusters_str = parts
+        .next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing num_clusters"))?;
+    let num_clusters_u64: u64 = clusters_str
+        .parse()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad num_clusters"))?;
+    if num_clusters_u64 == 0 || num_clusters_u64 > usize::MAX as u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "num_clusters must fit usize and be > 0",
+        ));
+    }
+    Ok(Header {
+        num_points,
+        num_clusters: num_clusters_u64 as usize,
+    })
+}
+
+fn run_in_memory<R: Read>(
+    reader: &mut BufReader<R>,
+    num_points: usize,
+    num_clusters: usize,
+) -> io::Result<()> {
+    let mut points = vec![[0f32; 3]; num_points];
+    read_points_into(reader, &mut points)?;
+
+    let assignments = kmeans_in_memory(&points, num_clusters);
+
+    let stdout = io::stdout();
+    let mut writer = BufWriter::new(stdout.lock());
+    write_assignments(&assignments, &mut writer)?;
+    writer.flush()
+}
+
+fn read_points_into<R: Read>(reader: &mut R, dest: &mut [[f32; 3]]) -> io::Result<()> {
+    let floats = dest.len() * 3;
+    let slice = unsafe {
+        std::slice::from_raw_parts_mut(dest.as_mut_ptr() as *mut f32, floats)
+    };
+    read_f32_slice(reader, slice)
+}
+
+fn read_f32_slice<R: Read>(reader: &mut R, slice: &mut [f32]) -> io::Result<()> {
+    let bytes = unsafe { f32_slice_as_bytes_mut(slice) };
+    reader.read_exact(bytes)
+}
+
+fn write_assignments<W: Write>(assignments: &[u32], writer: &mut W) -> io::Result<()> {
+    let bytes = unsafe { u32_slice_as_bytes(assignments) };
+    writer.write_all(bytes)
+}
+
+unsafe fn f32_slice_as_bytes_mut(slice: &mut [f32]) -> &mut [u8] {
+    std::slice::from_raw_parts_mut(slice.as_mut_ptr() as *mut u8, slice.len() * 4)
+}
+unsafe fn f32_slice_as_bytes(slice: &[f32]) -> &[u8] {
+    std::slice::from_raw_parts(slice.as_ptr() as *const u8, slice.len() * 4)
+}
+unsafe fn u32_slice_as_bytes(slice: &[u32]) -> &[u8] {
+    std::slice::from_raw_parts(slice.as_ptr() as *const u8, slice.len() * 4)
+}
+
+fn kmeans_in_memory(points: &[[f32; 3]], k: usize) -> Vec<u32> {
+    let n = points.len();
+    let mut rng = SimpleRng::new((n as u64) ^ ((k as u64) << 32) ^ 0x9e3779b97f4a7c15);
+    let mut centroids = initialize_centroids(points, k, &mut rng);
+    let max_iters = match n {
+        0..=100_000 => 50,
+        100_001..=1_000_000 => 35,
+        _ => 25,
+    };
+
+    let mut assignments = vec![usize::MAX; n];
+    let mut counts = vec![0usize; k];
+    let mut sums = vec![[0f64; 3]; k];
+
+    for _ in 0..max_iters {
+        for s in sums.iter_mut() {
+            s[0] = 0.0;
+            s[1] = 0.0;
+            s[2] = 0.0;
+        }
+        counts.fill(0);
+
+        let mut changes = 0usize;
+        for (idx, point) in points.iter().enumerate() {
+            let centroid_idx = linear_nearest(
+                [point[0] as f64, point[1] as f64, point[2] as f64],
+                &centroids,
+            );
+            if assignments[idx] != centroid_idx {
+                assignments[idx] = centroid_idx;
+                changes += 1;
+            }
+            counts[centroid_idx] += 1;
+            sums[centroid_idx][0] += point[0] as f64;
+            sums[centroid_idx][1] += point[1] as f64;
+            sums[centroid_idx][2] += point[2] as f64;
+        }
+
+        for c in 0..k {
+            if counts[c] == 0 {
+                let pick = rng.gen_range(points.len());
+                centroids[c] = [
+                    points[pick][0] as f64,
+                    points[pick][1] as f64,
+                    points[pick][2] as f64,
+                ];
+                counts[c] = 1;
+                sums[c][0] = centroids[c][0];
+                sums[c][1] = centroids[c][1];
+                sums[c][2] = centroids[c][2];
+            }
+        }
+
+        let mut max_shift = 0.0;
+        for c in 0..k {
+            let inv = 1.0 / counts[c] as f64;
+            let new_centroid = [
+                sums[c][0] * inv,
+                sums[c][1] * inv,
+                sums[c][2] * inv,
+            ];
+            let shift = squared_distance(new_centroid, &centroids[c]);
+            max_shift = max_shift.max(shift);
+            centroids[c] = new_centroid;
+        }
+        if changes == 0 || max_shift < 1e-8 {
+            break;
+        }
+    }
+
+    assignments.iter().map(|&a| a as u32).collect()
+}
+
+fn initialize_centroids(
+    points: &[[f32; 3]],
+    k: usize,
+    rng: &mut SimpleRng,
+) -> Vec<[f64; 3]> {
+    let n = points.len();
+    let mut centroids = Vec::with_capacity(k);
+    let first = rng.gen_range(n);
+    centroids.push([
+        points[first][0] as f64,
+        points[first][1] as f64,
+        points[first][2] as f64,
+    ]);
+
+    let mut dist_sq = vec![f64::INFINITY; n];
+    for _ in 1..k {
+        let mut total = 0.0;
+        let last_idx = centroids.len() - 1;
+        for (i, p) in points.iter().enumerate() {
+            let d = squared_distance_point(
+                [p[0] as f64, p[1] as f64, p[2] as f64],
+                &centroids[last_idx],
+            );
+            if d < dist_sq[i] {
+                dist_sq[i] = d;
+            }
+            total += dist_sq[i];
+        }
+        if total == 0.0 {
+            let idx = rng.gen_range(n);
+            centroids.push([
+                points[idx][0] as f64,
+                points[idx][1] as f64,
+                points[idx][2] as f64,
+            ]);
+        } else {
+            let mut target = rng.next_f64() * total;
+            let mut chosen = 0usize;
+            for (i, d) in dist_sq.iter().enumerate() {
+                target -= *d;
+                if target <= 0.0 {
+                    chosen = i;
+                    break;
+                }
+            }
+            centroids.push([
+                points[chosen][0] as f64,
+                points[chosen][1] as f64,
+                points[chosen][2] as f64,
+            ]);
+        }
+    }
+    centroids
+}
+
+fn squared_distance(a: [f64; 3], b: &[f64; 3]) -> f64 {
+    let dx = a[0] - b[0];
+    let dy = a[1] - b[1];
+    let dz = a[2] - b[2];
+    dx * dx + dy * dy + dz * dz
+}
+
+fn squared_distance_point(a: [f64; 3], b: &[f64; 3]) -> f64 {
+    squared_distance(a, b)
+}
+
+fn linear_nearest(point: [f64; 3], centroids: &[[f64; 3]]) -> usize {
+    let mut best = 0usize;
+    let mut best_dist = f64::INFINITY;
+    for (idx, c) in centroids.iter().enumerate() {
+        let d = squared_distance(point, c);
+        if d < best_dist {
+            best_dist = d;
+            best = idx;
+        }
+    }
+    best
+}
+
+fn run_streaming<R: Read>(
+    reader: &mut BufReader<R>,
+    num_points: u64,
+    num_clusters: usize,
+) -> io::Result<()> {
+    let chunk_points = choose_chunk_points(num_points, num_clusters).max(1);
+    let mut buffer = ChunkBuffer::new(chunk_points)?;
+
+    let (tmp_path, tmp_file) = create_temp_file()?;
+    let mut tmp_writer = BufWriter::with_capacity(8 * 1024 * 1024, tmp_file);
+
+    let mut centroids = vec![[0f64; 3]; num_clusters];
+    let mut counts = vec![0f64; num_clusters];
+    let mut chunk_sums = vec![[0f64; 3]; num_clusters];
+    let mut chunk_counts = vec![0u64; num_clusters];
+    let mut searcher = CentroidSearcher::new(num_clusters);
+
+    let mut rng = SimpleRng::new(num_points ^ ((num_clusters as u64) << 17) ^ 0xa5a5_a5a5_1234_5678);
+    let mut seed_positions = generate_seed_positions(num_points, num_clusters, &mut rng);
+    if !seed_positions.is_empty() {
+        seed_positions[0] = 0;
+    }
+    let mut seed_cursor = 0usize;
+    let mut filled = 0usize;
+    let mut processed = 0u64;
+
+    while processed < num_points {
+        let remaining = num_points - processed;
+        let current = if remaining as usize > chunk_points {
+            chunk_points
+        } else {
+            remaining as usize
+        };
+        buffer.read_from(reader, current)?;
+        tmp_writer.write_all(buffer.bytes(current))?;
+
+        reset_chunk_accumulators(&mut chunk_sums, &mut chunk_counts);
+        let floats = buffer.floats(current);
+        for i in 0..current {
+            let base = i * 3;
+            let point_idx = processed + i as u64;
+            let point = [
+                floats[base] as f64,
+                floats[base + 1] as f64,
+                floats[base + 2] as f64,
+            ];
+            if filled < num_clusters
+                && seed_cursor < seed_positions.len()
+                && point_idx == seed_positions[seed_cursor]
+            {
+                centroids[filled] = point;
+                chunk_counts[filled] += 1;
+                chunk_sums[filled][0] += point[0];
+                chunk_sums[filled][1] += point[1];
+                chunk_sums[filled][2] += point[2];
+                filled += 1;
+                seed_cursor += 1;
+                searcher.mark_dirty();
+                continue;
+            }
+            if filled == 0 {
+                centroids[0] = point;
+                chunk_counts[0] += 1;
+                chunk_sums[0][0] += point[0];
+                chunk_sums[0][1] += point[1];
+                chunk_sums[0][2] += point[2];
+                filled = 1;
+                searcher.mark_dirty();
+                continue;
+            }
+            let idx = searcher.nearest(point, &centroids[..filled]);
+            chunk_counts[idx] += 1;
+            chunk_sums[idx][0] += point[0];
+            chunk_sums[idx][1] += point[1];
+            chunk_sums[idx][2] += point[2];
+        }
+        apply_chunk_updates(
+            &mut centroids,
+            &mut counts,
+            &chunk_sums,
+            &chunk_counts,
+            filled,
+        );
+        processed += current as u64;
+    }
+    tmp_writer.flush()?;
+    drop(tmp_writer);
+
+    duplicate_missing_centroids(&mut centroids, &mut counts, filled);
+    heal_empty_clusters(&mut centroids, &mut counts);
+
+    let passes = decide_refinement_passes(num_points, num_clusters);
+    for _ in 0..passes {
+        refine_from_file(
+            &tmp_path,
+            num_points,
+            chunk_points,
+            &mut buffer,
+            &mut centroids,
+            &mut counts,
+            &mut chunk_sums,
+            &mut chunk_counts,
+        )?;
+        searcher.mark_dirty();
+    }
+
+    assign_and_output(
+        &tmp_path,
+        num_points,
+        chunk_points,
+        &mut buffer,
+        &centroids,
+    )?;
+
+    let _ = fs::remove_file(&tmp_path);
+    Ok(())
+}
+
+fn apply_chunk_updates(
+    centroids: &mut [[f64; 3]],
+    counts: &mut [f64],
+    chunk_sums: &[[f64; 3]],
+    chunk_counts: &[u64],
+    active: usize,
+) {
+    if active == 0 {
+        return;
+    }
+    for idx in 0..active {
+        let cnt = chunk_counts[idx];
+        if cnt == 0 {
+            continue;
+        }
+        let cnt_f = cnt as f64;
+        let mean = [
+            chunk_sums[idx][0] / cnt_f,
+            chunk_sums[idx][1] / cnt_f,
+            chunk_sums[idx][2] / cnt_f,
+        ];
+        counts[idx] += cnt_f;
+        let eta = cnt_f / counts[idx];
+        centroids[idx][0] = centroids[idx][0] * (1.0 - eta) + mean[0] * eta;
+        centroids[idx][1] = centroids[idx][1] * (1.0 - eta) + mean[1] * eta;
+        centroids[idx][2] = centroids[idx][2] * (1.0 - eta) + mean[2] * eta;
+    }
+}
+
+fn reset_chunk_accumulators(sums: &mut [[f64; 3]], counts: &mut [u64]) {
+    for s in sums.iter_mut() {
+        s[0] = 0.0;
+        s[1] = 0.0;
+        s[2] = 0.0;
+    }
+    counts.fill(0);
+}
+
+fn duplicate_missing_centroids(
+    centroids: &mut [[f64; 3]],
+    counts: &mut [f64],
+    filled: usize,
+) {
+    if centroids.is_empty() {
+        return;
+    }
+    let base = if filled == 0 { 1 } else { filled };
+    for idx in filled..centroids.len() {
+        let source = idx % base;
+        centroids[idx] = centroids[source];
+        counts[idx] = counts[source].max(1.0);
+    }
+}
+
+fn heal_empty_clusters(centroids: &mut [[f64; 3]], counts: &mut [f64]) {
+    if centroids.is_empty() {
+        return;
+    }
+    let fallback = counts
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(Ordering::Equal))
+        .map(|(idx, _)| idx)
+        .unwrap_or(0);
+    for (idx, cnt) in counts.iter_mut().enumerate() {
+        if *cnt == 0.0 {
+            centroids[idx] = centroids[fallback];
+            *cnt = counts[fallback].max(1.0);
+        }
+    }
+}
+
+fn refine_from_file(
+    path: &Path,
+    num_points: u64,
+    chunk_points: usize,
+    buffer: &mut ChunkBuffer,
+    centroids: &mut [[f64; 3]],
+    counts: &mut [f64],
+    chunk_sums: &mut [[f64; 3]],
+    chunk_counts: &mut [u64],
+) -> io::Result<()> {
+    let file = File::open(path)?;
+    let mut reader = BufReader::new(file);
+    let mut processed = 0u64;
+    let mut searcher = CentroidSearcher::new(centroids.len());
+
+    while processed < num_points {
+        let remaining = num_points - processed;
+        let current = if remaining as usize > chunk_points {
+            chunk_points
+        } else {
+            remaining as usize
+        };
+        buffer.read_from(&mut reader, current)?;
+        reset_chunk_accumulators(chunk_sums, chunk_counts);
+        let floats = buffer.floats(current);
+        for i in 0..current {
+            let base = i * 3;
+            let point = [
+                floats[base] as f64,
+                floats[base + 1] as f64,
+                floats[base + 2] as f64,
+            ];
+            let idx = searcher.nearest(point, centroids);
+            chunk_counts[idx] += 1;
+            chunk_sums[idx][0] += point[0];
+            chunk_sums[idx][1] += point[1];
+            chunk_sums[idx][2] += point[2];
+        }
+        apply_chunk_updates(
+            centroids,
+            counts,
+            chunk_sums,
+            chunk_counts,
+            centroids.len(),
+        );
+        processed += current as u64;
+    }
+    Ok(())
+}
+
+fn assign_and_output(
+    path: &Path,
+    num_points: u64,
+    chunk_points: usize,
+    buffer: &mut ChunkBuffer,
+    centroids: &[[f64; 3]],
+) -> io::Result<()> {
+    let file = File::open(path)?;
+    let mut reader = BufReader::new(file);
+    let stdout = io::stdout();
+    let mut writer = BufWriter::new(stdout.lock());
+    let mut searcher = CentroidSearcher::new(centroids.len());
+
+    let mut processed = 0u64;
+    while processed < num_points {
+        let remaining = num_points - processed;
+        let current = if remaining as usize > chunk_points {
+            chunk_points
+        } else {
+            remaining as usize
+        };
+        buffer.read_from(&mut reader, current)?;
+        let floats = buffer.floats(current);
+        for i in 0..current {
+            let base = i * 3;
+            let point = [
+                floats[base] as f64,
+                floats[base + 1] as f64,
+                floats[base + 2] as f64,
+            ];
+            let idx = searcher.nearest(point, centroids);
+            writer.write_all(&(idx as u32).to_le_bytes())?;
+        }
+        processed += current as u64;
+    }
+    writer.flush()
+}
+
+struct ChunkBuffer {
+    data: Vec<f32>,
+    capacity_points: usize,
+}
+
+impl ChunkBuffer {
+    fn new(capacity_points: usize) -> io::Result<Self> {
+        if capacity_points == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "chunk capacity must be positive",
+            ));
+        }
+        let floats = capacity_points
+            .checked_mul(3)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "chunk too large"))?;
+        Ok(Self {
+            data: vec![0.0; floats],
+            capacity_points,
+        })
+    }
+
+    fn read_from<R: Read>(&mut self, reader: &mut R, points: usize) -> io::Result<()> {
+        if points > self.capacity_points {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "read exceeds buffer capacity",
+            ));
+        }
+        let slice = &mut self.data[..points * 3];
+        read_f32_slice(reader, slice)
+    }
+
+    fn floats(&self, points: usize) -> &[f32] {
+        &self.data[..points * 3]
+    }
+
+    fn bytes(&self, points: usize) -> &[u8] {
+        unsafe { f32_slice_as_bytes(&self.data[..points * 3]) }
+    }
+}
+
+fn choose_chunk_points(num_points: u64, num_clusters: usize) -> usize {
+    let mut chunk = if num_points < 5_000_000 {
+        400_000
+    } else if num_points < 50_000_000 {
+        800_000
+    } else if num_points < 500_000_000 {
+        1_200_000
+    } else {
+        2_000_000
+    };
+    if num_clusters > 2000 {
+        chunk = chunk / 2;
+    }
+    if num_clusters > 5000 {
+        chunk = chunk / 2;
+    }
+    chunk.max(50_000)
+}
+
+fn decide_refinement_passes(num_points: u64, num_clusters: usize) -> usize {
+    if num_points <= 20_000_000 {
+        2
+    } else if num_points <= 200_000_000 && num_clusters <= 4000 {
+        1
+    } else {
+        0
+    }
+}
+
+fn generate_seed_positions(
+    num_points: u64,
+    num_clusters: usize,
+    rng: &mut SimpleRng,
+) -> Vec<u64> {
+    if num_clusters == 0 {
+        return Vec::new();
+    }
+    if num_points <= num_clusters as u64 {
+        return (0..num_points as usize).map(|i| i as u64).collect();
+    }
+    let mut positions = Vec::with_capacity(num_clusters);
+    for i in 0..num_clusters {
+        let start = ((i as u128 * num_points as u128) / num_clusters as u128) as u64;
+        let end = (((i as u128 + 1) * num_points as u128) / num_clusters as u128) as u64;
+        let span = end.saturating_sub(start).max(1);
+        let offset = rng.next_u64() % span;
+        let mut pos = start.saturating_add(offset);
+        if pos >= num_points {
+            pos = num_points - 1;
+        }
+        positions.push(pos);
+    }
+    positions.sort_unstable();
+    positions
+}
+
+struct SimpleRng {
+    state: u64,
+}
+
+impl SimpleRng {
+    fn new(seed: u64) -> Self {
+        let init = if seed == 0 {
+            0x9e3779b97f4a7c15
+        } else {
+            seed
+        };
+        Self { state: init }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.state;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.state = x;
+        x.wrapping_mul(0x2545F4914F6CDD1D)
+    }
+
+    fn next_f64(&mut self) -> f64 {
+        ((self.next_u64() >> 11) as f64) / ((1u64 << 53) as f64)
+    }
+
+    fn gen_range(&mut self, upper: usize) -> usize {
+        if upper <= 1 {
+            0
+        } else {
+            (self.next_u64() as usize) % upper
+        }
+    }
+}
+
+fn create_temp_file() -> io::Result<(PathBuf, File)> {
+    let base = env::temp_dir();
+    let pid = std::process::id();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    for attempt in 0..50 {
+        let path = base.join(format!("rust_kmeans_{pid}_{nanos}_{attempt}.bin"));
+        match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => return Ok((path, file)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "cannot create temp file",
+    ))
+}
+
+struct KdNode {
+    split_dim: u8,
+    split_value: f64,
+    left: Option<usize>,
+    right: Option<usize>,
+    bbox_min: [f64; 3],
+    bbox_max: [f64; 3],
+    points: Vec<usize>,
+    is_leaf: bool,
+}
+
+struct KdTree {
+    nodes: Vec<KdNode>,
+    stack: Vec<usize>,
+    root: Option<usize>,
+    leaf_size: usize,
+}
+
+impl KdTree {
+    fn new(leaf_size: usize) -> Self {
+        Self {
+            nodes: Vec::new(),
+            stack: Vec::new(),
+            root: None,
+            leaf_size,
+        }
+    }
+
+    fn rebuild(&mut self, centroids: &[[f64; 3]]) {
+        self.nodes.clear();
+        if centroids.is_empty() {
+            self.root = None;
+            return;
+        }
+        let mut indices: Vec<usize> = (0..centroids.len()).collect();
+        let root = self.build_recursive(centroids, &mut indices, 0);
+        self.root = Some(root);
+    }
+
+    fn build_recursive(
+        &mut self,
+        centroids: &[[f64; 3]],
+        indices: &mut [usize],
+        depth: usize,
+    ) -> usize {
+        let (bbox_min, bbox_max) = compute_bbox(centroids, indices);
+        if indices.len() <= self.leaf_size {
+            let node = KdNode {
+                split_dim: (depth % 3) as u8,
+                split_value: 0.0,
+                left: None,
+                right: None,
+                bbox_min,
+                bbox_max,
+                points: indices.to_vec(),
+                is_leaf: true,
+            };
+            let idx = self.nodes.len();
+            self.nodes.push(node);
+            return idx;
+        }
+        let axis = depth % 3;
+        let mid = indices.len() / 2;
+        indices.select_nth_unstable_by(mid, |&a, &b| {
+            let va = centroids[a][axis];
+            let vb = centroids[b][axis];
+            va.partial_cmp(&vb).unwrap_or(Ordering::Less)
+        });
+        let (left_slice, right_slice_with_median) = indices.split_at_mut(mid);
+        let (median_slice, right_slice) = right_slice_with_median.split_at_mut(1);
+        let median_idx = median_slice[0];
+
+        let left_child = if !left_slice.is_empty() {
+            Some(self.build_recursive(centroids, left_slice, depth + 1))
+        } else {
+            None
+        };
+        let right_child = if !right_slice.is_empty() {
+            Some(self.build_recursive(centroids, right_slice, depth + 1))
+        } else {
+            None
+        };
+
+        let node = KdNode {
+            split_dim: axis as u8,
+            split_value: centroids[median_idx][axis],
+            left: left_child,
+            right: right_child,
+            bbox_min,
+            bbox_max,
+            points: vec![median_idx],
+            is_leaf: false,
+        };
+        let idx = self.nodes.len();
+        self.nodes.push(node);
+        idx
+    }
+
+    fn nearest(&mut self, point: [f64; 3], centroids: &[[f64; 3]]) -> usize {
+        if let Some(root) = self.root {
+            self.stack.clear();
+            self.stack.push(root);
+            let mut best_idx = self.nodes[root].points[0];
+            let mut best_dist = squared_distance(point, &centroids[best_idx]);
+            while let Some(node_idx) = self.stack.pop() {
+                let node = &self.nodes[node_idx];
+                if bbox_distance(point, node) >= best_dist {
+                    continue;
+                }
+                for &idx in &node.points {
+                    let d = squared_distance(point, &centroids[idx]);
+                    if d < best_dist {
+                        best_dist = d;
+                        best_idx = idx;
+                    }
+                }
+                match (node.left, node.right) {
+                    (Some(l), Some(r)) => {
+                        let dl = bbox_distance(point, &self.nodes[l]);
+                        let dr = bbox_distance(point, &self.nodes[r]);
+                        if dl < dr {
+                            self.stack.push(r);
+                            self.stack.push(l);
+                        } else {
+                            self.stack.push(l);
+                            self.stack.push(r);
+                        }
+                    }
+                    (Some(l), None) => self.stack.push(l),
+                    (None, Some(r)) => self.stack.push(r),
+                    (None, None) => {}
+                }
+            }
+            best_idx
+        } else {
+            0
+        }
+    }
+}
+
+fn compute_bbox(centroids: &[[f64; 3]], indices: &[usize]) -> ([f64; 3], [f64; 3]) {
+    let mut min_v = [f64::INFINITY; 3];
+    let mut max_v = [f64::NEG_INFINITY; 3];
+    for &idx in indices {
+        for d in 0..3 {
+            let val = centroids[idx][d];
+            if val < min_v[d] {
+                min_v[d] = val;
+            }
+            if val > max_v[d] {
+                max_v[d] = val;
+            }
+        }
+    }
+    (min_v, max_v)
+}
+
+fn bbox_distance(point: [f64; 3], node: &KdNode) -> f64 {
+    let mut dist = 0.0;
+    for d in 0..3 {
+        if point[d] < node.bbox_min[d] {
+            let diff = node.bbox_min[d] - point[d];
+            dist += diff * diff;
+        } else if point[d] > node.bbox_max[d] {
+            let diff = point[d] - node.bbox_max[d];
+            dist += diff * diff;
+        }
+    }
+    dist
+}
+
+enum SearchStrategy {
+    Linear,
+    KdTree(KdTree),
+}
+
+struct CentroidSearcher {
+    strategy: SearchStrategy,
+    dirty: bool,
+}
+
+impl CentroidSearcher {
+    fn new(k: usize) -> Self {
+        if k >= 512 {
+            Self {
+                strategy: SearchStrategy::KdTree(KdTree::new(32)),
+                dirty: true,
+            }
+        } else {
+            Self {
+                strategy: SearchStrategy::Linear,
+                dirty: false,
+            }
+        }
+    }
+
+    fn mark_dirty(&mut self) {
+        if matches!(self.strategy, SearchStrategy::KdTree(_)) {
+            self.dirty = true;
+        }
+    }
+
+    fn nearest(&mut self, point: [f64; 3], centroids: &[[f64; 3]]) -> usize {
+        match &mut self.strategy {
+            SearchStrategy::Linear => linear_nearest(point, centroids),
+            SearchStrategy::KdTree(tree) => {
+                if self.dirty {
+                    tree.rebuild(centroids);
+                    self.dirty = false;
+                }
+                tree.nearest(point, centroids)
+            }
+        }
+    }
+}
+```
