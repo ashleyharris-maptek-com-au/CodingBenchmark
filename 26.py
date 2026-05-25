@@ -557,6 +557,8 @@ def run_clustering(code: str, case: dict, subpass: int,
                               input=input_data,
                               capture_output=True,
                               text=True,
+                              encoding='utf-8',
+                              errors='replace',
                               timeout=TIMEOUT_SECONDS)
       exec_time = time.time() - start_time
 

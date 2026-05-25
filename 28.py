@@ -416,6 +416,8 @@ def _gradeAnswer_uncached(result: dict, subPass: int, aiEngineName: str) -> tupl
                             input=input_data,
                             capture_output=True,
                             text=True,
+                            encoding='utf-8',
+                            errors='replace',
                             timeout=TIMEOUT_SECONDS)
       exec_time = time.time() - start
 

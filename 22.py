@@ -74,7 +74,6 @@ PIECES = {
   ],
 }
 
-
 LAST_GAME_STATS: Dict[Tuple[int, str], Dict] = {}
 
 
@@ -280,7 +279,8 @@ def create_tetris_svg(board: List[List[Optional[str]]], width: int, height: int)
   return svg_html
 
 
-def read_line_with_timeout(process: subprocess.Popen, timeout_seconds: float) -> Tuple[Optional[str], bool, float]:
+def read_line_with_timeout(process: subprocess.Popen,
+                           timeout_seconds: float) -> Tuple[Optional[str], bool, float]:
   """Read a line from process.stdout with timeout. Returns (line, timed_out, duration)."""
   if not process.stdout:
     return None, False, 0.0
@@ -448,8 +448,8 @@ Write complete, compilable C# code with a Main method.
 Include adaptive logic that chooses different strategies based on game complexity.
 """
 
-structure = None
 
+structure = None
 
 
 def run_tetris_game(code: str, case: dict, subpass: int,
@@ -489,7 +489,9 @@ def run_tetris_game(code: str, case: dict, subpass: int,
                                stdin=subprocess.PIPE,
                                stdout=subprocess.PIPE,
                                stderr=subprocess.PIPE,
-                               text=True)
+                               text=True,
+                               encoding='utf-8',
+                               errors='replace')
 
     # Send header
     process.stdin.write(f"{case['width']} {case['height']} {len(pieces)}\n")
@@ -667,8 +669,8 @@ def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
     if response_times:
       sorted_times = sorted(response_times)
       mid = len(sorted_times) // 2
-      median_rt = (sorted_times[mid] if len(sorted_times) % 2 == 1
-                   else (sorted_times[mid - 1] + sorted_times[mid]) / 2)
+      median_rt = (sorted_times[mid] if len(sorted_times) % 2 == 1 else
+                   (sorted_times[mid - 1] + sorted_times[mid]) / 2)
     pieces_placed = stats.get("pieces_placed", 0)
     total_pieces = stats.get("total_pieces", 0)
     lines_cleared = stats.get("lines_cleared", 0)
@@ -677,8 +679,7 @@ def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
     lines_per_100 = (lines_cleared / pieces_placed * 100) if pieces_placed else 0
     piece_counts = stats.get("piece_counts", {})
     stall_timeouts = stats.get("stall_timeouts", 0)
-    distribution = ", ".join(
-      f"{k}: {v}" for k, v in piece_counts.items() if v > 0) or "None"
+    distribution = ", ".join(f"{k}: {v}" for k, v in piece_counts.items() if v > 0) or "None"
     avg_rt_ms = avg_rt * 1000
     median_rt_ms = median_rt * 1000
     max_rt_ms = max_rt * 1000

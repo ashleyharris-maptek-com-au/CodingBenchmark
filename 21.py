@@ -425,7 +425,9 @@ def execute_snake_game(code: str, input_data: str, case: dict,
                                stdin=subprocess.PIPE,
                                stdout=subprocess.PIPE,
                                stderr=subprocess.PIPE,
-                               text=True)
+                               text=True,
+                               encoding='utf-8',
+                               errors='replace')
 
     # Send input
     process.stdin.write(input_data + "\n")

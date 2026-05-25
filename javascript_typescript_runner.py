@@ -19,7 +19,6 @@ from typing import Optional, Tuple
 
 from native_compiler import describe_this_pc
 
-
 SCRIPT_CACHE_DIR = Path(__file__).parent / "compile_cache" / "script_runners"
 TYPESCRIPT_TOOLS_DIR = Path(__file__).parent / "compile_cache" / "typescript_tools"
 _TS_INSTALL_ATTEMPTED = False
@@ -89,9 +88,8 @@ def _node_path() -> Optional[str]:
 def _kill_process(process: subprocess.Popen) -> None:
   try:
     if platform.system() == "Windows":
-      subprocess.run(["taskkill", "/F", "/T", "/PID", str(process.pid)],
-                     capture_output=True,
-                     timeout=5)
+      subprocess.run(
+        ["taskkill", "/F", "/T", "/PID", str(process.pid)], capture_output=True, timeout=5)
     else:
       os.killpg(os.getpgid(process.pid), signal.SIGKILL)
   except Exception:
@@ -113,12 +111,12 @@ def _run_node(script_path: Path, input_data: str, timeout: float) -> Tuple[str, 
   start = time.time()
   process = None
   try:
-    process = subprocess.Popen([node, "--max-old-space-size=4096", str(script_path)],
-                               stdin=subprocess.PIPE,
-                               stdout=subprocess.PIPE,
-                               stderr=subprocess.PIPE,
-                               creationflags=subprocess.CREATE_NEW_PROCESS_GROUP
-                               if platform.system() == "Windows" else 0)
+    process = subprocess.Popen(
+      [node, "--max-old-space-size=4096", str(script_path)],
+      stdin=subprocess.PIPE,
+      stdout=subprocess.PIPE,
+      stderr=subprocess.PIPE,
+      creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if platform.system() == "Windows" else 0)
     stdout, stderr = process.communicate(input=input_data.encode("utf-8"), timeout=timeout)
     elapsed = time.time() - start
     return (stdout.decode("utf-8", errors="replace"), stderr.decode("utf-8", errors="replace"),
@@ -149,11 +147,7 @@ def execute_javascript(code: str,
 
   try:
     stdout, stderr, exec_time, return_code = _run_node(script_path, input_data, timeout)
-    return ScriptRunResult(return_code == 0,
-                           stdout,
-                           stderr,
-                           exec_time,
-                           return_code,
+    return ScriptRunResult(return_code == 0, stdout, stderr, exec_time, return_code,
                            stderr if return_code != 0 else "",
                            "execution" if return_code != 0 else "")
   except ScriptExecutionError as e:
@@ -182,9 +176,12 @@ def _ensure_local_typescript() -> Optional[Path]:
 
   try:
     TYPESCRIPT_TOOLS_DIR.mkdir(parents=True, exist_ok=True)
-    subprocess.run([npm, "install", "--prefix", str(TYPESCRIPT_TOOLS_DIR), "typescript@latest"],
+    subprocess.run([npm, "install", "--prefix",
+                    str(TYPESCRIPT_TOOLS_DIR), "typescript@latest"],
                    capture_output=True,
                    text=True,
+                   encoding='utf-8',
+                   errors='replace',
                    timeout=180)
   except Exception:
     return None
@@ -219,6 +216,8 @@ def _node_supports_type_stripping() -> bool:
     res = subprocess.run([node, "-e", "let x: number = 1; console.log(x)"],
                          capture_output=True,
                          text=True,
+                         encoding='utf-8',
+                         errors='replace',
                          timeout=10)
     _NODE_STRIPS_TYPES = res.returncode == 0 and res.stdout.strip() == "1"
   except Exception:
@@ -254,7 +253,12 @@ def _compile_typescript(code: str, engine_name: str) -> Path:
       str(cache_dir),
       str(source_path),
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    result = subprocess.run(cmd,
+                            capture_output=True,
+                            text=True,
+                            encoding='utf-8',
+                            errors='replace',
+                            timeout=120)
     # TypeScript still emits JavaScript for many useful submissions even when
     # node type declarations are absent. Prefer runnable output over rejecting
     # harmless diagnostics about require/process/console.
@@ -289,11 +293,7 @@ def execute_typescript(code: str,
 
   try:
     stdout, stderr, exec_time, return_code = _run_node(script_path, input_data, timeout)
-    return ScriptRunResult(return_code == 0,
-                           stdout,
-                           stderr,
-                           exec_time,
-                           return_code,
+    return ScriptRunResult(return_code == 0, stdout, stderr, exec_time, return_code,
                            stderr if return_code != 0 else "",
                            "execution" if return_code != 0 else "")
   except ScriptExecutionError as e:
@@ -307,7 +307,11 @@ def describe_javascript_runtime() -> str:
   if not node:
     return "Node.js: not found"
   try:
-    version = subprocess.run([node, "--version"], capture_output=True, text=True,
+    version = subprocess.run([node, "--version"],
+                             capture_output=True,
+                             text=True,
+                             encoding='utf-8',
+                             errors='replace',
                              timeout=10).stdout.strip()
   except Exception:
     version = "unknown"
@@ -321,7 +325,11 @@ def describe_typescript_runtime() -> str:
     fallback = "yes" if _node_supports_type_stripping() else "no"
     return f"{node_desc}\nTypeScript compiler: not found\nNode TypeScript stripping fallback: {fallback}"
   try:
-    version = subprocess.run(tsc_cmd + ["--version"], capture_output=True, text=True,
+    version = subprocess.run(tsc_cmd + ["--version"],
+                             capture_output=True,
+                             text=True,
+                             encoding='utf-8',
+                             errors='replace',
                              timeout=20).stdout.strip()
   except Exception:
     version = "unknown"

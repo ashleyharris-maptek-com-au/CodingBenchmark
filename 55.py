@@ -239,7 +239,7 @@ Be sure that any deviation from the C++ standard library is supported by the giv
 as referencing the wrong intrinsics or non-standard header (like 'bits/stdc++.h') could fail your submission.
 
 Write complete, compilable C++ code with a main() function.
-"""
+""".strip()
 
 structure = None
 
@@ -362,7 +362,7 @@ PUZZLES = [
     "fen": "r4rk1/pp3pp1/2p2n2/4N1N1/3pP3/1B1P2QP/PPP3P1/R3R1K1 w - - 0 1",
     "name": "Double knight pinned attack",
     "desc": "White to play and win material or force mate.",
-    "max_moves": 6,
+    "max_moves": 8,
   },
   {
     "fen": "r2qk2r/1pp2p2/2np1n2/pB1Np1Bp/4P3/3P1N2/PPP2PPP/R2Q1RK1 w kq - 0 1",
@@ -531,6 +531,8 @@ def _run_engine_once(exe_path: str, fen: str, timeout: float) -> Tuple[Optional[
       input=input_data,
       capture_output=True,
       text=True,
+      encoding='utf-8',
+      errors='replace',
       timeout=timeout + 5,
     )
     if proc.returncode != 0:
@@ -602,6 +604,11 @@ def _grade_trivial(exe_path: str, subPass: int, aiEngineName: str):
   pos = TRIVIAL_POSITIONS[subPass]
   board = chess.Board(pos["fen"])
 
+  def failingEloDump():
+    elo = json.load(open("results/chessElo.json"))
+    elo[aiEngineName] = subPass * 50
+    json.dump(elo, open("results/chessElo.json", "w"), indent=2)
+
   move_str, err = _run_engine_once(exe_path, pos["fen"], timeout=10)
   if err:
     _REPORT_CACHE[(aiEngineName, subPass)] = {
@@ -613,6 +620,8 @@ def _grade_trivial(exe_path: str, subPass: int, aiEngineName: str):
       "score": 0.0,
       "moves": [],
     }
+
+    failingEloDump()
     return 0.0, f"[{pos['name']}] {err}"
 
   # Parse the move
@@ -627,6 +636,7 @@ def _grade_trivial(exe_path: str, subPass: int, aiEngineName: str):
       "score": 0.0,
       "moves": [],
     }
+    failingEloDump()
     return 0.0, f"[{pos['name']}] Invalid move: {move_str}"
 
   # Check against best moves (if specified)
@@ -684,6 +694,12 @@ def _grade_puzzle(exe_path: str, subPass: int, aiEngineName: str):
   sf_path = _find_stockfish()
   sf_engine = None
   whiteStartScore = None
+
+  def failingEloDump():
+    if subPass > 3:
+      elo = json.load(open("results/chessElo.json"))
+      elo[aiEngineName] = subPass * 50
+      json.dump(elo, open("results/chessElo.json", "w"), indent=2)
 
   def scoreToString(score):
     if score.is_mate():
@@ -750,19 +766,21 @@ def _grade_puzzle(exe_path: str, subPass: int, aiEngineName: str):
         detail = f"Puzzle start was {scoreToString(whiteStartScore)}<br>, end was {scoreToString(whiteEndScore)}"
         if whiteEndScore > whiteStartScore:
           score = 1.0
-        if whiteEndScore.is_mate() and whiteEndScore.mate() > 0 or whiteEndScore.score() > 0:
+        elif whiteEndScore.is_mate() and whiteEndScore.mate() > 0 or whiteEndScore.score() > 0:
           detail += " Made position worse but still winning."
           score = 0.2
         else:
+          failingEloDump()
           score = 0.0
       else:
         detail = f"Puzzle start was {scoreToString(whiteStartScore)}<br>, end was {scoreToString(whiteEndScore)}"
         if whiteEndScore < whiteStartScore:
           score = 1.0
-        if whiteEndScore.is_mate() and whiteEndScore.mate() < 0 or whiteEndScore.score() < 0:
+        elif whiteEndScore.is_mate() and whiteEndScore.mate() < 0 or whiteEndScore.score() < 0:
           detail += " Made position worse but still winning."
           score = 0.2
         else:
+          failingEloDump()
           score = 0.0
 
     else:
@@ -978,7 +996,12 @@ def _build_report_html(report, board_states, moves, score, error):
   # Build HTML with JS using plain string concat to avoid brace issues
   parts = []
   parts.append("<div style='margin:10px 0;padding:14px;border:1px solid #1f2937;")
-  parts.append("            border-radius:8px;background:#0f172a;height:380px;width:800px;'>")
+
+  if len(moves) < 6:
+    parts.append("            border-radius:8px;background:#0f172a;height:380px;width:800px;'>")
+  else:
+    parts.append("            border-radius:8px;background:#0f172a;height:500px;width:800px;'>")
+
   parts.append(
     f"  <div id='{uid}_board' style='width:360px;height:360px;margin:8px 0;float:left'></div>")
   parts.append(f"  <div style='font-weight:600;color:#e2e8f0;font-size:14px;margin-bottom:2px;'>")

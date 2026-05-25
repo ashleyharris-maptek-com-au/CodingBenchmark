@@ -102,6 +102,8 @@ def assemble_spirv(text: str, target_env: str = "vulkan1.0") -> bytes:
     result = subprocess.run([spirv_as, "--target-env", target_env, "-o", out_path, src_path],
                             capture_output=True,
                             text=True,
+                            encoding='utf-8',
+                            errors='replace',
                             timeout=30)
     if result.returncode != 0:
       error = result.stderr or result.stdout or "Unknown error"
@@ -136,6 +138,8 @@ def validate_spirv(binary: bytes, target_env: str = "vulkan1.0") -> Tuple[bool, 
     result = subprocess.run([spirv_val, "--target-env", target_env, spv_path],
                             capture_output=True,
                             text=True,
+                            encoding='utf-8',
+                            errors='replace',
                             timeout=30)
     if result.returncode == 0:
       return True, ""
@@ -184,6 +188,8 @@ def compile_glsl(source: str, stage: str = "frag", target_env: str = "vulkan1.0"
       [glslang, "-V", "--target-env", target_env, "-S", stage, "-o", out_path, src_path],
       capture_output=True,
       text=True,
+      encoding='utf-8',
+      errors='replace',
       timeout=30)
     if result.returncode != 0:
       error = result.stderr or result.stdout or "Unknown error"
@@ -239,6 +245,8 @@ def compile_hlsl(source: str,
     ],
                             capture_output=True,
                             text=True,
+                            encoding='utf-8',
+                            errors='replace',
                             timeout=30)
     if result.returncode != 0:
       error = result.stderr or result.stdout or "Unknown error"

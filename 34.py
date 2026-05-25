@@ -349,6 +349,8 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
                                 stdin=f,
                                 capture_output=True,
                                 text=True,
+                                encoding='utf-8',
+                                errors='replace',
                                 timeout=TIMEOUT_SECONDS)
         exec_time = time.time() - start
         if proc.returncode == 0:
@@ -364,6 +366,8 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
                               stdin=f,
                               capture_output=True,
                               text=True,
+                              encoding='utf-8',
+                              errors='replace',
                               timeout=TIMEOUT_SECONDS)
       exec_time = time.time() - start
     else:
@@ -375,6 +379,8 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
                             input=input_data,
                             capture_output=True,
                             text=True,
+                            encoding='utf-8',
+                            errors='replace',
                             timeout=TIMEOUT_SECONDS)
       exec_time = time.time() - start
 

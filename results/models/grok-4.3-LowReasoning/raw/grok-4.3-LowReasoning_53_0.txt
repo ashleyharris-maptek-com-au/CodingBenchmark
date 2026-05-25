@@ -1,118 +1,137 @@
 ```python
-import math
+import numpy as np
+from typing import Dict, Any
 
 # Module-level persistence
-_prev_y_err = 0.0
-_prev_x_err = 0.0
-_prev_z_err = 0.0
-_integral_y = 0.0
-_phase = "acquire"
-_last_range = 9999.0
+_prev_error = np.zeros(3)
+_integral = np.zeros(3)
+_phase = 0
+_last_range = 1000.0
 _fuel_used = 0.0
+_last_valid_pos = None
+_last_valid_vel = None
 
-def _safe(val, valid_key, state, default=0.0):
-    if state.get(valid_key, False):
-        return state.get(val, default)
-    return default
+def _get_relative_state(state: Dict[str, Any]):
+    """Prefer lidar > radar > fallback to target_dock"""
+    global _last_valid_pos, _last_valid_vel
+    
+    # Lidar first
+    if state.get('lidar_rel_x_valid', False) and state.get('lidar_relv_x_valid', False):
+        pos = np.array([
+            state['lidar_rel_pos_x_m'],
+            state['lidar_rel_pos_y_m'],
+            state['lidar_rel_pos_z_m']
+        ])
+        vel = np.array([
+            state['lidar_rel_vel_x_ms'],
+            state['lidar_rel_vel_y_ms'],
+            state['lidar_rel_vel_z_ms']
+        ])
+        _last_valid_pos, _last_valid_vel = pos, vel
+        return pos, vel
+    
+    # Radar fallback
+    if state.get('radar_rel_x_valid', False) and state.get('radar_relv_x_valid', False):
+        pos = np.array([
+            state['radar_rel_pos_x_m'],
+            state['radar_rel_pos_y_m'],
+            state['radar_rel_pos_z_m']
+        ])
+        vel = np.array([
+            state['radar_rel_vel_x_ms'],
+            state['radar_rel_vel_y_ms'],
+            state['radar_rel_vel_z_ms']
+        ])
+        _last_valid_pos, _last_valid_vel = pos, vel
+        return pos, vel
+    
+    # Target dock fallback (scalar range)
+    if state.get('target_dock_range_m', 0) > 0:
+        r = state['target_dock_range_m']
+        # Assume mostly along-track (V-bar) if no better data
+        pos = np.array([0.0, -r, 0.0])
+        vel = np.array([0.0, -state.get('target_dock_speed_ms', 0.0), 0.0])
+        return pos, vel
+    
+    # Last known
+    if _last_valid_pos is not None:
+        return _last_valid_pos, _last_valid_vel if _last_valid_vel is not None else np.zeros(3)
+    
+    return np.array([0., -200., 0.]), np.zeros(3)
 
-def autopilot_step(state, dt):
-    global _prev_y_err, _prev_x_err, _prev_z_err, _integral_y, _phase, _last_range
-
-    # Prefer lidar > radar > docking camera for relative state
-    rx = _safe("lidar_rel_pos_x_m", "lidar_rel_x_valid", state,
-               _safe("radar_rel_pos_x_m", "radar_rel_x_valid", state, 0.0))
-    ry = _safe("lidar_rel_pos_y_m", "lidar_rel_y_valid", state,
-               _safe("radar_rel_pos_y_m", "radar_rel_y_valid", state, 0.0))
-    rz = _safe("lidar_rel_pos_z_m", "lidar_rel_z_valid", state,
-               _safe("radar_rel_pos_z_m", "radar_rel_z_valid", state, 0.0))
-
-    vx = _safe("lidar_rel_vel_x_ms", "lidar_relv_x_valid", state,
-               _safe("radar_rel_vel_x_ms", "radar_relv_x_valid", state, 0.0))
-    vy = _safe("lidar_rel_vel_y_ms", "lidar_relv_y_valid", state,
-               _safe("radar_rel_vel_y_ms", "radar_relv_y_valid", state, 0.0))
-    vz = _safe("lidar_rel_vel_z_ms", "lidar_relv_z_valid", state,
-               _safe("radar_rel_vel_z_ms", "radar_relv_z_valid", state, 0.0))
-
-    # Fallback to docking camera range/bearing when close
-    cam_range = state.get("dock_camera_range_m", 999.0)
-    cam_active = state.get("dock_camera_active", False)
-    if cam_active and cam_range < 80:
-        rx = rx or 0.0
-        ry = -cam_range  # assume camera points along -y for V-bar
-        vx, vy, vz = 0.0, -0.3, 0.0  # conservative when camera dominant
-
-    range_est = math.sqrt(rx**2 + ry**2 + rz**2)
-    if range_est < 1.0:
-        range_est = state.get("target_dock_range_m", range_est)
-
-    # Simple phase machine
-    if range_est > 180:
-        _phase = "far"
-    elif range_est > 35:
-        _phase = "medium"
+def autopilot_step(state: Dict[str, Any], dt: float) -> Dict[str, float]:
+    global _prev_error, _integral, _phase, _last_range, _last_valid_pos, _last_valid_vel
+    
+    pos, vel = _get_relative_state(state)
+    r = np.linalg.norm(pos)
+    
+    # Determine phase
+    if r > 200:
+        _phase = 0  # Hohmann-style
+    elif r > 50:
+        _phase = 1  # V-bar approach
+    elif r > 10:
+        _phase = 2  # Linear CW
     else:
-        _phase = "close"
-
-    # Target velocity profile (very gentle final approach)
-    if _phase == "far":
-        target_vy = -0.8 if ry < -50 else -0.4
-    elif _phase == "medium":
-        target_vy = -0.25
+        _phase = 3  # Final docking
+    
+    # Target velocity (approach strategy)
+    if _phase == 0:  # Far - orbital mechanics
+        # If behind (y < 0), thrust retrograde to catch up
+        if pos[1] < -50:
+            target_vel = np.array([0.0, 0.8, 0.0])  # slow prograde relative after lowering
+            thrust_scale = 0.6
+        else:
+            target_vel = np.array([0.0, 0.0, 0.0])
+            thrust_scale = 0.3
+    elif _phase == 1:
+        # V-bar approach: close gap gently
+        target_vel = np.array([0.0, 0.25 * np.sign(pos[1]), 0.0])
+        thrust_scale = 0.4
+    elif _phase == 2:
+        # Linear regime - direct closure
+        target_vel = -0.08 * pos / max(r, 1e-3)  # 0.08 m/s approach
+        thrust_scale = 0.25
     else:
-        target_vy = -0.08 if range_est > 8 else -0.03
-
-    # PD control with orbital awareness
-    # y (along-track): use retrograde to close when behind
-    y_err = ry
-    y_derr = (y_err - _prev_y_err) / max(dt, 0.01)
-    _integral_y = max(min(_integral_y + y_err * dt, 30), -30)
-    thrust_y = -0.6 * (y_err / 200.0) - 1.8 * (vy - target_vy) - 0.01 * _integral_y
-    thrust_y = max(min(thrust_y, 0.9), -0.9)
-
-    # x (radial) - keep near zero with small corrections
-    x_err = rx
-    x_derr = (x_err - _prev_x_err) / max(dt, 0.01)
-    thrust_x = -0.35 * (x_err / 100.0) - 0.9 * vx
-    thrust_x = max(min(thrust_x, 0.6), -0.6)
-
-    # z (cross-track)
-    z_err = rz
-    z_derr = (z_err - _prev_z_err) / max(dt, 0.01)
-    thrust_z = -0.4 * (z_err / 80.0) - 1.1 * vz
-    thrust_z = max(min(thrust_z, 0.7), -0.7)
-
-    # Attitude rates (point nose roughly along velocity vector in LVLH)
-    att_rate_pitch = -0.008 * rx - 0.015 * vx
-    att_rate_yaw = 0.008 * rz + 0.015 * vz
-    att_rate_roll = 0.0
-
-    # Very conservative near docking port
-    if range_est < 12:
-        thrust_x *= 0.4
-        thrust_y *= 0.35
-        thrust_z *= 0.4
-        att_rate_pitch *= 0.5
-        att_rate_yaw *= 0.5
-
-    # Clamp all outputs
-    thrust_x = max(min(thrust_x, 1.0), -1.0)
-    thrust_y = max(min(thrust_y, 1.0), -1.0)
-    thrust_z = max(min(thrust_z, 1.0), -1.0)
-    att_rate_pitch = max(min(att_rate_pitch, 0.035), -0.035)
-    att_rate_yaw = max(min(att_rate_yaw, 0.035), -0.035)
-    att_rate_roll = max(min(att_rate_roll, 0.035), -0.035)
-
-    _prev_y_err = y_err
-    _prev_x_err = x_err
-    _prev_z_err = z_err
-    _last_range = range_est
-
+        # Final - very gentle
+        target_vel = -0.03 * pos / max(r, 1e-3)
+        thrust_scale = 0.15
+    
+    # Error and PID
+    error = vel - target_vel
+    _integral = np.clip(_integral + error * dt, -5, 5)
+    derivative = (error - _prev_error) / max(dt, 1e-3)
+    _prev_error = error.copy()
+    
+    Kp, Ki, Kd = 0.8, 0.02, 0.4
+    control = Kp * error + Ki * _integral + Kd * derivative
+    
+    # Convert to thrust commands (normalized)
+    thrust_cmd = np.clip(control * thrust_scale, -1.0, 1.0)
+    
+    # Attitude: point nose toward target (simple rate command)
+    if r > 5:
+        # Yaw/pitch toward -pos direction (along-track bias)
+        yaw_rate = np.clip(-pos[2] * 0.008, -0.03, 0.03)
+        pitch_rate = np.clip(pos[0] * 0.008, -0.03, 0.03)
+    else:
+        yaw_rate = pitch_rate = 0.0
+    
+    roll_rate = 0.0
+    
+    # Safety: fuel and speed limits
+    if state.get('fuel_remaining_pct', 100) < 5:
+        thrust_cmd *= 0.3
+    
+    if r < 3 and np.linalg.norm(vel) > 0.25:
+        thrust_cmd *= 0.4
+    
     return {
-        "thrust_x": thrust_x,
-        "thrust_y": thrust_y,
-        "thrust_z": thrust_z,
-        "att_rate_roll": att_rate_roll,
-        "att_rate_pitch": att_rate_pitch,
-        "att_rate_yaw": att_rate_yaw,
+        'thrust_x': float(thrust_cmd[0]),
+        'thrust_y': float(thrust_cmd[1]),
+        'thrust_z': float(thrust_cmd[2]),
+        'att_rate_roll': float(roll_rate),
+        'att_rate_pitch': float(pitch_rate),
+        'att_rate_yaw': float(yaw_rate)
     }
 ```

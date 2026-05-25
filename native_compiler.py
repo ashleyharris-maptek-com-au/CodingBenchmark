@@ -395,7 +395,13 @@ class CppCompiler(NativeCompiler):
     if self._compiler_type == 'msvc':
       env = self._get_msvc_env()
       try:
-        res = subprocess.run([compiler, '/?'], capture_output=True, text=True, env=env, timeout=10)
+        res = subprocess.run([compiler, '/?'],
+                             capture_output=True,
+                             text=True,
+                             encoding='utf-8',
+                             errors='replace',
+                             env=env,
+                             timeout=10)
         out = (res.stdout or "") + "\n" + (res.stderr or "")
       except Exception:
         out = ""
@@ -423,6 +429,8 @@ class CppCompiler(NativeCompiler):
         res = subprocess.run([compiler, f"-std={std}", '-c', src_path, '-o', obj_path],
                              capture_output=True,
                              text=True,
+                             encoding='utf-8',
+                             errors='replace',
                              timeout=20)
         if res.returncode == 0:
           self._detected_std = std
@@ -521,6 +529,8 @@ class CppCompiler(NativeCompiler):
         result = subprocess.run([vswhere, "-latest", "-property", "installationPath"],
                                 capture_output=True,
                                 text=True,
+                                encoding='utf-8',
+                                errors='replace',
                                 timeout=10)
         if result.returncode == 0:
           vs_install = result.stdout.strip()
@@ -580,6 +590,8 @@ class CppCompiler(NativeCompiler):
         result = subprocess.run([vswhere, "-latest", "-property", "installationPath"],
                                 capture_output=True,
                                 text=True,
+                                encoding='utf-8',
+                                errors='replace',
                                 timeout=10)
         if result.returncode == 0:
           vs_install = result.stdout.strip()
@@ -587,7 +599,13 @@ class CppCompiler(NativeCompiler):
           if os.path.exists(vcvars):
             # Run vcvars64.bat and capture environment
             cmd = f'cmd /c ""{vcvars}" && set"'
-            result = subprocess.run(cmd, capture_output=True, text=True, shell=True, timeout=30)
+            result = subprocess.run(cmd,
+                                    capture_output=True,
+                                    text=True,
+                                    encoding='utf-8',
+                                    errors='replace',
+                                    shell=True,
+                                    timeout=30)
             if result.returncode == 0:
               for line in result.stdout.splitlines():
                 if '=' in line:
@@ -636,7 +654,13 @@ class CppCompiler(NativeCompiler):
           f'/Fo:{obj_path}',
         ] + extra_flags
 
-        result = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=120)
+        result = subprocess.run(cmd,
+                                capture_output=True,
+                                text=True,
+                                encoding='utf-8',
+                                errors='replace',
+                                env=env,
+                                timeout=120)
 
         # Clean up obj file
         try:
@@ -659,7 +683,12 @@ class CppCompiler(NativeCompiler):
         if self.is_linux:
           cmd.append('-pthread')
 
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        result = subprocess.run(cmd,
+                                capture_output=True,
+                                text=True,
+                                encoding='utf-8',
+                                errors='replace',
+                                timeout=120)
 
       if result.returncode != 0:
         error_msg = result.stderr or result.stdout or "Unknown compilation error"
@@ -697,13 +726,24 @@ class CppCompiler(NativeCompiler):
       try:
         if self._compiler_type == 'msvc':
           env = self._get_msvc_env()
-          res = subprocess.run([compiler], capture_output=True, text=True, env=env, timeout=10)
+          res = subprocess.run([compiler],
+                               capture_output=True,
+                               text=True,
+                               encoding='utf-8',
+                               errors='replace',
+                               env=env,
+                               timeout=10)
           out = (res.stdout or "") + "\n" + (res.stderr or "")
           m = re.search(r"Compiler Version\s+([0-9.]+)", out)
           ver = m.group(1) if m else "unknown"
           return f"MSVC cl {ver} | std={std} ({std_flag})"
 
-        res = subprocess.run([compiler, "--version"], capture_output=True, text=True, timeout=10)
+        res = subprocess.run([compiler, "--version"],
+                             capture_output=True,
+                             text=True,
+                             encoding='utf-8',
+                             errors='replace',
+                             timeout=10)
         first_line = (res.stdout or "").splitlines()[0].strip() if (
           res.stdout or "").splitlines() else "unknown"
         return f"{first_line} | std={std} ({std_flag})"
@@ -743,6 +783,8 @@ class RustCompiler(NativeCompiler):
         res = subprocess.run([compiler, '-O', f'--edition={ed}', '-o', exe_path, src_path],
                              capture_output=True,
                              text=True,
+                             encoding='utf-8',
+                             errors='replace',
                              timeout=30)
         if res.returncode == 0:
           self._detected_edition = ed
@@ -823,7 +865,12 @@ class RustCompiler(NativeCompiler):
         src_path,
       ] + extra_flags
 
-      result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+      result = subprocess.run(cmd,
+                              capture_output=True,
+                              text=True,
+                              encoding='utf-8',
+                              errors='replace',
+                              timeout=120)
 
       if result.returncode != 0:
         error_msg = result.stderr or result.stdout or "Unknown compilation error"
@@ -857,13 +904,20 @@ class RustCompiler(NativeCompiler):
     def _compute() -> str:
       edition = self._detect_rust_edition()
 
-      result = subprocess.run([compiler, "--version"], capture_output=True, text=True, timeout=10)
+      result = subprocess.run([compiler, "--version"],
+                              capture_output=True,
+                              text=True,
+                              encoding='utf-8',
+                              errors='replace',
+                              timeout=10)
       ver = result.stdout.strip() if result.stdout.strip() else "unknown"
 
       try:
         verbose = subprocess.run([compiler, "--version", "--verbose"],
                                  capture_output=True,
                                  text=True,
+                                 encoding='utf-8',
+                                 errors='replace',
                                  timeout=10)
         extra = ""
         for line in (verbose.stdout or "").splitlines():
@@ -950,7 +1004,12 @@ class CSharpCompiler(NativeCompiler):
 
   def _dotnet_has_sdk(self, dotnet_path: str) -> bool:
     try:
-      r = subprocess.run([dotnet_path, '--list-sdks'], capture_output=True, text=True, timeout=10)
+      r = subprocess.run([dotnet_path, '--list-sdks'],
+                         capture_output=True,
+                         text=True,
+                         encoding='utf-8',
+                         errors='replace',
+                         timeout=10)
       if r.returncode != 0:
         return False
       return bool(r.stdout.strip())
@@ -966,6 +1025,8 @@ class CSharpCompiler(NativeCompiler):
         result = subprocess.run([vswhere, "-latest", "-property", "installationPath"],
                                 capture_output=True,
                                 text=True,
+                                encoding='utf-8',
+                                errors='replace',
                                 timeout=10)
         if result.returncode == 0:
           vs_install = result.stdout.strip()
@@ -1050,6 +1111,8 @@ class CSharpCompiler(NativeCompiler):
         cwd=str(project_dir),
         capture_output=True,
         text=True,
+        encoding='utf-8',
+        errors='replace',
         timeout=120)
 
       if result.returncode != 0:
@@ -1101,7 +1164,12 @@ class CSharpCompiler(NativeCompiler):
         src_path,
       ] + extra_flags
 
-      result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+      result = subprocess.run(cmd,
+                              capture_output=True,
+                              text=True,
+                              encoding='utf-8',
+                              errors='replace',
+                              timeout=120)
 
       if result.returncode != 0:
         error_msg = result.stderr or result.stdout or "Unknown compilation error"
@@ -1132,7 +1200,12 @@ class CSharpCompiler(NativeCompiler):
         src_path,
       ] + extra_flags
 
-      result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+      result = subprocess.run(cmd,
+                              capture_output=True,
+                              text=True,
+                              encoding='utf-8',
+                              errors='replace',
+                              timeout=120)
 
       if result.returncode != 0:
         error_msg = result.stderr or result.stdout or "Unknown compilation error"
@@ -1247,7 +1320,12 @@ class CSharpCompiler(NativeCompiler):
         dotnet = compiler
         dotnet_ver = "unknown"
         try:
-          r = subprocess.run([dotnet, '--version'], capture_output=True, text=True, timeout=10)
+          r = subprocess.run([dotnet, '--version'],
+                             capture_output=True,
+                             text=True,
+                             encoding='utf-8',
+                             errors='replace',
+                             timeout=10)
           if r.returncode == 0 and r.stdout.strip():
             dotnet_ver = r.stdout.strip()
         except Exception:
@@ -1255,7 +1333,12 @@ class CSharpCompiler(NativeCompiler):
 
         sdk_ver = dotnet_ver
         try:
-          r = subprocess.run([dotnet, '--list-sdks'], capture_output=True, text=True, timeout=10)
+          r = subprocess.run([dotnet, '--list-sdks'],
+                             capture_output=True,
+                             text=True,
+                             encoding='utf-8',
+                             errors='replace',
+                             timeout=10)
           if r.returncode == 0 and r.stdout.strip():
 
             def ver_key(v: str):
@@ -1290,12 +1373,16 @@ class CSharpCompiler(NativeCompiler):
             r = subprocess.run([dotnet, str(csc_dll), '/langversion:?'],
                                capture_output=True,
                                text=True,
+                               encoding='utf-8',
+                               errors='replace',
                                timeout=10)
             max_lv = max_langversion((r.stdout or "") + "\n" + (r.stderr or ""))
 
             rv = subprocess.run([dotnet, str(csc_dll), '/version'],
                                 capture_output=True,
                                 text=True,
+                                encoding='utf-8',
+                                errors='replace',
                                 timeout=10)
             if rv.stdout.strip():
               csc_ver = rv.stdout.strip().splitlines()[0].strip()
@@ -1306,7 +1393,12 @@ class CSharpCompiler(NativeCompiler):
 
       if self._compiler_type == 'mono':
         try:
-          r = subprocess.run([compiler, '--version'], capture_output=True, text=True, timeout=10)
+          r = subprocess.run([compiler, '--version'],
+                             capture_output=True,
+                             text=True,
+                             encoding='utf-8',
+                             errors='replace',
+                             timeout=10)
           ver = r.stdout.strip() if r.stdout.strip() else "unknown"
         except Exception:
           ver = "unknown"
@@ -1317,10 +1409,20 @@ class CSharpCompiler(NativeCompiler):
         ver = "unknown"
         max_lv = "unknown"
         try:
-          rv = subprocess.run([csc, '/version'], capture_output=True, text=True, timeout=10)
+          rv = subprocess.run([csc, '/version'],
+                              capture_output=True,
+                              text=True,
+                              encoding='utf-8',
+                              errors='replace',
+                              timeout=10)
           if rv.stdout.strip():
             ver = rv.stdout.strip().splitlines()[0].strip()
-          rl = subprocess.run([csc, '/langversion:?'], capture_output=True, text=True, timeout=10)
+          rl = subprocess.run([csc, '/langversion:?'],
+                              capture_output=True,
+                              text=True,
+                              encoding='utf-8',
+                              errors='replace',
+                              timeout=10)
           max_lv = max_langversion((rl.stdout or "") + "\n" + (rl.stderr or ""))
         except Exception:
           pass

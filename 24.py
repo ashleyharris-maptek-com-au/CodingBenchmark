@@ -1034,6 +1034,8 @@ def run_lander_simulation(code: str, case: dict, subpass: int,
                                stdout=subprocess.PIPE,
                                stderr=subprocess.PIPE,
                                text=True,
+                               encoding='utf-8',
+                               errors='replace',
                                bufsize=1)
 
     stdout_queue: Queue = Queue()
