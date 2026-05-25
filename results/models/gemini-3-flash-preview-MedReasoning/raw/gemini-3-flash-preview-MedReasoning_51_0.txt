@@ -1,0 +1,162 @@
+import math
+
+# Persistence for PID states and filters
+_S = {}
+
+def autopilot_step(state: dict, dt: float) -> dict:
+    """
+    Autopilot for a twin-engine airliner with sensor fusion and robust control.
+    Designed to handle historical accident scenarios including sensor failures and engine out.
+    """
+    global _S
+    
+    # --- Sensor Fusion Helper ---
+    def fuse(prefix, suffix=None, count=3):
+        vals = []
+        for i in range(1, count + 1):
+            k = f"{prefix}_{i}_{suffix}" if suffix else f"{prefix}_{i}"
+            vk = f"{prefix}_{i}_valid"
+            if k in state:
+                if state.get(vk, True):
+                    vals.append(state[k])
+        if not vals:
+            # Fallback: try all sensors regardless of valid flag
+            vals = [state[f"{prefix}_{i}_{suffix}" if suffix else f"{prefix}_{i}"] 
+                    for i in range(1, count+1) if (f"{prefix}_{i}_{suffix}" if suffix else f"{prefix}_{i}") in state]
+        if not vals:
+            # Final fallback: generic keys
+            k = f"{prefix}_{suffix}" if suffix else prefix
+            return state.get(k, 0.0)
+        vals.sort()
+        return vals[len(vals)//2]
+
+    # --- Initialization ---
+    if not _S:
+        _S = {
+            'i_vs': 0.0,
+            'i_ias': 0.0,
+            'i_hdg': 0.0,
+            'trim': state.get('elevator_trim_deg', 0.0) / 15.0,
+            'initialized': True
+        }
+
+    # --- Data Acquisition & Robustness ---
+    # Altitude fusion (Robust against Turkish 1951 radar failure)
+    baro_alt = fuse("baro_alt", "ft")
+    gps_alt = fuse("gps", "alt_ft")
+    radar_alt = fuse("radar_alt", "ft")
+    press_alt = fuse("adc", "pressure_alt_ft")
+    
+    # Cross-check baro vs GPS using pressure altitude as reference
+    alt = baro_alt
+    if abs(baro_alt - press_alt) > 2000 and abs(gps_alt - press_alt) < 1000:
+        alt = gps_alt
+
+    # Speed fusion (Robust against AF447/Birgenair pitot failure)
+    ias = fuse("ias", "kt")
+    gs = fuse("gps", "gs_kt")
+    tas = fuse("tas", "kt")
+    track = fuse("gps", "track_deg")
+    
+    if ias < 50 and gs > 120:
+        # Pitot icing detected: estimate IAS from GS and Wind
+        wind_speed = state.get('wind_speed_kt', 0)
+        wind_dir = state.get('wind_dir_deg', 0)
+        headwind = wind_speed * math.cos(math.radians(wind_dir - track))
+        ias = max(gs - headwind, 60.0)
+
+    # Attitude and rates
+    pitch = fuse("irs", "pitch_deg")
+    roll = fuse("irs", "roll_deg")
+    hdg = fuse("irs", "heading_deg")
+    vs = fuse("irs", "vs_fpm") or state.get("vertical_speed_fpm", 0.0)
+    p_rate = fuse("gyro", "pitch_rate_dps")
+    r_rate = fuse("gyro", "roll_rate_dps")
+    y_rate = fuse("gyro", "yaw_rate_dps")
+    aoa = fuse("aoa", "deg")
+    
+    # --- Targets ---
+    target_alt = state.get('target_alt_ft', alt)
+    target_ias = state.get('target_ias_kt', ias)
+    target_hdg = state.get('target_hdg_deg', hdg)
+    target_vs = state.get('target_vs_fpm', 0)
+    
+    ap_engaged = state.get('ap_engaged', False)
+    at_engaged = state.get('at_engaged', False)
+    
+    # --- Emergency Logic (Historical Accidents) ---
+    eng1_run = state.get('engine_1_running', True)
+    eng2_run = state.get('engine_2_running', True)
+    is_dual_engine_out = not eng1_run and not eng2_run
+    
+    if is_dual_engine_out:
+        # Dual engine failure (US Airways 1549): Target best glide speed
+        target_ias = 210 
+    
+    is_stalling = aoa > 12.0
+    is_overspeed = ias > 360 or fuse("mach") > 0.83
+    
+    on_ground = any([state.get(k, False) for k in ['weight_on_wheels_left', 'weight_on_wheels_nose', 'weight_on_wheels_right']])
+    if on_ground:
+        return {'throttle_1': 0.0, 'throttle_2': 0.0, 'elevator': 0.0, 'aileron': 0.0, 'rudder': 0.0}
+
+    outputs = {}
+
+    # --- Lateral Control ---
+    if ap_engaged:
+        hdg_err = (target_hdg - hdg + 180) % 360 - 180
+        target_bank = max(-25, min(25, hdg_err * 1.5))
+        roll_err = target_bank - roll
+        outputs['aileron'] = max(-1.0, min(1.0, (roll_err * 0.8 - r_rate) * 0.2))
+        
+        # Yaw coordination
+        lat_g = fuse("accel", "y_g")
+        outputs['rudder'] = max(-1.0, min(1.0, -lat_g * 2.0 - y_rate * 0.2))
+
+    # --- Vertical Control ---
+    if ap_engaged:
+        alt_err = target_alt - alt
+        
+        # Vertical speed selection
+        if abs(alt_err) > 2000:
+            vs_cmd = target_vs if abs(target_vs) > 100 else (2200 if alt_err > 0 else -2200)
+        else:
+            vs_cmd = max(-1500, min(1500, alt_err * 1.5))
+            
+        # Protections (Alpha Floor / Overspeed)
+        if is_stalling: vs_cmd = -3000
+        if is_overspeed: vs_cmd = 3000
+        
+        vs_err = vs_cmd - vs
+        _S['i_vs'] = max(-1000, min(1000, _S['i_vs'] + vs_err * dt))
+        
+        # Pitch Control
+        target_pitch = max(-10, min(18, vs_err * 0.005 + _S['i_vs'] * 0.001))
+        pitch_err = target_pitch - pitch
+        elevator = (pitch_err * 0.6 - p_rate) * 0.2
+        outputs['elevator'] = max(-1.0, min(1.0, elevator))
+        
+        # Auto-trim
+        _S['trim'] = max(-1.0, min(1.0, _S['trim'] + elevator * 0.05 * dt))
+        outputs['elevator_trim'] = _S['trim']
+
+    # --- Thrust Control ---
+    if at_engaged or is_stalling:
+        ias_err = target_ias - ias
+        _S['i_ias'] = max(-0.5, min(0.5, _S['i_ias'] + ias_err * dt))
+        
+        throttle = 0.5 + ias_err * 0.05 + _S['i_ias'] * 0.01
+        if is_stalling: throttle = 1.0 # Alpha floor
+        if is_dual_engine_out: throttle = 0.0 # Don't waste battery/fuel if both out
+            
+        outputs['throttle_1'] = max(0.0, min(1.0, throttle))
+        outputs['throttle_2'] = max(0.0, min(1.0, throttle))
+
+    # --- Asymmetric Thrust Compensation ---
+    n1_1 = state.get('engine_1_n1_pct', 0)
+    n1_2 = state.get('engine_2_n1_pct', 0)
+    if abs(n1_1 - n1_2) > 10:
+        asym_rudder = (n1_2 - n1_1) * 0.005
+        outputs['rudder'] = max(-1.0, min(1.0, outputs.get('rudder', 0.0) + asym_rudder))
+
+    return outputs

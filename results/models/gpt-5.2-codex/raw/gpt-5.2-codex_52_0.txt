@@ -1,0 +1,281 @@
+Below is a robust, **single‑function** Python autopilot that fuses redundant sensors, keeps lane, controls speed, avoids obstacles, handles low traction, and gracefully degrades when sensors flicker or fail.
+
+It uses **module‑level persistence** for filtering and PID control as required.
+
+```python
+import math
+
+# ===== Module-level persistent state =====
+_prev_speed_kmh = 0.0
+_prev_lane_offset = 0.0
+_prev_steer = 0.0
+_speed_integral = 0.0
+_lane_change_timer = 0.0
+_lane_change_override = None
+
+
+# ===== Helper functions =====
+def clamp(x, lo, hi):
+    return max(lo, min(hi, x))
+
+def median(values):
+    if not values:
+        return None
+    vs = sorted(values)
+    n = len(vs)
+    if n % 2 == 1:
+        return vs[n // 2]
+    return 0.5 * (vs[n // 2 - 1] + vs[n // 2])
+
+def robust_median(values, outlier_thresh=20.0):
+    if not values:
+        return None
+    m = median(values)
+    filtered = [v for v in values if abs(v - m) <= outlier_thresh]
+    if not filtered:
+        return m
+    return median(filtered)
+
+def valid_bool(x):
+    return bool(x) and not math.isnan(x) if isinstance(x, float) else bool(x)
+
+
+# ===== Main autopilot function =====
+def autopilot_step(state: dict, dt: float) -> dict:
+    global _prev_speed_kmh, _prev_lane_offset, _prev_steer
+    global _speed_integral, _lane_change_timer, _lane_change_override
+
+    # ---------- Time step ----------
+    if dt is None or dt <= 0.0:
+        dt = state.get("dt", 0.05)
+    dt = max(0.01, min(dt, 0.2))
+
+    # ---------- FUSE SPEED ----------
+    speed_candidates = []
+
+    # Wheel speeds
+    for wheel in ["fl", "fr", "rl", "rr"]:
+        v = state.get(f"wheel_speed_{wheel}_kmh", None)
+        valid = state.get(f"wheel_speed_{wheel}_valid", True)
+        if v is not None and 0 <= v <= 250 and valid_bool(valid):
+            speed_candidates.append(v)
+
+    # Vehicle speed sensors
+    for i in [1, 2]:
+        v = state.get(f"vehicle_speed_{i}_kmh", None)
+        if v is not None and 0 <= v <= 250:
+            speed_candidates.append(v)
+
+    # GPS speeds
+    for i in [1, 2]:
+        v = state.get(f"gps_{i}_speed_kmh", None)
+        valid = state.get(f"gps_{i}_valid", True)
+        if v is not None and 0 <= v <= 250 and valid_bool(valid):
+            speed_candidates.append(v)
+
+    fused_speed = robust_median(speed_candidates, outlier_thresh=25.0)
+    if fused_speed is None:
+        fused_speed = _prev_speed_kmh
+
+    # Low-pass filter
+    alpha_speed = 0.3
+    speed_kmh = alpha_speed * fused_speed + (1 - alpha_speed) * _prev_speed_kmh
+
+    # ---------- FUSE LANE OFFSET ----------
+    lane_offsets = []
+    for i in [1, 2, 3]:
+        offset = state.get(f"vision_{i}_lane_offset_m", None)
+        left_valid = state.get(f"vision_{i}_left_line_valid", False)
+        right_valid = state.get(f"vision_{i}_right_line_valid", False)
+        vision_valid = left_valid or right_valid
+        if offset is not None and abs(offset) <= 4.0 and vision_valid:
+            lane_offsets.append(offset)
+
+    fused_lane_offset = robust_median(lane_offsets, outlier_thresh=1.5)
+    if fused_lane_offset is None:
+        # if vision lost, keep last but slowly decay to center
+        fused_lane_offset = _prev_lane_offset * 0.95
+
+    alpha_lane = 0.3
+    lane_offset = alpha_lane * fused_lane_offset + (1 - alpha_lane) * _prev_lane_offset
+
+    # ---------- ROAD CURVATURE (optional) ----------
+    curvature_vals = []
+    for i in [1, 2, 3]:
+        curv = state.get(f"vision_{i}_road_curvature_1pm", None)
+        if curv is not None and abs(curv) < 0.02:
+            curvature_vals.append(curv)
+    road_curvature = median(curvature_vals) or 0.0
+
+    # ---------- SPEED LIMIT ----------
+    speed_limits = []
+    for i in [1, 2, 3]:
+        sl = state.get(f"vision_{i}_speed_limit_kmh", None)
+        valid = state.get(f"vision_{i}_speed_limit_valid", False)
+        if sl is not None and 10 <= sl <= 160 and valid_bool(valid):
+            speed_limits.append(sl)
+    speed_limit = median(speed_limits)
+
+    # ---------- TARGET SPEED ----------
+    target_speed = state.get("target_speed_kmh", 100.0)
+    if speed_limit is not None:
+        target_speed = min(target_speed, speed_limit)
+
+    # Traction management
+    mu = state.get("estimated_mu", 1.0)
+    mu = clamp(mu, 0.05, 1.0)
+    traction_factor = clamp(mu / 0.7, 0.2, 1.0)
+    target_speed *= traction_factor
+
+    # ---------- OBSTACLE DETECTION ----------
+    obstacle_dist = None
+    obstacle_rel_speed = None
+
+    # Vision obstacles
+    for i in [1, 2, 3]:
+        if state.get(f"vision_{i}_obstacle_valid", False) and state.get(f"vision_{i}_obstacle_detected", False):
+            dist = state.get(f"vision_{i}_obstacle_dist_m", None)
+            rel = state.get(f"vision_{i}_obstacle_rel_speed_kmh", None)
+            if dist is not None and dist > 0:
+                if obstacle_dist is None or dist < obstacle_dist:
+                    obstacle_dist = dist
+                    obstacle_rel_speed = rel
+
+    # Lidar forward beams
+    forward_angles = ["+005", "+015", "+030", "-005", "-015", "-030"]
+    lidar_dists = []
+    for ang in forward_angles:
+        r = state.get(f"lidar_{ang}_deg_range_m", None)
+        valid = state.get(f"lidar_{ang}_deg_valid", False)
+        if r is not None and r > 0.5 and valid_bool(valid):
+            lidar_dists.append(r)
+
+    lidar_min = min(lidar_dists) if lidar_dists else None
+    if lidar_min is not None:
+        if obstacle_dist is None or lidar_min < obstacle_dist:
+            obstacle_dist = lidar_min
+
+    # ---------- Side clearance for lane change ----------
+    left_angles = ["-045", "-060", "-090"]
+    right_angles = ["+045", "+060", "+090"]
+
+    def min_lidar(angles):
+        vals = []
+        for ang in angles:
+            r = state.get(f"lidar_{ang}_deg_range_m", None)
+            valid = state.get(f"lidar_{ang}_deg_valid", False)
+            if r is not None and r > 0.5 and valid_bool(valid):
+                vals.append(r)
+        return min(vals) if vals else None
+
+    left_min = min_lidar(left_angles)
+    right_min = min_lidar(right_angles)
+
+    left_clear = left_min is not None and left_min > 15
+    right_clear = right_min is not None and right_min > 15
+
+    # ---------- Lane change override ----------
+    current_lane = state.get("current_lane", 1)
+    target_lane = state.get("target_lane", current_lane)
+
+    # decrease override timer
+    if _lane_change_timer > 0.0:
+        _lane_change_timer -= dt
+        if _lane_change_timer <= 0.0:
+            _lane_change_override = None
+
+    # Detect obstacle and possibly trigger lane change override
+    if obstacle_dist is not None and obstacle_dist < 30 and _lane_change_override is None:
+        # choose a clear adjacent lane
+        if current_lane > 0 and left_clear:
+            _lane_change_override = current_lane - 1
+            _lane_change_timer = 3.0
+        elif current_lane < 2 and right_clear:
+            _lane_change_override = current_lane + 1
+            _lane_change_timer = 3.0
+
+    desired_lane = _lane_change_override if _lane_change_override is not None else target_lane
+
+    # ---------- Obstacle-based speed reduction ----------
+    emergency = False
+    if obstacle_dist is not None:
+        # compute TTC if relative speed is closing
+        ttc = None
+        if obstacle_rel_speed is not None and obstacle_rel_speed < 0:
+            closing_mps = (-obstacle_rel_speed) * (1000 / 3600)
+            if closing_mps > 0.1:
+                ttc = obstacle_dist / closing_mps
+
+        if obstacle_dist < 8 or (ttc is not None and ttc < 1.0):
+            emergency = True
+        elif obstacle_dist < 30 or (ttc is not None and ttc < 3.0):
+            # Reduce target speed based on distance
+            target_speed = min(target_speed, max(0.0, (obstacle_dist - 5) * 2.0))
+
+    # ---------- SPEED CONTROL ----------
+    speed_error = target_speed - speed_kmh
+    _speed_integral += speed_error * dt
+    _speed_integral = clamp(_speed_integral, -50, 50)
+
+    Kp = 0.05
+    Ki = 0.01
+    accel_cmd = Kp * speed_error + Ki * _speed_integral
+
+    if emergency:
+        throttle = 0.0
+        brake = 1.0
+    else:
+        if accel_cmd >= 0:
+            throttle = clamp(accel_cmd, 0.0, 1.0)
+            brake = 0.0
+        else:
+            throttle = 0.0
+            brake = clamp(-accel_cmd * 1.2, 0.0, 1.0)
+
+        # traction limits
+        throttle = min(throttle, 0.2 + 0.8 * mu)
+        brake = min(brake, 0.3 + 0.7 * mu)
+
+    # ---------- STEERING CONTROL ----------
+    lane_width = 3.5
+    desired_offset = (desired_lane - current_lane) * lane_width
+    lane_error = lane_offset - desired_offset
+    lane_rate = (lane_offset - _prev_lane_offset) / dt
+
+    Kp_lane = 0.4
+    Kd_lane = 0.1
+    steer_cmd = -Kp_lane * lane_error - Kd_lane * lane_rate
+
+    # small feedforward for curvature
+    steer_cmd += road_curvature * (speed_kmh / 100.0) * 0.5
+
+    # steering limits based on traction
+    steer_limit = clamp(mu * 1.2, 0.2, 1.0)
+    steer_cmd = clamp(steer_cmd, -steer_limit, steer_limit)
+
+    # smooth steering
+    steer = 0.7 * _prev_steer + 0.3 * steer_cmd
+    steer = clamp(steer, -1.0, 1.0)
+
+    # ---------- Update persistent state ----------
+    _prev_speed_kmh = speed_kmh
+    _prev_lane_offset = lane_offset
+    _prev_steer = steer
+
+    return {
+        "steering": steer,
+        "throttle": throttle,
+        "brake": brake
+    }
+```
+
+### ✅ Features Covered
+- **Sensor fusion** using median + outlier rejection.
+- **Lane keeping** using fused lane offset with smoothing.
+- **Speed control** with PID + speed limits.
+- **Obstacle avoidance** using vision + lidar.
+- **Traction management** using `estimated_mu`.
+- **Graceful degradation** (fallback to previous values).
+- **Persistence** via module-level state.
+
+This autopilot is intentionally conservative and robust against sensor flicker and multi-sensor failure scenarios.

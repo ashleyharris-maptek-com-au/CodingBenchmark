@@ -1,1 +1,356 @@
-{'__exception__': "Can't run here - we're trying to get this working in codex."}
+```cpp
+#include <iostream>
+#include <iomanip>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <atomic>
+#include <fstream>
+#include <string>
+#include <cmath>
+#include <algorithm>
+#include <cstdint>
+#include <limits>
+
+struct State {
+    double x{}, y{}, z{};
+    double vx{}, vy{}, vz{};
+    double pitch{}, yaw{}, roll{};
+    double pitch_rate{}, yaw_rate{}, roll_rate{};
+    double fuel{};
+};
+
+struct Command {
+    double thrust{};
+    double pitch_cmd{};
+    double yaw_cmd{};
+    double roll_cmd{};
+};
+
+struct ControllerConfig {
+    double gravity{};
+    double max_thrust{};
+    double target_x{};
+    double target_y{};
+    double landing_radius{};
+    double map_height{};
+    std::atomic<double>* targetZ{};
+};
+
+struct SharedState {
+    State latest{};
+    bool hasUpdate = false;
+    bool running = true;
+    std::mutex mtx;
+    std::condition_variable cv;
+};
+
+constexpr double PI = 3.14159265358979323846;
+constexpr double TWO_PI = 2.0 * PI;
+
+double wrapAngle(double angle) {
+    return std::remainder(angle, TWO_PI);
+}
+
+double clampUnit(double value) {
+    if (value > 1.0) return 1.0;
+    if (value < -1.0) return -1.0;
+    return value;
+}
+
+void terrainSampler(const std::string path,
+                    int width,
+                    int depth,
+                    double target_x,
+                    double target_y,
+                    std::atomic<double>& landingZ) {
+    if (path.empty() || width <= 0 || depth <= 0) {
+        return;
+    }
+    std::ifstream file(path, std::ios::binary);
+    if (!file) {
+        return;
+    }
+
+    auto readColumn = [&](int x, int y, uint16_t& a, uint16_t& b, uint16_t& c) -> bool {
+        if (x < 0 || x >= width || y < 0 || y >= depth) return false;
+        uint64_t idx = static_cast<uint64_t>(x) * static_cast<uint64_t>(depth) + static_cast<uint64_t>(y);
+        uint64_t offset = idx * 6ull;
+        file.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+        if (!file.read(reinterpret_cast<char*>(&a), sizeof(uint16_t))) return false;
+        if (!file.read(reinterpret_cast<char*>(&b), sizeof(uint16_t))) return false;
+        if (!file.read(reinterpret_cast<char*>(&c), sizeof(uint16_t))) return false;
+        return true;
+    };
+
+    int tx = static_cast<int>(std::llround(target_x));
+    int ty = static_cast<int>(std::llround(target_y));
+    tx = std::clamp(tx, 0, width - 1);
+    ty = std::clamp(ty, 0, depth - 1);
+
+    const int radius = 4;
+    double groundSum = 0.0;
+    int count = 0;
+
+    for (int dx = -radius; dx <= radius; ++dx) {
+        int cx = tx + dx;
+        if (cx < 0 || cx >= width) continue;
+        for (int dy = -radius; dy <= radius; ++dy) {
+            int cy = ty + dy;
+            if (cy < 0 || cy >= depth) continue;
+            uint16_t a, b, c;
+            if (!readColumn(cx, cy, a, b, c)) continue;
+            groundSum += static_cast<double>(a);
+            ++count;
+        }
+    }
+
+    if (count > 0) {
+        double avgGround = groundSum / static_cast<double>(count);
+        double current = landingZ.load(std::memory_order_relaxed);
+        double adjusted = std::max(current, avgGround + 0.5);
+        landingZ.store(adjusted, std::memory_order_relaxed);
+    }
+}
+
+Command computeCommand(const State& s, const ControllerConfig& cfg) {
+    Command cmd{};
+    double target_z = cfg.targetZ->load(std::memory_order_relaxed);
+
+    double rel_x = s.x - cfg.target_x;
+    double rel_y = s.y - cfg.target_y;
+    double rel_z = s.z - target_z;
+    double dist_xy = std::hypot(rel_x, rel_y);
+
+    double landing_radius = cfg.landing_radius;
+    double near_ratio = 0.0;
+    double denom = landing_radius * 2.0 + 1.0;
+    if (denom > 0.0) {
+        double ratio = dist_xy / denom;
+        near_ratio = std::clamp(1.0 - ratio, 0.0, 1.0);
+    }
+
+    double k_pos_xy = 0.004 + 0.004 * near_ratio;
+    double k_vel_xy = 0.30 + 0.35 * near_ratio;
+
+    double a_x = -k_pos_xy * rel_x - k_vel_xy * s.vx;
+    double a_y = -k_pos_xy * rel_y - k_vel_xy * s.vy;
+
+    if (dist_xy < landing_radius * 1.5 + 1.0) {
+        double extra = 0.2 + 0.8 * near_ratio;
+        a_x -= extra * s.vx;
+        a_y -= extra * s.vy;
+    }
+
+    double max_xy_acc = std::max(cfg.max_thrust * 0.65, 1.0);
+    double horiz_mag = std::hypot(a_x, a_y);
+    if (horiz_mag > max_xy_acc) {
+        double scale = max_xy_acc / (horiz_mag + 1e-9);
+        a_x *= scale;
+        a_y *= scale;
+    }
+
+    double z_goal;
+    if (dist_xy > landing_radius * 5.0) {
+        z_goal = target_z + std::min(std::max(35.0, dist_xy * 0.18), 150.0);
+    } else if (dist_xy > landing_radius * 2.0) {
+        z_goal = target_z + std::max(12.0, dist_xy * 0.09);
+    } else if (dist_xy > landing_radius) {
+        z_goal = target_z + 4.0;
+    } else {
+        z_goal = target_z;
+    }
+    z_goal = std::min(z_goal, cfg.map_height - 2.0);
+
+    double err_z = z_goal - s.z;
+    double k_pos_z = (rel_z > 60.0) ? 0.02 : 0.05;
+    double k_vel_z = (rel_z > 60.0) ? 0.40 : 0.85;
+    double a_z = k_pos_z * err_z - k_vel_z * s.vz;
+
+    double desired_vz;
+    if (rel_z > 60.0) {
+        desired_vz = -std::min(18.0, 0.09 * (rel_z - 30.0));
+    } else if (rel_z > 20.0) {
+        desired_vz = -std::min(8.0, 0.25 * (rel_z - 10.0));
+    } else if (rel_z > 5.0) {
+        desired_vz = -std::min(4.0, 0.45 * (rel_z - 3.0));
+    } else {
+        desired_vz = -std::min(2.0, 0.8 * rel_z + 0.3);
+    }
+
+    if (rel_z < 0.0) {
+        desired_vz = std::min(3.0, -0.45 * rel_z);
+    }
+
+    if (dist_xy < landing_radius * 1.2) {
+        if (rel_z < 5.0) desired_vz = std::max(desired_vz, -1.5);
+        if (rel_z < 2.0) desired_vz = std::max(desired_vz, -0.8);
+        if (rel_z < 1.0) desired_vz = std::max(desired_vz, -0.4);
+    }
+
+    double k_vz = 0.55;
+    a_z += k_vz * (desired_vz - s.vz);
+
+    a_z = std::clamp(a_z, -cfg.gravity, cfg.max_thrust * 0.9);
+
+    double req_x = a_x;
+    double req_y = a_y;
+    double req_z = a_z + cfg.gravity;
+    if (req_z < 0.0) req_z = 0.0;
+
+    double maxThrust = std::max(cfg.max_thrust, 1.0);
+    double force = std::sqrt(req_x * req_x + req_y * req_y + req_z * req_z);
+    if (force > maxThrust) {
+        double scale = maxThrust / (force + 1e-9);
+        req_x *= scale;
+        req_y *= scale;
+        req_z *= scale;
+        force = maxThrust;
+    }
+
+    double thrust = (force > 1e-6) ? force / maxThrust : 0.0;
+    thrust = std::clamp(thrust, 0.0, 1.0);
+
+    double dir_x = 0.0, dir_y = 0.0, dir_z = 1.0;
+    if (force > 1e-6) {
+        dir_x = req_x / force;
+        dir_y = req_y / force;
+        dir_z = std::clamp(req_z / force, 0.0, 1.0);
+    }
+
+    double yaw_target = s.yaw;
+    double pitch_target = 0.0;
+    double dir_horiz = std::hypot(dir_x, dir_y);
+    if (dir_horiz > 1e-5) {
+        yaw_target = std::atan2(dir_y, dir_x);
+        double cos_yaw = std::cos(yaw_target);
+        double sin_yaw = std::sin(yaw_target);
+        double sin_pitch = -(dir_x * cos_yaw + dir_y * sin_yaw);
+        sin_pitch = std::clamp(sin_pitch, -1.0, 1.0);
+        pitch_target = std::atan2(sin_pitch, dir_z);
+    }
+
+    double pitch_error = wrapAngle(pitch_target - s.pitch);
+    double yaw_error = wrapAngle(yaw_target - s.yaw);
+
+    double kp_pitch_cmd = 1.8;
+    double kd_pitch_cmd = 0.55;
+    double kp_yaw_cmd = 1.4;
+    double kd_yaw_cmd = 0.50;
+    double k_roll = 0.25;
+    double k_roll_rate = 0.15;
+
+    cmd.pitch_cmd = clampUnit(kp_pitch_cmd * pitch_error - kd_pitch_cmd * s.pitch_rate);
+    cmd.yaw_cmd = clampUnit(kp_yaw_cmd * yaw_error - kd_yaw_cmd * s.yaw_rate);
+    cmd.roll_cmd = clampUnit(-k_roll * s.roll - k_roll_rate * s.roll_rate);
+    cmd.thrust = thrust;
+
+    return cmd;
+}
+
+void readerThread(SharedState* shared) {
+    State s;
+    while (true) {
+        if (!(std::cin >> s.x >> s.y >> s.z >>
+              s.vx >> s.vy >> s.vz >>
+              s.pitch >> s.yaw >> s.roll >>
+              s.pitch_rate >> s.yaw_rate >> s.roll_rate >>
+              s.fuel)) {
+            break;
+        }
+        {
+            std::lock_guard<std::mutex> lock(shared->mtx);
+            shared->latest = s;
+            shared->hasUpdate = true;
+        }
+        shared->cv.notify_one();
+    }
+    {
+        std::lock_guard<std::mutex> lock(shared->mtx);
+        shared->running = false;
+    }
+    shared->cv.notify_all();
+}
+
+int main() {
+    std::ios::sync_with_stdio(false);
+    std::cin.tie(nullptr);
+
+    double width_d, depth_d, height_d;
+    double gravity, max_thrust, fuel;
+    if (!(std::cin >> width_d >> depth_d >> height_d >> gravity >> max_thrust >> fuel)) {
+        return 0;
+    }
+
+    double start_x, start_y, start_z;
+    double target_x, target_y, target_z;
+    if (!(std::cin >> start_x >> start_y >> start_z >> target_x >> target_y >> target_z)) {
+        return 0;
+    }
+
+    std::string terrainPath;
+    std::getline(std::cin >> std::ws, terrainPath);
+
+    std::string marker;
+    if (!(std::cin >> marker)) {
+        return 0;
+    }
+    // Expect marker == "STATE", but continue regardless.
+
+    int width = static_cast<int>(std::llround(width_d));
+    int depth = static_cast<int>(std::llround(depth_d));
+
+    double landing_radius = std::max(5.0, std::min(width_d, depth_d) * 0.02);
+
+    std::atomic<double> targetZAtomic(target_z);
+
+    if (!terrainPath.empty()) {
+        std::thread sampler(terrainSampler, terrainPath, width, depth,
+                            target_x, target_y, std::ref(targetZAtomic));
+        sampler.detach();
+    }
+
+    SharedState shared;
+    std::thread reader(readerThread, &shared);
+
+    ControllerConfig cfg;
+    cfg.gravity = gravity;
+    cfg.max_thrust = max_thrust;
+    cfg.target_x = target_x;
+    cfg.target_y = target_y;
+    cfg.landing_radius = landing_radius;
+    cfg.map_height = height_d;
+    cfg.targetZ = &targetZAtomic;
+
+    std::cout.setf(std::ios::fixed);
+    std::cout << std::setprecision(6);
+
+    while (true) {
+        State current;
+        {
+            std::unique_lock<std::mutex> lock(shared.mtx);
+            shared.cv.wait(lock, [&]() {
+                return shared.hasUpdate || !shared.running;
+            });
+            if (!shared.hasUpdate && !shared.running) {
+                break;
+            }
+            current = shared.latest;
+            shared.hasUpdate = false;
+        }
+
+        Command cmd = computeCommand(current, cfg);
+        std::cout << cmd.thrust << ' '
+                  << cmd.pitch_cmd << ' '
+                  << cmd.yaw_cmd << ' '
+                  << cmd.roll_cmd << '\n';
+        std::cout.flush();
+    }
+
+    if (reader.joinable()) {
+        reader.join();
+    }
+
+    return 0;
+}
+```

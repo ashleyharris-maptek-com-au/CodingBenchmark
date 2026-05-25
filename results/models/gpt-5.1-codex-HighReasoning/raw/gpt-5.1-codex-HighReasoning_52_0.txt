@@ -1,1 +1,384 @@
-{'__exception__': "Can't run here - we're trying to get this working in codex."}
+```python
+import math
+
+_LANE_WIDTH = 3.7  # meters between lane centers
+
+_memory = {
+    "speed_kmh": 0.0,
+    "lane_offset": 0.0,
+    "speed_integral": 0.0,
+    "speed_limit_kmh": None,
+    "obstacle_distance": 250.0,
+    "yaw_rate_dps": 0.0,
+    "curvature": 0.0,
+    "desired_offset": 0.0,
+    "current_lane": 1.0,
+    "last_outputs": {"steering": 0.0, "throttle": 0.0, "brake": 0.0},
+}
+
+
+def _is_number(val):
+    return isinstance(val, (int, float)) and not isinstance(val, bool) and math.isfinite(val)
+
+
+def _median(values):
+    if not values:
+        return None
+    values = sorted(values)
+    n = len(values)
+    mid = n // 2
+    if n % 2:
+        return values[mid]
+    return 0.5 * (values[mid - 1] + values[mid])
+
+
+def _lowpass(previous, measurement, alpha):
+    if measurement is None:
+        return previous
+    if previous is None:
+        return measurement
+    alpha = max(0.0, min(1.0, alpha))
+    return previous + alpha * (measurement - previous)
+
+
+def autopilot_step(state: dict, dt: float) -> dict:
+    global _memory
+
+    dt_state = state.get("dt")
+    if _is_number(dt_state) and dt_state > 0:
+        dt = dt_state
+    elif not (_is_number(dt) and dt > 0):
+        dt = 0.1
+    dt = max(0.02, min(0.2, dt))
+
+    # --- Speed fusion -------------------------------------------------------
+    primary_speeds, backup_speeds = [], []
+
+    def consider_speed(value, valid=True):
+        if not _is_number(value):
+            return
+        if value < -5.0 or value > 300.0:
+            return
+        (primary_speeds if valid is not False else backup_speeds).append(value)
+
+    wheel_keys = [
+        ("wheel_speed_fl_kmh", "wheel_speed_fl_valid"),
+        ("wheel_speed_fr_kmh", "wheel_speed_fr_valid"),
+        ("wheel_speed_rl_kmh", "wheel_speed_rl_valid"),
+        ("wheel_speed_rr_kmh", "wheel_speed_rr_valid"),
+    ]
+    for key, vkey in wheel_keys:
+        consider_speed(state.get(key), state.get(vkey))
+
+    consider_speed(state.get("vehicle_speed_1_kmh"))
+    consider_speed(state.get("vehicle_speed_2_kmh"))
+    consider_speed(state.get("gps_1_speed_kmh"), state.get("gps_1_valid"))
+    consider_speed(state.get("gps_2_speed_kmh"), state.get("gps_2_valid"))
+
+    if primary_speeds:
+        speed_raw = _median(primary_speeds)
+    elif backup_speeds:
+        speed_raw = _median(backup_speeds)
+    else:
+        speed_raw = _memory.get("speed_kmh", 0.0)
+
+    speed_kmh = _lowpass(_memory.get("speed_kmh"), speed_raw, 0.35)
+    if speed_kmh is None:
+        speed_kmh = speed_raw if speed_raw is not None else 0.0
+    _memory["speed_kmh"] = speed_kmh
+    speed_mps = speed_kmh / 3.6
+
+    # --- Yaw rate & lateral acceleration ------------------------------------
+    yaw_primary, yaw_backup = [], []
+    for idx in range(1, 4):
+        val = state.get(f"gyro_{idx}_yaw_rate_dps")
+        if not _is_number(val) or abs(val) > 200:
+            continue
+        if state.get(f"gyro_{idx}_valid") is False:
+            yaw_backup.append(val)
+        else:
+            yaw_primary.append(val)
+    yaw = _median(yaw_primary) if yaw_primary else (
+        _median(yaw_backup) if yaw_backup else _memory.get("yaw_rate_dps", 0.0)
+    )
+    yaw = _lowpass(_memory.get("yaw_rate_dps"), yaw, 0.4)
+    if yaw is None:
+        yaw = 0.0
+    _memory["yaw_rate_dps"] = yaw
+    yaw_rate_rad = math.radians(yaw)
+
+    lat_acc_values = []
+    for idx in range(1, 4):
+        val = state.get(f"accel_{idx}_lateral_ms2")
+        if _is_number(val) and abs(val) < 15:
+            lat_acc_values.append(val)
+    lat_acc = _median(lat_acc_values)
+    if lat_acc is None:
+        lat_acc = 0.0
+
+    # --- Lane sensing -------------------------------------------------------
+    lane_primary, lane_backup = [], []
+    for idx in range(1, 4):
+        offset = state.get(f"vision_{idx}_lane_offset_m")
+        left = state.get(f"vision_{idx}_left_line_dist_m")
+        right = state.get(f"vision_{idx}_right_line_dist_m")
+        left_valid = state.get(f"vision_{idx}_left_line_valid")
+        right_valid = state.get(f"vision_{idx}_right_line_valid")
+        lane_valid = not (left_valid is False and right_valid is False)
+
+        candidate = None
+        if _is_number(offset) and abs(offset) <= _LANE_WIDTH * 2.5:
+            candidate = offset
+        elif (
+            _is_number(left)
+            and _is_number(right)
+            and 0.2 < left < 6.0
+            and 0.2 < right < 6.0
+        ):
+            candidate = left - (left + right) / 2.0
+
+        if candidate is not None:
+            (lane_primary if lane_valid else lane_backup).append(candidate)
+
+    if lane_primary:
+        lane_measure = _median(lane_primary)
+        lane_confidence = len(lane_primary)
+    elif lane_backup:
+        lane_measure = _median(lane_backup)
+        lane_confidence = max(1, len(lane_backup))
+    else:
+        lane_measure = None
+        lane_confidence = 0
+
+    prev_lane = _memory.get("lane_offset", 0.0)
+    if lane_measure is not None and abs(lane_measure - prev_lane) > _LANE_WIDTH * 2.5:
+        lane_measure = prev_lane
+    lane_offset = _lowpass(prev_lane, lane_measure, 0.3)
+    if lane_offset is None:
+        lane_offset = prev_lane
+    _memory["lane_offset"] = lane_offset
+
+    # --- Curvature ----------------------------------------------------------
+    curve_primary, curve_backup = [], []
+    for idx in range(1, 4):
+        curv = state.get(f"vision_{idx}_road_curvature_1pm")
+        if not _is_number(curv) or abs(curv) > 0.05:
+            continue
+        if state.get(f"vision_{idx}_left_line_valid") or state.get(f"vision_{idx}_right_line_valid"):
+            curve_primary.append(curv)
+        else:
+            curve_backup.append(curv)
+    if curve_primary:
+        curvature = _median(curve_primary)
+    elif curve_backup:
+        curvature = _median(curve_backup)
+    else:
+        curvature = _memory.get("curvature", 0.0)
+    curvature = _lowpass(_memory.get("curvature", 0.0), curvature, 0.4)
+    if curvature is None:
+        curvature = 0.0
+    _memory["curvature"] = curvature
+
+    # --- Lane targets -------------------------------------------------------
+    current_lane = state.get("current_lane")
+    if _is_number(current_lane):
+        current_lane = max(0.0, min(2.0, current_lane))
+        _memory["current_lane"] = current_lane
+    else:
+        current_lane = _memory.get("current_lane", 1.0)
+
+    target_lane = state.get("target_lane")
+    if _is_number(target_lane):
+        target_lane = max(0.0, min(2.0, target_lane))
+    else:
+        target_lane = current_lane
+
+    desired_offset_raw = max(-_LANE_WIDTH * 2, min(_LANE_WIDTH * 2, (current_lane - target_lane) * _LANE_WIDTH))
+    desired_offset = _lowpass(_memory.get("desired_offset", 0.0), desired_offset_raw, 0.4)
+    if desired_offset is None:
+        desired_offset = desired_offset_raw
+    _memory["desired_offset"] = desired_offset
+    lane_error = lane_offset - desired_offset
+
+    # --- Traction estimation -------------------------------------------------
+    mu = state.get("estimated_mu")
+    if not _is_number(mu):
+        mu = 0.9
+    mu = max(0.1, min(1.05, mu))
+    rain_raw = state.get("rain_sensor")
+    rain_level = None
+    if isinstance(rain_raw, (int, float)):
+        rain_level = rain_raw
+    elif rain_raw:
+        rain_level = 1.0
+    else:
+        rain_level = 0.0
+    if rain_level > 0.5:
+        mu = min(mu, 0.65)
+    temp = state.get("temperature_c")
+    if _is_number(temp):
+        if temp < -5:
+            mu = min(mu, 0.4)
+        elif temp < 2:
+            mu = min(mu, 0.6)
+
+    # --- Desired speed ------------------------------------------------------
+    target_speed = state.get("target_speed_kmh")
+    if not _is_number(target_speed):
+        target_speed = 100.0
+    target_speed = max(0.0, min(160.0, target_speed))
+    desired_speed = target_speed
+
+    speed_limits, speed_limits_backup = [], []
+    for idx in range(1, 4):
+        limit = state.get(f"vision_{idx}_speed_limit_kmh")
+        valid = state.get(f"vision_{idx}_speed_limit_valid")
+        if _is_number(limit) and 10 <= limit <= 160:
+            (speed_limits if valid is not False else speed_limits_backup).append(limit)
+    limit_value = None
+    if speed_limits:
+        limit_value = min(speed_limits)
+    elif speed_limits_backup:
+        limit_value = min(speed_limits_backup)
+    elif _memory.get("speed_limit_kmh") is not None:
+        limit_value = _memory["speed_limit_kmh"]
+    if limit_value is not None:
+        _memory["speed_limit_kmh"] = limit_value
+        desired_speed = min(desired_speed, limit_value + 2.0)
+
+    traction_cap = max(30.0, 150.0 * mu)
+    desired_speed = min(desired_speed, traction_cap)
+
+    curvature_abs = abs(curvature)
+    if curvature_abs > 1e-4:
+        max_lat_acc = max(2.5, 6.0 * mu)
+        curve_speed_mps = math.sqrt(max_lat_acc / curvature_abs)
+        curve_speed_kmh = max(15.0, min(180.0, curve_speed_mps * 3.6))
+        desired_speed = min(desired_speed, curve_speed_kmh)
+
+    # --- Obstacle fusion ----------------------------------------------------
+    obstacle_primary, obstacle_backup, rel_speeds = [], [], []
+    for idx in range(1, 4):
+        detected = state.get(f"vision_{idx}_obstacle_detected")
+        dist = state.get(f"vision_{idx}_obstacle_dist_m")
+        rel = state.get(f"vision_{idx}_obstacle_rel_speed_kmh")
+        valid = state.get(f"vision_{idx}_obstacle_valid")
+        if detected and _is_number(dist) and 0.5 < dist < 250:
+            (obstacle_primary if valid is not False else obstacle_backup).append(dist)
+            if _is_number(rel):
+                rel_speeds.append(rel)
+
+    lidar_angles = ["+005", "-005", "+015", "-015", "+030", "-030", "+045", "-045"]
+    for angle in lidar_angles:
+        dist = state.get(f"lidar_{angle}_deg_range_m")
+        valid = state.get(f"lidar_{angle}_deg_valid")
+        if _is_number(dist) and 0.5 < dist < 200:
+            (obstacle_primary if valid is not False else obstacle_backup).append(dist)
+
+    obs_list = obstacle_primary if obstacle_primary else obstacle_backup
+    obstacle_raw = min(obs_list) if obs_list else None
+    prev_obs = _memory.get("obstacle_distance", 250.0)
+    if obstacle_raw is None:
+        obstacle_distance = min(prev_obs + max(speed_mps * dt * 3.0, 1.0), 250.0)
+    else:
+        if prev_obs is None:
+            obstacle_distance = obstacle_raw
+        elif obstacle_raw > prev_obs + 15.0:
+            obstacle_distance = prev_obs + min(10.0, obstacle_raw - prev_obs)
+        else:
+            obstacle_distance = obstacle_raw
+    _memory["obstacle_distance"] = obstacle_distance
+
+    if rel_speeds:
+        rel_speed = _median(rel_speeds)
+        closing_speed_mps = abs(rel_speed) / 3.6
+    else:
+        closing_speed_mps = max(0.0, speed_mps - desired_speed / 3.6)
+    time_to_collision = obstacle_distance / closing_speed_mps if closing_speed_mps > 0.1 else float("inf")
+
+    obstacle_brake_demand = 0.0
+    emergency_brake = False
+    safe_distance = max(5.0, speed_mps * 1.5)
+
+    if obstacle_distance < 200:
+        max_decel = max(2.5, mu * 6.0)
+        safe_speed_mps = math.sqrt(max(0.0, 2.0 * max_decel * max(obstacle_distance - 2.0, 0.1)))
+        safe_speed_kmh = safe_speed_mps * 3.6
+        desired_speed = min(desired_speed, safe_speed_kmh)
+
+        if obstacle_distance < safe_distance:
+            obstacle_brake_demand = max(
+                obstacle_brake_demand,
+                min(1.0, (safe_distance - obstacle_distance) / safe_distance),
+            )
+        if time_to_collision < 3.0:
+            obstacle_brake_demand = max(
+                obstacle_brake_demand,
+                min(1.0, (3.0 - time_to_collision) / 3.0),
+            )
+        if obstacle_distance < 12.0:
+            emergency_brake = True
+            desired_speed = min(desired_speed, obstacle_distance * 1.5)
+        if obstacle_distance < 6.0:
+            obstacle_brake_demand = 1.0
+            desired_speed = 0.0
+
+    desired_speed = max(0.0, desired_speed)
+
+    # --- Longitudinal control -----------------------------------------------
+    speed_error_ms = (desired_speed - speed_kmh) / 3.6
+    speed_integral = _memory.get("speed_integral", 0.0) + speed_error_ms * dt
+    speed_integral = max(-5.0, min(5.0, speed_integral))
+    _memory["speed_integral"] = speed_integral
+
+    throttle_cmd = max(0.0, min(1.0, 0.5 * speed_error_ms + 0.05 * speed_integral))
+    max_throttle = min(1.0, 0.3 + 0.7 * mu)
+    throttle_cmd = min(throttle_cmd, max_throttle)
+
+    brake_cmd = 0.0
+    if speed_error_ms < -0.1:
+        brake_cmd = min(1.0, (-speed_error_ms) / 2.0)
+    brake_cmd = max(brake_cmd, obstacle_brake_demand)
+    if emergency_brake:
+        brake_cmd = max(brake_cmd, 0.85)
+    else:
+        brake_cmd = min(brake_cmd, 0.2 + 0.6 * mu)
+
+    if brake_cmd > 0.05:
+        throttle_cmd = 0.0
+    brake_cmd = max(0.0, min(1.0, brake_cmd))
+
+    # --- Lateral control ----------------------------------------------------
+    if lane_confidence >= 2:
+        lane_weight = 1.0
+    elif lane_confidence == 1:
+        lane_weight = 0.6
+    else:
+        lane_weight = 0.0
+
+    steer_lane = lane_weight * 0.45 * lane_error
+    steer_damping = -0.8 * yaw_rate_rad - 0.03 * lat_acc
+    steer_curvature = (
+        max(-0.4, min(0.4, curvature * (speed_kmh / 5.0))) if lane_weight > 0 else 0.0
+    )
+
+    if lane_weight == 0.0:
+        steering = max(-0.3, min(0.3, steer_damping))
+        steering += max(-0.2, min(0.2, 0.1 * (lane_offset - desired_offset)))
+    else:
+        steering = steer_lane + steer_damping + steer_curvature
+
+    speed_factor = max(0.2, min(1.0, speed_kmh / 130.0))
+    steering = max(-speed_factor, min(speed_factor, steering))
+    steering_limit = 0.4 + 0.6 * mu
+    steering = max(-steering_limit, min(steering_limit, steering))
+
+    # --- Output -------------------------------------------------------------
+    outputs = {
+        "steering": float(max(-1.0, min(1.0, steering))),
+        "throttle": float(max(0.0, min(1.0, throttle_cmd))),
+        "brake": float(max(0.0, min(1.0, brake_cmd))),
+    }
+    _memory["last_outputs"] = outputs
+    return outputs
+```

@@ -1,0 +1,217 @@
+import math
+
+# Persistent state for the autopilot
+class Autopilot:
+    def __init__(self):
+        self.prev_steering_error = 0.0
+        self.steering_integral = 0.0
+        self.prev_speed_error = 0.0
+        self.speed_integral = 0.0
+        self.last_valid_speed_ms = 0.0
+        self.last_valid_lane_offset = 0.0
+        self.last_valid_yaw_rate_dps = 0.0
+        self.initialized = False
+        
+    def get_median(self, values):
+        if not values:
+            return None
+        sorted_vals = sorted(values)
+        n = len(sorted_vals)
+        if n % 2 == 1:
+            return sorted_vals[n // 2]
+        else:
+            return (sorted_vals[n // 2 - 1] + sorted_vals[n // 2]) / 2.0
+
+    def get_robust_median(self, values, last_val, max_diff):
+        if not values:
+            return last_val
+        median = self.get_median(values)
+        if len(values) >= 3:
+            filtered = [v for v in values if abs(v - median) < max_diff]
+            if filtered:
+                return self.get_median(filtered)
+        return median
+
+    def fuse_speed(self, state):
+        speeds_kmh = []
+        # Wheel speeds
+        for wheel in ['fl', 'fr', 'rl', 'rr']:
+            if state.get(f'wheel_speed_{wheel}_valid') and state.get(f'wheel_speed_{wheel}_kmh') is not None:
+                speeds_kmh.append(state[f'wheel_speed_{wheel}_kmh'])
+        # GPS speeds
+        for i in [1, 2]:
+            if state.get(f'gps_{i}_valid') and state.get(f'gps_{i}_speed_kmh') is not None:
+                speeds_kmh.append(state[f'gps_{i}_speed_kmh'])
+        # Vehicle speed sensors
+        for i in [1, 2]:
+            if state.get(f'vehicle_speed_{i}_kmh') is not None:
+                speeds_kmh.append(state[f'vehicle_speed_{i}_kmh'])
+        
+        if not speeds_kmh:
+            return self.last_valid_speed_ms
+        
+        # Robust fusion for speed
+        median_kmh = self.get_robust_median(speeds_kmh, self.last_valid_speed_ms * 3.6, 30.0)
+        self.last_valid_speed_ms = median_kmh / 3.6
+        return self.last_valid_speed_ms
+
+    def fuse_lane_offset(self, state):
+        offsets = []
+        for i in [1, 2, 3]:
+            v_off = state.get(f'vision_{i}_lane_offset_m')
+            # Check if vision reports lane offset and at least one line is valid
+            if v_off is not None and (state.get(f'vision_{i}_left_line_valid') or state.get(f'vision_{i}_right_line_valid')):
+                offsets.append(v_off)
+            else:
+                # Fallback to deriving from line distances
+                l_dist = state.get(f'vision_{i}_left_line_dist_m')
+                r_dist = state.get(f'vision_{i}_right_line_dist_m')
+                if l_dist is not None and r_dist is not None and l_dist < 10 and r_dist < 10:
+                    offsets.append((l_dist - r_dist) / 2.0)
+        
+        if not offsets:
+            return self.last_valid_lane_offset
+        
+        median_off = self.get_robust_median(offsets, self.last_valid_lane_offset, 2.0)
+        self.last_valid_lane_offset = median_off
+        return median_off
+
+    def fuse_yaw_rate(self, state):
+        rates = []
+        for i in [1, 2, 3]:
+            if state.get(f'gyro_{i}_valid') and state.get(f'gyro_{i}_yaw_rate_dps') is not None:
+                rates.append(state[f'gyro_{i}_yaw_rate_dps'])
+        if not rates:
+            return self.last_valid_yaw_rate_dps
+        median_rate = self.get_robust_median(rates, self.last_valid_yaw_rate_dps, 15.0)
+        self.last_valid_yaw_rate_dps = median_rate
+        return median_rate
+
+    def get_obstacle_info(self, state):
+        min_dist = 250.0
+        rel_speed_ms = 0.0
+        detected = False
+        # Vision obstacle detection
+        for i in [1, 2, 3]:
+            if state.get(f'vision_{i}_obstacle_valid') and state.get(f'vision_{i}_obstacle_detected'):
+                dist = state[f'vision_{i}_obstacle_dist_m']
+                if dist is not None and dist < min_dist:
+                    min_dist = dist
+                    rel_speed_ms = state[f'vision_{i}_obstacle_rel_speed_kmh'] / 3.6
+                    detected = True
+        
+        # Lidar front beams for redundancy
+        for angle in ['+005', '-005', '+015', '-015']:
+            if state.get(f'lidar_{angle}_deg_valid'):
+                dist = state.get(f'lidar_{angle}_deg_range_m')
+                if dist is not None and dist < min_dist:
+                    min_dist = dist
+                    # Note: lidar doesn't provide relative speed directly in this state dict
+                    detected = True
+        return detected, min_dist, rel_speed_ms
+
+    def step(self, state, dt):
+        if dt <= 0: dt = 0.02
+        if not self.initialized:
+            self.initialized = True
+            
+        # 1. Sensor Fusion
+        speed_ms = self.fuse_speed(state)
+        lane_offset = self.fuse_lane_offset(state)
+        yaw_rate_dps = self.fuse_yaw_rate(state)
+        mu = state.get('estimated_mu', 1.0)
+        if mu <= 0: mu = 0.1 # Minimum mu to avoid div by zero
+        
+        # 2. Longitudinal Planning (Speed Control)
+        target_speed_kmh = state.get('target_speed_kmh', 100.0)
+        # Check vision speed limits
+        limits = []
+        for i in [1, 2, 3]:
+            if state.get(f'vision_{i}_speed_limit_valid') and state.get(f'vision_{i}_speed_limit_kmh') is not None:
+                limits.append(state[f'vision_{i}_speed_limit_kmh'])
+        if limits:
+            target_speed_kmh = min(target_speed_kmh, self.get_median(limits))
+            
+        # Traction management: reduce speed on slippery surfaces
+        if mu < 0.3: target_speed_kmh = min(target_speed_kmh, 40.0)
+        elif mu < 0.6: target_speed_kmh = min(target_speed_kmh, 70.0)
+        
+        target_speed_ms = target_speed_kmh / 3.6
+        
+        # Obstacle avoidance and adaptive cruise
+        obs_detected, obs_dist, obs_rel_speed = self.get_obstacle_info(state)
+        if obs_detected:
+            # Desired gap based on speed (approx 2.5 second rule)
+            safety_gap = max(10.0, speed_ms * 2.5) 
+            if obs_dist < safety_gap:
+                # Match speed of lead vehicle or slow down more if very close
+                lead_speed_ms = max(0.0, speed_ms + obs_rel_speed)
+                # Linear reduction factor based on distance
+                target_speed_ms = min(target_speed_ms, lead_speed_ms * (obs_dist / safety_gap)**0.5)
+                # Emergency braking if distance is critical
+                if obs_dist < max(5.0, speed_ms * 0.5):
+                    target_speed_ms = 0.0
+
+        # 3. Longitudinal Control (PI Controller)
+        speed_error = target_speed_ms - speed_ms
+        self.speed_integral += speed_error * dt
+        self.speed_integral = max(-15, min(15, self.speed_integral))
+        
+        # Scale gains by mu for stability
+        kp_s = 0.7 * mu
+        ki_s = 0.15 * mu
+        accel_cmd = kp_s * speed_error + ki_s * self.speed_integral
+        
+        throttle = 0.0
+        brake = 0.0
+        if accel_cmd > 0:
+            throttle = min(1.0, accel_cmd / (2.5 * mu)) # 2.5 m/s2 max accel on dry
+            brake = 0.0
+        else:
+            brake = min(1.0, -accel_cmd / (5.0 * mu)) # 5.0 m/s2 max decel on dry
+            throttle = 0.0
+            
+        # 4. Lateral Planning & Control (Lane Keeping & Changing)
+        current_lane = state.get('current_lane', 1)
+        target_lane = state.get('target_lane', 1)
+        lane_width = 3.5
+        
+        # Calculate offset target for lane changes
+        target_offset_rel = (target_lane - current_lane) * lane_width
+        steering_error = -(lane_offset - target_offset_rel)
+        
+        # Road Curvature Feed-Forward
+        curvatures = []
+        for i in [1, 2, 3]:
+            if state.get(f'vision_{i}_road_curvature_1pm') is not None:
+                curvatures.append(state[f'vision_{i}_road_curvature_1pm'])
+        avg_curv = self.get_median(curvatures) if curvatures else 0.0
+        # Steering angle approx L * curvature. L=2.8m. Max steering ~30 deg (0.52 rad)
+        ff_steering = (avg_curv * 2.8) / 0.52
+        
+        # Dynamic PD gains: reduce sensitivity at higher speeds for stability
+        v_ref = max(5.0, speed_ms)
+        kp_lat = 0.5 * mu * (18.0 / v_ref)
+        kd_lat = 0.3 * mu * (18.0 / v_ref)
+        
+        steering_derivative = (steering_error - self.prev_steering_error) / dt
+        self.prev_steering_error = steering_error
+        
+        steering = kp_lat * steering_error + kd_lat * steering_derivative + ff_steering
+        steering = max(-1.0, min(1.0, steering))
+        
+        return {
+            'steering': float(steering),
+            'throttle': float(throttle),
+            'brake': float(brake)
+        }
+
+# Global singleton instance for the autopilot logic
+_autopilot = Autopilot()
+
+def autopilot_step(state: dict, dt: float) -> dict:
+    """
+    Autopilot step function for self-driving car on multi-lane freeway.
+    Handles sensor fusion, lane keeping, speed control, and obstacle avoidance.
+    """
+    return _autopilot.step(state, dt)
