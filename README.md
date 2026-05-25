@@ -1,8 +1,22 @@
 # Ash's LLM Coding Benchmark
 
-A growing suite of **54 tests** that measure LLM ability to design algorithms, write systems code, and reason about performance constraints. The benchmark now spans classic algorithms, systems engineering, GPU compute, physics simulation, and shader authoring (GLSL/HLSL/SPIR-V).
+A suite of **65 tests** that measure LLM ability to design algorithms, write systems code, and reason about performance constraints. The benchmark spans classic algorithms, systems engineering, GPU compute, physics simulation, game playing, and shaders.
 
-Live report example: <https://ashleyharris-maptek-com-au.github.io/CodingBenchmark/results/gpt-5-mini.html>
+Tested languages include:
+
+- Python.
+- C++
+- C#
+- JavaScript
+- TypeScript
+- SPIRV
+- GLSL
+- HLSL
+- Rust
+
+Live report example: <https://ashleyharris-maptek-com-au.github.io/CodingBenchmark/results/index.html>
+
+![Top Level Results](https://ashleyharris-maptek-com-au.github.io/CodingBenchmark/results/topLevelResults.png)
 
 ## What this benchmark covers
 
@@ -10,7 +24,7 @@ Live report example: <https://ashleyharris-maptek-com-au.github.io/CodingBenchma
 - NP-hard heuristics and approximation strategies
 - Robustness and input handling for large files/streams
 - Numerical simulation correctness (physics, fluids, orbital mechanics)
-- GPU compute and shader authoring (GLSL/HLSL/SPIR-V)
+- GPU compute and shader authoring
 - Visualization and report generation for interpretability
 
 Each test defines its own prompt, input generation, scoring, and report visualization. Many tests include multiple **subpasses** to stress scaling behavior.
@@ -22,7 +36,7 @@ Each test defines its own prompt, input generation, scoring, and report visualiz
 - `placebo_data/` - baseline implementations ("Human with tools")
 - `results/` - HTML reports and run artifacts
 - `visualization_utils.py` - shared rendering helpers for reports
-- `1.py` ... `54.py` - individual tests
+- `1.py` ... `65.py` - individual tests
 
 ## Installation
 
@@ -33,7 +47,7 @@ pip install -r requirements.txt
 
 ## Usage
 
-Run the benchmark via `CodingBenchmark.py` (the CLI has evolved from the original single-test script).
+Run the benchmark via `CodingBenchmark.py`
 
 ```bash
 # Run all tests on all models
@@ -88,11 +102,11 @@ Outputs are written to `results/`, and model-specific reports are saved under `r
 
 The benchmark includes multiple baseline behaviors to control against in `placebo_data/`:
 
-- naive
-- naive-optimised
-- best-published
-- random
-- human
+- naive (The most basic algorithm one could write to solve the problem)
+- naive-optimised (as above - but SIMD / threading / other optimisations)
+- best-published (Trying to use existing projects or research papers)
+- random (Just generating random code)
+- human (Hand written solutions by me, time permitting.)
 
 These are used for sanity checks and to provide a reference for LLM performance. Consider these a work in progress at the moment.
 
