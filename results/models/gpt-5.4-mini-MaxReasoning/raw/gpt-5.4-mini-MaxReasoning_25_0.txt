@@ -1,0 +1,1153 @@
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+
+public static class Program
+{
+    private const double G = 6.67430e-11;
+    private const double DaySeconds = 86400.0;
+    private const double ImpactMissTolerance = 1_000_000.0; // 1000 km
+
+    public static void Main()
+    {
+        var fs = new FastScanner(Console.OpenStandardInput());
+        if (!fs.HasMore())
+        {
+            return;
+        }
+
+        int numBodies = fs.NextInt();
+        double warningDays = fs.NextDouble();
+        double impactorMass = fs.NextDouble();
+        double deltaVBudget = fs.NextDouble();
+        double asteroidMass = fs.NextDouble();
+        double t0UnixUtc = fs.NextDouble(); // Unused; scenario already starts at t=0.
+
+        var bodies = new List<Body>(numBodies);
+        int sunIdx = -1;
+        int earthIdx = -1;
+        int asteroidIdx = -1;
+        int moonIdx = -1;
+
+        for (int i = 0; i < numBodies; i++)
+        {
+            string name = fs.Next();
+            double mass = fs.NextDouble();
+            var pos = new Vec3(fs.NextDouble(), fs.NextDouble(), fs.NextDouble());
+            var vel = new Vec3(fs.NextDouble(), fs.NextDouble(), fs.NextDouble());
+            bodies.Add(new Body(name, mass, pos, vel));
+
+            if (name.Equals("Sun", StringComparison.OrdinalIgnoreCase))
+                sunIdx = i;
+            if (name.Equals("Earth", StringComparison.OrdinalIgnoreCase))
+                earthIdx = i;
+            if (name.Equals("Asteroid", StringComparison.OrdinalIgnoreCase))
+                asteroidIdx = i;
+            if (name.Equals("Moon", StringComparison.OrdinalIgnoreCase))
+                moonIdx = i;
+        }
+
+        if (fs.HasMore())
+        {
+            _ = fs.Next(); // bsp path, unused in this solver
+        }
+
+        if (sunIdx < 0)
+        {
+            sunIdx = 0;
+            double maxMass = bodies[0].Mass;
+            for (int i = 1; i < bodies.Count; i++)
+            {
+                if (bodies[i].Mass > maxMass)
+                {
+                    maxMass = bodies[i].Mass;
+                    sunIdx = i;
+                }
+            }
+        }
+        if (earthIdx < 0)
+            earthIdx = FindByName(bodies, "Earth", 0);
+        if (asteroidIdx < 0)
+            asteroidIdx = FindByName(bodies, "Asteroid", 0);
+        if (moonIdx < 0)
+            moonIdx = FindByName(bodies, "Moon", -1);
+
+        var eph = new Ephemeris(bodies.ToArray(), warningDays);
+        var planner = new MissionPlanner(
+            eph,
+            bodies.ToArray(),
+            sunIdx,
+            earthIdx,
+            asteroidIdx,
+            moonIdx,
+            warningDays,
+            impactorMass,
+            deltaVBudget,
+            asteroidMass);
+
+        MissionPlan plan = planner.Solve();
+
+        Console.WriteLine(plan.Burns.Count);
+        foreach (var burn in plan.Burns)
+        {
+            Console.WriteLine(string.Format(CultureInfo.InvariantCulture,
+                "{0:G17} {1:G17} {2:G17} {3:G17}",
+                burn.TimeDays, burn.Dv.X, burn.Dv.Y, burn.Dv.Z));
+        }
+
+        Console.WriteLine(string.Format(CultureInfo.InvariantCulture,
+            "{0:G17} {1:G17} {2:G17} {3:G17}",
+            plan.ImpactTimeDays, plan.ImpactRelativeVelocity.X, plan.ImpactRelativeVelocity.Y, plan.ImpactRelativeVelocity.Z));
+    }
+
+    private static int FindByName(IReadOnlyList<Body> bodies, string name, int fallback)
+    {
+        for (int i = 0; i < bodies.Count; i++)
+        {
+            if (bodies[i].Name.Equals(name, StringComparison.OrdinalIgnoreCase))
+                return i;
+        }
+        return fallback >= 0 ? fallback : 0;
+    }
+
+    private static Vec3 ClampVec(Vec3 v, double maxMag)
+    {
+        double m = v.Norm();
+        if (m <= maxMag || m <= 0.0)
+            return v;
+        return v * (maxMag / m);
+    }
+
+    private static bool IsFinite(Vec3 v)
+    {
+        return double.IsFinite(v.X) && double.IsFinite(v.Y) && double.IsFinite(v.Z);
+    }
+
+    private sealed class MissionPlanner
+    {
+        private readonly Ephemeris _eph;
+        private readonly Body[] _bodies;
+        private readonly int _sunIdx;
+        private readonly int _earthIdx;
+        private readonly int _asteroidIdx;
+        private readonly int _moonIdx;
+        private readonly double _warningDays;
+        private readonly double _warningSec;
+        private readonly double _impactorMass;
+        private readonly double _budget;
+        private readonly double _asteroidMass;
+        private readonly double _muCentral;
+        private readonly bool[] _excludedForTestParticle;
+        private readonly double _impactScale;
+
+        public MissionPlanner(Ephemeris eph, Body[] bodies, int sunIdx, int earthIdx, int asteroidIdx, int moonIdx,
+            double warningDays, double impactorMass, double budget, double asteroidMass)
+        {
+            _eph = eph;
+            _bodies = bodies;
+            _sunIdx = sunIdx;
+            _earthIdx = earthIdx;
+            _asteroidIdx = asteroidIdx;
+            _moonIdx = moonIdx;
+            _warningDays = warningDays;
+            _warningSec = warningDays * DaySeconds;
+            _impactorMass = impactorMass;
+            _budget = budget;
+            _asteroidMass = asteroidMass;
+            _muCentral = G * bodies[sunIdx].Mass;
+            _impactScale = impactorMass / (asteroidMass + impactorMass);
+
+            _excludedForTestParticle = new bool[bodies.Length];
+            if (earthIdx >= 0) _excludedForTestParticle[earthIdx] = true;
+            if (asteroidIdx >= 0) _excludedForTestParticle[asteroidIdx] = true;
+            if (moonIdx >= 0) _excludedForTestParticle[moonIdx] = true;
+        }
+
+        public MissionPlan Solve()
+        {
+            var coarse = SearchCandidates();
+
+            // Try the best few by coarse score and the lowest-burn few, then pick the best detailed result.
+            var selected = SelectCandidatesForDetail(coarse, 12, 8);
+
+            MissionResult best = null;
+            foreach (var cand in selected)
+            {
+                var direct = EvaluateVariant(cand, useCorrection: false);
+                var corrected = EvaluateVariant(cand, useCorrection: true);
+
+                var winner = ChooseBetterVariant(direct, corrected);
+                if (winner == null)
+                    continue;
+
+                if (best == null || CompareResults(winner, best) > 0)
+                    best = winner;
+            }
+
+            if (best == null)
+            {
+                // Fallback: take the best coarse candidate and build the simplest possible plan.
+                var fallback = coarse.Count > 0 ? coarse[0] : null;
+                if (fallback == null)
+                {
+                    return new MissionPlan
+                    {
+                        Burns = new List<Burn>(),
+                        ImpactTimeDays = _warningDays,
+                        ImpactRelativeVelocity = new Vec3()
+                    };
+                }
+                best = EvaluateVariant(fallback, useCorrection: false) ?? new MissionResult
+                {
+                    Burns = new List<Burn>(),
+                    ImpactTimeDays = fallback.ImpactDays,
+                    ImpactRelativeVelocity = new Vec3(),
+                    TotalBurn = 0.0,
+                    Feasible = false,
+                    EarthMiss = 0.0,
+                    ImpactMiss = double.PositiveInfinity
+                };
+            }
+
+            return new MissionPlan
+            {
+                Burns = best.Burns,
+                ImpactTimeDays = best.ImpactTimeDays,
+                ImpactRelativeVelocity = best.ImpactRelativeVelocity
+            };
+        }
+
+        private List<CoarseCandidate> SearchCandidates()
+        {
+            var candidates = new List<CoarseCandidate>();
+            double minFlightDays = Math.Max(0.05, Math.Min(1.0, _warningDays * 0.02));
+            double latestLaunchDays = Math.Max(0.0, _warningDays - minFlightDays);
+            int launchCount = ClampInt((int)Math.Round(_warningDays / 20.0) + 20, 20, 80);
+            int impactCount = 25;
+
+            for (int li = 0; li < launchCount; li++)
+            {
+                double launchDays = launchCount == 1 ? 0.0 : latestLaunchDays * li / (launchCount - 1);
+                double impactStart = launchDays + minFlightDays;
+                double impactEnd = _warningDays - 1e-4;
+                if (impactStart >= impactEnd)
+                    continue;
+
+                for (int ii = 0; ii < impactCount; ii++)
+                {
+                    double impactDays = impactCount == 1 ? impactStart : impactStart + (impactEnd - impactStart) * ii / (impactCount - 1);
+                    if (impactDays <= launchDays)
+                        continue;
+
+                    TryAddCandidate(candidates, launchDays, impactDays, false);
+                    TryAddCandidate(candidates, launchDays, impactDays, true);
+                }
+            }
+
+            candidates.Sort((a, b) =>
+            {
+                int cmp = b.Score.CompareTo(a.Score);
+                if (cmp != 0) return cmp;
+                cmp = a.LaunchBurn.CompareTo(b.LaunchBurn);
+                if (cmp != 0) return cmp;
+                cmp = a.LaunchDays.CompareTo(b.LaunchDays);
+                if (cmp != 0) return cmp;
+                cmp = a.ImpactDays.CompareTo(b.ImpactDays);
+                if (cmp != 0) return cmp;
+                return a.LongWay ? 1 : -1;
+            });
+
+            return candidates;
+        }
+
+        private void TryAddCandidate(List<CoarseCandidate> candidates, double launchDays, double impactDays, bool longWay)
+        {
+            double launchSec = launchDays * DaySeconds;
+            double impactSec = impactDays * DaySeconds;
+            double dtSec = impactSec - launchSec;
+            if (dtSec <= 0.0)
+                return;
+
+            State earthL = _eph.GetState(_earthIdx, launchSec);
+            State sunL = _eph.GetState(_sunIdx, launchSec);
+            State asteroidI = _eph.GetState(_asteroidIdx, impactSec);
+            State sunI = _eph.GetState(_sunIdx, impactSec);
+
+            Vec3 r1 = earthL.R - sunL.R;
+            Vec3 v1 = earthL.V - sunL.V;
+            Vec3 r2 = asteroidI.R - sunI.R;
+            Vec3 v2 = asteroidI.V - sunI.V;
+
+            if (!KeplerSolver.TrySolveLambert(r1, r2, dtSec, _muCentral, longWay, out Vec3 vDep, out Vec3 vArr))
+                return;
+
+            Vec3 dvLaunch = vDep - v1;
+            double launchBurn = dvLaunch.Norm();
+            if (!double.IsFinite(launchBurn))
+                return;
+
+            Vec3 relImpact = vArr - v2;
+            Vec3 asteroidVelAfterImpact = v2 + _impactScale * relImpact;
+            double postDtSec = _warningSec - impactSec;
+            if (postDtSec < 0.0)
+                return;
+
+            Vec3 asteroidAfter = KeplerSolver.Propagate(r2, asteroidVelAfterImpact, postDtSec, _muCentral, out _);
+            State earthWarn = _eph.GetState(_earthIdx, _warningSec);
+            double miss = (asteroidAfter - earthWarn.R).Norm();
+            if (!double.IsFinite(miss))
+                return;
+
+            candidates.Add(new CoarseCandidate
+            {
+                LaunchDays = launchDays,
+                ImpactDays = impactDays,
+                LongWay = longWay,
+                LaunchBurn = launchBurn,
+                Score = miss
+            });
+        }
+
+        private List<CoarseCandidate> SelectCandidatesForDetail(List<CoarseCandidate> coarse, int topByScore, int topByBurn)
+        {
+            var selected = new List<CoarseCandidate>();
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+
+            int countScore = Math.Min(topByScore, coarse.Count);
+            for (int i = 0; i < countScore; i++)
+            {
+                AddUnique(selected, seen, coarse[i]);
+            }
+
+            var byBurn = new List<CoarseCandidate>(coarse);
+            byBurn.Sort((a, b) =>
+            {
+                int cmp = a.LaunchBurn.CompareTo(b.LaunchBurn);
+                if (cmp != 0) return cmp;
+                return b.Score.CompareTo(a.Score);
+            });
+            int countBurn = Math.Min(topByBurn, byBurn.Count);
+            for (int i = 0; i < countBurn; i++)
+            {
+                AddUnique(selected, seen, byBurn[i]);
+            }
+
+            return selected;
+        }
+
+        private static void AddUnique(List<CoarseCandidate> list, HashSet<string> seen, CoarseCandidate c)
+        {
+            string key = c.LaunchDays.ToString("G17", CultureInfo.InvariantCulture) + "|" +
+                         c.ImpactDays.ToString("G17", CultureInfo.InvariantCulture) + "|" +
+                         (c.LongWay ? "1" : "0");
+            if (seen.Add(key))
+                list.Add(c);
+        }
+
+        private MissionResult ChooseBetterVariant(MissionResult a, MissionResult b)
+        {
+            if (a == null) return b;
+            if (b == null) return a;
+            int cmp = CompareResults(a, b);
+            return cmp >= 0 ? a : b;
+        }
+
+        private int CompareResults(MissionResult a, MissionResult b)
+        {
+            // Feasible results dominate infeasible ones.
+            if (a.Feasible != b.Feasible)
+                return a.Feasible ? 1 : -1;
+
+            int cmp = a.EarthMiss.CompareTo(b.EarthMiss);
+            if (cmp != 0) return cmp;
+
+            cmp = b.ImpactMiss.CompareTo(a.ImpactMiss); // smaller impact miss is better
+            if (cmp != 0) return cmp;
+
+            cmp = b.TotalBurn.CompareTo(a.TotalBurn); // smaller burn is better
+            if (cmp != 0) return cmp;
+
+            cmp = a.Burns.Count.CompareTo(b.Burns.Count); // fewer burns is better when all else equal
+            if (cmp != 0) return -cmp;
+
+            return 0;
+        }
+
+        private MissionResult EvaluateVariant(CoarseCandidate cand, bool useCorrection)
+        {
+            double launchSec = cand.LaunchDays * DaySeconds;
+            double impactSec = cand.ImpactDays * DaySeconds;
+            double dtSec = impactSec - launchSec;
+            if (dtSec <= 0.0)
+                return null;
+
+            State earthL = _eph.GetState(_earthIdx, launchSec);
+            State sunL = _eph.GetState(_sunIdx, launchSec);
+            State asteroidI = _eph.GetState(_asteroidIdx, impactSec);
+            State sunI = _eph.GetState(_sunIdx, impactSec);
+
+            Vec3 r1 = earthL.R - sunL.R;
+            Vec3 v1 = earthL.V - sunL.V;
+            Vec3 r2 = asteroidI.R - sunI.R;
+            Vec3 v2 = asteroidI.V - sunI.V;
+
+            if (!KeplerSolver.TrySolveLambert(r1, r2, dtSec, _muCentral, cand.LongWay, out Vec3 vDep, out Vec3 vArr))
+                return null;
+
+            Vec3 dvLaunch = vDep - v1;
+            double launchBurn = dvLaunch.Norm();
+            if (!double.IsFinite(launchBurn))
+                return null;
+
+            var burns = new List<Burn>();
+            burns.Add(new Burn { TimeDays = cand.LaunchDays, Dv = dvLaunch });
+
+            // Direct trajectory first.
+            State spacecraft0 = new State(earthL.R, earthL.V + dvLaunch);
+            double stepDays = Math.Clamp(dtSec / DaySeconds / 400.0, 0.02, 0.25);
+            State scAtImpactDirect = PropagateTestParticle(spacecraft0, launchSec, impactSec, stepDays, out _, null);
+            double directImpactMiss = (scAtImpactDirect.R - asteroidI.R).Norm();
+            Vec3 directRelImpactVel = scAtImpactDirect.V - asteroidI.V;
+            double directTotalBurn = launchBurn;
+            bool directFeasible = directTotalBurn <= _budget + 1e-6 && directImpactMiss <= ImpactMissTolerance;
+            double directEarthMiss = ComputeEarthMissAfterImpact(asteroidI, impactSec, directRelImpactVel);
+
+            MissionResult directResult = new MissionResult
+            {
+                Burns = new List<Burn>(burns),
+                ImpactTimeDays = cand.ImpactDays,
+                ImpactRelativeVelocity = directRelImpactVel,
+                LaunchBurn = launchBurn,
+                CorrectionBurn = 0.0,
+                TotalBurn = directTotalBurn,
+                ImpactMiss = directImpactMiss,
+                EarthMiss = directEarthMiss,
+                Feasible = directFeasible
+            };
+
+            if (!useCorrection)
+                return directResult;
+
+            // One mid-course correction near the end of flight.
+            double frac = dtSec / DaySeconds > 365.0 ? 0.90 : (dtSec / DaySeconds > 30.0 ? 0.85 : 0.75);
+            double corrSec = launchSec + frac * dtSec;
+            if (corrSec >= impactSec - 1.0)
+                corrSec = launchSec + 0.5 * dtSec;
+            if (corrSec <= launchSec + 1.0)
+            {
+                // Not enough room for a useful correction.
+                return directResult;
+            }
+
+            State scAtCorr = PropagateTestParticle(spacecraft0, launchSec, corrSec, stepDays, out _, null);
+            State sunC = _eph.GetState(_sunIdx, corrSec);
+            Vec3 rc = scAtCorr.R - sunC.R;
+            Vec3 vc = scAtCorr.V - sunC.V;
+            Vec3 rTarget = asteroidI.R - sunI.R;
+
+            double remSec = impactSec - corrSec;
+            if (remSec <= 0.0)
+                return directResult;
+
+            if (!KeplerSolver.TrySolveLambert(rc, rTarget, remSec, _muCentral, false, out Vec3 vDep2, out Vec3 vArr2))
+            {
+                // Try the long-way branch if the short way fails.
+                if (!KeplerSolver.TrySolveLambert(rc, rTarget, remSec, _muCentral, true, out vDep2, out vArr2))
+                    return directResult;
+            }
+
+            Vec3 dvCorr = vDep2 - vc;
+            double corrBurn = dvCorr.Norm();
+            if (!double.IsFinite(corrBurn))
+                return directResult;
+
+            State scAtCorrBurn = new State(scAtCorr.R, scAtCorr.V + dvCorr);
+            State scAtImpactCorr = PropagateTestParticle(scAtCorrBurn, corrSec, impactSec, stepDays, out _, null);
+            double corrImpactMiss = (scAtImpactCorr.R - asteroidI.R).Norm();
+            Vec3 corrRelImpactVel = scAtImpactCorr.V - asteroidI.V;
+            double totalBurn = launchBurn + corrBurn;
+            bool feasible = totalBurn <= _budget + 1e-6 && corrImpactMiss <= ImpactMissTolerance;
+            double earthMiss = ComputeEarthMissAfterImpact(asteroidI, impactSec, corrRelImpactVel);
+
+            return new MissionResult
+            {
+                Burns = new List<Burn> { new Burn { TimeDays = cand.LaunchDays, Dv = dvLaunch }, new Burn { TimeDays = corrSec / DaySeconds, Dv = dvCorr } },
+                ImpactTimeDays = cand.ImpactDays,
+                ImpactRelativeVelocity = corrRelImpactVel,
+                LaunchBurn = launchBurn,
+                CorrectionBurn = corrBurn,
+                TotalBurn = totalBurn,
+                ImpactMiss = corrImpactMiss,
+                EarthMiss = earthMiss,
+                Feasible = feasible
+            };
+        }
+
+        private double ComputeEarthMissAfterImpact(State asteroidImpact, double impactSec, Vec3 impactRelVelocity)
+        {
+            State earthWarn = _eph.GetState(_earthIdx, _warningSec);
+            Vec3 asteroidNewVel = asteroidImpact.V + _impactScale * impactRelVelocity;
+            double postDtSec = _warningSec - impactSec;
+            if (postDtSec <= 0.0)
+                return (asteroidImpact.R - earthWarn.R).Norm();
+
+            double stepDays = Math.Clamp(postDtSec / DaySeconds / 400.0, 0.02, 0.25);
+            State asteroidStart = new State(asteroidImpact.R, asteroidNewVel);
+            State asteroidEnd = PropagateTestParticle(asteroidStart, impactSec, _warningSec, stepDays, out _, null);
+            return (asteroidEnd.R - earthWarn.R).Norm();
+        }
+
+        private State PropagateTestParticle(State start, double tStartSec, double tEndSec, double stepDays, out double minMiss, object unused)
+        {
+            minMiss = double.PositiveInfinity;
+            if (tEndSec <= tStartSec)
+                return start;
+
+            double h = stepDays * DaySeconds;
+            if (h <= 0.0)
+                h = 0.05 * DaySeconds;
+
+            Vec3 r = start.R;
+            Vec3 v = start.V;
+            double t = tStartSec;
+
+            while (t < tEndSec - 1e-9)
+            {
+                double dt = Math.Min(h, tEndSec - t);
+                RK4Step(ref r, ref v, t, dt);
+                t += dt;
+            }
+
+            return new State(r, v);
+        }
+
+        private void RK4Step(ref Vec3 r, ref Vec3 v, double tSec, double hSec)
+        {
+            Vec3 a1 = Acceleration(tSec, r);
+            Vec3 k1r = v;
+            Vec3 k1v = a1;
+
+            Vec3 a2 = Acceleration(tSec + 0.5 * hSec, r + k1r * (0.5 * hSec));
+            Vec3 k2r = v + k1v * (0.5 * hSec);
+            Vec3 k2v = a2;
+
+            Vec3 a3 = Acceleration(tSec + 0.5 * hSec, r + k2r * (0.5 * hSec));
+            Vec3 k3r = v + k2v * (0.5 * hSec);
+            Vec3 k3v = a3;
+
+            Vec3 a4 = Acceleration(tSec + hSec, r + k3r * hSec);
+            Vec3 k4r = v + k3v * hSec;
+            Vec3 k4v = a4;
+
+            r = r + (k1r + k2r * 2.0 + k3r * 2.0 + k4r) * (hSec / 6.0);
+            v = v + (k1v + k2v * 2.0 + k3v * 2.0 + k4v) * (hSec / 6.0);
+        }
+
+        private Vec3 Acceleration(double tSec, Vec3 particlePos)
+        {
+            _eph.GetInterpolationInfo(tSec, out int idx, out double u);
+            Vec3 acc = new Vec3();
+
+            for (int i = 0; i < _bodies.Length; i++)
+            {
+                if (_excludedForTestParticle[i])
+                    continue;
+
+                State body = _eph.GetState(i, idx, u);
+                Vec3 diff = body.R - particlePos;
+                double dist2 = diff.NormSquared();
+                if (dist2 < 1e-8)
+                    continue;
+                double invDist = 1.0 / Math.Sqrt(dist2);
+                double invDist3 = invDist * invDist * invDist;
+                acc += diff * (G * _bodies[i].Mass * invDist3);
+            }
+
+            return acc;
+        }
+    }
+
+    private sealed class CoarseCandidate
+    {
+        public double LaunchDays;
+        public double ImpactDays;
+        public bool LongWay;
+        public double LaunchBurn;
+        public double Score;
+    }
+
+    private sealed class MissionResult
+    {
+        public List<Burn> Burns;
+        public double ImpactTimeDays;
+        public Vec3 ImpactRelativeVelocity;
+        public double LaunchBurn;
+        public double CorrectionBurn;
+        public double TotalBurn;
+        public double ImpactMiss;
+        public double EarthMiss;
+        public bool Feasible;
+    }
+
+    private sealed class MissionPlan
+    {
+        public List<Burn> Burns;
+        public double ImpactTimeDays;
+        public Vec3 ImpactRelativeVelocity;
+    }
+
+    private struct Burn
+    {
+        public double TimeDays;
+        public Vec3 Dv;
+    }
+
+    private struct Body
+    {
+        public readonly string Name;
+        public readonly double Mass;
+        public readonly Vec3 R0;
+        public readonly Vec3 V0;
+
+        public Body(string name, double mass, Vec3 r0, Vec3 v0)
+        {
+            Name = name;
+            Mass = mass;
+            R0 = r0;
+            V0 = v0;
+        }
+    }
+
+    private struct State
+    {
+        public Vec3 R;
+        public Vec3 V;
+
+        public State(Vec3 r, Vec3 v)
+        {
+            R = r;
+            V = v;
+        }
+    }
+
+    private struct Vec3
+    {
+        public double X;
+        public double Y;
+        public double Z;
+
+        public Vec3(double x, double y, double z)
+        {
+            X = x;
+            Y = y;
+            Z = z;
+        }
+
+        public double NormSquared() => X * X + Y * Y + Z * Z;
+        public double Norm() => Math.Sqrt(NormSquared());
+
+        public static Vec3 operator +(Vec3 a, Vec3 b) => new Vec3(a.X + b.X, a.Y + b.Y, a.Z + b.Z);
+        public static Vec3 operator -(Vec3 a, Vec3 b) => new Vec3(a.X - b.X, a.Y - b.Y, a.Z - b.Z);
+        public static Vec3 operator *(Vec3 a, double s) => new Vec3(a.X * s, a.Y * s, a.Z * s);
+        public static Vec3 operator *(double s, Vec3 a) => a * s;
+        public static Vec3 operator /(Vec3 a, double s) => new Vec3(a.X / s, a.Y / s, a.Z / s);
+
+        public static double Dot(Vec3 a, Vec3 b) => a.X * b.X + a.Y * b.Y + a.Z * b.Z;
+        public static Vec3 Cross(Vec3 a, Vec3 b) => new Vec3(
+            a.Y * b.Z - a.Z * b.Y,
+            a.Z * b.X - a.X * b.Z,
+            a.X * b.Y - a.Y * b.X);
+
+        public override string ToString() => string.Format(CultureInfo.InvariantCulture, "({0:G17}, {1:G17}, {2:G17})", X, Y, Z);
+    }
+
+    private sealed class Ephemeris
+    {
+        private readonly Body[] _bodies;
+        private readonly double _warningDays;
+        private readonly double _warningSec;
+        private readonly double _stepSec;
+        private readonly int _steps;
+        private readonly Vec3[][] _pos;
+        private readonly Vec3[][] _vel;
+
+        public Ephemeris(Body[] bodies, double warningDays)
+        {
+            _bodies = bodies;
+            _warningDays = warningDays;
+            _warningSec = warningDays * DaySeconds;
+
+            int steps = Math.Max(1, (int)Math.Ceiling(warningDays / 0.25));
+            _steps = steps;
+            _stepSec = _warningSec / steps;
+
+            _pos = new Vec3[bodies.Length][];
+            _vel = new Vec3[bodies.Length][];
+            for (int i = 0; i < bodies.Length; i++)
+            {
+                _pos[i] = new Vec3[steps + 1];
+                _vel[i] = new Vec3[steps + 1];
+            }
+
+            IntegrateBodies();
+        }
+
+        public void GetInterpolationInfo(double tSec, out int idx, out double u)
+        {
+            if (tSec <= 0.0)
+            {
+                idx = 0;
+                u = 0.0;
+                return;
+            }
+            if (tSec >= _warningSec)
+            {
+                idx = _steps - 1;
+                u = 1.0;
+                return;
+            }
+
+            double x = tSec / _stepSec;
+            idx = (int)Math.Floor(x);
+            if (idx < 0) idx = 0;
+            if (idx >= _steps) idx = _steps - 1;
+            u = x - idx;
+        }
+
+        public State GetState(int bodyIdx, double tSec)
+        {
+            GetInterpolationInfo(tSec, out int idx, out double u);
+            return GetState(bodyIdx, idx, u);
+        }
+
+        public State GetState(int bodyIdx, int idx, double u)
+        {
+            if (idx < 0) idx = 0;
+            if (idx >= _steps) idx = _steps - 1;
+            double uu = u;
+            if (uu < 0.0) uu = 0.0;
+            if (uu > 1.0) uu = 1.0;
+
+            Vec3 p0 = _pos[bodyIdx][idx];
+            Vec3 v0 = _vel[bodyIdx][idx];
+            Vec3 p1 = _pos[bodyIdx][idx + 1];
+            Vec3 v1 = _vel[bodyIdx][idx + 1];
+
+            double u2 = uu * uu;
+            double u3 = u2 * uu;
+            double h = _stepSec;
+
+            double h00 = 2.0 * u3 - 3.0 * u2 + 1.0;
+            double h10 = u3 - 2.0 * u2 + uu;
+            double h01 = -2.0 * u3 + 3.0 * u2;
+            double h11 = u3 - u2;
+
+            Vec3 pos = p0 * h00 + v0 * (h10 * h) + p1 * h01 + v1 * (h11 * h);
+
+            Vec3 vel =
+                p0 * ((6.0 * u2 - 6.0 * uu) / h) +
+                v0 * (3.0 * u2 - 4.0 * uu + 1.0) +
+                p1 * ((-6.0 * u2 + 6.0 * uu) / h) +
+                v1 * (3.0 * u2 - 2.0 * uu);
+
+            return new State(pos, vel);
+        }
+
+        private void IntegrateBodies()
+        {
+            int n = _bodies.Length;
+            Vec3[] pos = new Vec3[n];
+            Vec3[] vel = new Vec3[n];
+            double[] mass = new double[n];
+            for (int i = 0; i < n; i++)
+            {
+                pos[i] = _bodies[i].R0;
+                vel[i] = _bodies[i].V0;
+                mass[i] = _bodies[i].Mass;
+            }
+
+            for (int step = 0; step <= _steps; step++)
+            {
+                for (int i = 0; i < n; i++)
+                {
+                    _pos[i][step] = pos[i];
+                    _vel[i][step] = vel[i];
+                }
+
+                if (step == _steps)
+                    break;
+
+                double h = _stepSec;
+                Vec3[] a1 = ComputeAccelerations(pos, mass);
+                for (int i = 0; i < n; i++)
+                    vel[i] = vel[i] + a1[i] * (0.5 * h);
+
+                for (int i = 0; i < n; i++)
+                    pos[i] = pos[i] + vel[i] * h;
+
+                Vec3[] a2 = ComputeAccelerations(pos, mass);
+                for (int i = 0; i < n; i++)
+                    vel[i] = vel[i] + a2[i] * (0.5 * h);
+            }
+        }
+
+        private static Vec3[] ComputeAccelerations(Vec3[] pos, double[] mass)
+        {
+            int n = pos.Length;
+            Vec3[] acc = new Vec3[n];
+            for (int i = 0; i < n; i++)
+            {
+                for (int j = i + 1; j < n; j++)
+                {
+                    Vec3 diff = pos[j] - pos[i];
+                    double dist2 = diff.NormSquared();
+                    if (dist2 < 1e-12)
+                        continue;
+
+                    double invDist = 1.0 / Math.Sqrt(dist2);
+                    double invDist3 = invDist * invDist * invDist;
+                    double factor = G * invDist3;
+
+                    Vec3 a = diff * factor;
+                    acc[i] = acc[i] + a * mass[j];
+                    acc[j] = acc[j] - a * mass[i];
+                }
+            }
+            return acc;
+        }
+    }
+
+    private static class KeplerSolver
+    {
+        public static Vec3 Propagate(Vec3 r0, Vec3 v0, double dtSec, double mu, out Vec3 vOut)
+        {
+            if (Math.Abs(dtSec) < 1e-12)
+            {
+                vOut = v0;
+                return r0;
+            }
+
+            double r0mag = r0.Norm();
+            double v0mag2 = v0.NormSquared();
+            double vr0 = Vec3.Dot(r0, v0) / r0mag;
+            double sqrtMu = Math.Sqrt(mu);
+            double alpha = 2.0 / r0mag - v0mag2 / mu;
+
+            double chi;
+            if (Math.Abs(alpha) > 1e-8)
+            {
+                chi = sqrtMu * Math.Abs(alpha) * dtSec;
+            }
+            else
+            {
+                chi = sqrtMu * dtSec / r0mag;
+            }
+
+            if (chi == 0.0)
+                chi = 1e-6;
+
+            for (int iter = 0; iter < 80; iter++)
+            {
+                double z = alpha * chi * chi;
+                double C = StumpffC(z);
+                double S = StumpffS(z);
+
+                double F = (vr0 / sqrtMu) * chi * chi * C + (1.0 - alpha * r0mag) * chi * chi * chi * S + r0mag * chi - sqrtMu * dtSec;
+                double dF = (vr0 / sqrtMu) * chi * (1.0 - z * S) + (1.0 - alpha * r0mag) * chi * chi * C + r0mag;
+
+                if (Math.Abs(dF) < 1e-14)
+                    break;
+
+                double delta = F / dF;
+                chi -= delta;
+
+                if (Math.Abs(delta) < 1e-8)
+                    break;
+            }
+
+            double zf = alpha * chi * chi;
+            double Cf = StumpffC(zf);
+            double Sf = StumpffS(zf);
+
+            double f = 1.0 - chi * chi / r0mag * Cf;
+            double g = dtSec - (chi * chi * chi / sqrtMu) * Sf;
+            Vec3 r = r0 * f + v0 * g;
+            double rmag = r.Norm();
+            double gdot = 1.0 - chi * chi / rmag * Cf;
+            double fdot = (sqrtMu / (rmag * r0mag)) * (zf * Sf - 1.0) * chi;
+            Vec3 v = r0 * fdot + v0 * gdot;
+
+            vOut = v;
+            return r;
+        }
+
+        public static bool TrySolveLambert(Vec3 r1, Vec3 r2, double dtSec, double mu, bool longWay, out Vec3 v1, out Vec3 v2)
+        {
+            v1 = default;
+            v2 = default;
+
+            double r1m = r1.Norm();
+            double r2m = r2.Norm();
+            if (r1m <= 0.0 || r2m <= 0.0 || dtSec <= 0.0 || !double.IsFinite(dtSec))
+                return false;
+
+            double cosD = Vec3.Dot(r1, r2) / (r1m * r2m);
+            cosD = Math.Clamp(cosD, -1.0, 1.0);
+            double dtheta = Math.Acos(cosD);
+            if (longWay)
+                dtheta = 2.0 * Math.PI - dtheta;
+
+            double sinD = Math.Sin(dtheta);
+            double denom = 1.0 - cosD;
+            if (denom < 1e-12)
+                return false;
+
+            double A = sinD * Math.Sqrt(r1m * r2m / denom);
+            if (Math.Abs(A) < 1e-12 || !double.IsFinite(A))
+                return false;
+
+            Func<double, double> tof = z =>
+            {
+                double C = StumpffC(z);
+                double S = StumpffS(z);
+                if (C <= 0.0 || !double.IsFinite(C) || !double.IsFinite(S))
+                    return double.NaN;
+
+                double sqrtC = Math.Sqrt(C);
+                double y = r1m + r2m + A * ((z * S - 1.0) / sqrtC);
+                if (y <= 0.0 || !double.IsFinite(y))
+                    return double.NaN;
+
+                double term1 = Math.Pow(y / C, 1.5) * S;
+                double term2 = A * Math.Sqrt(y);
+                double t = (term1 + term2) / Math.Sqrt(mu);
+                return t;
+            };
+
+            var samples = new double[]
+            {
+                -10000.0, -5000.0, -2000.0, -1000.0, -500.0, -200.0, -100.0, -50.0, -20.0, -10.0, -5.0, -2.0, -1.0, -0.5, -0.2, -0.1,
+                0.0,
+                0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0, 5000.0, 10000.0
+            };
+
+            double bestLow = 0.0, bestHigh = 0.0;
+            double bestAbsMid = double.PositiveInfinity;
+            bool foundBracket = false;
+
+            double prevZ = double.NaN;
+            double prevF = double.NaN;
+            for (int i = 0; i < samples.Length; i++)
+            {
+                double z = samples[i];
+                double tofVal = tof(z);
+                if (double.IsNaN(tofVal))
+                {
+                    prevZ = double.NaN;
+                    prevF = double.NaN;
+                    continue;
+                }
+
+                double diff = tofVal - dtSec;
+                if (!double.IsNaN(prevF))
+                {
+                    double prevDiff = prevF - dtSec;
+                    if (Math.Sign(diff) != Math.Sign(prevDiff))
+                    {
+                        double mid = 0.5 * (prevZ + z);
+                        double absMid = Math.Abs(mid);
+                        if (absMid < bestAbsMid)
+                        {
+                            bestAbsMid = absMid;
+                            bestLow = prevZ;
+                            bestHigh = z;
+                            foundBracket = true;
+                        }
+                    }
+                }
+
+                prevZ = z;
+                prevF = tofVal;
+            }
+
+            if (!foundBracket)
+                return false;
+
+            double low = bestLow;
+            double high = bestHigh;
+            double fLow = tof(low);
+            double fHigh = tof(high);
+            if (double.IsNaN(fLow) || double.IsNaN(fHigh))
+                return false;
+
+            fLow -= dtSec;
+            fHigh -= dtSec;
+            if (Math.Sign(fLow) == Math.Sign(fHigh))
+                return false;
+
+            double midZ = 0.0;
+            for (int iter = 0; iter < 80; iter++)
+            {
+                midZ = 0.5 * (low + high);
+                double fMid = tof(midZ);
+                if (double.IsNaN(fMid))
+                {
+                    // Nudge toward the side with a finite value.
+                    midZ = 0.5 * (midZ + low);
+                    fMid = tof(midZ);
+                    if (double.IsNaN(fMid))
+                        midZ = 0.5 * (midZ + high);
+                    fMid = tof(midZ);
+                    if (double.IsNaN(fMid))
+                        return false;
+                }
+
+                double diff = fMid - dtSec;
+                if (Math.Abs(diff) < 1e-8)
+                    break;
+
+                if (Math.Sign(diff) == Math.Sign(fLow))
+                {
+                    low = midZ;
+                    fLow = diff;
+                }
+                else
+                {
+                    high = midZ;
+                    fHigh = diff;
+                }
+            }
+
+            double zFinal = midZ;
+            double Cfinal = StumpffC(zFinal);
+            double Sfinal = StumpffS(zFinal);
+            if (Cfinal <= 0.0 || !double.IsFinite(Cfinal))
+                return false;
+
+            double sqrtCfinal = Math.Sqrt(Cfinal);
+            double yFinal = r1m + r2m + A * ((zFinal * Sfinal - 1.0) / sqrtCfinal);
+            if (yFinal <= 0.0 || !double.IsFinite(yFinal))
+                return false;
+
+            double f = 1.0 - yFinal / r1m;
+            double g = A * Math.Sqrt(yFinal / mu);
+            if (Math.Abs(g) < 1e-12 || !double.IsFinite(g))
+                return false;
+            double gdot = 1.0 - yFinal / r2m;
+
+            v1 = (r2 - r1 * f) / g;
+            v2 = (r2 * gdot - r1) / g;
+            return IsFinite(v1) && IsFinite(v2);
+        }
+
+        private static double StumpffC(double z)
+        {
+            double az = Math.Abs(z);
+            if (az < 1e-8)
+            {
+                // Series expansion around 0.
+                return 0.5 - z / 24.0 + z * z / 720.0 - z * z * z / 40320.0;
+            }
+            if (z > 0.0)
+            {
+                double s = Math.Sqrt(z);
+                return (1.0 - Math.Cos(s)) / z;
+            }
+            else
+            {
+                double s = Math.Sqrt(-z);
+                return (Math.Cosh(s) - 1.0) / (-z);
+            }
+        }
+
+        private static double StumpffS(double z)
+        {
+            double az = Math.Abs(z);
+            if (az < 1e-8)
+            {
+                return 1.0 / 6.0 - z / 120.0 + z * z / 5040.0 - z * z * z / 362880.0;
+            }
+            if (z > 0.0)
+            {
+                double s = Math.Sqrt(z);
+                return (s - Math.Sin(s)) / (s * s * s);
+            }
+            else
+            {
+                double s = Math.Sqrt(-z);
+                return (Math.Sinh(s) - s) / (s * s * s);
+            }
+        }
+    }
+
+    private static int ClampInt(int value, int min, int max)
+    {
+        if (value < min) return min;
+        if (value > max) return max;
+        return value;
+    }
+
+    private sealed class FastScanner
+    {
+        private readonly Stream _stream;
+        private readonly byte[] _buffer = new byte[1 << 16];
+        private int _len;
+        private int _ptr;
+
+        public FastScanner(Stream stream)
+        {
+            _stream = stream;
+        }
+
+        public bool HasMore()
+        {
+            int c;
+            do
+            {
+                c = Read();
+            } while (c != -1 && char.IsWhiteSpace((char)c));
+
+            if (c == -1)
+                return false;
+
+            _ptr--;
+            return true;
+        }
+
+        public string Next()
+        {
+            int c;
+            do
+            {
+                c = Read();
+            } while (c != -1 && char.IsWhiteSpace((char)c));
+
+            if (c == -1)
+                return string.Empty;
+
+            var sb = new System.Text.StringBuilder();
+            while (c != -1 && !char.IsWhiteSpace((char)c))
+            {
+                sb.Append((char)c);
+                c = Read();
+            }
+            return sb.ToString();
+        }
+
+        public int NextInt() => int.Parse(Next(), CultureInfo.InvariantCulture);
+        public double NextDouble() => double.Parse(Next(), CultureInfo.InvariantCulture);
+
+        private int Read()
+        {
+            if (_ptr >= _len)
+            {
+                _len = _stream.Read(_buffer, 0, _buffer.Length);
+                _ptr = 0;
+                if (_len <= 0)
+                    return -1;
+            }
+            return _buffer[_ptr++];
+        }
+    }
+}

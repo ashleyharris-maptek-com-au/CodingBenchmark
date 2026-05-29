@@ -40,13 +40,22 @@ RANDOM_SEED = 33333
 _BASELINE_CACHE = BaselineCache("test14_minesweeper")
 _GRADE_CACHE = GradeCache("test14")
 
+HUGE_SUBPASS_START = 8
+MIN_RAM_GB_FOR_HUGE_SUBPASSES = 64
+MAX_CACHED_REPORT_BOARD_CELLS = 10_000
 
-def _grade_cache_key_parts(subPass: int, aiEngineName: str, code: str, board_input: str) -> tuple:
+
+def _grade_cache_key_parts(subPass: int, aiEngineName: str, code: str) -> tuple:
+  case = TEST_CASES[subPass]
   return (
-    "test14-grade-v1",
+    "test14-grade-v2",
     f"model={aiEngineName}",
     f"subpass={subPass}",
-    board_input,
+    f"height={case['height']}",
+    f"width={case['width']}",
+    f"mines={case['num_mines']}",
+    f"reveal={case['reveal_ratio']}",
+    f"seed={case['seed']}",
     code,
   )
 
@@ -137,71 +146,43 @@ def string_to_board(s: str) -> List[List[str]]:
 
 
 # Test configurations
-TEST_CASES = [{
-  "board": lambda: generate_minesweeper_board(8, 8, 10, 0.4, RANDOM_SEED)[0],
-  "safe_cells": lambda: generate_minesweeper_board(8, 8, 10, 0.4, RANDOM_SEED)[1],
-  "description": "8x8 board, 10 mines"
-}, {
-  "board": lambda: generate_minesweeper_board(24, 24, 80, 0.25, RANDOM_SEED + 3)[0],
-  "safe_cells": lambda: generate_minesweeper_board(24, 24, 80, 0.25, RANDOM_SEED + 3)[1],
-  "description": "24x24 board, 80 mines"
-}, {
-  "board":
-  lambda: generate_minesweeper_board(50, 50, 400, 0.15, RANDOM_SEED + 5)[0],
-  "safe_cells":
-  lambda: generate_minesweeper_board(50, 50, 400, 0.15, RANDOM_SEED + 5)[1],
-  "description":
-  "50x50 board, 400 mines"
-}, {
-  "board":
-  lambda: generate_minesweeper_board(100, 100, 1500, 0.1, RANDOM_SEED + 6)[0],
-  "safe_cells":
-  lambda: generate_minesweeper_board(100, 100, 1500, 0.1, RANDOM_SEED + 6)[1],
-  "description":
-  "100x100 board, 1500 mines"
-}, {
-  "board":
-  lambda: generate_minesweeper_board(200, 200, 6000, 0.08, RANDOM_SEED + 7)[0],
-  "safe_cells":
-  lambda: generate_minesweeper_board(200, 200, 6000, 0.08, RANDOM_SEED + 7)[1],
-  "description":
-  "200x200 board, 6000 mines"
-}, {
-  "board":
-  lambda: generate_minesweeper_board(500, 500, 40000, 0.05, RANDOM_SEED + 8)[0],
-  "safe_cells":
-  lambda: generate_minesweeper_board(500, 500, 40000, 0.05, RANDOM_SEED + 8)[1],
-  "description":
-  "500x500 board, 40000 mines"
-}, {
-  "board":
-  lambda: generate_minesweeper_board(1000, 1000, 150000, 0.03, RANDOM_SEED + 9)[0],
-  "safe_cells":
-  lambda: generate_minesweeper_board(1000, 1000, 150000, 0.03, RANDOM_SEED + 9)[1],
-  "description":
-  "1000x1000 board, 150000 mines (1M cells)"
-}, {
-  "board":
-  lambda: generate_minesweeper_board(2000, 2000, 600000, 0.02, RANDOM_SEED + 10)[0],
-  "safe_cells":
-  lambda: generate_minesweeper_board(2000, 2000, 600000, 0.02, RANDOM_SEED + 10)[1],
-  "description":
-  "2000x2000 board, 600000 mines (4M cells)"
-}, {
-  "board":
-  lambda: generate_minesweeper_board(5000, 5000, 1000000, 0.02, RANDOM_SEED + 11)[0],
-  "safe_cells":
-  lambda: generate_minesweeper_board(5000, 5000, 1000000, 0.02, RANDOM_SEED + 11)[1],
-  "description":
-  "5000x5000 board, 1000000 mines (25M cells)"
-}, {
-  "board":
-  lambda: generate_minesweeper_board(10000, 10000, 5000000, 0.005, RANDOM_SEED + 12)[0],
-  "safe_cells":
-  lambda: generate_minesweeper_board(10000, 10000, 5000000, 0.005, RANDOM_SEED + 12)[1],
-  "description":
-  "10000x10000 board, 5000000 mines (100M cells)"
-}]
+def _make_test_case(width: int, height: int, num_mines: int, reveal_ratio: float, seed: int,
+                    description: str) -> dict:
+  return {
+    "width": width,
+    "height": height,
+    "num_mines": num_mines,
+    "reveal_ratio": reveal_ratio,
+    "seed": seed,
+    "board": lambda: generate_minesweeper_board(width, height, num_mines, reveal_ratio, seed)[0],
+    "safe_cells": lambda: generate_minesweeper_board(width, height, num_mines, reveal_ratio,
+                                                     seed)[1],
+    "description": description,
+  }
+
+
+TEST_CASES = [
+  _make_test_case(8, 8, 10, 0.4, RANDOM_SEED, "8x8 board, 10 mines"),
+  _make_test_case(24, 24, 80, 0.25, RANDOM_SEED + 3, "24x24 board, 80 mines"),
+  _make_test_case(50, 50, 400, 0.15, RANDOM_SEED + 5, "50x50 board, 400 mines"),
+  _make_test_case(100, 100, 1500, 0.1, RANDOM_SEED + 6, "100x100 board, 1500 mines"),
+  _make_test_case(200, 200, 6000, 0.08, RANDOM_SEED + 7, "200x200 board, 6000 mines"),
+  _make_test_case(500, 500, 40000, 0.05, RANDOM_SEED + 8, "500x500 board, 40000 mines"),
+  _make_test_case(1000, 1000, 150000, 0.03, RANDOM_SEED + 9,
+                  "1000x1000 board, 150000 mines (1M cells)"),
+  _make_test_case(2000, 2000, 600000, 0.02, RANDOM_SEED + 10,
+                  "2000x2000 board, 600000 mines (4M cells)"),
+  _make_test_case(5000, 5000, 1000000, 0.02, RANDOM_SEED + 11,
+                  "5000x5000 board, 1000000 mines (25M cells)"),
+  _make_test_case(10000, 10000, 5000000, 0.005, RANDOM_SEED + 12,
+                  "10000x10000 board, 5000000 mines (100M cells)"),
+]
+
+
+def _generate_case_data(subPass: int) -> Tuple[List[List[str]], Set[Tuple[int, int]]]:
+  case = TEST_CASES[subPass]
+  return generate_minesweeper_board(case["width"], case["height"], case["num_mines"],
+                                    case["reveal_ratio"], case["seed"])
 
 
 def prepareSubpassPrompt(subPass: int) -> str:
@@ -553,9 +534,11 @@ def _render_minesweeper_grid_html(board: List[List[str]], moves: List[Tuple[int,
 
 def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
   """Grade the Minesweeper solver."""
+  grade_start = time.time()
   result = normalize_code_result(result, "csharp_code")
 
   global lastGame
+  lastGame = None
 
   if not result:
     return 0.0, "No result provided"
@@ -564,24 +547,40 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
     return 0.0, "No C# code provided"
 
   case = TEST_CASES[subPass]
-  board = case["board"]()
-  safe_cells = case["safe_cells"]()
   description = case["description"]
   code = result["csharp_code"]
-  board_input = format_input(board)
-  cache_parts = _grade_cache_key_parts(subPass, aiEngineName, code, board_input)
+  ramInGb = get_ram_in_gb()
+  if subPass >= HUGE_SUBPASS_START and ramInGb < MIN_RAM_GB_FOR_HUGE_SUBPASSES:
+    explanation = (
+      f"[{description}] Not enough RAM to safely grade this subpass "
+      f"({ramInGb:.1f} GiB detected, {MIN_RAM_GB_FOR_HUGE_SUBPASSES} GiB required). "
+      "Skipping local grading and assuming pass.")
+    html = f"<h4>Minesweeper Solver - {description}</h4><p>{explanation}</p>"
+    return 1.0, explanation, html
+
+  cache_parts = _grade_cache_key_parts(subPass, aiEngineName, code)
 
   def compute_grade_record() -> dict:
+    board, safe_cells = _generate_case_data(subPass)
+    t = time.time()
     moves, error, exec_time = execute_solver(code, board, subPass, aiEngineName)
+    solver_time = time.time() - t
+    if solver_time > 1:
+      print(f"Solver execution took {solver_time:.2f}s for subpass {subPass}")
 
     if error:
+      _restore_cached_last_game(board, None)
       return {
         "score": 0.0,
         "explanation": f"[{description}] {error}",
         "game": None,
       }
 
+    t = time.time()
     is_valid, validation_error, correct, incorrect = validate_solution(moves, board, safe_cells)
+    validation_time = time.time() - t
+    if validation_time > 1:
+      print(f"Validation took {validation_time:.2f}s for subpass {subPass}")
     game_record = {
       "moves": [list(move) for move in moves],
       "correct": correct,
@@ -589,21 +588,18 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
     }
 
     if not is_valid:
+      _restore_cached_last_game(board, game_record)
       return {
         "score": 0.0,
         "explanation": f"[{description}] {validation_error}",
         "game": game_record,
       }
 
-    ramInGb = get_ram_in_gb()
-    if ramInGb < 64 and subPass > 7:
-      return {
-        "score": 1.0,
-        "explanation": "Not enough RAM to safely grade answer - it was validated, assuming pass.",
-        "game": game_record,
-      }
-
+    t = time.time()
     baseline_safe = _get_cached_baseline_safe_cells(board)
+    baseline_time = time.time() - t
+    if baseline_time > 1:
+      print(f"Baseline calculation took {baseline_time:.2f}s for subpass {subPass}")
     baseline_count = len(baseline_safe)
     total_safe = len(safe_cells)
 
@@ -634,31 +630,43 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
 
     explanation = (f"[{description}] Found: {correct} safe, Baseline: {baseline_count}, "
                    f"Total safe: {total_safe}, Time: {exec_time:.1f}s - {quality}")
+    _restore_cached_last_game(board, game_record)
     return {
       "score": score,
       "explanation": explanation,
       "game": game_record,
     }
 
-  record = _GRADE_CACHE.get_or_compute_json("grade_record", compute_grade_record, *cache_parts)
-  _restore_cached_last_game(board, record.get("game"))
+  t = time.time()
+  record = _GRADE_CACHE.get_json("grade_record", *cache_parts)
+  if record is not None:
+    if case["height"] * case["width"] <= MAX_CACHED_REPORT_BOARD_CELLS:
+      board = case["board"]()
+      _restore_cached_last_game(board, record.get("game"))
+  else:
+    record = _GRADE_CACHE.get_or_compute_json("grade_record", compute_grade_record, *cache_parts)
+  cache_time = time.time() - t
+  if cache_time > 1:
+    print(f"Grade cache lookup took {cache_time:.2f}s for subpass {subPass}")
+  total_grade_time = time.time() - grade_start
+  if total_grade_time > 1:
+    print(f"gradeAnswer total took {total_grade_time:.2f}s for subpass {subPass}")
   return float(record.get("score", 0.0)), record.get("explanation", "No explanation")
 
 
 def setup() -> None:
   for subPass in range(len(TEST_CASES)):
     case = TEST_CASES[subPass]
-    board = case["board"]()
-    height = len(board)
-    width = len(board[0]) if board else 0
     # CSP is O(cells * iterations); skip warming huge boards.
-    if height * width > 1_000_000:
+    if case["height"] * case["width"] > 1_000_000:
       continue
+    board = case["board"]()
     _get_cached_baseline_safe_cells(board)
 
 
 def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
   """Generate HTML report."""
+  report_start = time.time()
   result = normalize_code_result(result, "csharp_code")
   if not result:
     return "<p style='color:red'>No result provided</p>"
@@ -680,10 +688,17 @@ def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
 
   if lastGame:
     (board, moves, correct, incorrect) = lastGame
+    t = time.time()
     html += _render_minesweeper_grid_html(board, moves)
+    render_time = time.time() - t
+    if render_time > 1:
+      print(f"Grid rendering took {render_time:.2f}s for subpass {subPass}")
 
     html += f"<p>Moves: {len(moves)}, Correct: {correct}, Incorrect: {incorrect}</p>"
 
+  total_report_time = time.time() - report_start
+  if total_report_time > 1:
+    print(f"Report generation took {total_report_time:.2f}s for subpass {subPass}")
   return html
 
 

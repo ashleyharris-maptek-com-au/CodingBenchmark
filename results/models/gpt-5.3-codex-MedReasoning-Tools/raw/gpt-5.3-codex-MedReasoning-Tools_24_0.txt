@@ -1,0 +1,369 @@
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <limits>
+#include <mutex>
+#include <sstream>
+#include <string>
+#include <thread>
+
+namespace {
+
+constexpr double kPi = 3.14159265358979323846;
+constexpr double kTickSeconds = 0.05; // 20 Hz output
+
+struct Vec3 {
+    double x = 0.0;
+    double y = 0.0;
+    double z = 0.0;
+
+    Vec3() = default;
+    Vec3(double x_, double y_, double z_) : x(x_), y(y_), z(z_) {}
+
+    Vec3 operator+(const Vec3& o) const { return Vec3{x + o.x, y + o.y, z + o.z}; }
+    Vec3 operator-(const Vec3& o) const { return Vec3{x - o.x, y - o.y, z - o.z}; }
+    Vec3 operator*(double s) const { return Vec3{x * s, y * s, z * s}; }
+    Vec3 operator/(double s) const { return Vec3{x / s, y / s, z / s}; }
+};
+
+double dot(const Vec3& a, const Vec3& b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+double norm(const Vec3& v) { return std::sqrt(dot(v, v)); }
+Vec3 normalize(const Vec3& v) {
+    const double n = norm(v);
+    if (n < 1e-9) return Vec3{0.0, 0.0, 0.0};
+    return v / n;
+}
+
+double clamp(double v, double lo, double hi) {
+    return std::max(lo, std::min(hi, v));
+}
+
+double wrapAngle(double a) {
+    while (a > kPi) a -= 2.0 * kPi;
+    while (a < -kPi) a += 2.0 * kPi;
+    return a;
+}
+
+struct TerrainColumn {
+    uint16_t a = 0;
+    uint16_t b = 0;
+    uint16_t c = 0;
+    bool valid = false;
+};
+
+class TerrainAccessor {
+public:
+    TerrainAccessor() = default;
+
+    bool init(const std::string& path, int width, int depth, int height) {
+        width_ = width;
+        depth_ = depth;
+        height_ = height;
+        file_.open(path, std::ios::binary);
+        return file_.is_open();
+    }
+
+    bool queryColumn(int xi, int yi, TerrainColumn& out) {
+        if (xi < 0 || yi < 0 || xi >= width_ || yi >= depth_) {
+            out.valid = false;
+            return false;
+        }
+        const uint64_t idx = static_cast<uint64_t>(xi) * static_cast<uint64_t>(depth_) + static_cast<uint64_t>(yi);
+        const uint64_t offset = idx * 6ULL;
+        std::array<unsigned char, 6> buf{};
+
+        std::lock_guard<std::mutex> lk(mu_);
+        file_.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+        if (!file_.good()) {
+            file_.clear();
+            out.valid = false;
+            return false;
+        }
+        file_.read(reinterpret_cast<char*>(buf.data()), static_cast<std::streamsize>(buf.size()));
+        if (file_.gcount() != static_cast<std::streamsize>(buf.size())) {
+            file_.clear();
+            out.valid = false;
+            return false;
+        }
+
+        out.a = static_cast<uint16_t>(buf[0] | (buf[1] << 8));
+        out.b = static_cast<uint16_t>(buf[2] | (buf[3] << 8));
+        out.c = static_cast<uint16_t>(buf[4] | (buf[5] << 8));
+        out.valid = true;
+        return true;
+    }
+
+    int height() const { return height_; }
+
+private:
+    int width_ = 0;
+    int depth_ = 0;
+    int height_ = 0;
+    std::ifstream file_;
+    std::mutex mu_;
+};
+
+struct SharedState {
+    std::mutex mu;
+    Vec3 pos;
+    Vec3 vel;
+    double pitch = 0.0;
+    double yaw = 0.0;
+    double roll = 0.0;
+    double pitch_rate = 0.0;
+    double yaw_rate = 0.0;
+    double roll_rate = 0.0;
+    double fuel = 0.0;
+    bool have_state = false;
+    bool eof = false;
+};
+
+struct Command {
+    double thrust = 0.0;
+    double pitch_cmd = 0.0;
+    double yaw_cmd = 0.0;
+    double roll_cmd = 0.0;
+};
+
+struct Config {
+    int width = 0;
+    int depth = 0;
+    int height = 0;
+    double gravity = 1.62;
+    double max_thrust = 0.0;
+    double fuel0 = 0.0;
+    Vec3 start;
+    Vec3 target;
+    std::string terrain_path;
+};
+
+double estimateRouteSolidTop(
+    TerrainAccessor& terrain,
+    const Vec3& from,
+    const Vec3& to,
+    int samples,
+    double fallback) {
+
+    double solidTop = fallback;
+    for (int i = 0; i <= samples; ++i) {
+        const double t = static_cast<double>(i) / static_cast<double>(samples);
+        const double x = from.x * (1.0 - t) + to.x * t;
+        const double y = from.y * (1.0 - t) + to.y * t;
+
+        TerrainColumn col;
+        if (!terrain.queryColumn(static_cast<int>(std::llround(x)), static_cast<int>(std::llround(y)), col) || !col.valid) {
+            continue;
+        }
+        const double top = (col.b < col.c) ? static_cast<double>(col.c) : static_cast<double>(col.a);
+        solidTop = std::max(solidTop, top);
+    }
+    return solidTop;
+}
+
+Command computeCommand(const Config& cfg, TerrainAccessor& terrain, const SharedState& ss) {
+    Command cmd;
+
+    const Vec3 pos = ss.pos;
+    const Vec3 vel = ss.vel;
+    const Vec3 target = cfg.target;
+
+    const double landing_radius = std::max(5.0, 0.02 * static_cast<double>(std::min(cfg.width, cfg.depth)));
+    const Vec3 to_target = target - pos;
+    const double horiz_dist = std::sqrt(to_target.x * to_target.x + to_target.y * to_target.y);
+
+    const double solid_top = estimateRouteSolidTop(
+        terrain,
+        pos,
+        target,
+        24,
+        target.z
+    );
+
+    const double safety_margin = std::max(8.0, 0.02 * static_cast<double>(cfg.height));
+    double cruise_z = std::max(target.z + 20.0, solid_top + safety_margin);
+    cruise_z = clamp(cruise_z, 5.0, static_cast<double>(cfg.height) - 5.0);
+
+    const bool close_horiz = horiz_dist < (landing_radius * 1.5);
+    const double z_ref = close_horiz ? (target.z + 1.0) : cruise_z;
+
+    double vz_ref = 0.0;
+    if (close_horiz) {
+        const double dz = pos.z - target.z;
+        vz_ref = -clamp(0.2 * dz, 0.3, 1.8);
+        if (dz < 3.0) vz_ref = -0.3;
+    }
+
+    const double kp_xy = 0.035;
+    const double kd_xy = 0.22;
+    Vec3 a_cmd;
+    a_cmd.x = kp_xy * (target.x - pos.x) - kd_xy * vel.x;
+    a_cmd.y = kp_xy * (target.y - pos.y) - kd_xy * vel.y;
+
+    const double axy_max = std::max(1.0, 0.45 * cfg.max_thrust);
+    const double axy_mag = std::sqrt(a_cmd.x * a_cmd.x + a_cmd.y * a_cmd.y);
+    if (axy_mag > axy_max) {
+        const double s = axy_max / axy_mag;
+        a_cmd.x *= s;
+        a_cmd.y *= s;
+    }
+
+    const double kp_z = close_horiz ? 0.22 : 0.10;
+    const double kd_z = close_horiz ? 0.38 : 0.24;
+    a_cmd.z = kp_z * (z_ref - pos.z) + kd_z * (vz_ref - vel.z);
+
+    TerrainColumn here;
+    if (terrain.queryColumn(static_cast<int>(std::llround(pos.x)), static_cast<int>(std::llround(pos.y)), here) && here.valid) {
+        const double floor_z = static_cast<double>(here.a);
+        const double ground_margin = 4.0;
+        if (pos.z < floor_z + ground_margin) {
+            a_cmd.z = std::max(a_cmd.z, 3.0 + (floor_z + ground_margin - pos.z) * 0.8);
+        }
+
+        if (here.b < here.c && pos.z > static_cast<double>(here.b) - 3.0 && pos.z < static_cast<double>(here.c) + 3.0) {
+            a_cmd.z = std::max(a_cmd.z, 4.0);
+        }
+    }
+
+    const Vec3 req = Vec3{a_cmd.x, a_cmd.y, a_cmd.z + cfg.gravity};
+    const double req_mag = norm(req);
+
+    double thrust = (cfg.max_thrust > 1e-6) ? (req_mag / cfg.max_thrust) : 0.0;
+    thrust = clamp(thrust, 0.0, 1.0);
+
+    Vec3 dir = normalize(req_mag < 1e-9 ? Vec3{0.0, 0.0, 1.0} : req);
+
+    double pitch_des = std::asin(clamp(-dir.x, -1.0, 1.0));
+    pitch_des = clamp(pitch_des, -kPi * 0.5, kPi * 0.5);
+
+    const double cp = std::max(1e-6, std::cos(pitch_des));
+    double yaw_des = std::atan2(dir.y / cp, dir.z / cp);
+
+    const double pitch_err = pitch_des - ss.pitch;
+    const double yaw_err = wrapAngle(yaw_des - ss.yaw);
+    const double roll_err = -ss.roll;
+
+    const double kp_ang = 2.2;
+    const double kd_ang = 0.9;
+
+    cmd.pitch_cmd = clamp(kp_ang * pitch_err - kd_ang * ss.pitch_rate, -1.0, 1.0);
+    cmd.yaw_cmd = clamp(kp_ang * yaw_err - kd_ang * ss.yaw_rate, -1.0, 1.0);
+    cmd.roll_cmd = clamp(1.2 * roll_err - 0.8 * ss.roll_rate, -1.0, 1.0);
+    cmd.thrust = thrust;
+
+    const double speed = norm(vel);
+    if (close_horiz && std::abs(pos.z - target.z) < 2.5 && speed < 2.8) {
+        cmd.thrust = clamp((cfg.gravity + 0.1) / std::max(1e-6, cfg.max_thrust), 0.0, 1.0);
+        cmd.pitch_cmd = clamp(-ss.pitch * 1.5 - ss.pitch_rate * 0.7, -1.0, 1.0);
+        cmd.yaw_cmd = clamp(-ss.yaw * 1.5 - ss.yaw_rate * 0.7, -1.0, 1.0);
+        cmd.roll_cmd = clamp(-ss.roll * 1.2 - ss.roll_rate * 0.7, -1.0, 1.0);
+    }
+
+    if (ss.fuel <= 0.0) {
+        cmd.thrust = 0.0;
+        cmd.pitch_cmd = 0.0;
+        cmd.yaw_cmd = 0.0;
+        cmd.roll_cmd = 0.0;
+    }
+
+    return cmd;
+}
+
+} // namespace
+
+int main() {
+    std::ios::sync_with_stdio(false);
+    std::cin.tie(nullptr);
+
+    Config cfg;
+    if (!(std::cin >> cfg.width >> cfg.depth >> cfg.height >> cfg.gravity >> cfg.max_thrust >> cfg.fuel0)) {
+        return 0;
+    }
+    if (!(std::cin >> cfg.start.x >> cfg.start.y >> cfg.start.z >> cfg.target.x >> cfg.target.y >> cfg.target.z)) {
+        return 0;
+    }
+
+    std::string dummy;
+    std::getline(std::cin, dummy);
+    std::getline(std::cin, cfg.terrain_path);
+
+    std::string state_word;
+    if (!(std::cin >> state_word)) {
+        return 0;
+    }
+
+    TerrainAccessor terrain;
+    terrain.init(cfg.terrain_path, cfg.width, cfg.depth, cfg.height);
+
+    SharedState shared;
+
+    std::thread input_thread([&shared]() {
+        while (true) {
+            SharedState next;
+            double x, y, z, vx, vy, vz, pitch, yaw, roll, pitch_rate, yaw_rate, roll_rate, fuel;
+            if (!(std::cin >> x >> y >> z >> vx >> vy >> vz >> pitch >> yaw >> roll >> pitch_rate >> yaw_rate >> roll_rate >> fuel)) {
+                std::lock_guard<std::mutex> lk(shared.mu);
+                shared.eof = true;
+                break;
+            }
+            {
+                std::lock_guard<std::mutex> lk(shared.mu);
+                shared.pos = Vec3{x, y, z};
+                shared.vel = Vec3{vx, vy, vz};
+                shared.pitch = pitch;
+                shared.yaw = yaw;
+                shared.roll = roll;
+                shared.pitch_rate = pitch_rate;
+                shared.yaw_rate = yaw_rate;
+                shared.roll_rate = roll_rate;
+                shared.fuel = fuel;
+                shared.have_state = true;
+            }
+        }
+    });
+
+    Command last_cmd;
+    auto next_tick = std::chrono::steady_clock::now();
+
+    while (true) {
+        SharedState snapshot;
+        {
+            std::lock_guard<std::mutex> lk(shared.mu);
+            snapshot = shared;
+        }
+
+        if (snapshot.eof && !snapshot.have_state) break;
+
+        if (snapshot.have_state) {
+            last_cmd = computeCommand(cfg, terrain, snapshot);
+        } else {
+            last_cmd.thrust = clamp(cfg.gravity / std::max(1e-6, cfg.max_thrust), 0.0, 1.0);
+            last_cmd.pitch_cmd = 0.0;
+            last_cmd.yaw_cmd = 0.0;
+            last_cmd.roll_cmd = 0.0;
+        }
+
+        std::cout << std::fixed << std::setprecision(6)
+                  << last_cmd.thrust << ' '
+                  << last_cmd.pitch_cmd << ' '
+                  << last_cmd.yaw_cmd << ' '
+                  << last_cmd.roll_cmd << '\n';
+        std::cout.flush();
+
+        if (snapshot.eof) break;
+
+        next_tick += std::chrono::milliseconds(static_cast<int>(kTickSeconds * 1000.0));
+        std::this_thread::sleep_until(next_tick);
+    }
+
+    if (input_thread.joinable()) {
+        input_thread.join();
+    }
+
+    return 0;
+}

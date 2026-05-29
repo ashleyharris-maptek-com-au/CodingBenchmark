@@ -1,0 +1,245 @@
+#include <iostream>
+#include <fstream>
+#include <string>
+#include <thread>
+#include <mutex>
+#include <atomic>
+#include <cmath>
+#include <chrono>
+#include <condition_variable>
+#include <vector>
+#include <algorithm>
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+struct State {
+    double x=0,y=0,z=0;
+    double vx=0,vy=0,vz=0;
+    double pitch=0,yaw=0,roll=0;
+    double pitch_rate=0,yaw_rate=0,roll_rate=0;
+    double fuel=0;
+    bool valid=false;
+};
+
+struct Config {
+    double width=1000,depth=1000,height=1000;
+    double gravity=1.62,max_thrust=10.0,fuel_init=100.0;
+    double sx=0,sy=0,sz=0;
+    double tx=0,ty=0,tz=0;
+    std::string terrain_path;
+    bool valid=false;
+};
+
+std::mutex smtx, cmtx;
+std::condition_variable ccv;
+State gstate;
+Config gcfg;
+std::atomic<bool> running{true};
+
+void reader_thread() {
+    double w,d,h,g,mt,f,sx,sy,sz,tx,ty,tz;
+    std::string path, marker;
+
+    std::cin >> w >> d >> h >> g >> mt >> f;
+    std::cin >> sx >> sy >> sz >> tx >> ty >> tz;
+    std::cin.ignore(65536,'\n');
+    std::getline(std::cin, path);
+    std::cin >> marker; // "STATE"
+
+    {
+        std::lock_guard<std::mutex> lk(cmtx);
+        gcfg.width=w; gcfg.depth=d; gcfg.height=h;
+        gcfg.gravity=g; gcfg.max_thrust=mt; gcfg.fuel_init=f;
+        gcfg.sx=sx; gcfg.sy=sy; gcfg.sz=sz;
+        gcfg.tx=tx; gcfg.ty=ty; gcfg.tz=tz;
+        gcfg.terrain_path=path;
+        gcfg.valid=true;
+    }
+    ccv.notify_all();
+
+    while (running) {
+        double x,y,z,vx,vy,vz,p,ya,ro,pr,yr,rr,fu;
+        if (std::cin >> x>>y>>z>>vx>>vy>>vz>>p>>ya>>ro>>pr>>yr>>rr>>fu) {
+            std::lock_guard<std::mutex> lk(smtx);
+            gstate={x,y,z,vx,vy,vz,p,ya,ro,pr,yr,rr,fu,true};
+        } else {
+            break;
+        }
+    }
+    running=false;
+}
+
+static inline double clamp(double v, double lo, double hi) {
+    return v < lo ? lo : (v > hi ? hi : v);
+}
+
+static inline double wrap_angle(double a) {
+    while (a >  M_PI) a -= 2*M_PI;
+    while (a < -M_PI) a += 2*M_PI;
+    return a;
+}
+
+int main() {
+    std::ios_base::sync_with_stdio(false);
+    std::cin.tie(nullptr);
+
+    std::thread rt(reader_thread);
+
+    // Wait for config before starting control loop
+    Config cfg;
+    {
+        std::unique_lock<std::mutex> lk(cmtx);
+        ccv.wait(lk, []{return gcfg.valid;});
+        cfg = gcfg;
+    }
+
+    // Control loop at ~20 Hz (50ms per iteration)
+    while (running || gstate.valid) {
+        auto t0 = std::chrono::steady_clock::now();
+
+        State s;
+        {
+            std::lock_guard<std::mutex> lk(smtx);
+            s = gstate;
+        }
+
+        double thrust=0.0, pc=0.0, yc=0.0, rc=0.0;
+
+        if (s.valid) {
+            double dx = cfg.tx - s.x;
+            double dy = cfg.ty - s.y;
+            double dz = cfg.tz - s.z;
+            double dh = std::sqrt(dx*dx + dy*dy);
+            double dist3 = std::sqrt(dx*dx + dy*dy + dz*dz);
+
+            // Compute max approach speeds using braking kinematics: v = sqrt(2*a*d)
+            // Use conservative estimates for max decel
+            double max_h_accel = cfg.max_thrust * 0.25; // horizontal accel budget
+            double max_v_decel = std::max(cfg.max_thrust * 0.5 - cfg.gravity, 0.5);
+
+            double max_h_speed = std::sqrt(2.0 * max_h_accel * std::max(dh, 0.1));
+            double max_v_speed = std::sqrt(2.0 * max_v_decel * std::max(std::abs(dz), 0.1));
+
+            // Hard caps to avoid extreme speeds
+            max_h_speed = std::min(max_h_speed, 300.0);
+            max_v_speed = std::min(max_v_speed, 100.0);
+
+            // Final approach: be very slow
+            if (dh < 10.0 && std::abs(dz) < 10.0) {
+                max_h_speed = std::min(max_h_speed, 1.5);
+                max_v_speed = std::min(max_v_speed, 1.5);
+            } else if (dh < 50.0 && std::abs(dz) < 50.0) {
+                max_h_speed = std::min(max_h_speed, 5.0);
+                max_v_speed = std::min(max_v_speed, 5.0);
+            }
+
+            // Desired horizontal velocity: point toward target
+            double dvx = 0.0, dvy = 0.0;
+            if (dh > 0.1) {
+                dvx = (dx / dh) * max_h_speed;
+                dvy = (dy / dh) * max_h_speed;
+            }
+
+            // Vertical strategy:
+            // While far away horizontally, maintain altitude clearance above target.
+            // As we close in, descend to target.
+            double clearance = std::min(dh * 0.1, 50.0);
+            double target_alt;
+            if (dh > 20.0) {
+                target_alt = cfg.tz + clearance;
+                // Also don't descend below our start altitude while far away
+                target_alt = std::max(target_alt, cfg.sz - (cfg.sz - cfg.tz) * (1.0 - dh / std::max(dist3, 1.0)));
+            } else {
+                // Final approach: blend from clearance down to target
+                double blend = dh / 20.0;
+                target_alt = cfg.tz + clearance * blend;
+            }
+
+            double dz_eff = target_alt - s.z;
+            double dvz = clamp(dz_eff * 0.4, -max_v_speed, max_v_speed);
+
+            // Desired acceleration = velocity error * gain + gravity compensation
+            double kv = 1.5;
+            double ax = kv * (dvx - s.vx);
+            double ay = kv * (dvy - s.vy);
+            double az = kv * (dvz - s.vz) + cfg.gravity;
+
+            // Ensure we always have some upward thrust component
+            if (az < cfg.gravity * 0.5) az = cfg.gravity * 0.5;
+
+            // Limit horizontal acceleration (affects tilt angle)
+            double ah = std::sqrt(ax*ax + ay*ay);
+            // Max tilt ~60 degrees: sin(60)~0.866
+            double max_tilt_acc = cfg.max_thrust * 0.7;
+            if (ah > max_tilt_acc) {
+                ax *= max_tilt_acc / ah;
+                ay *= max_tilt_acc / ah;
+                ah = max_tilt_acc;
+            }
+
+            // Total desired acceleration magnitude
+            double total = std::sqrt(ax*ax + ay*ay + az*az);
+            thrust = clamp(total / cfg.max_thrust, 0.0, 1.0);
+
+            // Fuel conservation: if low on fuel, reduce aggressiveness
+            if (s.fuel < 10.0) {
+                // Minimize horizontal thrust, just try to survive
+                double fuel_factor = s.fuel / 10.0;
+                ax *= fuel_factor;
+                ay *= fuel_factor;
+                ah = std::sqrt(ax*ax + ay*ay);
+                total = std::sqrt(ax*ax + ay*ay + az*az);
+                thrust = clamp(total / cfg.max_thrust, 0.0, 1.0);
+            }
+
+            // Compute desired pitch and yaw from desired acceleration vector.
+            // Thrust direction: (-sin(pitch)*cos(yaw), -sin(pitch)*sin(yaw), cos(pitch))
+            // For desired (ax, ay, az)/total:
+            //   pitch = -asin(ah/total)  [negative: +pitch tilts into -X]
+            //   yaw   = atan2(ay, ax)
+            double des_pitch = 0.0;
+            double des_yaw = s.yaw;
+
+            if (total > 0.01) {
+                double ah_norm = ah / total;
+                des_pitch = -std::asin(clamp(ah_norm, 0.0, 1.0));
+                if (ah > 0.01) {
+                    des_yaw = std::atan2(ay, ax);
+                }
+            }
+
+            // Clamp pitch to safe range
+            des_pitch = clamp(des_pitch, -M_PI / 2.5, M_PI / 2.5);
+
+            // Attitude PD controller
+            double kp = 3.5, kd = 1.8;
+            double pe = des_pitch - s.pitch;
+            double ye = wrap_angle(des_yaw - s.yaw);
+
+            pc = clamp(kp * pe - kd * s.pitch_rate, -1.0, 1.0);
+            yc = clamp(kp * ye - kd * s.yaw_rate,   -1.0, 1.0);
+            rc = clamp(-kd * s.roll_rate,             -1.0, 1.0);
+
+        } else {
+            // No state yet: output hover thrust to avoid free-fall
+            thrust = clamp(cfg.gravity / cfg.max_thrust, 0.0, 1.0);
+            pc = 0.0; yc = 0.0; rc = 0.0;
+        }
+
+        // Output command
+        std::cout << thrust << " " << pc << " " << yc << " " << rc << "\n";
+        std::cout.flush();
+
+        // Sleep for remainder of 50ms slot
+        auto elapsed = std::chrono::steady_clock::now() - t0;
+        auto sleep_time = std::chrono::milliseconds(50) - elapsed;
+        if (sleep_time > std::chrono::milliseconds(0)) {
+            std::this_thread::sleep_for(sleep_time);
+        }
+    }
+
+    if (rt.joinable()) rt.join();
+    return 0;
+}

@@ -5,7 +5,7 @@ import time
 from pathlib import Path
 
 from native_compiler import CSharpCompiler, compile_and_run, describe_this_pc
-from solver_utils import StreamingInputFile, normalize_code_result
+from solver_utils import GradeCache, StreamingInputFile, normalize_code_result
 from collections import defaultdict
 
 title = "Chinese Postman Problem Solver (C#)"
@@ -39,6 +39,8 @@ GRAPH_CONFIGS = [
   (50000, 500000),  # Epic - 50k nodes, 500k edges
   (100000, 1000000),  # Legendary - 100k nodes, 1M edges
 ]
+
+_GRADE_CACHE = GradeCache("test2")
 
 
 def generate_connected_graph(num_nodes: int, num_edges: int, seed: int) -> list:
@@ -304,6 +306,27 @@ def parse_route_output(output: str) -> tuple:
 lastRoute = None
 
 
+def _grade_cache_key_parts(subPass: int, aiEngineName: str, code: str) -> tuple:
+  num_nodes, edge_count = GRAPH_CONFIGS[subPass]
+  return (
+    "test2-grade-v1",
+    f"model={aiEngineName}",
+    f"subpass={subPass}",
+    f"nodes={num_nodes}",
+    f"edges={edge_count}",
+    f"seed={RANDOM_SEED + subPass * 100}",
+    code,
+  )
+
+
+def _restore_cached_last_route(route_record) -> None:
+  global lastRoute
+  if not route_record:
+    lastRoute = None
+    return
+  lastRoute = [int(node) for node in route_record]
+
+
 def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
   result = normalize_code_result(result, "csharp_code")
   if not result:
@@ -322,65 +345,81 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
   num_nodes, _ = GRAPH_CONFIGS[subPass]
   edges = GRAPHS_CACHE[subPass]
   code = result["csharp_code"]
+  cache_parts = _grade_cache_key_parts(subPass, aiEngineName, code)
 
-  if _should_use_streaming(subPass):
-    streaming_input = _get_streaming_input(subPass, edges, num_nodes)
-    input_file_path = streaming_input.generate()
-    run = compile_and_run(code,
-                          "csharp",
-                          aiEngineName,
-                          input_file=input_file_path,
-                          timeout=TIMEOUT_SECONDS)
-  else:
-    input_data = format_input(num_nodes, edges)
-    run = compile_and_run(code,
-                          "csharp",
-                          aiEngineName,
-                          input_data=input_data,
-                          timeout=TIMEOUT_SECONDS)
+  def compute_grade_record() -> dict:
+    if _should_use_streaming(subPass):
+      streaming_input = _get_streaming_input(subPass, edges, num_nodes)
+      input_file_path = streaming_input.generate()
+      run = compile_and_run(code,
+                            "csharp",
+                            aiEngineName,
+                            input_file=input_file_path,
+                            timeout=TIMEOUT_SECONDS)
+    else:
+      input_data = format_input(num_nodes, edges)
+      run = compile_and_run(code,
+                            "csharp",
+                            aiEngineName,
+                            input_data=input_data,
+                            timeout=TIMEOUT_SECONDS)
 
-  if not run:
-    return 0.0, f"[{num_nodes} nodes, {len(edges)} edges] {run.error_message()}"
+    if not run:
+      return {
+        "score": 0.0,
+        "explanation": f"[{num_nodes} nodes, {len(edges)} edges] {run.error_message()}",
+        "route": None,
+      }
 
-  route, parse_error = parse_route_output(run.stdout)
-  exec_time = run.exec_time
-  if parse_error:
-    return 0.0, f"[{num_nodes} nodes, {len(edges)} edges] {parse_error}"
+    route, parse_error = parse_route_output(run.stdout)
+    exec_time = run.exec_time
+    if parse_error:
+      return {
+        "score": 0.0,
+        "explanation": f"[{num_nodes} nodes, {len(edges)} edges] {parse_error}",
+        "route": None,
+      }
 
-  global lastRoute
-  lastRoute = route
+    is_valid, validation_error, _ = validate_route(num_nodes, edges, route)
+    if not is_valid:
+      return {
+        "score": 0.0,
+        "explanation": f"[{num_nodes} nodes, {len(edges)} edges] Invalid route: {validation_error}",
+        "route": route,
+      }
 
-  # Validate the route
-  is_valid, validation_error, _ = validate_route(num_nodes, edges, route)
-  if not is_valid:
-    return 0.0, f"[{num_nodes} nodes, {len(edges)} edges] Invalid route: {validation_error}"
+    route_distance = calculate_route_distance(edges, route)
+    baseline_distance = get_baseline_distance(num_nodes, edges)
 
-  # Calculate distances
-  route_distance = calculate_route_distance(edges, route)
-  baseline_distance = get_baseline_distance(num_nodes, edges)
+    ratio = route_distance / baseline_distance if baseline_distance > 0 else float('inf')
 
-  ratio = route_distance / baseline_distance if baseline_distance > 0 else float('inf')
+    if ratio <= 1.05:
+      score = 1.0
+      quality = "excellent (within 5% of baseline)"
+    elif ratio <= 1.3:
+      score = 0.5
+      quality = "good (within 30% of baseline)"
+    elif ratio <= 1.5:
+      score = 0.25
+      quality = "acceptable (within 2x baseline)"
+    else:
+      score = 0.0
+      quality = f"poor ({ratio:.1f}x baseline)"
 
-  # Score based on how close to baseline (or better)
-  if ratio <= 1.05:
-    score = 1.0
-    quality = "excellent (within 5% of baseline)"
-  elif ratio <= 1.3:
-    score = 0.5
-    quality = "good (within 30% of baseline)"
-  elif ratio <= 1.5:
-    score = 0.25
-    quality = "acceptable (within 2x baseline)"
-  else:
-    score = 0.0
-    quality = f"poor ({ratio:.1f}x baseline)"
+    explanation = (f"[{num_nodes} nodes, {len(edges)} edges] Route distance: {route_distance:.0f}, "
+                   f"Baseline: {baseline_distance:.0f}, "
+                   f"Ratio: {ratio:.2f}x, "
+                   f"Time: {exec_time:.1f}s - {quality}")
 
-  explanation = (f"[{num_nodes} nodes, {len(edges)} edges] Route distance: {route_distance:.0f}, "
-                 f"Baseline: {baseline_distance:.0f}, "
-                 f"Ratio: {ratio:.2f}x, "
-                 f"Time: {exec_time:.1f}s - {quality}")
+    return {
+      "score": score,
+      "explanation": explanation,
+      "route": route,
+    }
 
-  return score, explanation
+  record = _GRADE_CACHE.get_or_compute_json("grade_record", compute_grade_record, *cache_parts)
+  _restore_cached_last_route(record.get("route"))
+  return float(record.get("score", 0.0)), record.get("explanation", "No explanation")
 
 
 def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:

@@ -1,0 +1,261 @@
+use std::io::{self, BufRead, BufWriter, Write};
+use std::sync::Arc;
+use std::thread;
+
+struct Sample {
+    x: f32,
+    y: f32,
+    z: f32,
+    hole_idx: u32,
+    sample_idx: u32,
+}
+
+struct Outlier {
+    hole_idx: u32,
+    sample_idx: u32,
+    prop_idx: u32,
+    confidence: f32,
+}
+
+fn encode_cell(ix: i32, iy: i32, iz: i32) -> u64 {
+    let ux = (ix as u64).wrapping_add(1 << 19) & 0xFFFFF;
+    let uy = (iy as u64).wrapping_add(1 << 19) & 0xFFFFF;
+    let uz = (iz as u64).wrapping_add(1 << 19) & 0xFFFFF;
+    ux | (uy << 20) | (uz << 40)
+}
+
+fn decode_cell(id: u64) -> (i32, i32, i32) {
+    let ux = id & 0xFFFFF;
+    let uy = (id >> 20) & 0xFFFFF;
+    let uz = (id >> 40) & 0xFFFFF;
+    (
+        (ux as i32).wrapping_sub(1 << 19),
+        (uy as i32).wrapping_sub(1 << 19),
+        (uz as i32).wrapping_sub(1 << 19),
+    )
+}
+
+fn main() -> io::Result<()> {
+    let stdin = io::stdin();
+    let mut reader = stdin.lock();
+    let mut line = String::new();
+
+    // 1. Read dimensions
+    if reader.read_line(&mut line)? == 0 { return Ok(()); }
+    let dims: Vec<usize> = line.split_whitespace().filter_map(|s| s.parse().ok()).collect();
+    if dims.len() < 2 { return Ok(()); }
+    let num_holes = dims[0];
+    let num_props = dims[1];
+
+    // 2. Read property names
+    line.clear();
+    reader.read_line(&mut line)?;
+    let prop_names: Vec<String> = line.split_whitespace().map(|s| s.to_string()).collect();
+
+    // 3. Read hole and sample data
+    let mut hole_ids = Vec::with_capacity(num_holes);
+    let mut samples = Vec::new();
+    let mut all_props = Vec::new();
+
+    let mut min_x = f32::MAX;
+    let mut max_x = f32::MIN;
+    let mut min_y = f32::MAX;
+    let mut max_y = f32::MIN;
+    let mut min_z = f32::MAX;
+    let mut max_z = f32::MIN;
+
+    for h_idx in 0..num_holes {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 { break; }
+        let mut parts = line.split_whitespace();
+        let hole_id = parts.next().unwrap_or("unknown").to_string();
+        let sx: f64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+        let sy: f64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+        let sz: f64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+        let dx: f64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+        let dy: f64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+        let dz: f64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+        let _len: f64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+        let num_s: usize = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+
+        hole_ids.push(hole_id);
+
+        let dlen = (dx*dx + dy*dy + dz*dz).sqrt();
+        let (ux, uy, uz) = if dlen > 1e-9 { (dx/dlen, dy/dlen, dz/dlen) } else { (0.0, 0.0, 0.0) };
+
+        for s_idx in 0..num_s {
+            line.clear();
+            if reader.read_line(&mut line)? == 0 { break; }
+            let mut s_parts = line.split_whitespace();
+            let depth: f64 = s_parts.next().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+            
+            let x = (sx + depth * ux) as f32;
+            let y = (sy + depth * uy) as f32;
+            let z = (sz + depth * uz) as f32;
+
+            if x < min_x { min_x = x; } if x > max_x { max_x = x; }
+            if y < min_y { min_y = y; } if y > max_y { max_y = y; }
+            if z < min_z { min_z = z; } if z > max_z { max_z = z; }
+
+            samples.push(Sample {
+                x, y, z,
+                hole_idx: h_idx as u32,
+                sample_idx: s_idx as u32,
+            });
+
+            for _ in 0..num_props {
+                let p: f32 = s_parts.next().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+                all_props.push(p);
+            }
+        }
+    }
+
+    if samples.is_empty() {
+        println!("0");
+        return Ok(());
+    }
+
+    // 4. Adaptive Grid Size
+    let dx = max_x - min_x;
+    let dy = max_y - min_y;
+    let dz = max_z - min_z;
+    let volume = (dx as f64) * (dy as f64) * (dz as f64);
+    let num_samples = samples.len() as f64;
+    // Aim for ~4 samples per cell on average, so 27-cell neighborhood has ~100 samples
+    let grid_size = if volume > 0.0 && num_samples > 0.0 {
+        ((volume / num_samples) * 4.0).powf(1.0/3.0).max(0.1) as f32
+    } else {
+        1.0f32
+    };
+
+    // 5. Build Spatial Index
+    let mut cell_assignments: Vec<(u64, usize)> = samples.iter().enumerate()
+        .map(|(i, s)| {
+            let ix = (s.x / grid_size).floor() as i32;
+            let iy = (s.y / grid_size).floor() as i32;
+            let iz = (s.z / grid_size).floor() as i32;
+            (encode_cell(ix, iy, iz), i)
+        })
+        .collect();
+    cell_assignments.sort_unstable_by_key(|a| a.0);
+
+    let mut cell_list = Vec::new();
+    if !cell_assignments.is_empty() {
+        let mut start = 0;
+        for i in 1..cell_assignments.len() {
+            if cell_assignments[i].0 != cell_assignments[start].0 {
+                cell_list.push((cell_assignments[start].0, (start, i)));
+                start = i;
+            }
+        }
+        cell_list.push((cell_assignments[start].0, (start, cell_assignments.len())));
+    }
+
+    // 6. Parallel Outlier Detection
+    let num_threads = thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    let arc_samples = Arc::new(samples);
+    let arc_all_props = Arc::new(all_props);
+    let arc_cell_assignments = Arc::new(cell_assignments);
+    let arc_cell_list = Arc::new(cell_list);
+    let arc_prop_names = Arc::new(prop_names);
+
+    let mut handles = Vec::new();
+    let num_cells = arc_cell_list.len();
+    let chunk_size = (num_cells + num_threads - 1) / num_threads;
+
+    for t_idx in 0..num_threads {
+        let samples = Arc::clone(&arc_samples);
+        let all_props = Arc::clone(&arc_all_props);
+        let cell_assignments = Arc::clone(&arc_cell_assignments);
+        let cell_list = Arc::clone(&arc_cell_list);
+        
+        let start_cell = t_idx * chunk_size;
+        let end_cell = (start_cell + chunk_size).min(num_cells);
+
+        handles.push(thread::spawn(move || {
+            let mut local_outliers = Vec::new();
+            if start_cell >= end_cell { return local_outliers; }
+            let mut neighbor_indices = Vec::new();
+
+            for c_idx in start_cell..end_cell {
+                let (cell_id, (c_start, c_end)) = cell_list[c_idx];
+                let (ix, iy, iz) = decode_cell(cell_id);
+
+                // Collect neighbor samples
+                neighbor_indices.clear();
+                for dx in -1..=1 {
+                    for dy in -1..=1 {
+                        for dz in -1..=1 {
+                            let nid = encode_cell(ix + dx, iy + dy, iz + dz);
+                            if let Ok(idx) = cell_list.binary_search_by_key(&nid, |&(id, _)| id) {
+                                let (n_start, n_end) = cell_list[idx].1;
+                                for k in n_start..n_end {
+                                    neighbor_indices.push(cell_assignments[k].1);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if neighbor_indices.len() < 5 { continue; }
+
+                // For each property, calculate stats
+                for p_idx in 0..num_props {
+                    let mut sum = 0.0f64;
+                    let mut sum_sq = 0.0f64;
+                    for &s_idx in &neighbor_indices {
+                        let val = all_props[s_idx * num_props + p_idx] as f64;
+                        sum += val;
+                        sum_sq += val * val;
+                    }
+
+                    let count = neighbor_indices.len() as f64;
+                    let mean = sum / count;
+                    let variance = (sum_sq / count) - (mean * mean);
+                    let std_dev = variance.max(0.0).sqrt();
+                    let threshold_sigma = std_dev + (mean.abs() * 1e-5 + 1e-8);
+
+                    // Check samples in the current cell
+                    for k in c_start..c_end {
+                        let s_idx = cell_assignments[k].1;
+                        let val = all_props[s_idx * num_props + p_idx] as f64;
+                        let confidence = (val - mean).abs() / threshold_sigma;
+
+                        if confidence > 4.0 {
+                            local_outliers.push(Outlier {
+                                hole_idx: samples[s_idx].hole_idx,
+                                sample_idx: samples[s_idx].sample_idx,
+                                prop_idx: p_idx as u32,
+                                confidence: confidence as f32,
+                            });
+                        }
+                    }
+                }
+            }
+            local_outliers
+        }));
+    }
+
+    let mut all_outliers = Vec::new();
+    for h in handles {
+        if let Ok(res) = h.join() {
+            all_outliers.extend(res);
+        }
+    }
+
+    // 7. Sort and Print
+    all_outliers.sort_unstable_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut out = BufWriter::new(io::stdout());
+    writeln!(out, "{}", all_outliers.len())?;
+    for o in all_outliers {
+        writeln!(out, "{} {} {} {:.4}", 
+            hole_ids[o.hole_idx as usize], 
+            o.sample_idx, 
+            arc_prop_names[o.prop_idx as usize], 
+            o.confidence
+        )?;
+    }
+
+    Ok(())
+}

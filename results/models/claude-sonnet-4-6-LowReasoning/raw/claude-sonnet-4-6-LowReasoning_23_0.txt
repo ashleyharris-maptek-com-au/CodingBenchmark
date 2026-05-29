@@ -1,0 +1,200 @@
+use std::io::{self, BufRead, Write, BufWriter};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
+
+#[derive(Clone)]
+struct State {
+    x: f64,
+    y: f64,
+    vx: f64,
+    vy: f64,
+    angle: f64,
+    angular_vel: f64,
+    fuel_remaining: f64,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self { x: 0.0, y: 0.0, vx: 0.0, vy: 0.0, angle: 0.0, angular_vel: 0.0, fuel_remaining: 100.0 }
+    }
+}
+
+#[derive(Clone, Default)]
+struct Config {
+    gravity: f64,
+    max_thrust: f64,
+    target_x: f64,
+    target_y: f64,
+}
+
+struct Shared {
+    state: State,
+    config: Config,
+    config_ready: bool,
+}
+
+fn compute_control(s: &State, c: &Config) -> (f64, f64) {
+    use std::f64::consts::PI;
+
+    let g = c.gravity;
+    let mt = c.max_thrust;
+
+    let ex = c.target_x - s.x;
+    let ey = c.target_y - s.y; // positive = target is below us (y increases downward)
+    let dist = (ex * ex + ey * ey).sqrt();
+
+    // Desired horizontal acceleration to move toward target x
+    let ax_des = (0.4 * ex - 1.2 * s.vx).clamp(-g * 0.6, g * 0.6);
+
+    // Desired descent speed based on distance to target
+    // When far: descend faster; when close: descend slowly
+    let vy_des = if ey > 5.0 {
+        dist.sqrt().min(3.0)
+    } else if ey > 0.5 {
+        (ey * 0.4).clamp(0.0, 1.5)
+    } else {
+        // Very close to target vertically - nearly stop vertical movement
+        (ey * 0.2).clamp(-0.5, 0.5)
+    };
+
+    // Desired net vertical acceleration (positive = downward)
+    let ay_des = (0.5 * ey - 1.5 * (s.vy - vy_des)).clamp(-g * 2.0, g * 0.5);
+
+    // Required thrust components to achieve desired accelerations:
+    //   net_ax = mt * thrust * sin(angle) = ax_des
+    //   net_ay = -mt * thrust * cos(angle) + g = ay_des
+    //   => mt * thrust * cos(angle) = g - ay_des  (upward thrust component)
+    //   => mt * thrust * sin(angle) = ax_des      (horizontal thrust component)
+    let tv = (g - ay_des).max(0.0); // upward component (must be non-negative)
+    let th = ax_des;                // horizontal component
+
+    // Desired angle and thrust magnitude
+    let angle_des = f64::atan2(th, tv).clamp(-0.7, 0.7);
+    let thrust_needed = (tv * tv + th * th).sqrt() / mt;
+    let thrust = thrust_needed.clamp(0.0, 1.0);
+
+    // Angle PD controller
+    let mut ae = angle_des - s.angle;
+    // Normalize to [-pi, pi]
+    ae -= (2.0 * PI) * (ae / (2.0 * PI)).round();
+    let turn = (5.0 * ae - 2.0 * s.angular_vel).clamp(-1.0, 1.0);
+
+    (thrust, turn)
+}
+
+fn main() {
+    let shared = Arc::new(Mutex::new(Shared {
+        state: State::default(),
+        config: Config::default(),
+        config_ready: false,
+    }));
+
+    let sh_reader = Arc::clone(&shared);
+
+    // Reader thread: parses stdin (map header + continuous state updates)
+    thread::spawn(move || {
+        let stdin = io::stdin();
+        let mut reader = stdin.lock();
+        let mut buf = String::with_capacity(512);
+
+        // Line 1: width height gravity max_thrust fuel
+        buf.clear();
+        if reader.read_line(&mut buf).unwrap_or(0) == 0 {
+            return;
+        }
+        let v: Vec<f64> = buf.split_whitespace().filter_map(|s| s.parse().ok()).collect();
+        if v.len() < 5 {
+            return;
+        }
+        let height = v[1] as usize;
+        let gravity = v[2];
+        let max_thrust = v[3];
+
+        // Line 2: start_x start_y target_x target_y
+        buf.clear();
+        if reader.read_line(&mut buf).unwrap_or(0) == 0 {
+            return;
+        }
+        let v2: Vec<f64> = buf.split_whitespace().filter_map(|s| s.parse().ok()).collect();
+        if v2.len() < 4 {
+            return;
+        }
+        let target_x = v2[2];
+        let target_y = v2[3];
+
+        {
+            let mut s = sh_reader.lock().unwrap();
+            s.config = Config { gravity, max_thrust, target_x, target_y };
+            s.config_ready = true;
+        }
+
+        // Read and discard map rows (memory-efficient: reuse buffer)
+        for _ in 0..height {
+            buf.clear();
+            if reader.read_line(&mut buf).unwrap_or(0) == 0 {
+                break;
+            }
+        }
+
+        // Continuous state updates: x y vx vy angle angular_vel fuel_remaining
+        loop {
+            buf.clear();
+            match reader.read_line(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    let v: Vec<f64> = buf.split_whitespace().filter_map(|s| s.parse().ok()).collect();
+                    if v.len() >= 7 {
+                        let mut s = sh_reader.lock().unwrap();
+                        s.state = State {
+                            x: v[0],
+                            y: v[1],
+                            vx: v[2],
+                            vy: v[3],
+                            angle: v[4],
+                            angular_vel: v[5],
+                            fuel_remaining: v[6],
+                        };
+                    }
+                }
+            }
+        }
+    });
+
+    // Control output loop at 25 Hz (output every 40ms)
+    let stdout = io::stdout();
+    let mut out = BufWriter::new(stdout.lock());
+    let interval = Duration::from_millis(40);
+
+    let mut cached_state = State::default();
+    let mut cached_config = Config::default();
+    let mut config_ready = false;
+
+    loop {
+        let tick = Instant::now();
+
+        // Read latest state
+        if let Ok(s) = shared.lock() {
+            cached_state = s.state.clone();
+            if s.config_ready {
+                cached_config = s.config.clone();
+                config_ready = true;
+            }
+        }
+
+        let (thrust, turn) = if config_ready {
+            compute_control(&cached_state, &cached_config)
+        } else {
+            // Hover gently until we have configuration
+            (0.5, 0.0)
+        };
+
+        let _ = writeln!(out, "{:.3} {:.3}", thrust, turn);
+        let _ = out.flush();
+
+        let elapsed = tick.elapsed();
+        if elapsed < interval {
+            thread::sleep(interval - elapsed);
+        }
+    }
+}

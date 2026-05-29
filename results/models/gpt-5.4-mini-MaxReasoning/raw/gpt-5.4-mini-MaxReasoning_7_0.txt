@@ -1,0 +1,1053 @@
+// CSG union solver for two watertight triangle meshes.
+// Fast paths: disjoint / containment detection with BVH + ray casting.
+// General path: classic BSP-based polygon boolean union.
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstdint>
+#include <initializer_list>
+#include <iomanip>
+#include <iostream>
+#include <limits>
+#include <memory>
+#include <numeric>
+#include <random>
+#include <stack>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+using std::array;
+using std::cout;
+using std::size_t;
+using std::vector;
+
+struct Vec3 {
+    double x = 0.0, y = 0.0, z = 0.0;
+
+    Vec3() = default;
+    Vec3(double xx, double yy, double zz) : x(xx), y(yy), z(zz) {}
+
+    Vec3 operator+(const Vec3& o) const { return Vec3{x + o.x, y + o.y, z + o.z}; }
+    Vec3 operator-(const Vec3& o) const { return Vec3{x - o.x, y - o.y, z - o.z}; }
+    Vec3 operator*(double s) const { return Vec3{x * s, y * s, z * s}; }
+    Vec3 operator/(double s) const { return Vec3{x / s, y / s, z / s}; }
+    Vec3& operator+=(const Vec3& o) { x += o.x; y += o.y; z += o.z; return *this; }
+    Vec3& operator-=(const Vec3& o) { x -= o.x; y -= o.y; z -= o.z; return *this; }
+};
+
+static inline Vec3 operator*(double s, const Vec3& v) { return v * s; }
+
+static inline double dot(const Vec3& a, const Vec3& b) {
+    return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+
+static inline Vec3 cross(const Vec3& a, const Vec3& b) {
+    return Vec3{
+        a.y * b.z - a.z * b.y,
+        a.z * b.x - a.x * b.z,
+        a.x * b.y - a.y * b.x
+    };
+}
+
+static inline double length2(const Vec3& v) { return dot(v, v); }
+static inline double length(const Vec3& v) { return std::sqrt(length2(v)); }
+
+static inline Vec3 normalized(const Vec3& v) {
+    double len = length(v);
+    if (len <= 0.0) {
+        return Vec3{0.0, 0.0, 0.0};
+    }
+    return v / len;
+}
+
+static inline Vec3 lerp(const Vec3& a, const Vec3& b, double t) {
+    return a + (b - a) * t;
+}
+
+static inline double dist2(const Vec3& a, const Vec3& b) {
+    return length2(a - b);
+}
+
+struct AABB {
+    Vec3 mn, mx;
+
+    AABB() {
+        reset();
+    }
+
+    void reset() {
+        mn = Vec3{
+            std::numeric_limits<double>::infinity(),
+            std::numeric_limits<double>::infinity(),
+            std::numeric_limits<double>::infinity()
+        };
+        mx = Vec3{
+            -std::numeric_limits<double>::infinity(),
+            -std::numeric_limits<double>::infinity(),
+            -std::numeric_limits<double>::infinity()
+        };
+    }
+
+    void expand(const Vec3& p) {
+        mn.x = std::min(mn.x, p.x); mn.y = std::min(mn.y, p.y); mn.z = std::min(mn.z, p.z);
+        mx.x = std::max(mx.x, p.x); mx.y = std::max(mx.y, p.y); mx.z = std::max(mx.z, p.z);
+    }
+
+    void expand(const AABB& b) {
+        expand(b.mn);
+        expand(b.mx);
+    }
+
+    bool valid() const {
+        return mn.x <= mx.x && mn.y <= mx.y && mn.z <= mx.z;
+    }
+};
+
+static inline bool boxesOverlap(const AABB& a, const AABB& b) {
+    return !(a.mx.x < b.mn.x || a.mn.x > b.mx.x ||
+             a.mx.y < b.mn.y || a.mn.y > b.mx.y ||
+             a.mx.z < b.mn.z || a.mn.z > b.mx.z);
+}
+
+struct Face {
+    int a = 0, b = 0, c = 0;
+};
+
+struct Triangle {
+    int a = 0, b = 0, c = 0;
+    Vec3 centroid;
+    AABB box;
+};
+
+struct Polygon {
+    vector<Vec3> v;
+    Vec3 normal;
+
+    void flip() {
+        std::reverse(v.begin(), v.end());
+        normal = Vec3{-normal.x, -normal.y, -normal.z};
+    }
+};
+
+static double gClassEps = 1e-12;
+static double gMergeEps = 1e-9;
+static double gAreaEps2 = 1e-24;
+
+static inline Vec3 polygonNormal(const vector<Vec3>& pts) {
+    if (pts.size() < 3) {
+        return Vec3{0.0, 0.0, 0.0};
+    }
+    Vec3 n = cross(pts[1] - pts[0], pts[2] - pts[0]);
+    return normalized(n);
+}
+
+static inline bool pointClose(const Vec3& a, const Vec3& b) {
+    return dist2(a, b) <= gMergeEps * gMergeEps;
+}
+
+static void simplifyPolygon(Polygon& p) {
+    if (p.v.size() < 3) {
+        p.v.clear();
+        return;
+    }
+
+    vector<Vec3> tmp;
+    tmp.reserve(p.v.size());
+    for (const Vec3& pt : p.v) {
+        if (tmp.empty() || !pointClose(tmp.back(), pt)) {
+            tmp.push_back(pt);
+        }
+    }
+    if (tmp.size() > 1 && pointClose(tmp.front(), tmp.back())) {
+        tmp.pop_back();
+    }
+
+    if (tmp.size() < 3) {
+        p.v.clear();
+        return;
+    }
+
+    vector<Vec3> out;
+    out.reserve(tmp.size());
+    for (size_t i = 0; i < tmp.size(); ++i) {
+        const Vec3& a = tmp[(i + tmp.size() - 1) % tmp.size()];
+        const Vec3& b = tmp[i];
+        const Vec3& c = tmp[(i + 1) % tmp.size()];
+        if (pointClose(a, b) || pointClose(b, c)) {
+            continue;
+        }
+        Vec3 cr = cross(b - a, c - b);
+        if (length2(cr) <= gAreaEps2) {
+            continue;
+        }
+        out.push_back(b);
+    }
+
+    if (out.size() < 3) {
+        p.v.clear();
+        return;
+    }
+    p.v.swap(out);
+}
+
+static inline bool polygonHasArea(const Polygon& p) {
+    if (p.v.size() < 3) {
+        return false;
+    }
+    const Vec3& base = p.v[0];
+    for (size_t i = 1; i + 1 < p.v.size(); ++i) {
+        Vec3 cr = cross(p.v[i] - base, p.v[i + 1] - base);
+        if (length2(cr) > gAreaEps2) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static inline double triangleArea2(const Vec3& a, const Vec3& b, const Vec3& c) {
+    return length2(cross(b - a, c - a));
+}
+
+struct Plane {
+    Vec3 n;
+    double d = 0.0;
+    bool valid = false;
+
+    static Plane fromPolygon(const Polygon& p) {
+        Plane pl;
+        pl.n = p.normal;
+        pl.d = dot(pl.n, p.v[0]);
+        pl.valid = true;
+        return pl;
+    }
+
+    void flip() {
+        n = Vec3{-n.x, -n.y, -n.z};
+        d = -d;
+    }
+
+    double dist(const Vec3& p) const {
+        return dot(n, p) - d;
+    }
+
+    enum { COPLANAR = 0, FRONT = 1, BACK = 2, SPANNING = 3 };
+
+    void splitPolygon(
+        const Polygon& poly,
+        vector<Polygon>& coplanarFront,
+        vector<Polygon>& coplanarBack,
+        vector<Polygon>& front,
+        vector<Polygon>& back
+    ) const {
+        const size_t nverts = poly.v.size();
+        if (nverts < 3) {
+            return;
+        }
+
+        vector<double> distv(nverts);
+        vector<int> types(nverts);
+        int polygonType = 0;
+
+        for (size_t i = 0; i < nverts; ++i) {
+            double dv = dist(poly.v[i]);
+            distv[i] = dv;
+            int t = (dv < -gClassEps) ? BACK : (dv > gClassEps ? FRONT : COPLANAR);
+            types[i] = t;
+            polygonType |= t;
+        }
+
+        if (polygonType == COPLANAR) {
+            if (dot(n, poly.normal) >= 0.0) {
+                coplanarFront.push_back(poly);
+            } else {
+                coplanarBack.push_back(poly);
+            }
+            return;
+        }
+
+        if (polygonType == FRONT) {
+            front.push_back(poly);
+            return;
+        }
+
+        if (polygonType == BACK) {
+            back.push_back(poly);
+            return;
+        }
+
+        Polygon f;
+        Polygon b;
+        f.normal = poly.normal;
+        b.normal = poly.normal;
+        f.v.reserve(nverts + 2);
+        b.v.reserve(nverts + 2);
+
+        for (size_t i = 0; i < nverts; ++i) {
+            size_t j = (i + 1) % nverts;
+            const Vec3& vi = poly.v[i];
+            const Vec3& vj = poly.v[j];
+            int ti = types[i];
+            int tj = types[j];
+
+            if (ti != BACK) {
+                f.v.push_back(vi);
+            }
+            if (ti != FRONT) {
+                b.v.push_back(vi);
+            }
+
+            if ((ti | tj) == SPANNING) {
+                double t = distv[i] / (distv[i] - distv[j]);
+                Vec3 v = lerp(vi, vj, t);
+                f.v.push_back(v);
+                b.v.push_back(v);
+            }
+        }
+
+        simplifyPolygon(f);
+        simplifyPolygon(b);
+
+        if (f.v.size() >= 3 && polygonHasArea(f)) {
+            front.push_back(std::move(f));
+        }
+        if (b.v.size() >= 3 && polygonHasArea(b)) {
+            back.push_back(std::move(b));
+        }
+    }
+};
+
+struct BSPNode {
+    Plane plane;
+    vector<Polygon> polygons;
+    std::unique_ptr<BSPNode> front;
+    std::unique_ptr<BSPNode> back;
+
+    void build(vector<Polygon> polys) {
+        if (polys.empty()) {
+            return;
+        }
+        if (!plane.valid) {
+            plane = Plane::fromPolygon(polys[0]);
+        }
+
+        vector<Polygon> frontList;
+        vector<Polygon> backList;
+        frontList.reserve(polys.size());
+        backList.reserve(polys.size());
+
+        for (const Polygon& p : polys) {
+            plane.splitPolygon(p, polygons, polygons, frontList, backList);
+        }
+
+        if (!frontList.empty()) {
+            if (!front) {
+                front = std::make_unique<BSPNode>();
+            }
+            front->build(std::move(frontList));
+        }
+        if (!backList.empty()) {
+            if (!back) {
+                back = std::make_unique<BSPNode>();
+            }
+            back->build(std::move(backList));
+        }
+    }
+
+    vector<Polygon> clipPolygons(const vector<Polygon>& polys) const {
+        if (!plane.valid) {
+            return polys;
+        }
+
+        vector<Polygon> frontList;
+        vector<Polygon> backList;
+        frontList.reserve(polys.size());
+        backList.reserve(polys.size());
+
+        for (const Polygon& p : polys) {
+            plane.splitPolygon(p, frontList, backList, frontList, backList);
+        }
+
+        if (front) {
+            frontList = front->clipPolygons(frontList);
+        }
+        if (back) {
+            backList = back->clipPolygons(backList);
+        } else {
+            backList.clear();
+        }
+
+        frontList.insert(frontList.end(), backList.begin(), backList.end());
+        return frontList;
+    }
+
+    void clipTo(const BSPNode& bsp) {
+        polygons = bsp.clipPolygons(polygons);
+        if (front) {
+            front->clipTo(bsp);
+        }
+        if (back) {
+            back->clipTo(bsp);
+        }
+    }
+
+    void invert() {
+        if (!plane.valid) {
+            return;
+        }
+        for (Polygon& p : polygons) {
+            p.flip();
+        }
+        plane.flip();
+        if (front) {
+            front->invert();
+        }
+        if (back) {
+            back->invert();
+        }
+        std::swap(front, back);
+    }
+
+    void allPolygons(vector<Polygon>& out) const {
+        out.insert(out.end(), polygons.begin(), polygons.end());
+        if (front) {
+            front->allPolygons(out);
+        }
+        if (back) {
+            back->allPolygons(out);
+        }
+    }
+
+    vector<Polygon> allPolygons() const {
+        vector<Polygon> out;
+        allPolygons(out);
+        return out;
+    }
+};
+
+struct BVHNode {
+    AABB box;
+    int left = -1;
+    int right = -1;
+    int start = 0;
+    int count = 0;
+
+    bool leaf() const { return left < 0 && right < 0; }
+};
+
+struct BVH {
+    const vector<Vec3>* verts = nullptr;
+    const vector<Triangle>* tris = nullptr;
+    vector<int> order;
+    vector<BVHNode> nodes;
+    int root = -1;
+    int leafSize = 8;
+
+    void build(const vector<Vec3>* vertsPtr, const vector<Triangle>* trisPtr) {
+        verts = vertsPtr;
+        tris = trisPtr;
+        nodes.clear();
+        order.clear();
+        root = -1;
+
+        if (!tris || tris->empty()) {
+            return;
+        }
+
+        const int n = static_cast<int>(tris->size());
+        order.resize(n);
+        std::iota(order.begin(), order.end(), 0);
+        nodes.reserve(static_cast<size_t>(n) * 2u);
+        root = buildRec(0, n);
+    }
+
+    int buildRec(int l, int r) {
+        int idx = static_cast<int>(nodes.size());
+        nodes.emplace_back();
+
+        AABB box;
+        AABB centroidBox;
+        box.reset();
+        centroidBox.reset();
+        for (int i = l; i < r; ++i) {
+            const Triangle& t = (*tris)[order[i]];
+            box.expand(t.box);
+            centroidBox.expand(t.centroid);
+        }
+
+        BVHNode node;
+        node.box = box;
+        node.start = l;
+        node.count = r - l;
+
+        if (r - l <= leafSize) {
+            nodes[idx] = node;
+            return idx;
+        }
+
+        Vec3 ext = centroidBox.mx - centroidBox.mn;
+        int axis = 0;
+        if (ext.y > ext.x && ext.y >= ext.z) {
+            axis = 1;
+        } else if (ext.z > ext.x && ext.z > ext.y) {
+            axis = 2;
+        }
+
+        int m = (l + r) / 2;
+        auto cmp = [&](int ia, int ib) {
+            const Vec3& ca = (*tris)[ia].centroid;
+            const Vec3& cb = (*tris)[ib].centroid;
+            if (axis == 0) return ca.x < cb.x;
+            if (axis == 1) return ca.y < cb.y;
+            return ca.z < cb.z;
+        };
+        std::nth_element(order.begin() + l, order.begin() + m, order.begin() + r, cmp);
+
+        node.left = buildRec(l, m);
+        node.right = buildRec(m, r);
+        node.box = nodes[node.left].box;
+        node.box.expand(nodes[node.right].box);
+
+        nodes[idx] = node;
+        return idx;
+    }
+
+    bool rayBoxHit(const Vec3& o, const Vec3& d, const AABB& b) const {
+        double tmin = 0.0;
+        double tmax = std::numeric_limits<double>::infinity();
+
+        auto axisTest = [&](double origin, double dir, double mn, double mx) -> bool {
+            if (std::fabs(dir) < 1e-18) {
+                return origin >= mn && origin <= mx;
+            }
+            double inv = 1.0 / dir;
+            double t1 = (mn - origin) * inv;
+            double t2 = (mx - origin) * inv;
+            if (t1 > t2) {
+                std::swap(t1, t2);
+            }
+            tmin = std::max(tmin, t1);
+            tmax = std::min(tmax, t2);
+            return tmin <= tmax;
+        };
+
+        if (!axisTest(o.x, d.x, b.mn.x, b.mx.x)) return false;
+        if (!axisTest(o.y, d.y, b.mn.y, b.mx.y)) return false;
+        if (!axisTest(o.z, d.z, b.mn.z, b.mx.z)) return false;
+        return tmax >= std::max(0.0, tmin);
+    }
+
+    bool rayTriHit(const Vec3& o, const Vec3& d, const Triangle& t) const {
+        const Vec3& v0 = (*verts)[t.a];
+        const Vec3& v1 = (*verts)[t.b];
+        const Vec3& v2 = (*verts)[t.c];
+
+        Vec3 e1 = v1 - v0;
+        Vec3 e2 = v2 - v0;
+        Vec3 p = cross(d, e2);
+        double det = dot(e1, p);
+        if (std::fabs(det) < gClassEps) {
+            return false;
+        }
+        double invDet = 1.0 / det;
+        Vec3 s = o - v0;
+        double u = dot(s, p) * invDet;
+        if (u <= gClassEps || u >= 1.0 - gClassEps) {
+            return false;
+        }
+        Vec3 q = cross(s, e1);
+        double v = dot(d, q) * invDet;
+        if (v <= gClassEps || u + v >= 1.0 - gClassEps) {
+            return false;
+        }
+        double tt = dot(e2, q) * invDet;
+        return tt > gClassEps;
+    }
+
+    int rayCount(const Vec3& o, const Vec3& d) const {
+        if (root < 0) {
+            return 0;
+        }
+        int hits = 0;
+        std::vector<int> stack;
+        stack.push_back(root);
+        while (!stack.empty()) {
+            int ni = stack.back();
+            stack.pop_back();
+            const BVHNode& node = nodes[ni];
+            if (!rayBoxHit(o, d, node.box)) {
+                continue;
+            }
+            if (node.leaf()) {
+                for (int i = 0; i < node.count; ++i) {
+                    const Triangle& t = (*tris)[order[node.start + i]];
+                    if (rayTriHit(o, d, t)) {
+                        ++hits;
+                    }
+                }
+            } else {
+                if (node.left >= 0) stack.push_back(node.left);
+                if (node.right >= 0) stack.push_back(node.right);
+            }
+        }
+        return hits;
+    }
+};
+
+struct Mesh {
+    vector<Vec3> verts;
+    vector<Face> faces;
+    vector<Triangle> tris;
+    vector<Polygon> polys;
+    BVH bvh;
+
+    void buildDerived() {
+        tris.clear();
+        polys.clear();
+        tris.reserve(faces.size());
+        polys.reserve(faces.size());
+
+        for (const Face& f : faces) {
+            if (f.a < 0 || f.b < 0 || f.c < 0) {
+                continue;
+            }
+            if (f.a >= static_cast<int>(verts.size()) ||
+                f.b >= static_cast<int>(verts.size()) ||
+                f.c >= static_cast<int>(verts.size())) {
+                continue;
+            }
+
+            const Vec3& a = verts[f.a];
+            const Vec3& b = verts[f.b];
+            const Vec3& c = verts[f.c];
+
+            Vec3 n = cross(b - a, c - a);
+            if (length2(n) <= gAreaEps2) {
+                continue;
+            }
+
+            Triangle t;
+            t.a = f.a;
+            t.b = f.b;
+            t.c = f.c;
+            t.centroid = (a + b + c) / 3.0;
+            t.box.reset();
+            t.box.expand(a);
+            t.box.expand(b);
+            t.box.expand(c);
+            tris.push_back(t);
+
+            Polygon p;
+            p.v = {a, b, c};
+            p.normal = normalized(n);
+            polys.push_back(std::move(p));
+        }
+
+        bvh.build(&verts, &tris);
+    }
+};
+
+static bool bvhPotentialOverlap(const BVH& a, const BVH& b) {
+    if (a.root < 0 || b.root < 0) {
+        return false;
+    }
+    if (!boxesOverlap(a.nodes[a.root].box, b.nodes[b.root].box)) {
+        return false;
+    }
+
+    std::vector<std::pair<int, int>> stack;
+    stack.reserve(64);
+    stack.emplace_back(a.root, b.root);
+
+    while (!stack.empty()) {
+        auto [ia, ib] = stack.back();
+        stack.pop_back();
+
+        const BVHNode& na = a.nodes[ia];
+        const BVHNode& nb = b.nodes[ib];
+        if (!boxesOverlap(na.box, nb.box)) {
+            continue;
+        }
+
+        if (na.leaf() && nb.leaf()) {
+            for (int i = 0; i < na.count; ++i) {
+                const Triangle& ta = (*a.tris)[a.order[na.start + i]];
+                for (int j = 0; j < nb.count; ++j) {
+                    const Triangle& tb = (*b.tris)[b.order[nb.start + j]];
+                    if (boxesOverlap(ta.box, tb.box)) {
+                        return true;
+                    }
+                }
+            }
+            continue;
+        }
+
+        if (na.leaf()) {
+            stack.emplace_back(ia, nb.left);
+            stack.emplace_back(ia, nb.right);
+            continue;
+        }
+
+        if (nb.leaf()) {
+            stack.emplace_back(na.left, ib);
+            stack.emplace_back(na.right, ib);
+            continue;
+        }
+
+        double va = (na.box.mx.x - na.box.mn.x) * (na.box.mx.y - na.box.mn.y) * (na.box.mx.z - na.box.mn.z);
+        double vb = (nb.box.mx.x - nb.box.mn.x) * (nb.box.mx.y - nb.box.mn.y) * (nb.box.mx.z - nb.box.mn.z);
+
+        if (va >= vb) {
+            stack.emplace_back(na.left, ib);
+            stack.emplace_back(na.right, ib);
+        } else {
+            stack.emplace_back(ia, nb.left);
+            stack.emplace_back(ia, nb.right);
+        }
+    }
+    return false;
+}
+
+static int classifyPointInMesh(const Mesh& mesh, const Vec3& p) {
+    if (mesh.bvh.root < 0) {
+        return 0;
+    }
+
+    const Vec3 rayDirs[3] = {
+        normalized(Vec3{0.873456789, 0.421234567, 0.246813579}),
+        normalized(Vec3{-0.531975308, 0.817345679, 0.219753086}),
+        normalized(Vec3{0.331245679, -0.272468135, 0.903157894})
+    };
+
+    int votesInside = 0;
+    int votesOutside = 0;
+    for (const Vec3& d : rayDirs) {
+        int hits = mesh.bvh.rayCount(p, d);
+        if (hits & 1) {
+            ++votesInside;
+        } else {
+            ++votesOutside;
+        }
+    }
+
+    if (votesInside >= 2) {
+        return 1;
+    }
+    if (votesOutside >= 2) {
+        return 0;
+    }
+    return -1;
+}
+
+struct OutputTri {
+    Vec3 a, b, c;
+};
+
+struct CellKey {
+    long long x = 0, y = 0, z = 0;
+    bool operator==(const CellKey& o) const noexcept {
+        return x == o.x && y == o.y && z == o.z;
+    }
+};
+
+struct CellHash {
+    static uint64_t mix(uint64_t x) {
+        x += 0x9e3779b97f4a7c15ULL;
+        x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+        x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+        return x ^ (x >> 31);
+    }
+
+    size_t operator()(const CellKey& k) const noexcept {
+        uint64_t h1 = mix(static_cast<uint64_t>(k.x));
+        uint64_t h2 = mix(static_cast<uint64_t>(k.y) ^ 0x9e3779b97f4a7c15ULL);
+        uint64_t h3 = mix(static_cast<uint64_t>(k.z) ^ 0xbf58476d1ce4e5b9ULL);
+        return static_cast<size_t>(h1 ^ (h2 << 1) ^ (h3 << 7));
+    }
+};
+
+struct VertexDeduper {
+    double eps = 1e-9;
+    double eps2 = 1e-18;
+    std::unordered_map<CellKey, vector<int>, CellHash> cells;
+    vector<Vec3> verts;
+
+    explicit VertexDeduper(double e = 1e-9) : eps(e), eps2(e * e) {}
+
+    CellKey keyFor(const Vec3& p) const {
+        return CellKey{
+            static_cast<long long>(std::floor(p.x / eps)),
+            static_cast<long long>(std::floor(p.y / eps)),
+            static_cast<long long>(std::floor(p.z / eps))
+        };
+    }
+
+    int add(const Vec3& p) {
+        CellKey base = keyFor(p);
+        for (long long dx = -1; dx <= 1; ++dx) {
+            for (long long dy = -1; dy <= 1; ++dy) {
+                for (long long dz = -1; dz <= 1; ++dz) {
+                    CellKey k{base.x + dx, base.y + dy, base.z + dz};
+                    auto it = cells.find(k);
+                    if (it == cells.end()) {
+                        continue;
+                    }
+                    for (int idx : it->second) {
+                        if (dist2(verts[idx], p) <= eps2) {
+                            return idx;
+                        }
+                    }
+                }
+            }
+        }
+
+        int id = static_cast<int>(verts.size());
+        verts.push_back(p);
+        cells[base].push_back(id);
+        return id;
+    }
+};
+
+static vector<OutputTri> emitMesh(const Mesh& mesh) {
+    vector<OutputTri> out;
+    out.reserve(mesh.faces.size());
+    for (const Face& f : mesh.faces) {
+        if (f.a < 0 || f.b < 0 || f.c < 0) {
+            continue;
+        }
+        if (f.a >= static_cast<int>(mesh.verts.size()) ||
+            f.b >= static_cast<int>(mesh.verts.size()) ||
+            f.c >= static_cast<int>(mesh.verts.size())) {
+            continue;
+        }
+        const Vec3& a = mesh.verts[f.a];
+        const Vec3& b = mesh.verts[f.b];
+        const Vec3& c = mesh.verts[f.c];
+        if (triangleArea2(a, b, c) <= gAreaEps2) {
+            continue;
+        }
+        out.push_back(OutputTri{a, b, c});
+    }
+    return out;
+}
+
+static void addPolygonTriangles(const Polygon& p, vector<OutputTri>& out) {
+    if (p.v.size() < 3) {
+        return;
+    }
+    const Vec3& a = p.v[0];
+    for (size_t i = 1; i + 1 < p.v.size(); ++i) {
+        const Vec3& b = p.v[i];
+        const Vec3& c = p.v[i + 1];
+        if (triangleArea2(a, b, c) <= gAreaEps2) {
+            continue;
+        }
+        out.push_back(OutputTri{a, b, c});
+    }
+}
+
+static void emitMeshAsPolygonTriangles(const vector<Polygon>& polys, vector<OutputTri>& out) {
+    for (const Polygon& p : polys) {
+        addPolygonTriangles(p, out);
+    }
+}
+
+static void writeOutput(const vector<OutputTri>& tris) {
+    VertexDeduper dedup(gMergeEps);
+    dedup.cells.reserve(tris.size() * 2 + 8);
+    dedup.verts.reserve(tris.size() * 3);
+    vector<array<int, 3>> faces;
+    faces.reserve(tris.size());
+
+    for (const OutputTri& t : tris) {
+        int ia = dedup.add(t.a);
+        int ib = dedup.add(t.b);
+        int ic = dedup.add(t.c);
+        if (ia == ib || ib == ic || ia == ic) {
+            continue;
+        }
+        faces.push_back(array<int, 3>{ia, ib, ic});
+    }
+
+    vector<int> remap(dedup.verts.size(), -1);
+    vector<Vec3> verts;
+    verts.reserve(dedup.verts.size());
+    for (auto& f : faces) {
+        for (int k = 0; k < 3; ++k) {
+            int idx = f[k];
+            if (remap[idx] < 0) {
+                remap[idx] = static_cast<int>(verts.size());
+                verts.push_back(dedup.verts[idx]);
+            }
+            f[k] = remap[idx];
+        }
+    }
+
+    cout << verts.size() << ' ' << faces.size() << '\n';
+    cout.setf(std::ios::fmtflags(0), std::ios::floatfield);
+    cout << std::setprecision(17);
+    for (const Vec3& v : verts) {
+        cout << v.x << ' ' << v.y << ' ' << v.z << '\n';
+    }
+    for (const auto& f : faces) {
+        cout << f[0] << ' ' << f[1] << ' ' << f[2] << '\n';
+    }
+}
+
+static void writeRawMesh(const Mesh& mesh) {
+    cout << mesh.verts.size() << ' ' << mesh.faces.size() << '\n';
+    cout.setf(std::ios::fmtflags(0), std::ios::floatfield);
+    cout << std::setprecision(17);
+    for (const Vec3& v : mesh.verts) {
+        cout << v.x << ' ' << v.y << ' ' << v.z << '\n';
+    }
+    for (const Face& f : mesh.faces) {
+        cout << f.a << ' ' << f.b << ' ' << f.c << '\n';
+    }
+}
+
+static void writeRawUnion(const Mesh& a, const Mesh& b) {
+    cout << (a.verts.size() + b.verts.size()) << ' ' << (a.faces.size() + b.faces.size()) << '\n';
+    cout.setf(std::ios::fmtflags(0), std::ios::floatfield);
+    cout << std::setprecision(17);
+    for (const Vec3& v : a.verts) {
+        cout << v.x << ' ' << v.y << ' ' << v.z << '\n';
+    }
+    for (const Vec3& v : b.verts) {
+        cout << v.x << ' ' << v.y << ' ' << v.z << '\n';
+    }
+    for (const Face& f : a.faces) {
+        cout << f.a << ' ' << f.b << ' ' << f.c << '\n';
+    }
+    const int offset = static_cast<int>(a.verts.size());
+    for (const Face& f : b.faces) {
+        cout << (f.a + offset) << ' ' << (f.b + offset) << ' ' << (f.c + offset) << '\n';
+    }
+}
+
+static double meshBoundingScale(const Mesh& a, const Mesh& b) {
+    AABB box;
+    box.reset();
+    for (const Vec3& v : a.verts) {
+        box.expand(v);
+    }
+    for (const Vec3& v : b.verts) {
+        box.expand(v);
+    }
+    if (!box.valid()) {
+        return 1.0;
+    }
+    Vec3 ext = box.mx - box.mn;
+    double scale = std::max({std::fabs(ext.x), std::fabs(ext.y), std::fabs(ext.z), 1.0});
+    return scale;
+}
+
+static Vec3 faceCentroid(const Mesh& mesh, const Face& f) {
+    return (mesh.verts[f.a] + mesh.verts[f.b] + mesh.verts[f.c]) / 3.0;
+}
+
+int main() {
+    std::ios::sync_with_stdio(false);
+    std::cin.tie(nullptr);
+
+    int VA = 0, FA = 0, VB = 0, FB = 0;
+    if (!(std::cin >> VA >> FA >> VB >> FB)) {
+        return 0;
+    }
+
+    Mesh A, B;
+    A.verts.resize(std::max(VA, 0));
+    B.verts.resize(std::max(VB, 0));
+
+    for (int i = 0; i < VA; ++i) {
+        std::cin >> A.verts[i].x >> A.verts[i].y >> A.verts[i].z;
+    }
+    A.faces.clear();
+    A.faces.reserve(std::max(FA, 0));
+    for (int i = 0; i < FA; ++i) {
+        Face f;
+        std::cin >> f.a >> f.b >> f.c;
+        A.faces.push_back(f);
+    }
+
+    for (int i = 0; i < VB; ++i) {
+        std::cin >> B.verts[i].x >> B.verts[i].y >> B.verts[i].z;
+    }
+    B.faces.reserve(std::max(FB, 0));
+    for (int i = 0; i < FB; ++i) {
+        Face f;
+        std::cin >> f.a >> f.b >> f.c;
+        B.faces.push_back(f);
+    }
+
+    // Union is symmetric. Put the smaller face set first to keep the BSP work modest.
+    if (A.faces.size() > B.faces.size()) {
+        std::swap(A, B);
+    }
+
+    double scale = meshBoundingScale(A, B);
+    gClassEps = std::max(scale * 1e-12, 1e-12);
+    gMergeEps = std::max(scale * 1e-11, 1e-12);
+    gAreaEps2 = std::max(scale * scale * 1e-24, 1e-30);
+
+    A.buildDerived();
+    B.buildDerived();
+
+    if (A.tris.empty() && B.tris.empty()) {
+        cout << "0 0\n";
+        return 0;
+    }
+    if (A.tris.empty()) {
+        writeRawMesh(B);
+        return 0;
+    }
+    if (B.tris.empty()) {
+        writeRawMesh(A);
+        return 0;
+    }
+
+    bool potentialOverlap = bvhPotentialOverlap(A.bvh, B.bvh);
+
+    if (!potentialOverlap) {
+        int aInB = classifyPointInMesh(B, faceCentroid(A, A.faces[0]));
+        int bInA = classifyPointInMesh(A, faceCentroid(B, B.faces[0]));
+
+        if (aInB == 1 && bInA == 0) {
+            writeRawMesh(B);
+            return 0;
+        }
+        if (bInA == 1 && aInB == 0) {
+            writeRawMesh(A);
+            return 0;
+        }
+        if (aInB == 0 && bInA == 0) {
+            writeRawUnion(A, B);
+            return 0;
+        }
+        // Ambiguous boundary contact: fall through to the general boolean.
+    }
+
+    std::mt19937_64 rng(0xC0FFEEULL);
+    std::shuffle(A.polys.begin(), A.polys.end(), rng);
+    std::shuffle(B.polys.begin(), B.polys.end(), rng);
+
+    BSPNode aTree;
+    BSPNode bTree;
+    aTree.build(A.polys);
+    bTree.build(B.polys);
+
+    aTree.clipTo(bTree);
+    bTree.clipTo(aTree);
+    bTree.invert();
+    bTree.clipTo(aTree);
+    bTree.invert();
+    aTree.build(bTree.allPolygons());
+
+    vector<Polygon> result = aTree.allPolygons();
+    vector<OutputTri> out;
+    out.reserve(result.size() * 2);
+    emitMeshAsPolygonTriangles(result, out);
+    writeOutput(out);
+    return 0;
+}

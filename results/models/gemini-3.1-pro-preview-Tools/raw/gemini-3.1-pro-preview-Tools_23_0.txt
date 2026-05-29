@@ -1,0 +1,384 @@
+use std::io::{self, BufRead, Write};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
+use std::collections::{BinaryHeap, HashMap};
+
+#[derive(Clone, Default, Debug)]
+struct State {
+    x: f32,
+    y: f32,
+    vx: f32,
+    vy: f32,
+    angle: f32,
+    angular_vel: f32,
+    fuel: f32,
+}
+
+struct SharedData {
+    current_state: Option<State>,
+    waypoints: Option<Vec<(f32, f32)>>,
+}
+
+#[derive(Eq, PartialEq)]
+struct Node {
+    f: u32,
+    idx: usize,
+    x: usize,
+    y: usize,
+}
+impl Ord for Node {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        other.f.cmp(&self.f)
+    }
+}
+impl PartialOrd for Node {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+fn heuristic(x: usize, y: usize, tx: usize, ty: usize) -> u32 {
+    ((x as i32 - tx as i32).abs() + (y as i32 - ty as i32).abs()) as u32
+}
+
+fn is_obstacle(map_data: &[u64], width: usize, height: usize, x: usize, y: usize) -> bool {
+    if x >= width || y >= height { return true; }
+    let idx = y * width + x;
+    (map_data[idx / 64] & (1 << (idx % 64))) != 0
+}
+
+fn line_of_sight(p0: (f32, f32), p1: (f32, f32), map_data: &[u64], width: usize, height: usize) -> bool {
+    let mut x0 = p0.0 as i32;
+    let mut y0 = p0.1 as i32;
+    let x1 = p1.0 as i32;
+    let y1 = p1.1 as i32;
+
+    let dx = (x1 - x0).abs();
+    let dy = -(y1 - y0).abs();
+    let sx = if x0 < x1 { 1 } else { -1 };
+    let sy = if y0 < y1 { 1 } else { -1 };
+    let mut err = dx + dy;
+
+    loop {
+        if x0 >= 0 && x0 < width as i32 && y0 >= 0 && y0 < height as i32 {
+            if is_obstacle(map_data, width, height, x0 as usize, y0 as usize) {
+                return false;
+            }
+        } else {
+            return false;
+        }
+        if x0 == x1 && y0 == y1 { break; }
+        let e2 = 2 * err;
+        if e2 >= dy {
+            err += dy;
+            x0 += sx;
+        }
+        if e2 <= dx {
+            err += dx;
+            y0 += sy;
+        }
+    }
+    true
+}
+
+fn simplify_path(path: &[(f32, f32)], map_data: &[u64], width: usize, height: usize) -> Vec<(f32, f32)> {
+    if path.len() <= 2 { return path.to_vec(); }
+    let mut simplified = Vec::new();
+    simplified.push(path[0]);
+    
+    let mut current_idx = 0;
+    while current_idx < path.len() - 1 {
+        let mut next_idx = current_idx + 1;
+        for j in (current_idx + 2)..path.len() {
+            if line_of_sight(path[current_idx], path[j], map_data, width, height) {
+                next_idx = j;
+            } else {
+                break;
+            }
+        }
+        simplified.push(path[next_idx]);
+        current_idx = next_idx;
+    }
+    simplified
+}
+
+fn get_desired_velocity(err: f32, max_accel: f32, max_v: f32) -> f32 {
+    let abs_err = err.abs();
+    let v = if abs_err < 5.0 {
+        let v_at_5 = (2.0 * max_accel * 5.0).sqrt();
+        (v_at_5 / 5.0) * abs_err
+    } else {
+        (2.0 * max_accel * abs_err).sqrt()
+    };
+    v.copysign(err).clamp(-max_v, max_v)
+}
+
+fn compute_control(
+    state: &State, 
+    wp: (f32, f32), 
+    is_last: bool, 
+    gravity: f32, 
+    max_thrust: f32
+) -> (f32, f32) {
+    let err_x = wp.0 - state.x;
+    let err_y = wp.1 - state.y;
+
+    let max_accel_x = (max_thrust * 0.4).max(1.0);
+    let max_accel_y_up = ((max_thrust - gravity) * 0.6).max(1.0);
+    let max_accel_y_down = (gravity * 0.6).max(1.0);
+
+    let max_accel_y = if err_y > 0.0 { max_accel_y_down } else { max_accel_y_up };
+
+    let v_max_x = if is_last { 15.0 } else { 30.0 };
+    let v_max_y = if is_last { 10.0 } else { 20.0 };
+
+    let v_des_x = get_desired_velocity(err_x, max_accel_x, v_max_x);
+    let v_des_y = get_desired_velocity(err_y, max_accel_y, v_max_y);
+
+    let kd = 1.5;
+    let ax_des = kd * (v_des_x - state.vx);
+    let ay_des = kd * (v_des_y - state.vy);
+
+    let req_T_sin = ax_des;
+    let req_T_cos = (gravity - ay_des).max(0.1); // Prevent flipping upside down
+
+    let T_req = (req_T_sin * req_T_sin + req_T_cos * req_T_cos).sqrt();
+    let theta_req = req_T_sin.atan2(req_T_cos);
+
+    let mut thrust = T_req / max_thrust;
+    thrust = thrust.clamp(0.0, 1.0);
+
+    let mut angle_diff = theta_req - state.angle;
+    while angle_diff > std::f32::consts::PI { angle_diff -= 2.0 * std::f32::consts::PI; }
+    while angle_diff < -std::f32::consts::PI { angle_diff += 2.0 * std::f32::consts::PI; }
+
+    let kp_a = 4.0;
+    let turn = (kp_a * angle_diff).clamp(-1.0, 1.0);
+
+    (thrust, turn)
+}
+
+fn main() {
+    let stdin = io::stdin();
+    let mut reader = io::BufReader::with_capacity(1024 * 1024, stdin.lock());
+    let mut line = String::new();
+
+    if reader.read_line(&mut line).unwrap_or(0) == 0 { return; }
+    let parts: Vec<f32> = line.split_whitespace().filter_map(|s| s.parse().ok()).collect();
+    if parts.len() < 4 { return; }
+    let width = parts[0] as usize;
+    let height = parts[1] as usize;
+    let gravity = parts[2];
+    let max_thrust = parts[3];
+
+    line.clear();
+    if reader.read_line(&mut line).unwrap_or(0) == 0 { return; }
+    let parts: Vec<f32> = line.split_whitespace().filter_map(|s| s.parse().ok()).collect();
+    if parts.len() < 4 { return; }
+    let start_x = parts[0];
+    let start_y = parts[1];
+    let target_x = parts[2];
+    let target_y = parts[3];
+
+    let total_bits = width * height;
+    let mut map_data = vec![0u64; (total_bits + 63) / 64];
+
+    let mut buf = Vec::new();
+    for y in 0..height {
+        buf.clear();
+        if reader.read_until(b'\n', &mut buf).unwrap_or(0) == 0 { break; }
+        let base_idx = y * width;
+        for x in 0..width.min(buf.len()) {
+            if buf[x] == b'#' {
+                let idx = base_idx + x;
+                map_data[idx / 64] |= 1 << (idx % 64);
+            }
+        }
+    }
+
+    let shared_data = Arc::new(Mutex::new(SharedData {
+        current_state: None,
+        waypoints: None,
+    }));
+
+    let map_arc = Arc::new(map_data);
+    let shared_clone = shared_data.clone();
+    let map_clone = map_arc.clone();
+    
+    thread::spawn(move || {
+        let sx = start_x as usize;
+        let sy = start_y as usize;
+        let tx = target_x as usize;
+        let ty = target_y as usize;
+
+        let mut open_set = BinaryHeap::new();
+        let mut g_score = HashMap::new();
+        let mut parent = HashMap::new();
+
+        let start_idx = sy * width + sx;
+        g_score.insert(start_idx, 0u32);
+        open_set.push(Node {
+            f: heuristic(sx, sy, tx, ty),
+            idx: start_idx,
+            x: sx,
+            y: sy,
+        });
+
+        let mut iterations = 0;
+        let mut found = false;
+        while let Some(current) = open_set.pop() {
+            iterations += 1;
+            if current.x == tx && current.y == ty {
+                found = true;
+                break;
+            }
+            if iterations > 1_000_000 {
+                break;
+            }
+
+            let curr_g = *g_score.get(&current.idx).unwrap();
+
+            let dx = [-1, 1, 0, 0, -1, -1, 1, 1];
+            let dy = [0, 0, -1, 1, -1, 1, -1, 1];
+            let cost = [10, 10, 10, 10, 14, 14, 14, 14];
+
+            for i in 0..8 {
+                let nx = current.x as i32 + dx[i];
+                let ny = current.y as i32 + dy[i];
+
+                if nx >= 0 && nx < width as i32 && ny >= 0 && ny < height as i32 {
+                    let nx = nx as usize;
+                    let ny = ny as usize;
+                    
+                    if is_obstacle(&map_clone, width, height, nx, ny) { continue; }
+
+                    let n_idx = ny * width + nx;
+                    let tentative_g = curr_g + cost[i];
+
+                    if tentative_g < *g_score.get(&n_idx).unwrap_or(&u32::MAX) {
+                        g_score.insert(n_idx, tentative_g);
+                        parent.insert(n_idx, current.idx);
+                        
+                        let h = heuristic(nx, ny, tx, ty) * 10; 
+                        let f = tentative_g + 2 * h;
+                        
+                        open_set.push(Node {
+                            f,
+                            idx: n_idx,
+                            x: nx,
+                            y: ny,
+                        });
+                    }
+                }
+            }
+        }
+
+        let mut path = Vec::new();
+        let mut curr = ty * width + tx;
+        
+        if !found {
+            let mut best_idx = start_idx;
+            let mut best_h = u32::MAX;
+            for (&idx, _) in g_score.iter() {
+                let cx = idx % width;
+                let cy = idx / width;
+                let h = heuristic(cx, cy, tx, ty);
+                if h < best_h {
+                    best_h = h;
+                    best_idx = idx;
+                }
+            }
+            curr = best_idx;
+        }
+
+        while curr != start_idx {
+            let cx = curr % width;
+            let cy = curr / width;
+            path.push((cx as f32, cy as f32));
+            if let Some(&p) = parent.get(&curr) {
+                curr = p;
+            } else {
+                break;
+            }
+        }
+        path.push((start_x, start_y));
+        path.reverse();
+        
+        if path.is_empty() {
+            path.push((target_x, target_y));
+        }
+
+        let mut simplified = simplify_path(&path, &map_clone, width, height);
+        if found {
+            if let Some(last) = simplified.last_mut() {
+                *last = (target_x, target_y);
+            }
+        }
+
+        let mut sd = shared_clone.lock().unwrap();
+        sd.waypoints = Some(simplified);
+    });
+
+    let shared_clone_ctrl = shared_data.clone();
+    thread::spawn(move || {
+        let mut current_wp_idx = 0;
+        loop {
+            let start_time = Instant::now();
+            
+            let (state_opt, wps_opt) = {
+                let sd = shared_clone_ctrl.lock().unwrap();
+                (sd.current_state.clone(), sd.waypoints.clone())
+            };
+
+            if let Some(state) = state_opt {
+                let (wp, is_last) = if let Some(wps) = wps_opt {
+                    if current_wp_idx >= wps.len() {
+                        current_wp_idx = wps.len() - 1;
+                    }
+                    let target_wp = wps[current_wp_idx];
+                    let dist = ((target_wp.0 - state.x).powi(2) + (target_wp.1 - state.y).powi(2)).sqrt();
+                    
+                    if dist < 3.0 && current_wp_idx < wps.len() - 1 {
+                        current_wp_idx += 1;
+                    }
+                    
+                    let is_last = current_wp_idx == wps.len() - 1;
+                    (wps[current_wp_idx], is_last)
+                } else {
+                    ((start_x, start_y), false)
+                };
+
+                let (thrust, turn) = compute_control(&state, wp, is_last, gravity, max_thrust);
+                println!("{:.3} {:.3}", thrust, turn);
+                io::stdout().flush().unwrap();
+            }
+
+            let elapsed = start_time.elapsed();
+            if elapsed < Duration::from_millis(50) {
+                thread::sleep(Duration::from_millis(50) - elapsed);
+            }
+        }
+    });
+
+    loop {
+        line.clear();
+        if reader.read_line(&mut line).unwrap_or(0) == 0 {
+            break;
+        }
+        let parts: Vec<f32> = line.split_whitespace().filter_map(|s| s.parse().ok()).collect();
+        if parts.len() >= 7 {
+            let state = State {
+                x: parts[0],
+                y: parts[1],
+                vx: parts[2],
+                vy: parts[3],
+                angle: parts[4],
+                angular_vel: parts[5],
+                fuel: parts[6],
+            };
+            let mut sd = shared_data.lock().unwrap();
+            sd.current_state = Some(state);
+        }
+    }
+}

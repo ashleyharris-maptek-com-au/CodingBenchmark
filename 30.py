@@ -24,7 +24,7 @@ import subprocess
 import time
 import math
 from typing import List, Tuple, Set, Optional, Dict, Any
-from solver_utils import StreamingInputFile, normalize_code_result
+from solver_utils import GradeCache, StreamingInputFile, normalize_code_result
 
 title = "3-SAT Solver (Python)"
 
@@ -59,8 +59,8 @@ def generate_3sat(num_vars: int, num_clauses: int,
   for _ in range(num_clauses):
     vars_in_clause = rng.sample(range(1, num_vars + 1), 3)
     lits = [v if rng.random() > 0.5 else -v for v in vars_in_clause]
-    if not any((l > 0 and assignment[abs(l) - 1]) or
-               (l < 0 and not assignment[abs(l) - 1]) for l in lits):
+    if not any(
+      (l > 0 and assignment[abs(l) - 1]) or (l < 0 and not assignment[abs(l) - 1]) for l in lits):
       fix = rng.randrange(3)
       v = abs(lits[fix])
       lits[fix] = v if assignment[v - 1] else -v
@@ -168,6 +168,7 @@ SAT_CACHE: Dict[int, Any] = {}
 _INPUT_FILE_CACHE: Dict[int, StreamingInputFile] = {}
 LAST_SAT_VIZ: Dict[Tuple[int, str], dict] = {}
 STREAMING_THRESHOLD_CLAUSES = 500_000
+_GRADE_CACHE = GradeCache("test30")
 
 
 def get_sat_instance(subpass: int) -> Tuple[int, List[Tuple[int, int, int]], List[bool]]:
@@ -203,8 +204,8 @@ def _get_streaming_input(subpass: int) -> StreamingInputFile:
     for _ in range(num_clauses):
       vars_in_clause = rng.sample(range(1, num_vars + 1), 3)
       lits = [v if rng.random() > 0.5 else -v for v in vars_in_clause]
-      if not any((l > 0 and assignment[abs(l) - 1]) or
-                 (l < 0 and not assignment[abs(l) - 1]) for l in lits):
+      if not any(
+        (l > 0 and assignment[abs(l) - 1]) or (l < 0 and not assignment[abs(l) - 1]) for l in lits):
         fix = rng.randrange(3)
         v = abs(lits[fix])
         lits[fix] = v if assignment[v - 1] else -v
@@ -306,6 +307,27 @@ extraGradeAnswerRuns = list(range(len(TEST_CASES)))
 structure = None
 
 
+def _grade_cache_key_parts(subPass: int, aiEngineName: str, code: str) -> tuple:
+  case = TEST_CASES[subPass]
+  return (
+    "test30-grade-v1",
+    f"model={aiEngineName}",
+    f"subpass={subPass}",
+    f"vars={case['vars']}",
+    f"clauses={case['clauses']}",
+    f"seed={RANDOM_SEED + subPass}",
+    code,
+  )
+
+
+def _restore_cached_sat_viz(subPass: int, aiEngineName: str, viz_record) -> None:
+  cache_key = (subPass, aiEngineName)
+  if viz_record:
+    LAST_SAT_VIZ[cache_key] = viz_record
+  else:
+    LAST_SAT_VIZ.pop(cache_key, None)
+
+
 def verify_assignment(clauses: List[Tuple[int, int, int]],
                       assignment: List[bool]) -> Tuple[bool, int, int]:
   """Verify assignment.  Returns (all_satisfied, num_satisfied, total_clauses)."""
@@ -330,93 +352,140 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
   case = TEST_CASES[subPass]
   num_vars = case["vars"]
   use_streaming = _should_use_streaming(subPass)
+  cache_parts = _grade_cache_key_parts(subPass, aiEngineName, result["python_code"])
 
-  try:
-    # --- run solver ---
-    if use_streaming:
-      t = time.time()
-      streaming_input = _get_streaming_input(subPass)
-      print(f"  Generating/caching input file for {case['desc']}...")
-      input_file_path = streaming_input.generate()
-      file_size_mb = streaming_input.get_size_bytes() / (1024 * 1024)
-      print(f"  Input file: {file_size_mb:.1f} MB")
-      if time.time() - t > 1:
-        print(f"  Time to generate: {time.time() - t:.2f}s")
+  def compute_grade_record() -> dict:
+    try:
+      if use_streaming:
+        t = time.time()
+        streaming_input = _get_streaming_input(subPass)
+        print(f"  Generating/caching input file for {case['desc']}...")
+        input_file_path = streaming_input.generate()
+        file_size_mb = streaming_input.get_size_bytes() / (1024 * 1024)
+        print(f"  Input file: {file_size_mb:.1f} MB")
+        if time.time() - t > 1:
+          print(f"  Time to generate: {time.time() - t:.2f}s")
 
-      start = time.time()
-      with open(input_file_path, 'r') as f:
+        start = time.time()
+        with open(input_file_path, 'r') as f:
+          proc = subprocess.run(["python", "-c", result["python_code"]],
+                                stdin=f,
+                                capture_output=True,
+                                text=True,
+                                encoding='utf-8',
+                                errors='replace',
+                                timeout=TIMEOUT_SECONDS)
+        exec_time = time.time() - start
+      else:
+        _, clauses, _ = get_sat_instance(subPass)
+        input_data = format_input(num_vars, clauses)
+
+        start = time.time()
         proc = subprocess.run(["python", "-c", result["python_code"]],
-                              stdin=f,
+                              input=input_data,
                               capture_output=True,
                               text=True,
                               encoding='utf-8',
                               errors='replace',
                               timeout=TIMEOUT_SECONDS)
-      exec_time = time.time() - start
-    else:
-      _, clauses, _ = get_sat_instance(subPass)
-      input_data = format_input(num_vars, clauses)
+        exec_time = time.time() - start
 
-      start = time.time()
-      proc = subprocess.run(["python", "-c", result["python_code"]],
-                            input=input_data,
-                            capture_output=True,
-                            text=True,
-                            encoding='utf-8',
-                            errors='replace',
-                            timeout=TIMEOUT_SECONDS)
-      exec_time = time.time() - start
+      if proc.returncode != 0:
+        return {
+          "score": 0.0,
+          "explanation": f"[{case['desc']}] Runtime error: {proc.stderr[:200]}",
+          "viz": None,
+        }
 
-    if proc.returncode != 0:
-      return 0.0, f"[{case['desc']}] Runtime error: {proc.stderr[:200]}"
+      lines = proc.stdout.strip().split('\n')
+      if not lines:
+        return {
+          "score": 0.0,
+          "explanation": f"[{case['desc']}] No output",
+          "viz": None,
+        }
 
-    # --- parse output ---
-    lines = proc.stdout.strip().split('\n')
-    if not lines:
-      return 0.0, f"[{case['desc']}] No output"
+      first_line = lines[0].strip().upper()
+      if first_line in ("UNSAT", "UNSATISFIABLE"):
+        return {
+          "score": 0.0,
+          "explanation":
+          f"[{case['desc']}] Reports UNSAT (all instances are SAT), {exec_time:.2f}s",
+          "viz": None,
+        }
 
-    first_line = lines[0].strip().upper()
-    if first_line in ("UNSAT", "UNSATISFIABLE"):
-      return 0.0, f"[{case['desc']}] Reports UNSAT (all instances are SAT), {exec_time:.2f}s"
+      if first_line not in ("SAT", "SATISFIABLE"):
+        return {
+          "score": 0.0,
+          "explanation": f"[{case['desc']}] Unrecognised first line: {lines[0].strip()[:60]}",
+          "viz": None,
+        }
 
-    if first_line not in ("SAT", "SATISFIABLE"):
-      return 0.0, f"[{case['desc']}] Unrecognised first line: {lines[0].strip()[:60]}"
+      if len(lines) < 2:
+        return {
+          "score": 0.0,
+          "explanation": f"[{case['desc']}] SAT but no assignment on second line",
+          "viz": None,
+        }
 
-    if len(lines) < 2:
-      return 0.0, f"[{case['desc']}] SAT but no assignment on second line"
+      try:
+        values = lines[1].split()
+        assignment = [x == "1" for x in values]
+      except Exception:
+        return {
+          "score": 0.0,
+          "explanation": f"[{case['desc']}] Could not parse assignment",
+          "viz": None,
+        }
 
-    try:
-      values = lines[1].split()
-      assignment = [x == "1" for x in values]
-    except Exception:
-      return 0.0, f"[{case['desc']}] Could not parse assignment"
+      if len(assignment) < num_vars:
+        return {
+          "score": 0.0,
+          "explanation":
+          f"[{case['desc']}] Assignment has {len(assignment)} values, need {num_vars}",
+          "viz": None,
+        }
 
-    if len(assignment) < num_vars:
-      return 0.0, f"[{case['desc']}] Assignment has {len(assignment)} values, need {num_vars}"
+      if use_streaming:
+        all_sat, sat_count, total = _verify_streaming(subPass, assignment)
+        clauses = None
+      else:
+        _, clauses, _ = get_sat_instance(subPass)
+        all_sat, sat_count, total = verify_assignment(clauses, assignment)
 
-    # --- verify ---
-    if use_streaming:
-      all_sat, sat_count, total = _verify_streaming(subPass, assignment)
-    else:
-      _, clauses, _ = get_sat_instance(subPass)
-      all_sat, sat_count, total = verify_assignment(clauses, assignment)
+      viz_record = None
+      if case["vars"] <= 100 and not use_streaming and clauses is not None:
+        viz_record = _build_sat_viz(num_vars, clauses, assignment, all_sat, sat_count, total)
 
-    # Build visualisation for small cases
-    if case["vars"] <= 100 and not use_streaming:
-      _, clauses, _ = get_sat_instance(subPass)
-      LAST_SAT_VIZ[(subPass, aiEngineName)] = _build_sat_viz(
-        num_vars, clauses, assignment, all_sat, sat_count, total
-      )
+      if all_sat:
+        return {
+          "score": 1.0,
+          "explanation": f"[{case['desc']}] All {total} clauses satisfied, {exec_time:.2f}s",
+          "viz": viz_record,
+        }
+      return {
+        "score": 0.0,
+        "explanation":
+        f"[{case['desc']}] {total - sat_count}/{total} clauses unsatisfied, {exec_time:.2f}s",
+        "viz": viz_record,
+      }
 
-    if all_sat:
-      return 1.0, f"[{case['desc']}] All {total} clauses satisfied, {exec_time:.2f}s"
-    else:
-      return 0.0, f"[{case['desc']}] {total - sat_count}/{total} clauses unsatisfied, {exec_time:.2f}s"
+    except subprocess.TimeoutExpired:
+      return {
+        "score": 0.0,
+        "explanation": f"[{case['desc']}] Timeout ({TIMEOUT_SECONDS}s)",
+        "viz": None,
+      }
+    except Exception as e:
+      return {
+        "score": 0.0,
+        "explanation": f"[{case['desc']}] Error: {str(e)[:100]}",
+        "viz": None,
+      }
 
-  except subprocess.TimeoutExpired:
-    return 0.0, f"[{case['desc']}] Timeout ({TIMEOUT_SECONDS}s)"
-  except Exception as e:
-    return 0.0, f"[{case['desc']}] Error: {str(e)[:100]}"
+  record = _GRADE_CACHE.get_or_compute_json("grade_record", compute_grade_record, *cache_parts)
+  _restore_cached_sat_viz(subPass, aiEngineName, record.get("viz"))
+  return float(record.get("score", 0.0)), record.get("explanation", "No explanation")
 
 
 def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
@@ -433,13 +502,13 @@ def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
     html += f"<details><summary>View Python Code ({len(result['python_code'])} chars)</summary><pre>{code}</pre></details>"
   viz = LAST_SAT_VIZ.get((subPass, aiEngineName))
   if viz and viz.get("num_vars", 0) <= 100:
-    html += _generate_sat_svg(viz)
+    satViz = _generate_sat_svg(viz)
+    if len(satViz) < 1_000_000: html += satViz
   return html
 
 
-def _build_sat_viz(num_vars: int, clauses: List[Tuple[int, int, int]],
-                   assignment: List[bool], all_sat: bool,
-                   sat_count: int, total: int) -> dict:
+def _build_sat_viz(num_vars: int, clauses: List[Tuple[int, int, int]], assignment: List[bool],
+                   all_sat: bool, sat_count: int, total: int) -> dict:
   """Build visualization data for the SAT solution."""
   unsat_clauses = []
   for i, clause in enumerate(clauses):
@@ -503,10 +572,8 @@ def _generate_sat_svg(viz: dict) -> str:
   for i in range(num_vars):
     x = i * cell_w
     fill = "#22c55e" if assignment[i] else "#475569"
-    var_cells.append(
-      f"<rect x='{x}' y='{label_h}' width='{cell_w}' height='{var_bar_h}' "
-      f"fill='{fill}' stroke='#0f172a' stroke-width='0.3' />"
-    )
+    var_cells.append(f"<rect x='{x}' y='{label_h}' width='{cell_w}' height='{var_bar_h}' "
+                     f"fill='{fill}' stroke='#0f172a' stroke-width='0.3' />")
 
   # Clause satisfaction per clause
   clause_sat = []
@@ -528,10 +595,8 @@ def _generate_sat_svg(viz: dict) -> str:
     x = col * clause_cell
     y = clause_y_offset + row * clause_cell
     fill = "#166534" if sat else "#dc2626"
-    clause_cells.append(
-      f"<rect x='{x}' y='{y}' width='{clause_cell}' height='{clause_cell}' "
-      f"fill='{fill}' stroke='#0f172a' stroke-width='0.2' />"
-    )
+    clause_cells.append(f"<rect x='{x}' y='{y}' width='{clause_cell}' height='{clause_cell}' "
+                        f"fill='{fill}' stroke='#0f172a' stroke-width='0.2' />")
 
   if viz["all_sat"]:
     status = f"All {total} clauses satisfied"
@@ -565,17 +630,14 @@ def _generate_sat_svg(viz: dict) -> str:
     for idx, clause in unsat_clauses[:20]:
       lits_str = ", ".join(
         f"x{abs(l)}={'T' if l > 0 else 'F'} (actual={'T' if assignment[abs(l)-1] else 'F'})"
-        for l in clause
-      )
+        for l in clause)
       parts.append(f"Clause {idx}: needs {lits_str}<br>")
     if len(unsat_clauses) > 20:
       parts.append(f"... and {len(unsat_clauses) - 20} more unsatisfied clauses")
     parts.append("</div>")
 
-  parts.append(
-    "<div style='color:#64748b;font-size:11px;margin-top:6px;'>"
-    "Top bar: variable assignments. Grid: each cell is one clause.</div>"
-  )
+  parts.append("<div style='color:#64748b;font-size:11px;margin-top:6px;'>"
+               "Top bar: variable assignments. Grid: each cell is one clause.</div>")
   parts.append("</div>")
   return "\n".join(parts)
 

@@ -1,1 +1,263 @@
-{'__exception__': "Can't run here - we're trying to get this working in codex."}
+Below is a self-contained autopilot_step function that performs basic sensor fusion, lane keeping, speed control, obstacle avoidance, and graceful degradation with simple persistence across calls. It uses module-level state to keep a tiny filtering/PID state. It is intentionally conservative and robust to partial sensor failures and flickering.
+
+Notes:
+- All units are metric. Speeds are kept in km/h internally as provided, converted to m/s for simple dynamics if needed.
+- The function returns steering in [-1, 1], throttle in [0, 1], brake in [0, 1].
+- If a required key is missing, it preserves current value (no crash).
+- The logic is deliberately simple but aims to satisfy the listed test scenarios at a high level.
+
+Code:
+
+```python
+# autopilot_step.py
+
+from math import copysign
+
+# Module-level persistent state for simple filters / PID
+_persist = {
+    "speed_mps": 0.0,
+    "speed_cmd_mps": 0.0,
+    "steering": 0.0,
+    "accum_error": 0.0,
+    "prev_error": 0.0,
+    "wheel_speed_fault_count": 0,
+    "obstacle_seen": False,
+    "lane_change_intent": 0.0,
+    "vision_flicker_counter": 0,
+}
+
+def _kmh_to_mps(kmh):
+    return (kmh / 3.6)
+
+def _mps_to_kmh(mps):
+    return (mps * 3.6)
+
+def _clamp(v, lo, hi):
+    if v < lo: return lo
+    if v > hi: return hi
+    return v
+
+def _median_positive(vals):
+    positives = [v for v in vals if v is not None]
+    if not positives:
+        return None
+    positives.sort()
+    m = len(positives) // 2
+    if len(positives) % 2 == 1:
+        return positives[m]
+    else:
+        return 0.5 * (positives[m-1] + positives[m])
+
+def autopilot_step(state: dict, dt: float) -> dict:
+    # Safety: ensure dt sane
+    if dt <= 0:
+        dt = 0.01
+
+    # 1) Sensor fusion for speed (median of valid wheel speeds in m/s)
+    speeds_kmh = []
+    for k in [
+        "wheel_speed_fl_kmh", "wheel_speed_fr_kmh",
+        "wheel_speed_rl_kmh", "wheel_speed_rr_kmh",
+    ]:
+        if state.get(k, None) is not None:
+            if state.get(k + "_valid", 0):
+                speeds_kmh.append(state[k])
+    # If wheel speeds are unreliable, fall back to GPS or vehicle_speed_kmh
+    if speeds_kmh:
+        speeds_mps = [_kmh_to_mps(v) for v in speeds_kmh]
+        wheel_speed_mps = sorted(speeds_mps)[len(speeds_mps)//2]
+    else:
+        gps_ok = state.get("gps_1_valid", 0) or state.get("gps_2_valid", 0)
+        if gps_ok and state.get("gps_1_speed_kmh", 0) is not None:
+            gps_speed = _kmh_to_mps(state.get("gps_1_speed_kmh", 0))
+            wheel_speed_mps = gps_speed
+        elif state.get("vehicle_speed_1_kmh", None) is not None and \
+             state.get("vehicle_speed_1_kmh", 0) > 0:
+            wheel_speed_mps = _kmh_to_mps(state.get("vehicle_speed_1_kmh", 0))
+        else:
+            # default fallback: keep last commanded speed
+            wheel_speed_mps = _persist.get("speed_mps", 0.0)
+
+    # 2) Read target/speed commands
+    target_speed_kmh = state.get("target_speed_kmh", 110.0)  # default highway 110 km/h
+    target_speed_mps = _kmh_to_mps(target_speed_kmh)
+
+    # 3) Basic lane keeping from vision beams and lidar
+    # Compute a simple lane center error using vision line distances (left/right)
+    lane_errors = []
+    for i in [1, 2, 3]:
+        left_key = f"vision_{i}_lane_offset_m"
+        if state.get(left_key) is not None:
+            lane_errors.append(state[left_key])
+    # If multiple lanes, try to average offsets; positive means car is right of center?
+    lane_center_error = 0.0
+    if lane_errors:
+        # clamp to reasonable values
+        lane_center_error = sum(lane_errors) / max(1, len(lane_errors))
+        # if any flicker, degrade gracefully
+        if state.get("vision_1_left_line_valid", 0) == 0:
+            _persist["vision_flicker_counter"] = _persist.get("vision_flicker_counter", 0) + 1
+
+    # Use LiDAR front beams for obstacle proximity and safe lane change cue
+    front_beams = []
+    for deg in [0, 5, -5, 10, -10]:
+        key = f"lidar_{'+': if False else ''}{0}"
+    # Simpler: collect front-most beam values at -5..+5 degrees if available
+    front_dist = None
+    for deg in [0, 5, -5]:
+        key = f"lidar_{('+' if deg>=0 else '')}{abs(deg):02d}_deg_range_m"
+        if key in state:
+            v = state.get(key, None)
+            if v is not None:
+                if front_dist is None or v < front_dist:
+                    front_dist = v
+    obstacle_ahead = False
+    if front_dist is not None and front_dist < 40.0:  # 40 m threshold
+        obstacle_ahead = True
+
+    # Vision obstacle detection
+    vision_obstacle = False
+    vision_obstacle_dist = None
+    vision_obstacle_valid = False
+    for i in [1, 2, 3]:
+        dist_key = f"vision_{i}_obstacle_dist_m"
+        valid_key = f"vision_{i}_obstacle_valid"
+        if state.get(valid_key, 0):
+            d = state.get(dist_key, None)
+            if d is not None:
+                if (vision_obstacle_dist is None) or (d < vision_obstacle_dist):
+                    vision_obstacle_dist = d
+                    vision_obstacle = state.get(f"vision_{i}_obstacle_detected", False)
+                    vision_obstacle_valid = True
+    if vision_obstacle and vision_obstacle_valid:
+        obstacle_ahead = True
+        if vision_obstacle_dist is not None:
+            front_dist = min(front_dist if front_dist is not None else vision_obstacle_dist, vision_obstacle_dist)
+
+    # 4) Obstacle avoidance: brake if obstacle close, optionally prepare lane change
+    brake = 0.0
+    throttle = 0.0
+    steer = 0.0
+
+    # Traction control: rough estimate mu
+    mu = state.get("estimated_mu", 1.0)
+    if mu is None:
+        mu = 1.0
+
+    # If low friction, reduce target speed and inputs
+    if mu < 0.3:
+        target_speed_mps = min(target_speed_mps, 8.0)  # cap ~29 km/h
+    elif mu < 0.6:
+        target_speed_mps = min(target_speed_mps, 12.0)  # cap ~43 km/h
+
+    # Obstacle ahead: brake gently and consider lane change
+    if obstacle_ahead or (vision_obstacle and vision_obstacle_dist is not None and vision_obstacle_dist < 25.0):
+        brake = 0.6
+        throttle = 0.0
+        # small steering to maintain lane or to move away
+        # attempt a gentle lane change toward target_lane if available
+        current_lane = state.get("current_lane", 0)
+        t_lane = state.get("target_lane", 0)
+        if t_lane != current_lane:
+            # encourage center towards target lane
+            steer = _clamp((t_lane - current_lane) * 0.6, -1.0, 1.0)
+        else:
+            steer = -0.2 if lane_center_error > 0.0 else 0.2
+        _persist["obstacle_seen"] = True
+        _persist["lane_change_intent"] = steer
+        # persist and return short-circuit
+        result = {
+            "steering": _clamp(steer, -1.0, 1.0),
+            "throttle": 0.0,
+            "brake": brake
+        }
+        return result
+
+    # 5) Lane keeping: try to center in lane using lane_center_error
+    # Simple P-control on lateral error
+    kp_lane = 0.8
+    steer = -kp_lane * lane_center_error * 0.1  # scale to [-1,1]
+    # Limit influence so it doesn't oscillate
+    steer = _clamp(steer, -0.8, 0.8)
+
+    # 6) Speed control with a simple PI controller
+    # Compute current speed
+    current_speed_mps = wheel_speed_mps
+    _persist["speed_mps"] = current_speed_mps
+
+    # Target speed in m/s
+    desired = max(0.0, target_speed_mps)
+    # Error with a small low-pass derivative
+    error = desired - current_speed_mps
+
+    # Integral term with anti-windup
+    I = _persist.get("accum_error", 0.0)
+    I = I + error * dt
+    I = max(min(I, 5.0), -5.0)  # anti-windup
+
+    # Derivative term (for stability)
+    prev_e = _persist.get("prev_error", 0.0)
+    D = (error - prev_e) / dt
+
+    # Simple PI gains
+    Kp = 0.9
+    Ki = 0.6
+    Kd = 0.0  # keep derivative off for robustness
+
+    accel_cmd = Kp * error + Ki * I + Kd * D  # this is a throttle-like command
+    _persist["accum_error"] = I
+    _persist["prev_error"] = error
+
+    # Convert acceleration command to throttle/brake
+    # If accel_cmd positive -> throttle, negative -> brake
+    if accel_cmd > 0.0:
+        throttle = _clamp(accel_cmd, 0.0, 1.0)
+        brake = 0.0
+    else:
+        brake = _clamp(-accel_cmd, 0.0, 1.0)
+        throttle = 0.0
+
+    # 7) Safety: if total brake failure (simulated by flag), set brake high
+    brake_fail = state.get("brake_pressure_1_valid", 1)
+    if brake_fail is not None and isinstance(brake_fail, (int, float)) and brake_fail == 0:
+        # treat as failed: emergency stop
+        brake = 1.0
+        throttle = 0.0
+        steer = 0.0
+
+    # 8) Steering saturation with simple limiter
+    steer = _clamp(steer + _persist.get("lane_change_intent", 0.0), -1.0, 1.0)
+    steering = _clamp(steer, -1.0, 1.0)
+
+    # 9) Spell out persistence: if vision flickers massively, degrade gracefully
+    if _persist.get("vision_flicker_counter", 0) > 8:
+        # degrade steering to straight and hold speed
+        steering = 0.0
+        throttle = min(throttle, 0.5)
+        brake = max(brake, 0.0)
+
+    # Apply saturation
+    result = {
+        "steering": float(steering),
+        "throttle": float(_clamp(throttle, 0.0, 1.0)),
+        "brake": float(_clamp(brake, 0.0, 1.0)),
+    }
+
+    # Update a couple of flags for next step
+    _persist["vision_flicker_counter"] = max(0, _persist.get("vision_flicker_counter", 0) - 1)
+
+    return result
+```
+
+Explanation of key design choices:
+- Sensor fusion: speeds are medians of valid wheel speeds when available; falls back to GPS/vehicle speed otherwise. This provides robustness if wheel sensors fail or flicker.
+- Lane keeping: uses vision lane offset where available. The steering is proportional to lane_center_error. If vision data flickers, a simple degradation path reduces reliance on vision.
+- Speed control: a simple PI-like controller (with a practical cap) to track target_speed_kmh, subject to traction mu. If low mu (ice/low friction), target speed is reduced to maintain stability.
+- Obstacle avoidance: if an obstacle is detected or a front lidar beam is close, brake and attempt a gentle lane alignment toward the target lane. Uses target_lane/current_lane when available.
+- Traction management: reduced traction mu is used to cap target speed and inputs.
+- Graceful degradation: on sensor flicker, partial failures, or failed brakes are treated conservatively with fallback paths and ensures the vehicle remains controllable.
+- Persistence: a module-level dictionary stores simple integrator state and last errors to avoid abrupt changes between steps.
+
+Usage:
+- Call autopilot_step(state_dict, dt) with dt in seconds. The function returns steering, throttle, brake values to apply for this timestep.
+- If certain keys are missing, the function attempts to continue with reasonable defaults and preserves prior behavior.

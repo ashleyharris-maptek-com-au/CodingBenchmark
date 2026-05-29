@@ -16,7 +16,7 @@ import time
 import math
 from typing import List, Tuple, Set, Dict, Any
 from native_compiler import CppCompiler, CompilationError, ExecutionError, describe_this_pc
-from solver_utils import StreamingInputFile, normalize_code_result
+from solver_utils import GradeCache, StreamingInputFile, normalize_code_result
 
 title = "Steiner Tree (C++)"
 
@@ -65,7 +65,7 @@ def _build_edges_from_meta(num_vertices: int, planted_edges: List[Tuple[int, int
                            decoy_count: int, seed: int) -> List[Tuple[int, int, int]]:
   rng = random.Random(seed + 991)
   edges = list(planted_edges)
-  planted_set = { (u, v) for u, v, _ in planted_edges }
+  planted_set = {(u, v) for u, v, _ in planted_edges}
   edge_set = set(planted_set)
 
   while len(edges) < len(planted_edges) + decoy_count:
@@ -83,12 +83,12 @@ def _build_edges_from_meta(num_vertices: int, planted_edges: List[Tuple[int, int
   return edges
 
 
-def generate_graph(num_vertices: int, num_edges: int, num_terminals: int,
-                   seed: int) -> Tuple[List[Tuple[int, int, int]], List[int], List[Tuple[int, int, int]], int, int]:
+def generate_graph(
+    num_vertices: int, num_edges: int, num_terminals: int, seed: int
+) -> Tuple[List[Tuple[int, int, int]], List[int], List[Tuple[int, int, int]], int, int]:
   """Generate weighted graph with planted Steiner tree + decoy edges."""
   terminals, planted_edges, planted_weight, decoy_count = _generate_planted_meta(
-    num_vertices, num_edges, num_terminals, seed
-  )
+    num_vertices, num_edges, num_terminals, seed)
   edges = _build_edges_from_meta(num_vertices, planted_edges, decoy_count, seed)
   return edges, terminals, planted_edges, planted_weight, decoy_count
 
@@ -191,14 +191,14 @@ INSTANCE_CACHE: Dict[int, Any] = {}
 _INPUT_FILE_CACHE: Dict[int, StreamingInputFile] = {}
 LAST_STEINER_VIZ: Dict[Tuple[int, str], dict] = {}
 STREAMING_THRESHOLD_EDGES = 1_000_000
+_GRADE_CACHE = GradeCache("test32")
 
 
 def get_instance(subpass: int, include_edges: bool = True):
   if subpass not in INSTANCE_CACHE:
     case = TEST_CASES[subpass]
     terminals, planted_edges, planted_weight, decoy_count = _generate_planted_meta(
-      case["vertices"], case["edges"], case["terminals"], RANDOM_SEED + subpass
-    )
+      case["vertices"], case["edges"], case["terminals"], RANDOM_SEED + subpass)
     INSTANCE_CACHE[subpass] = {
       "num_vertices": case["vertices"],
       "edges": None,
@@ -210,10 +210,8 @@ def get_instance(subpass: int, include_edges: bool = True):
 
   cached = INSTANCE_CACHE[subpass]
   if include_edges and cached["edges"] is None:
-    cached["edges"] = _build_edges_from_meta(
-      cached["num_vertices"], cached["planted_edges"], cached["decoy_count"],
-      RANDOM_SEED + subpass
-    )
+    cached["edges"] = _build_edges_from_meta(cached["num_vertices"], cached["planted_edges"],
+                                             cached["decoy_count"], RANDOM_SEED + subpass)
 
   return (
     cached["num_vertices"],
@@ -237,9 +235,8 @@ def _get_streaming_input(subpass: int) -> StreamingInputFile:
   cache_key = f"steiner32|v={case['vertices']}|e={case['edges']}|t={case['terminals']}|seed={RANDOM_SEED + subpass}"
 
   def generator():
-    num_vertices, _, terminals, planted_edges, _, decoy_count = get_instance(
-      subpass, include_edges=False
-    )
+    num_vertices, _, terminals, planted_edges, _, decoy_count = get_instance(subpass,
+                                                                             include_edges=False)
     total_edges = len(planted_edges) + decoy_count
     yield f"{num_vertices} {total_edges} {len(terminals)}\n"
     for u, v, w in planted_edges:
@@ -331,6 +328,31 @@ extraGradeAnswerRuns = list(range(len(TEST_CASES)))
 structure = None
 
 
+def _grade_cache_key_parts(subPass: int, aiEngineName: str, code: str) -> tuple:
+  case = TEST_CASES[subPass]
+  return (
+    "test32-grade-v2",
+    f"model={aiEngineName}",
+    f"subpass={subPass}",
+    f"vertices={case['vertices']}",
+    f"edges={case['edges']}",
+    f"terminals={case['terminals']}",
+    f"seed={RANDOM_SEED + subPass}",
+    code,
+  )
+
+
+def _restore_cached_steiner_viz(subPass: int, aiEngineName: str, viz_record) -> None:
+  cache_key = (subPass, aiEngineName)
+  if viz_record:
+    normalized_viz = dict(viz_record)
+    normalized_viz["edges"] = [tuple(edge) for edge in viz_record.get("edges", [])]
+    normalized_viz["tree_edges"] = [tuple(edge) for edge in viz_record.get("tree_edges", [])]
+    LAST_STEINER_VIZ[cache_key] = normalized_viz
+  else:
+    LAST_STEINER_VIZ.pop(cache_key, None)
+
+
 def verify_steiner_tree(num_vertices: int, edges: List[Tuple[int, int, int]], terminals: Set[int],
                         tree_edges: List[Tuple[int, int]]) -> Tuple[bool, int, str]:
   """Verify tree connects all terminals. Returns (valid, weight, message)."""
@@ -374,7 +396,7 @@ def _verify_planted_tree(terminals: Set[int], tree_edges: List[Tuple[int, int]],
                          planted_edges: List[Tuple[int, int, int]],
                          planted_weight: int) -> Tuple[bool, int, str]:
   planted_set = {(min(u, v), max(u, v)) for u, v, _ in planted_edges}
-  planted_weights = { (min(u, v), max(u, v)): w for u, v, w in planted_edges }
+  planted_weights = {(min(u, v), max(u, v)): w for u, v, w in planted_edges}
 
   if len(tree_edges) != len(set(tree_edges)):
     return False, 0, "Duplicate edges in tree"
@@ -469,104 +491,146 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
 
   case = TEST_CASES[subPass]
   use_streaming = _should_use_streaming(subPass)
+  cache_parts = _grade_cache_key_parts(subPass, aiEngineName, result["cpp_code"])
 
-  compiler = CppCompiler(aiEngineName)
-  if not compiler.find_compiler():
-    return 0.0, "No C++ compiler found"
+  def compute_grade_record() -> dict:
+    compiler = CppCompiler(aiEngineName)
+    if not compiler.find_compiler():
+      return {
+        "score": 0.0,
+        "explanation": "No C++ compiler found",
+        "viz": None,
+      }
 
-  t1 = time.time()
+    t1 = time.time()
 
-  try:
-    exe_path = compiler.compile(result["cpp_code"])
-  except CompilationError as e:
-    return 0.0, f"Compilation error: {str(e)[:200]}"
+    try:
+      exe_path = compiler.compile(result["cpp_code"])
+    except CompilationError as e:
+      return {
+        "score": 0.0,
+        "explanation": f"Compilation error: {str(e)[:200]}",
+        "viz": None,
+      }
 
-  d = time.time() - t1
-  if d > 1: print(f"  Compilation time: {d:.2f}s")
+    d = time.time() - t1
+    if d > 1: print(f"  Compilation time: {d:.2f}s")
 
-  try:
-    if use_streaming:
+    try:
+      if use_streaming:
+        t = time.time()
+        streaming_input = _get_streaming_input(subPass)
+        print(f"  Generating/caching input file for {case['desc']}...")
+        input_file_path = streaming_input.generate()
+        file_size_mb = streaming_input.get_size_bytes() / (1024 * 1024)
+        print(f"  Input file: {file_size_mb:.1f} MB")
+        if time.time() - t > 1:
+          print(f"  Time to generate: {time.time() - t:.2f}s")
+
+        start = time.time()
+        stdout, stderr, exec_time, return_code = compiler.execute(exe_path,
+                                                                  timeout=TIMEOUT_SECONDS,
+                                                                  stdin_file=input_file_path)
+
+        if return_code != 0:
+          return {
+            "score": 0.0,
+            "explanation": f"Runtime error: {stderr[:200]}",
+            "viz": None,
+          }
+
+        proc_stdout = stdout
+      else:
+        num_vertices, edges, terminals, _, _, _ = get_instance(subPass)
+        input_data = format_input(num_vertices, edges, terminals)
+
+        start = time.time()
+        proc = subprocess.run([str(exe_path)],
+                              input=input_data,
+                              capture_output=True,
+                              text=True,
+                              encoding='utf-8',
+                              errors='replace',
+                              timeout=TIMEOUT_SECONDS)
+        exec_time = time.time() - start
+
+        if proc.returncode != 0:
+          return {
+            "score": 0.0,
+            "explanation": f"Runtime error: {proc.stderr[:200]}",
+            "viz": None,
+          }
+        proc_stdout = proc.stdout
+
+      lines = proc_stdout.strip().split('\n')
+      header = lines[0].split()
+      reported_weight = int(header[0])
+      num_tree_edges = int(header[1])
+      num_vertices, edges, terminals, planted_edges, planted_weight, _ = get_instance(subPass)
+
+      tree_edges = []
+      for i in range(1, num_tree_edges + 1):
+        if i < len(lines):
+          parts = lines[i].split()
+          tree_edges.append((int(parts[0]), int(parts[1])))
+
       t = time.time()
-      streaming_input = _get_streaming_input(subPass)
-      print(f"  Generating/caching input file for {case['desc']}...")
-      input_file_path = streaming_input.generate()
-      file_size_mb = streaming_input.get_size_bytes() / (1024 * 1024)
-      print(f"  Input file: {file_size_mb:.1f} MB")
-      if time.time() - t > 1:
-        print(f"  Time to generate: {time.time() - t:.2f}s")
+      if use_streaming:
+        valid, actual_weight, msg = _verify_planted_tree(set(terminals), tree_edges, planted_edges,
+                                                         planted_weight)
+      else:
+        valid, actual_weight, msg = verify_steiner_tree(num_vertices, edges, set(terminals),
+                                                        tree_edges)
+      d = time.time() - t
+      if d > 1:
+        print(f"  Verification time: {d:.2f}s")
 
-      start = time.time()
-      stdout, stderr, exec_time, return_code = compiler.execute(exe_path,
-                                                                timeout=TIMEOUT_SECONDS,
-                                                                stdin_file=input_file_path)
+      viz_record = None
+      if num_vertices <= 150 and not use_streaming:
+        viz_record = _build_steiner_viz(num_vertices, edges, terminals, tree_edges, reported_weight,
+                                        actual_weight, valid, msg)
 
-      if return_code != 0:
-        return 0.0, f"Runtime error: {stderr[:200]}"
+      if not valid:
+        return {
+          "score": 0.2,
+          "explanation": f"[{case['desc']}] {msg}",
+          "viz": viz_record,
+        }
 
-      proc_stdout = stdout
-    else:
-      num_vertices, edges, terminals, _, _, _ = get_instance(subPass)
-      input_data = format_input(num_vertices, edges, terminals)
+      if use_streaming:
+        return {
+          "score": 1.0,
+          "explanation": f"[{case['desc']}] Weight {actual_weight}, {exec_time:.2f}s",
+          "viz": viz_record,
+        }
 
-      start = time.time()
-      proc = subprocess.run([str(exe_path)],
-                            input=input_data,
-                            capture_output=True,
-                            text=True,
-                            encoding='utf-8',
-                            errors='replace',
-                            timeout=TIMEOUT_SECONDS)
-      exec_time = time.time() - start
+      upper = mst_upper_bound(num_vertices, edges, terminals)
+      ratio = actual_weight / upper if upper > 0 else 1.0
+      score = min(1.0, 1.5 - ratio * 0.5)
 
-      if proc.returncode != 0:
-        return 0.0, f"Runtime error: {proc.stderr[:200]}"
-      proc_stdout = proc.stdout
+      return {
+        "score": max(0.5, score),
+        "explanation":
+        f"[{case['desc']}] Weight {actual_weight} (MST bound: {upper}), {exec_time:.2f}s",
+        "viz": viz_record,
+      }
 
-    lines = proc_stdout.strip().split('\n')
-    header = lines[0].split()
-    reported_weight = int(header[0])
-    num_tree_edges = int(header[1])
-    num_vertices, edges, terminals, planted_edges, planted_weight, _ = get_instance(subPass)
+    except subprocess.TimeoutExpired:
+      return {
+        "score": 0.0,
+        "explanation": f"[{case['desc']}] Timeout",
+        "viz": None,
+      }
+    except Exception as e:
+      return {
+        "score": 0.0,
+        "explanation": f"[{case['desc']}] Error: {str(e)[:100]}",
+        "viz": None,
+      }
 
-    tree_edges = []
-    for i in range(1, num_tree_edges + 1):
-      if i < len(lines):
-        parts = lines[i].split()
-        tree_edges.append((int(parts[0]), int(parts[1])))
-
-    t = time.time()
-    if use_streaming:
-      valid, actual_weight, msg = _verify_planted_tree(
-        set(terminals), tree_edges, planted_edges, planted_weight
-      )
-    else:
-      valid, actual_weight, msg = verify_steiner_tree(num_vertices, edges, set(terminals), tree_edges)
-    d = time.time() - t
-    if d > 1:
-      print(f"  Verification time: {d:.2f}s")
-
-    if num_vertices <= 150 and not use_streaming:
-      LAST_STEINER_VIZ[(subPass, aiEngineName)] = _build_steiner_viz(
-        num_vertices, edges, terminals, tree_edges, reported_weight, actual_weight, valid, msg
-      )
-
-    if not valid:
-      return 0.2, f"[{case['desc']}] {msg}"
-
-    if use_streaming:
-      return 1.0, f"[{case['desc']}] Weight {actual_weight}, {exec_time:.2f}s"
-
-    upper = mst_upper_bound(num_vertices, edges, terminals)
-    ratio = actual_weight / upper if upper > 0 else 1.0
-    score = min(1.0, 1.5 - ratio * 0.5)
-
-    return max(
-      0.5, score), f"[{case['desc']}] Weight {actual_weight} (MST bound: {upper}), {exec_time:.2f}s"
-
-  except subprocess.TimeoutExpired:
-    return 0.0, f"[{case['desc']}] Timeout"
-  except Exception as e:
-    return 0.0, f"[{case['desc']}] Error: {str(e)[:100]}"
+  record = _GRADE_CACHE.get_or_compute_json("grade_record", compute_grade_record, *cache_parts)
+  _restore_cached_steiner_viz(subPass, aiEngineName, record.get("viz"))
+  return float(record.get("score", 0.0)), record.get("explanation", "No explanation")
 
 
 def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
@@ -587,15 +651,10 @@ def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
   return html
 
 
-def _build_steiner_viz(num_vertices: int, edges: List[Tuple[int, int, int]],
-                       terminals: List[int], tree_edges: List[Tuple[int, int]],
-                       reported_weight: int, actual_weight: int, valid: bool,
-                       msg: str) -> dict:
-  terminal_set = set(terminals)
+def _build_steiner_viz(num_vertices: int, edges: List[Tuple[int, int, int]], terminals: List[int],
+                       tree_edges: List[Tuple[int, int]], reported_weight: int, actual_weight: int,
+                       valid: bool, msg: str) -> dict:
   tree_set = {tuple(sorted(edge)) for edge in tree_edges}
-  edge_lookup = {}
-  for u, v, w in edges:
-    edge_lookup[(min(u, v), max(u, v))] = w
 
   return {
     "num_vertices": num_vertices,
@@ -606,16 +665,14 @@ def _build_steiner_viz(num_vertices: int, edges: List[Tuple[int, int, int]],
     "actual_weight": actual_weight,
     "valid": valid,
     "message": msg,
-    "edge_weights": edge_lookup,
-    "terminal_set": terminal_set,
   }
 
 
 def _generate_steiner_svg(viz: dict) -> str:
   num_vertices = viz["num_vertices"]
-  terminals = viz["terminal_set"]
-  tree_edges = set(viz["tree_edges"])
-  edges = viz["edges"]
+  terminals = set(viz.get("terminal_set", viz.get("terminals", [])))
+  tree_edges = {tuple(edge) for edge in viz.get("tree_edges", [])}
+  edges = [tuple(edge) for edge in viz.get("edges", [])]
 
   width = 720
   height = 520
@@ -632,10 +689,8 @@ def _generate_steiner_svg(viz: dict) -> str:
   for u, v, _ in edges:
     x1, y1 = positions[u]
     x2, y2 = positions[v]
-    edge_lines.append(
-      f"<line x1='{x1:.2f}' y1='{y1:.2f}' x2='{x2:.2f}' y2='{y2:.2f}' "
-      "stroke='#1f2937' stroke-width='1' opacity='0.35'/>"
-    )
+    edge_lines.append(f"<line x1='{x1:.2f}' y1='{y1:.2f}' x2='{x2:.2f}' y2='{y2:.2f}' "
+                      "stroke='#1f2937' stroke-width='1' opacity='0.35'/>")
 
   tree_lines = []
   for u, v in tree_edges:
@@ -643,10 +698,8 @@ def _generate_steiner_svg(viz: dict) -> str:
       continue
     x1, y1 = positions[u]
     x2, y2 = positions[v]
-    tree_lines.append(
-      f"<line x1='{x1:.2f}' y1='{y1:.2f}' x2='{x2:.2f}' y2='{y2:.2f}' "
-      "stroke='#22c55e' stroke-width='2.2' opacity='0.9'/>"
-    )
+    tree_lines.append(f"<line x1='{x1:.2f}' y1='{y1:.2f}' x2='{x2:.2f}' y2='{y2:.2f}' "
+                      "stroke='#22c55e' stroke-width='2.2' opacity='0.9'/>")
 
   node_circles = []
   for i in range(num_vertices):
@@ -671,26 +724,19 @@ def _generate_steiner_svg(viz: dict) -> str:
     "<text x='32' y='60'>Terminal</text>"
     "<circle cx='20' cy='74' r='4' fill='#94a3b8' stroke='#1f2937' stroke-width='1'/>"
     "<text x='32' y='78'>Steiner/other</text>"
-    "</g>"
-  )
+    "</g>")
 
-  return (
-    "<div style='margin:12px 0;padding:10px;border:1px solid #1f2937;"
-    "border-radius:8px;background:#0b1120;'>"
-    f"<div style='color:#e2e8f0;font-size:13px;margin-bottom:6px;'>"
-    f"<strong>Steiner Tree Visualization</strong> &mdash; "
-    f"<span style='color:{status_color};'>{status}</span> "
-    f"(reported={viz['reported_weight']}, actual={viz['actual_weight']})</div>"
-    f"<div style='color:#94a3b8;font-size:11px;margin-bottom:6px;'>{viz['message']}</div>"
-    f"<svg width='100%' viewBox='0 0 {width} {height}' "
-    "style='background:#0b1120;border:1px solid #334155;border-radius:6px;'>"
-    + "".join(edge_lines)
-    + "".join(tree_lines)
-    + "".join(node_circles)
-    + legend
-    + "</svg>"
-    + "</div>"
-  )
+  return ("<div style='margin:12px 0;padding:10px;border:1px solid #1f2937;"
+          "border-radius:8px;background:#0b1120;'>"
+          f"<div style='color:#e2e8f0;font-size:13px;margin-bottom:6px;'>"
+          f"<strong>Steiner Tree Visualization</strong> &mdash; "
+          f"<span style='color:{status_color};'>{status}</span> "
+          f"(reported={viz['reported_weight']}, actual={viz['actual_weight']})</div>"
+          f"<div style='color:#94a3b8;font-size:11px;margin-bottom:6px;'>{viz['message']}</div>"
+          f"<svg width='100%' viewBox='0 0 {width} {height}' "
+          "style='background:#0b1120;border:1px solid #334155;border-radius:6px;'>" +
+          "".join(edge_lines) + "".join(tree_lines) + "".join(node_circles) + legend + "</svg>" +
+          "</div>")
 
 
 highLevelSummary = """

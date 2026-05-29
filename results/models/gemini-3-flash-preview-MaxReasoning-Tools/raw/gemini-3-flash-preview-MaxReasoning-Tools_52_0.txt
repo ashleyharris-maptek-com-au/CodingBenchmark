@@ -1,0 +1,182 @@
+import math
+
+# Global state for persistence across autopilot_step calls
+_AUTOPILOT_STATE = {
+    'speed_integral': 0.0,
+    'speed_prev_error': 0.0,
+    'lane_integral': 0.0,
+    'lane_prev_error': 0.0,
+    'last_valid_speed': 0.0,
+    'last_valid_lane_offset': 0.0,
+    'initialized': False
+}
+
+def autopilot_step(state: dict, dt: float) -> dict:
+    """
+    Autopilot for a self-driving car on a multi-lane freeway.
+    Handles sensor fusion, lane keeping, speed control, and obstacle avoidance.
+    """
+    global _AUTOPILOT_STATE
+    
+    # Handle initialization and time step
+    if not _AUTOPILOT_STATE['initialized']:
+        # Try to initialize speed from available sensors
+        init_speed = state.get('vehicle_speed_1_kmh') or state.get('vehicle_speed_2_kmh') or 0.0
+        _AUTOPILOT_STATE['last_valid_speed'] = init_speed
+        _AUTOPILOT_STATE['initialized'] = True
+        
+    if dt <= 0:
+        return {'steering': 0.0, 'throttle': 0.0, 'brake': 0.0}
+
+    # --- 1. SENSOR FUSION ---
+
+    # Speed Fusion: Combine wheel speeds, GPS, and dedicated speed sensors
+    speeds = []
+    # Dedicated sensors
+    for k in ['vehicle_speed_1_kmh', 'vehicle_speed_2_kmh']:
+        if state.get(k) is not None: speeds.append(state[k])
+    # GPS speed
+    if state.get('gps_1_valid'): speeds.append(state.get('gps_1_speed_kmh'))
+    if state.get('gps_2_valid'): speeds.append(state.get('gps_2_speed_kmh'))
+    # Wheel speeds
+    w_speeds = []
+    for s in ['fl', 'fr', 'rl', 'rr']:
+        if state.get(f'wheel_speed_{s}_valid'):
+            w_speeds.append(state.get(f'wheel_speed_{s}_kmh'))
+    if w_speeds:
+        speeds.append(sum(w_speeds) / len(w_speeds))
+    
+    # Robust speed estimate (median for outlier rejection)
+    if speeds:
+        speeds.sort()
+        current_speed_kmh = speeds[len(speeds)//2]
+        _AUTOPILOT_STATE['last_valid_speed'] = current_speed_kmh
+    else:
+        current_speed_kmh = _AUTOPILOT_STATE['last_valid_speed']
+
+    # Lane Offset Fusion: Combine 3 independent vision systems
+    offsets = []
+    for i in range(1, 4):
+        v = f'vision_{i}_'
+        if state.get(v + 'left_line_valid') and state.get(v + 'right_line_valid'):
+            # Calculate offset from line distances (center = 0)
+            l_dist = state[v + 'left_line_dist_m']
+            r_dist = state[v + 'right_line_dist_m']
+            if l_dist is not None and r_dist is not None:
+                offsets.append((l_dist - r_dist) / 2.0)
+        elif state.get(v + 'lane_offset_m') is not None:
+            # Fallback to reported lane offset
+            offsets.append(state[v + 'lane_offset_m'])
+            
+    if offsets:
+        offsets.sort()
+        current_lane_offset = offsets[len(offsets)//2]
+        _AUTOPILOT_STATE['last_valid_lane_offset'] = current_lane_offset
+    else:
+        current_lane_offset = _AUTOPILOT_STATE['last_valid_lane_offset']
+
+    # Obstacle Detection: Combine vision systems and Lidar
+    dist_to_obj = 200.0
+    for i in range(1, 4):
+        v = f'vision_{i}_'
+        if state.get(v + 'obstacle_valid') and state.get(v + 'obstacle_detected'):
+            dist_to_obj = min(dist_to_obj, state.get(v + 'obstacle_dist_m', 200.0))
+            
+    # Lidar check for objects directly ahead
+    # Angles near 0 are directly in front; angles further out only matter at close range
+    for ang_str in ['+005', '-005', '+015', '-015', '+030', '-030']:
+        if state.get(f'lidar_{ang_str}_deg_valid'):
+            d = state.get(f'lidar_{ang_str}_deg_range_m', 200.0)
+            ang_val = abs(float(ang_str))
+            # Heuristic: object is in lane if it's narrow angle or very close
+            if ang_val <= 5 or (ang_val <= 15 and d < 30) or (ang_val <= 30 and d < 10):
+                dist_to_obj = min(dist_to_obj, d)
+
+    # Road Curvature (average of vision systems)
+    curvatures = []
+    for i in range(1, 4):
+        c = state.get(f'vision_{i}_road_curvature_1pm')
+        if c is not None:
+            curvatures.append(c)
+    curvature = sorted(curvatures)[len(curvatures)//2] if curvatures else 0.0
+
+    # Traction mu (1.0 = dry, <0.3 = ice)
+    mu = max(0.05, state.get('estimated_mu', 1.0))
+
+    # --- 2. LONGITUDINAL CONTROL ---
+
+    # Determine target speed based on user request and speed limits
+    user_target = state.get('target_speed_kmh', 100.0)
+    limits = []
+    for i in range(1, 4):
+        if state.get(f'vision_{i}_speed_limit_valid'):
+            limits.append(state.get(f'vision_{i}_speed_limit_kmh', 130.0))
+    current_limit = min(limits) if limits else 130.0
+    target_v_kmh = min(user_target, current_limit)
+    
+    # Reduce target speed for curves
+    if abs(curvature) > 0.0001:
+        # a_lat = v^2 * curvature. Limit to approx 0.3g * mu
+        max_v_ms = math.sqrt((mu * 9.81 * 0.3) / abs(curvature))
+        target_v_kmh = min(target_v_kmh, max_v_ms * 3.6)
+        
+    # Reduce target speed for obstacles
+    if dist_to_obj < 100:
+        # v = sqrt(2 * a * d). Comfort decel ~ 3m/s2 * mu
+        safe_v_ms = math.sqrt(max(0, 2 * (3.0 * mu) * (dist_to_obj - 6)))
+        target_v_kmh = min(target_v_kmh, safe_v_ms * 3.6)
+
+    # Speed PID
+    err_v = target_v_kmh - current_speed_kmh
+    _AUTOPILOT_STATE['speed_integral'] += err_v * dt
+    _AUTOPILOT_STATE['speed_integral'] = max(-30, min(30, _AUTOPILOT_STATE['speed_integral']))
+    deriv_v = (err_v - _AUTOPILOT_STATE['speed_prev_error']) / dt
+    _AUTOPILOT_STATE['speed_prev_error'] = err_v
+    
+    # Gains (scaled by traction)
+    kp_v, ki_v, kd_v = 0.2 * mu, 0.01 * mu, 0.05 * mu
+    accel_cmd = kp_v * err_v + ki_v * _AUTOPILOT_STATE['speed_integral'] + kd_v * deriv_v
+    
+    throttle = max(0.0, min(1.0, accel_cmd))
+    brake = max(0.0, min(1.0, -accel_cmd))
+    
+    # Emergency Override
+    if dist_to_obj < 10:
+        brake = 1.0
+        throttle = 0.0
+
+    # --- 3. LATERAL CONTROL ---
+
+    # Lane Change Logic
+    lane_width = 3.7
+    target_lane = state.get('target_lane', 0)
+    current_lane = state.get('current_lane', 0)
+    target_rel_offset = (target_lane - current_lane) * lane_width
+    
+    # Lane PID
+    err_l = target_rel_offset - current_lane_offset
+    _AUTOPILOT_STATE['lane_integral'] += err_l * dt
+    _AUTOPILOT_STATE['lane_integral'] = max(-10, min(10, _AUTOPILOT_STATE['lane_integral']))
+    deriv_l = (err_l - _AUTOPILOT_STATE['lane_prev_error']) / dt
+    _AUTOPILOT_STATE['lane_prev_error'] = err_l
+    
+    # Yaw rate for damping
+    gyros = []
+    for i in range(1, 4):
+        if state.get(f'gyro_{i}_valid'):
+            gyros.append(state.get(f'gyro_{i}_yaw_rate_dps', 0.0))
+    yaw_rate = sorted(gyros)[len(gyros)//2] if gyros else 0.0
+    
+    # Lateral PID gains
+    kp_l, ki_l, kd_l = 0.3 * mu, 0.02 * mu, 0.15 * mu
+    steer_cmd = kp_l * err_l + ki_l * _AUTOPILOT_STATE['lane_integral'] + kd_l * deriv_l
+    steer_cmd += curvature * 15.0 # Feed-forward
+    steer_cmd -= yaw_rate * 0.005 * mu # Stability damping
+    
+    steering = max(-1.0, min(1.0, steer_cmd))
+
+    return {
+        'steering': steering,
+        'throttle': throttle,
+        'brake': brake
+    }

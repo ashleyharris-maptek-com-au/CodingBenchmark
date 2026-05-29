@@ -1,18 +1,5 @@
 use std::cmp::min;
-use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
-
-const SMALL_POINTS_THRESHOLD: u64 = 5_000_000;
-const MEDIUM_POINTS_THRESHOLD: u64 = 50_000_000;
-const SAMPLE_MAX_SMALL: usize = 200_000;
-const SAMPLE_MAX_MEDIUM: usize = 400_000;
-const SAMPLE_MAX_LARGE: usize = 800_000;
-const MINI_BATCH_SMALL: usize = 4096;
-const MINI_BATCH_MEDIUM: usize = 16384;
-const MINI_BATCH_LARGE: usize = 65536;
-const BUFFER_POINTS: usize = 1 << 15;
-const MAX_ITERS_SMALL: usize = 18;
-const MAX_ITERS_MEDIUM: usize = 12;
-const MAX_ITERS_LARGE: usize = 6;
+use std::io::{self, BufReader, BufWriter, Read, Write};
 
 #[derive(Clone, Copy, Debug, Default)]
 struct Point3 {
@@ -22,29 +9,29 @@ struct Point3 {
 }
 
 impl Point3 {
+    #[inline]
     fn zero() -> Self {
         Self { x: 0.0, y: 0.0, z: 0.0 }
     }
 
+    #[inline]
     fn add_assign(&mut self, other: Point3) {
         self.x += other.x;
         self.y += other.y;
         self.z += other.z;
     }
 
-    fn div_scalar(self, s: f32) -> Self {
-        if s == 0.0 {
-            self
-        } else {
-            Self {
-                x: self.x / s,
-                y: self.y / s,
-                z: self.z / s,
-            }
+    #[inline]
+    fn scale(self, factor: f32) -> Self {
+        Self {
+            x: self.x * factor,
+            y: self.y * factor,
+            z: self.z * factor,
         }
     }
 
-    fn distance2(&self, other: &Self) -> f32 {
+    #[inline]
+    fn dist2(self, other: Point3) -> f32 {
         let dx = self.x - other.x;
         let dy = self.y - other.y;
         let dz = self.z - other.z;
@@ -52,73 +39,237 @@ impl Point3 {
     }
 }
 
-struct XorShift64 {
-    state: u64,
+#[derive(Clone, Copy, Debug)]
+enum Strategy {
+    FullMemory,
+    Streaming,
 }
 
-impl XorShift64 {
-    fn new(seed: u64) -> Self {
-        let s = if seed == 0 { 0x9E3779B97F4A7C15 } else { seed };
-        Self { state: s }
+fn main() -> io::Result<()> {
+    let mut stdin = BufReader::with_capacity(1 << 20, io::stdin().lock());
+    let mut input = Vec::new();
+    stdin.read_to_end(&mut input)?;
+
+    let mut cursor = 0usize;
+    let num_points: usize = read_u64_ascii(&input, &mut cursor)?
+        .try_into()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "num_points too large"))?;
+    let num_clusters: usize = read_u64_ascii(&input, &mut cursor)?
+        .try_into()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "num_clusters too large"))?;
+
+    if num_clusters == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "num_clusters must be positive",
+        ));
+    }
+    if num_points == 0 {
+        return Ok(());
     }
 
-    fn next_u64(&mut self) -> u64 {
-        let mut x = self.state;
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        self.state = x;
-        x
+    skip_ascii_whitespace(&input, &mut cursor);
+    let point_bytes = num_points
+        .checked_mul(12)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "input too large"))?;
+    if input.len().saturating_sub(cursor) < point_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "not enough binary point data",
+        ));
     }
 
-    fn gen_range(&mut self, upper: usize) -> usize {
-        if upper <= 1 {
-            0
+    let points_blob = &input[cursor..cursor + point_bytes];
+    let effective_clusters = min(num_clusters, num_points);
+    let strategy = choose_strategy(num_points, effective_clusters);
+    let assignments = match strategy {
+        Strategy::FullMemory => solve_full_memory(points_blob, num_points, effective_clusters),
+        Strategy::Streaming => solve_streaming(points_blob, num_points, effective_clusters),
+    };
+
+    let mut stdout = BufWriter::with_capacity(1 << 20, io::stdout().lock());
+    for idx in assignments {
+        stdout.write_all(&(idx as u32).to_le_bytes())?;
+    }
+    stdout.flush()?;
+    Ok(())
+}
+
+fn choose_strategy(num_points: usize, num_clusters: usize) -> Strategy {
+    let bytes = num_points.saturating_mul(12);
+    if bytes <= 256 * 1024 * 1024 && num_clusters <= 4096 && num_points <= 20_000_000 {
+        Strategy::FullMemory
+    } else {
+        Strategy::Streaming
+    }
+}
+
+fn solve_full_memory(points_blob: &[u8], num_points: usize, num_clusters: usize) -> Vec<usize> {
+    let points = decode_points(points_blob, num_points);
+    let mut centroids = init_centroids_sample(&points, num_clusters);
+    let mut assignments = vec![0usize; num_points];
+    let max_iters = if num_points <= 1_000_000 { 20 } else { 12 };
+
+    for _ in 0..max_iters {
+        let mut sums = vec![Point3::zero(); num_clusters];
+        let mut counts = vec![0usize; num_clusters];
+        let mut changed = 0usize;
+
+        for (i, &p) in points.iter().enumerate() {
+            let cluster = nearest_centroid(p, &centroids);
+            if assignments[i] != cluster {
+                changed += 1;
+                assignments[i] = cluster;
+            }
+            sums[cluster].add_assign(p);
+            counts[cluster] += 1;
+        }
+
+        update_centroids(&mut centroids, &sums, &counts, &points);
+        if changed * 1000 <= num_points {
+            break;
+        }
+    }
+
+    assignments
+}
+
+fn solve_streaming(points_blob: &[u8], num_points: usize, num_clusters: usize) -> Vec<usize> {
+    let sample_cap = min(
+        num_points,
+        min(200_000usize.max(num_clusters.saturating_mul(32)), 2_000_000),
+    );
+    let stride = ((num_points / sample_cap.max(1)).max(1)) as usize;
+    let mut sample = Vec::with_capacity(sample_cap);
+    let mut idx = 0usize;
+    while idx < num_points && sample.len() < sample_cap {
+        sample.push(read_point(points_blob, idx));
+        idx = idx.saturating_add(stride);
+    }
+    if sample.is_empty() {
+        sample.push(read_point(points_blob, 0));
+    }
+
+    let mut centroids = init_centroids_sample(&sample, num_clusters);
+    let warmup_iters = if sample.len() <= 100_000 { 10 } else { 6 };
+    let mut warm_assignments = vec![0usize; sample.len()];
+    for _ in 0..warmup_iters {
+        let mut sums = vec![Point3::zero(); num_clusters];
+        let mut counts = vec![0usize; num_clusters];
+        let mut changed = 0usize;
+        for (i, &p) in sample.iter().enumerate() {
+            let cluster = nearest_centroid(p, &centroids);
+            if warm_assignments[i] != cluster {
+                changed += 1;
+                warm_assignments[i] = cluster;
+            }
+            sums[cluster].add_assign(p);
+            counts[cluster] += 1;
+        }
+        update_centroids(&mut centroids, &sums, &counts, &sample);
+        if changed * 2000 <= sample.len().max(1) {
+            break;
+        }
+    }
+
+    let refine_passes = if num_points >= 100_000_000 { 1 } else { 2 };
+    let batch_size = if num_points >= 100_000_000 { 262_144 } else { 131_072 };
+    let mut assignments = vec![0usize; num_points];
+
+    for _ in 0..refine_passes {
+        let mut sums = vec![Point3::zero(); num_clusters];
+        let mut counts = vec![0usize; num_clusters];
+        let mut start = 0usize;
+        while start < num_points {
+            let end = min(start + batch_size, num_points);
+            for i in start..end {
+                let p = read_point(points_blob, i);
+                let cluster = nearest_centroid(p, &centroids);
+                assignments[i] = cluster;
+                sums[cluster].add_assign(p);
+                counts[cluster] += 1;
+            }
+            start = end;
+        }
+        update_centroids_streaming(&mut centroids, &sums, &counts, points_blob, num_points);
+    }
+
+    assignments
+}
+
+fn init_centroids_sample(points: &[Point3], num_clusters: usize) -> Vec<Point3> {
+    let mut centroids = Vec::with_capacity(num_clusters);
+    centroids.push(points[0]);
+
+    let target = min(num_clusters, points.len());
+    while centroids.len() < target {
+        let mut best_point = points[0];
+        let mut best_score = -1.0f32;
+        let step = (points.len() / 8192).max(1);
+        let mut i = 0usize;
+        while i < points.len() {
+            let p = points[i];
+            let d = distance_to_set(p, &centroids);
+            if d > best_score {
+                best_score = d;
+                best_point = p;
+            }
+            i += step;
+        }
+        centroids.push(best_point);
+    }
+
+    while centroids.len() < num_clusters {
+        let source = centroids[centroids.len() % target.max(1)];
+        let offset = (centroids.len() as f32) * 1.0e-4;
+        centroids.push(Point3 {
+            x: source.x + offset,
+            y: source.y - offset,
+            z: source.z + offset * 0.5,
+        });
+    }
+
+    centroids
+}
+
+fn update_centroids(
+    centroids: &mut [Point3],
+    sums: &[Point3],
+    counts: &[usize],
+    fallback_points: &[Point3],
+) {
+    for i in 0..centroids.len() {
+        if counts[i] > 0 {
+            centroids[i] = sums[i].scale(1.0 / counts[i] as f32);
         } else {
-            (self.next_u64() % upper as u64) as usize
+            centroids[i] = fallback_points[i % fallback_points.len()];
         }
     }
 }
 
-fn read_header<R: BufRead>(reader: &mut R) -> io::Result<(u64, usize)> {
-    let mut line = Vec::new();
-    let n = reader.read_until(b'\n', &mut line)?;
-    if n == 0 {
-        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "missing header"));
-    }
-    let header = std::str::from_utf8(&line)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "header is not valid utf-8"))?;
-    let mut parts = header.split_whitespace();
-    let num_points = parts
-        .next()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing num_points"))?
-        .parse::<u64>()
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid num_points"))?;
-    let num_clusters = parts
-        .next()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing num_clusters"))?
-        .parse::<usize>()
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid num_clusters"))?;
-    Ok((num_points, num_clusters.max(1)))
-}
-
-fn bytes_to_points(bytes: &[u8], count: usize, out: &mut Vec<Point3>) {
-    out.clear();
-    out.reserve(count);
-    for i in 0..count {
-        let base = i * 12;
-        let x = f32::from_le_bytes(bytes[base..base + 4].try_into().unwrap());
-        let y = f32::from_le_bytes(bytes[base + 4..base + 8].try_into().unwrap());
-        let z = f32::from_le_bytes(bytes[base + 8..base + 12].try_into().unwrap());
-        out.push(Point3 { x, y, z });
+fn update_centroids_streaming(
+    centroids: &mut [Point3],
+    sums: &[Point3],
+    counts: &[usize],
+    points_blob: &[u8],
+    num_points: usize,
+) {
+    for i in 0..centroids.len() {
+        if counts[i] > 0 {
+            centroids[i] = sums[i].scale(1.0 / counts[i] as f32);
+        } else {
+            let idx = (i * 9973) % num_points;
+            centroids[i] = read_point(points_blob, idx);
+        }
     }
 }
 
-fn nearest_center(point: &Point3, centers: &[Point3]) -> usize {
+#[inline]
+fn nearest_centroid(point: Point3, centroids: &[Point3]) -> usize {
     let mut best = 0usize;
-    let mut best_dist = f32::INFINITY;
-    for (i, center) in centers.iter().enumerate() {
-        let d = point.distance2(center);
+    let mut best_dist = point.dist2(centroids[0]);
+    for (i, &c) in centroids.iter().enumerate().skip(1) {
+        let d = point.dist2(c);
         if d < best_dist {
             best_dist = d;
             best = i;
@@ -127,243 +278,56 @@ fn nearest_center(point: &Point3, centers: &[Point3]) -> usize {
     best
 }
 
-fn kmeans_plus_plus_init(points: &[Point3], k: usize, rng: &mut XorShift64) -> Vec<Point3> {
-    if points.is_empty() {
-        return vec![Point3::zero(); k];
+#[inline]
+fn distance_to_set(point: Point3, centroids: &[Point3]) -> f32 {
+    let mut best = point.dist2(centroids[0]);
+    for &c in &centroids[1..] {
+        let d = point.dist2(c);
+        if d < best {
+            best = d;
+        }
     }
-    let k = k.max(1);
-    let mut centers = Vec::with_capacity(k);
-    centers.push(points[rng.gen_range(points.len())]);
-    let mut distances = vec![f32::INFINITY; points.len()];
-
-    while centers.len() < k {
-        let mut total = 0.0f64;
-        for (i, p) in points.iter().enumerate() {
-            let d = p.distance2(centers.last().unwrap());
-            if d < distances[i] {
-                distances[i] = d;
-            }
-            total += distances[i] as f64 + 1e-12;
-        }
-
-        if total <= 0.0 {
-            centers.push(points[rng.gen_range(points.len())]);
-            continue;
-        }
-
-        let mut target = (rng.next_u64() as f64 / u64::MAX as f64) * total;
-        let mut chosen = points[0];
-        for (i, p) in points.iter().enumerate() {
-            target -= distances[i] as f64 + 1e-12;
-            if target <= 0.0 {
-                chosen = *p;
-                break;
-            }
-        }
-        centers.push(chosen);
-    }
-
-    centers
+    best
 }
 
-fn run_full_kmeans(points: &[Point3], k: usize, max_iters: usize, rng: &mut XorShift64) -> Vec<Point3> {
-    let mut centers = kmeans_plus_plus_init(points, k, rng);
-    let mut assignments = vec![0usize; points.len()];
-
-    for _ in 0..max_iters {
-        let mut sums = vec![Point3::zero(); k];
-        let mut counts = vec![0u64; k];
-        let mut changed = 0usize;
-
-        for (idx, p) in points.iter().enumerate() {
-            let cluster = nearest_center(p, &centers);
-            if cluster != assignments[idx] {
-                assignments[idx] = cluster;
-                changed += 1;
-            }
-            sums[cluster].add_assign(*p);
-            counts[cluster] += 1;
-        }
-
-        for i in 0..k {
-            if counts[i] > 0 {
-                centers[i] = sums[i].div_scalar(counts[i] as f32);
-            } else {
-                centers[i] = points[rng.gen_range(points.len())];
-            }
-        }
-
-        if changed == 0 {
-            break;
-        }
+fn decode_points(blob: &[u8], num_points: usize) -> Vec<Point3> {
+    let mut points = Vec::with_capacity(num_points);
+    for i in 0..num_points {
+        points.push(read_point(blob, i));
     }
-
-    centers
+    points
 }
 
-fn reservoir_sample<R: Read>(reader: &mut R, total_points: u64, sample_size: usize, rng: &mut XorShift64) -> io::Result<Vec<Point3>> {
-    let target = min(total_points as usize, sample_size.max(1));
-    let mut sample = Vec::with_capacity(target);
-    let mut buf = [0u8; 12];
-
-    for i in 0..total_points {
-        reader.read_exact(&mut buf)?;
-        let p = Point3 {
-            x: f32::from_le_bytes(buf[0..4].try_into().unwrap()),
-            y: f32::from_le_bytes(buf[4..8].try_into().unwrap()),
-            z: f32::from_le_bytes(buf[8..12].try_into().unwrap()),
-        };
-
-        if (i as usize) < target {
-            sample.push(p);
-        } else {
-            let j = (rng.next_u64() % (i + 1)) as usize;
-            if j < target {
-                sample[j] = p;
-            }
-        }
-    }
-
-    Ok(sample)
-}
-
-fn refine_centers_minibatch(points: &[Point3], centers: &mut [Point3], batch_size: usize, passes: usize, rng: &mut XorShift64) {
-    if points.is_empty() || centers.is_empty() {
-        return;
-    }
-    let k = centers.len();
-    let mut seen = vec![1u32; k];
-
-    for _ in 0..passes {
-        let steps = ((points.len() + batch_size - 1) / batch_size).max(1);
-        for _ in 0..steps {
-            let mut sums = vec![Point3::zero(); k];
-            let mut counts = vec![0u32; k];
-            for _ in 0..batch_size {
-                let p = points[rng.gen_range(points.len())];
-                let idx = nearest_center(&p, centers);
-                sums[idx].add_assign(p);
-                counts[idx] += 1;
-            }
-            for i in 0..k {
-                if counts[i] > 0 {
-                    let lr = counts[i] as f32 / (seen[i] + counts[i]) as f32;
-                    let mean = sums[i].div_scalar(counts[i] as f32);
-                    centers[i].x += (mean.x - centers[i].x) * lr;
-                    centers[i].y += (mean.y - centers[i].y) * lr;
-                    centers[i].z += (mean.z - centers[i].z) * lr;
-                    seen[i] += counts[i];
-                }
-            }
-        }
+#[inline]
+fn read_point(blob: &[u8], idx: usize) -> Point3 {
+    let base = idx * 12;
+    Point3 {
+        x: f32::from_le_bytes(blob[base..base + 4].try_into().unwrap()),
+        y: f32::from_le_bytes(blob[base + 4..base + 8].try_into().unwrap()),
+        z: f32::from_le_bytes(blob[base + 8..base + 12].try_into().unwrap()),
     }
 }
 
-fn write_assignments_for_points<W: Write>(writer: &mut W, points: &[Point3], centers: &[Point3]) -> io::Result<()> {
-    let mut out = vec![0u8; points.len() * 4];
-    for (i, p) in points.iter().enumerate() {
-        let idx = nearest_center(p, centers) as u32;
-        out[i * 4..i * 4 + 4].copy_from_slice(&idx.to_le_bytes());
+fn read_u64_ascii(input: &[u8], cursor: &mut usize) -> io::Result<u64> {
+    skip_ascii_whitespace(input, cursor);
+    let start = *cursor;
+    while *cursor < input.len() && input[*cursor].is_ascii_digit() {
+        *cursor += 1;
     }
-    writer.write_all(&out)
+    if *cursor == start {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "expected ASCII integer",
+        ));
+    }
+    let text = std::str::from_utf8(&input[start..*cursor])
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid ASCII header"))?;
+    text.parse::<u64>()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid integer"))
 }
 
-fn solve_small(mut reader: BufReader<io::StdinLock<'_>>, mut writer: BufWriter<io::StdoutLock<'_>>, num_points: u64, k: usize) -> io::Result<()> {
-    let bytes_len = num_points as usize * 12;
-    let mut bytes = vec![0u8; bytes_len];
-    reader.read_exact(&mut bytes)?;
-    let mut points = Vec::with_capacity(num_points as usize);
-    bytes_to_points(&bytes, num_points as usize, &mut points);
-
-    let mut rng = XorShift64::new(num_points ^ ((k as u64) << 32) ^ 0xA5A5_5A5A_DEAD_BEEF);
-    let centers = run_full_kmeans(&points, k, MAX_ITERS_SMALL, &mut rng);
-    write_assignments_for_points(&mut writer, &points, &centers)?;
-    writer.flush()
-}
-
-fn solve_streaming(mut reader: BufReader<io::StdinLock<'_>>, mut writer: BufWriter<io::StdoutLock<'_>>, num_points: u64, k: usize) -> io::Result<()> {
-    let mut rng = XorShift64::new(num_points ^ ((k as u64) << 32) ^ 0x1234_5678_9ABC_DEF0);
-    let sample_cap = if num_points <= MEDIUM_POINTS_THRESHOLD {
-        SAMPLE_MAX_MEDIUM
-    } else {
-        SAMPLE_MAX_LARGE
-    };
-    let batch_size = if num_points <= MEDIUM_POINTS_THRESHOLD {
-        MINI_BATCH_MEDIUM
-    } else {
-        MINI_BATCH_LARGE
-    };
-    let refine_passes = if num_points <= MEDIUM_POINTS_THRESHOLD {
-        MAX_ITERS_MEDIUM
-    } else {
-        MAX_ITERS_LARGE
-    };
-
-    let sample = reservoir_sample(&mut reader, num_points, sample_cap.max(k), &mut rng)?;
-    let mut centers = kmeans_plus_plus_init(&sample, k, &mut rng);
-    refine_centers_minibatch(&sample, &mut centers, batch_size.min(sample.len().max(1)), refine_passes, &mut rng);
-
-    let stdin = io::stdin();
-    let mut reader2 = BufReader::with_capacity(1 << 20, stdin.lock());
-    let (_np2, _k2) = read_header(&mut reader2)?;
-
-    let mut raw = vec![0u8; BUFFER_POINTS * 12];
-    let mut points = Vec::with_capacity(BUFFER_POINTS);
-    let mut remaining = num_points;
-    while remaining > 0 {
-        let take = min(remaining as usize, BUFFER_POINTS);
-        let need = take * 12;
-        reader2.read_exact(&mut raw[..need])?;
-        bytes_to_points(&raw[..need], take, &mut points);
-        write_assignments_for_points(&mut writer, &points, &centers)?;
-        remaining -= take as u64;
-    }
-    writer.flush()
-}
-
-fn solve_hybrid(mut reader: BufReader<io::StdinLock<'_>>, mut writer: BufWriter<io::StdoutLock<'_>>, num_points: u64, k: usize) -> io::Result<()> {
-    let sample_size = min(num_points as usize, SAMPLE_MAX_SMALL.max(k));
-    let bytes_len = num_points as usize * 12;
-    let mut bytes = vec![0u8; bytes_len];
-    reader.read_exact(&mut bytes)?;
-    let mut points = Vec::with_capacity(num_points as usize);
-    bytes_to_points(&bytes, num_points as usize, &mut points);
-
-    let mut rng = XorShift64::new(0xCAFEBABE ^ num_points ^ ((k as u64) << 16));
-    let mut sample = Vec::with_capacity(sample_size);
-    let stride = ((points.len() / sample_size.max(1)).max(1)) as usize;
-    let mut idx = 0usize;
-    while sample.len() < sample_size && idx < points.len() {
-        sample.push(points[idx]);
-        idx += stride;
-    }
-    while sample.len() < sample_size {
-        sample.push(points[rng.gen_range(points.len())]);
-    }
-
-    let mut centers = kmeans_plus_plus_init(&sample, k, &mut rng);
-    refine_centers_minibatch(&points, &mut centers, MINI_BATCH_SMALL, MAX_ITERS_MEDIUM, &mut rng);
-    write_assignments_for_points(&mut writer, &points, &centers)?;
-    writer.flush()
-}
-
-fn main() -> io::Result<()> {
-    let stdin = io::stdin();
-    let stdout = io::stdout();
-    let mut reader = BufReader::with_capacity(1 << 20, stdin.lock());
-    let writer = BufWriter::with_capacity(1 << 20, stdout.lock());
-
-    let (num_points, k) = read_header(&mut reader)?;
-    if num_points == 0 {
-        return Ok(());
-    }
-
-    let est_bytes = num_points.saturating_mul(12);
-    if num_points <= SMALL_POINTS_THRESHOLD && est_bytes <= 256 * 1024 * 1024 {
-        solve_small(reader, writer, num_points, k)
-    } else if num_points <= SMALL_POINTS_THRESHOLD && k <= 4096 {
-        solve_hybrid(reader, writer, num_points, k)
-    } else {
-        solve_streaming(reader, writer, num_points, k)
+fn skip_ascii_whitespace(input: &[u8], cursor: &mut usize) {
+    while *cursor < input.len() && input[*cursor].is_ascii_whitespace() {
+        *cursor += 1;
     }
 }

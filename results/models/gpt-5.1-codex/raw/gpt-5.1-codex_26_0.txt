@@ -1,1 +1,778 @@
-{'__exception__': "Can't run here - we're trying to get this working in codex."}
+```rust
+use std::cmp::min;
+use std::io::{
+    self, BufRead, BufReader, BufWriter, Error, ErrorKind, Read, Write,
+};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+const MAX_TOP_ANCHORS: usize = 6;
+
+#[derive(Clone, Copy, Default)]
+struct Point {
+    x: f32,
+    y: f32,
+    z: f32,
+}
+
+impl Point {
+    #[inline(always)]
+    fn zero() -> Self {
+        Self { x: 0.0, y: 0.0, z: 0.0 }
+    }
+
+    #[inline(always)]
+    fn add_assign(&mut self, other: &Point) {
+        self.x += other.x;
+        self.y += other.y;
+        self.z += other.z;
+    }
+
+    #[inline(always)]
+    fn scale(&self, factor: f32) -> Self {
+        Self {
+            x: self.x * factor,
+            y: self.y * factor,
+            z: self.z * factor,
+        }
+    }
+
+    #[inline(always)]
+    fn distance2(&self, other: &Point) -> f32 {
+        let dx = self.x - other.x;
+        let dy = self.y - other.y;
+        let dz = self.z - other.z;
+        dx * dx + dy * dy + dz * dz
+    }
+}
+
+struct SimpleRng {
+    state: u64,
+}
+
+impl SimpleRng {
+    fn from_entropy() -> Self {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_else(|_| std::time::Duration::from_secs(0))
+            .as_nanos() as u64;
+        let seed = nanos ^ 0x9E37_79B9_7F4A_7C15_u64;
+        Self { state: seed | 1 }
+    }
+
+    #[inline(always)]
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.state;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.state = x;
+        x.wrapping_mul(0x2545F4914F6CDD1D)
+    }
+
+    #[inline(always)]
+    fn next_f64(&mut self) -> f64 {
+        const SCALE: f64 = 1.0 / ((1u64 << 53) as f64);
+        ((self.next_u64() >> 11) as f64) * SCALE
+    }
+
+    #[inline(always)]
+    fn gen_range(&mut self, upper: usize) -> usize {
+        if upper <= 1 {
+            0
+        } else {
+            (self.next_u64() % (upper as u64)) as usize
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct InMemoryConfig {
+    max_iters: usize,
+    tolerance: f32,
+}
+
+#[derive(Clone, Copy)]
+enum Scale {
+    Medium,
+    Large,
+    Extreme,
+}
+
+struct StreamConfig {
+    sample_cap: usize,
+    sample_min: usize,
+    samples_per_cluster: usize,
+    sample_iterations: usize,
+    base_anchor_count: usize,
+    base_top_anchors: usize,
+    rebuild_interval: u64,
+    tail_lr: f32,
+    warmup: f64,
+}
+
+impl StreamConfig {
+    fn new(scale: Scale) -> Self {
+        match scale {
+            Scale::Medium => StreamConfig {
+                sample_cap: 2_000_000,
+                sample_min: 150_000,
+                samples_per_cluster: 24,
+                sample_iterations: 8,
+                base_anchor_count: 160,
+                base_top_anchors: 2,
+                rebuild_interval: 2_000_000,
+                tail_lr: 7e-4,
+                warmup: 512.0,
+            },
+            Scale::Large => StreamConfig {
+                sample_cap: 1_200_000,
+                sample_min: 200_000,
+                samples_per_cluster: 16,
+                sample_iterations: 6,
+                base_anchor_count: 224,
+                base_top_anchors: 3,
+                rebuild_interval: 1_200_000,
+                tail_lr: 4e-4,
+                warmup: 1024.0,
+            },
+            Scale::Extreme => StreamConfig {
+                sample_cap: 800_000,
+                sample_min: 150_000,
+                samples_per_cluster: 12,
+                sample_iterations: 4,
+                base_anchor_count: 256,
+                base_top_anchors: 4,
+                rebuild_interval: 800_000,
+                tail_lr: 2e-4,
+                warmup: 2048.0,
+            },
+        }
+    }
+
+    fn anchor_count(&self, k: usize) -> usize {
+        if k <= 256 || self.base_anchor_count == 0 {
+            0
+        } else {
+            let mut target = (k / 8).max(32);
+            target = target.min(self.base_anchor_count);
+            target = target.min(k);
+            target
+        }
+    }
+
+    fn top_anchor_from(&self, anchor_count: usize) -> usize {
+        if anchor_count == 0 {
+            0
+        } else {
+            let desired = self.base_top_anchors.max(1).min(MAX_TOP_ANCHORS);
+            desired.min(anchor_count)
+        }
+    }
+
+    fn rebuild_interval_for(&self, k: usize) -> u64 {
+        let mut interval = self.rebuild_interval.max(50_000);
+        if k > 5_000 {
+            interval = interval / 2;
+        } else if k > 2_000 {
+            interval = (interval * 3) / 4;
+        }
+        interval.max(50_000)
+    }
+
+    fn sample_target(&self, total_points: u64, k: usize) -> usize {
+        if total_points == 0 {
+            return 0;
+        }
+        let mut per_cluster = self.samples_per_cluster as u64;
+        if k < 32 {
+            per_cluster = per_cluster.saturating_mul(6);
+        } else if k < 64 {
+            per_cluster = per_cluster.saturating_mul(4);
+        } else if k < 256 {
+            per_cluster = per_cluster.saturating_mul(2);
+        }
+        let mut target =
+            per_cluster.saturating_mul(k.max(1) as u64);
+        let min_cap = self.sample_min as u64;
+        let max_cap = self.sample_cap as u64;
+        if target < min_cap {
+            target = min_cap;
+        }
+        if target > max_cap {
+            target = max_cap;
+        }
+        if target > total_points {
+            target = total_points;
+        }
+        let min_required = (k as u64).min(total_points).max(1);
+        if target < min_required {
+            target = min_required;
+        }
+        target as usize
+    }
+}
+
+enum Strategy {
+    InMemory(InMemoryConfig),
+    Streaming(StreamConfig),
+}
+
+fn select_strategy(num_points: u64, k: usize) -> Strategy {
+    const TRIVIAL_POINT_LIMIT: u64 = 5_000_000;
+    const TRIVIAL_CLUSTER_LIMIT: usize = 512;
+
+    if num_points <= TRIVIAL_POINT_LIMIT
+        && k <= TRIVIAL_CLUSTER_LIMIT
+        && num_points <= usize::MAX as u64
+    {
+        return Strategy::InMemory(InMemoryConfig {
+            max_iters: 50,
+            tolerance: 5e-4,
+        });
+    }
+
+    let scale = if num_points <= 80_000_000 {
+        Scale::Medium
+    } else if num_points <= 1_000_000_000 {
+        Scale::Large
+    } else {
+        Scale::Extreme
+    };
+    Strategy::Streaming(StreamConfig::new(scale))
+}
+
+fn read_ascii_token<R: BufRead>(reader: &mut R) -> io::Result<Option<String>> {
+    let mut token = Vec::new();
+    loop {
+        let buf = reader.fill_buf()?;
+        if buf.is_empty() {
+            if token.is_empty() {
+                return Ok(None);
+            } else {
+                let s = String::from_utf8(token)
+                    .map_err(|_| io::Error::new(ErrorKind::InvalidData, "header contains non-UTF8"))?;
+                return Ok(Some(s));
+            }
+        }
+        let mut idx = 0;
+        while idx < buf.len() {
+            let b = buf[idx];
+            if b.is_ascii_whitespace() {
+                if token.is_empty() {
+                    idx += 1;
+                    continue;
+                } else {
+                    let s = String::from_utf8(token)
+                        .map_err(|_| io::Error::new(ErrorKind::InvalidData, "header contains non-UTF8"))?;
+                    reader.consume(idx + 1);
+                    return Ok(Some(s));
+                }
+            } else {
+                token.push(b);
+                idx += 1;
+            }
+        }
+        reader.consume(idx);
+    }
+}
+
+fn skip_leading_whitespace<R: BufRead>(reader: &mut R) -> io::Result<()> {
+    loop {
+        let buf = reader.fill_buf()?;
+        if buf.is_empty() {
+            return Ok(());
+        }
+        let mut consumed = 0;
+        while consumed < buf.len() && buf[consumed].is_ascii_whitespace() {
+            consumed += 1;
+        }
+        reader.consume(consumed);
+        if consumed < buf.len() {
+            return Ok(());
+        }
+    }
+}
+
+fn read_point<R: Read>(reader: &mut R) -> io::Result<Point> {
+    let mut buf = [0u8; 12];
+    reader.read_exact(&mut buf)?;
+    let x = f32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    let y = f32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+    let z = f32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
+    Ok(Point { x, y, z })
+}
+
+fn main() -> io::Result<()> {
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+
+    let mut reader = BufReader::with_capacity(1 << 20, stdin.lock());
+    let mut writer = BufWriter::with_capacity(1 << 20, stdout.lock());
+
+    let num_points_token = read_ascii_token(&mut reader)?
+        .ok_or_else(|| io::Error::new(ErrorKind::UnexpectedEof, "missing num_points"))?;
+    let num_clusters_token = read_ascii_token(&mut reader)?
+        .ok_or_else(|| io::Error::new(ErrorKind::UnexpectedEof, "missing num_clusters"))?;
+    let num_points: u64 = num_points_token
+        .parse()
+        .map_err(|_| io::Error::new(ErrorKind::InvalidData, "invalid num_points"))?;
+    let num_clusters_u64: u64 = num_clusters_token
+        .parse()
+        .map_err(|_| io::Error::new(ErrorKind::InvalidData, "invalid num_clusters"))?;
+    if num_clusters_u64 == 0 {
+        return Err(Error::new(ErrorKind::InvalidInput, "num_clusters must be > 0"));
+    }
+    if num_clusters_u64 > u32::MAX as u64 {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "num_clusters exceeds supported range",
+        ));
+    }
+    let num_clusters = num_clusters_u64 as usize;
+
+    skip_leading_whitespace(&mut reader)?;
+
+    if num_points == 0 {
+        writer.flush()?;
+        return Ok(());
+    }
+
+    let strategy = select_strategy(num_points, num_clusters);
+    let mut rng = SimpleRng::from_entropy();
+
+    match strategy {
+        Strategy::InMemory(config) => {
+            if num_points > usize::MAX as u64 {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "dataset too large for in-memory strategy",
+                ));
+            }
+            run_trivial(
+                &mut reader,
+                &mut writer,
+                num_points as usize,
+                num_clusters,
+                &config,
+                &mut rng,
+            )?;
+        }
+        Strategy::Streaming(config) => {
+            run_streaming(
+                &mut reader,
+                &mut writer,
+                num_points,
+                num_clusters,
+                &config,
+                &mut rng,
+            )?;
+        }
+    }
+
+    writer.flush()?;
+    Ok(())
+}
+
+fn run_trivial<R: Read, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    total_points: usize,
+    k: usize,
+    config: &InMemoryConfig,
+    rng: &mut SimpleRng,
+) -> io::Result<()> {
+    let mut points = Vec::with_capacity(total_points);
+    for _ in 0..total_points {
+        points.push(read_point(reader)?);
+    }
+    let assignments = run_full_kmeans(&points, k, config, rng);
+    for idx in assignments {
+        writer.write_all(&(idx as u32).to_le_bytes())?;
+    }
+    Ok(())
+}
+
+fn run_full_kmeans(
+    points: &[Point],
+    k: usize,
+    config: &InMemoryConfig,
+    rng: &mut SimpleRng,
+) -> Vec<u32> {
+    if points.is_empty() || k == 0 {
+        return Vec::new();
+    }
+    let mut centroids = initialize_centroids(points, k, rng);
+    let mut assignments = vec![u32::MAX; points.len()];
+    for _ in 0..config.max_iters {
+        let mut sums = vec![Point::zero(); k];
+        let mut counts = vec![0u64; k];
+        let mut moved = 0usize;
+        for (i, point) in points.iter().enumerate() {
+            let idx = find_nearest(point, &centroids, None, 0) as u32;
+            if assignments[i] != idx {
+                moved += 1;
+                assignments[i] = idx;
+            }
+            sums[idx as usize].add_assign(point);
+            counts[idx as usize] += 1;
+        }
+        for j in 0..k {
+            if counts[j] > 0 {
+                centroids[j] = sums[j].scale(1.0 / counts[j] as f32);
+            } else {
+                centroids[j] = points[rng.gen_range(points.len())];
+            }
+        }
+        if moved == 0 || (moved as f32 / points.len() as f32) < config.tolerance {
+            break;
+        }
+    }
+    assignments
+}
+
+fn run_streaming<R: Read, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    num_points: u64,
+    k: usize,
+    config: &StreamConfig,
+    rng: &mut SimpleRng,
+) -> io::Result<()> {
+    if num_points == 0 || k == 0 {
+        return Ok(());
+    }
+
+    let sample_target = config.sample_target(num_points, k);
+    let mut sample_points = Vec::with_capacity(min(sample_target, num_points as usize));
+    while (sample_points.len() as u64) < num_points && sample_points.len() < sample_target {
+        sample_points.push(read_point(reader)?);
+    }
+
+    let mut sample_iters = config.sample_iterations.max(1);
+    if k > 4_096 && sample_iters > 3 {
+        sample_iters = 3;
+    } else if k > 2_048 && sample_iters > 4 {
+        sample_iters = 4;
+    }
+
+    let anchor_count = config.anchor_count(k);
+    let top_anchor = config.top_anchor_from(anchor_count);
+    let rebuild_interval = config.rebuild_interval_for(k);
+
+    let mut centroids =
+        train_centroids_on_sample(&sample_points, k, sample_iters, anchor_count, top_anchor, rng);
+
+    let mut anchor_index = if anchor_count > 0 {
+        Some(build_anchor_index(&centroids, anchor_count, rng))
+    } else {
+        None
+    };
+
+    let mut counts = vec![0f64; centroids.len()];
+    let warmup = config.warmup.max(1.0);
+    let mut processed = 0u64;
+    let mut since_rebuild = 0u64;
+
+    for point in &sample_points {
+        let idx = find_nearest(point, &centroids, anchor_index.as_ref(), top_anchor);
+        counts[idx] += 1.0;
+        let lr = compute_lr(counts[idx], warmup, config.tail_lr);
+        apply_online_update(&mut centroids[idx], point, lr);
+        writer.write_all(&(idx as u32).to_le_bytes())?;
+        processed += 1;
+        if anchor_count > 0 {
+            since_rebuild += 1;
+            if since_rebuild >= rebuild_interval {
+                anchor_index = Some(build_anchor_index(&centroids, anchor_count, rng));
+                since_rebuild = 0;
+            }
+        }
+    }
+
+    if anchor_count > 0 {
+        anchor_index = Some(build_anchor_index(&centroids, anchor_count, rng));
+        since_rebuild = 0;
+    }
+
+    drop(sample_points);
+
+    while processed < num_points {
+        let point = read_point(reader)?;
+        let idx = find_nearest(&point, &centroids, anchor_index.as_ref(), top_anchor);
+        counts[idx] += 1.0;
+        let lr = compute_lr(counts[idx], warmup, config.tail_lr);
+        apply_online_update(&mut centroids[idx], &point, lr);
+        writer.write_all(&(idx as u32).to_le_bytes())?;
+        processed += 1;
+        if anchor_count > 0 {
+            since_rebuild += 1;
+            if since_rebuild >= rebuild_interval {
+                anchor_index = Some(build_anchor_index(&centroids, anchor_count, rng));
+                since_rebuild = 0;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn train_centroids_on_sample(
+    points: &[Point],
+    k: usize,
+    iterations: usize,
+    anchor_count: usize,
+    top_anchors: usize,
+    rng: &mut SimpleRng,
+) -> Vec<Point> {
+    if k == 0 {
+        return Vec::new();
+    }
+    if points.is_empty() {
+        return vec![Point::zero(); k];
+    }
+    let mut centroids = initialize_centroids(points, k, rng);
+    if iterations == 0 {
+        return centroids;
+    }
+    let mut anchor_index = if anchor_count > 0 {
+        Some(build_anchor_index(&centroids, anchor_count, rng))
+    } else {
+        None
+    };
+    let top = top_anchors.min(MAX_TOP_ANCHORS);
+
+    for _ in 0..iterations {
+        let mut sums = vec![Point::zero(); centroids.len()];
+        let mut counts = vec![0u32; centroids.len()];
+        for point in points {
+            let idx = find_nearest(point, &centroids, anchor_index.as_ref(), top);
+            sums[idx].add_assign(point);
+            counts[idx] += 1;
+        }
+        for (idx, centroid) in centroids.iter_mut().enumerate() {
+            if counts[idx] > 0 {
+                *centroid = sums[idx].scale(1.0 / counts[idx] as f32);
+            } else {
+                *centroid = points[rng.gen_range(points.len())];
+            }
+        }
+        if anchor_count > 0 {
+            anchor_index = Some(build_anchor_index(&centroids, anchor_count, rng));
+        }
+    }
+    centroids
+}
+
+fn initialize_centroids(points: &[Point], k: usize, rng: &mut SimpleRng) -> Vec<Point> {
+    if k == 0 {
+        return Vec::new();
+    }
+    if points.is_empty() {
+        return vec![Point::zero(); k];
+    }
+    if k == 1 {
+        let mut acc = Point::zero();
+        for p in points {
+            acc.add_assign(p);
+        }
+        return vec![acc.scale(1.0 / points.len() as f32)];
+    }
+    let use_kmeanspp = should_use_kmeanspp(points.len(), k);
+    let mut centroids = if use_kmeanspp {
+        kmeanspp(points, k, rng)
+    } else {
+        random_sample(points, k.min(points.len()), rng)
+    };
+    if centroids.len() < k {
+        let mut idx = 0usize;
+        while centroids.len() < k {
+            centroids.push(points[idx % points.len()]);
+            idx += 1;
+        }
+    }
+    centroids
+}
+
+fn should_use_kmeanspp(point_count: usize, k: usize) -> bool {
+    if k == 0 || point_count == 0 {
+        return false;
+    }
+    let limit = 250_000_000u128;
+    let product = (point_count as u128) * (k as u128);
+    k <= 2_048 && product <= limit
+}
+
+fn kmeanspp(points: &[Point], k: usize, rng: &mut SimpleRng) -> Vec<Point> {
+    if points.is_empty() || k == 0 {
+        return Vec::new();
+    }
+    let mut centers = Vec::with_capacity(k);
+    centers.push(points[rng.gen_range(points.len())]);
+    if k == 1 {
+        return centers;
+    }
+    let mut min_dist_sq = vec![f32::MAX; points.len()];
+    for c in 1..k {
+        let last_center = centers[c - 1];
+        for (i, point) in points.iter().enumerate() {
+            let dist = point.distance2(&last_center);
+            if dist < min_dist_sq[i] {
+                min_dist_sq[i] = dist;
+            }
+        }
+        let sum: f64 = min_dist_sq.iter().map(|&d| d as f64).sum();
+        if sum <= f64::EPSILON {
+            centers.push(points[rng.gen_range(points.len())]);
+            continue;
+        }
+        let mut r = rng.next_f64() * sum;
+        let mut chosen = points.len() - 1;
+        for (i, &d) in min_dist_sq.iter().enumerate() {
+            r -= d as f64;
+            if r <= 0.0 {
+                chosen = i;
+                break;
+            }
+        }
+        centers.push(points[chosen]);
+    }
+    centers
+}
+
+fn random_sample(points: &[Point], count: usize, rng: &mut SimpleRng) -> Vec<Point> {
+    if points.is_empty() || count == 0 {
+        return Vec::new();
+    }
+    if count >= points.len() {
+        return points.to_vec();
+    }
+    let mut result: Vec<Point> = points.iter().take(count).copied().collect();
+    for (i, point) in points.iter().enumerate().skip(count) {
+        let j = rng.gen_range(i + 1);
+        if j < count {
+            result[j] = *point;
+        }
+    }
+    result
+}
+
+struct AnchorIndex {
+    anchors: Vec<Point>,
+    members: Vec<Vec<usize>>,
+}
+
+fn build_anchor_index(centroids: &[Point], desired: usize, rng: &mut SimpleRng) -> AnchorIndex {
+    let count = desired.min(centroids.len()).max(1);
+    let anchors = if centroids.len() <= count {
+        centroids.to_vec()
+    } else {
+        random_sample(centroids, count, rng)
+    };
+    let mut members = vec![Vec::<usize>::new(); anchors.len()];
+    for (idx, centroid) in centroids.iter().enumerate() {
+        let anchor_idx = nearest_of_slice(centroid, &anchors);
+        members[anchor_idx].push(idx);
+    }
+    AnchorIndex { anchors, members }
+}
+
+fn nearest_of_slice(point: &Point, centers: &[Point]) -> usize {
+    let mut best = 0usize;
+    let mut best_dist = point.distance2(&centers[0]);
+    for (idx, center) in centers.iter().enumerate().skip(1) {
+        let dist = point.distance2(center);
+        if dist < best_dist {
+            best = idx;
+            best_dist = dist;
+        }
+    }
+    best
+}
+
+fn find_nearest(
+    point: &Point,
+    centroids: &[Point],
+    anchor: Option<&AnchorIndex>,
+    top_anchors: usize,
+) -> usize {
+    if centroids.is_empty() {
+        return 0;
+    }
+    if let Some(anchor_index) = anchor {
+        let anchor_count = anchor_index.anchors.len();
+        if anchor_count > 0 && top_anchors > 0 {
+            let limit = top_anchors
+                .min(anchor_count)
+                .min(MAX_TOP_ANCHORS)
+                .max(1);
+            let mut top_idx = [usize::MAX; MAX_TOP_ANCHORS];
+            let mut top_dist = [f32::MAX; MAX_TOP_ANCHORS];
+            for (i, anchor_point) in anchor_index.anchors.iter().enumerate() {
+                let dist = point.distance2(anchor_point);
+                insert_sorted(&mut top_idx, &mut top_dist, limit, i, dist);
+            }
+            let mut best = usize::MAX;
+            let mut best_dist = f32::MAX;
+            for &aid in top_idx.iter().take(limit) {
+                if aid == usize::MAX {
+                    continue;
+                }
+                for &cid in &anchor_index.members[aid] {
+                    let dist = point.distance2(&centroids[cid]);
+                    if dist < best_dist {
+                        best_dist = dist;
+                        best = cid;
+                    }
+                }
+            }
+            if best != usize::MAX {
+                return best;
+            }
+        }
+    }
+    nearest_of_slice(point, centroids)
+}
+
+fn insert_sorted(
+    top_idx: &mut [usize; MAX_TOP_ANCHORS],
+    top_dist: &mut [f32; MAX_TOP_ANCHORS],
+    limit: usize,
+    candidate_idx: usize,
+    candidate_dist: f32,
+) {
+    let mut pos = limit;
+    for i in 0..limit {
+        if candidate_dist < top_dist[i] {
+            pos = i;
+            break;
+        }
+    }
+    if pos == limit {
+        return;
+    }
+    for j in (pos + 1..limit).rev() {
+        top_idx[j] = top_idx[j - 1];
+        top_dist[j] = top_dist[j - 1];
+    }
+    top_idx[pos] = candidate_idx;
+    top_dist[pos] = candidate_dist;
+}
+
+#[inline(always)]
+fn apply_online_update(target: &mut Point, source: &Point, lr: f32) {
+    target.x += (source.x - target.x) * lr;
+    target.y += (source.y - target.y) * lr;
+    target.z += (source.z - target.z) * lr;
+}
+
+#[inline(always)]
+fn compute_lr(count: f64, warmup: f64, tail_lr: f32) -> f32 {
+    if count <= 0.0 {
+        1.0
+    } else if count <= warmup {
+        (1.0 / count) as f32
+    } else {
+        tail_lr.max((1.0 / count) as f32)
+    }
+}
+```

@@ -1,0 +1,332 @@
+use std::collections::HashMap;
+use std::io::{self, BufRead, BufWriter, Write};
+
+struct SampleRecord {
+    hole_id: String,
+    sample_idx: usize,
+    pos: [f64; 3],
+    values: Vec<Option<f64>>,
+}
+
+struct Suspect {
+    hole_id: String,
+    sample_idx: usize,
+    property: String,
+    confidence: f64,
+}
+
+fn main() {
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let mut out = BufWriter::new(stdout.lock());
+
+    let mut lines = stdin.lock().lines();
+
+    // Parse header
+    let header = match lines.next() {
+        Some(Ok(l)) => l,
+        _ => return,
+    };
+    let mut hparts = header.split_whitespace();
+    let num_holes: usize = hparts.next().unwrap_or("0").parse().unwrap_or(0);
+    let num_properties: usize = hparts.next().unwrap_or("0").parse().unwrap_or(0);
+
+    // Parse property names
+    let prop_line = match lines.next() {
+        Some(Ok(l)) => l,
+        _ => return,
+    };
+    let property_names: Vec<String> = prop_line
+        .split_whitespace()
+        .map(|s| s.to_string())
+        .collect();
+
+    let mut all_samples: Vec<SampleRecord> = Vec::new();
+
+    // Parse holes
+    for _ in 0..num_holes {
+        let hole_line = match lines.next() {
+            Some(Ok(l)) => l,
+            _ => break,
+        };
+        let hv: Vec<&str> = hole_line.split_whitespace().collect();
+        if hv.len() < 9 {
+            continue;
+        }
+        let hole_id = hv[0].to_string();
+        let sx: f64 = hv[1].parse().unwrap_or(0.0);
+        let sy: f64 = hv[2].parse().unwrap_or(0.0);
+        let sz: f64 = hv[3].parse().unwrap_or(0.0);
+        let dx: f64 = hv[4].parse().unwrap_or(0.0);
+        let dy: f64 = hv[5].parse().unwrap_or(0.0);
+        let dz: f64 = hv[6].parse().unwrap_or(-1.0);
+        let _length: f64 = hv[7].parse().unwrap_or(0.0);
+        let num_samples: usize = hv[8].parse().unwrap_or(0);
+
+        let mag = (dx * dx + dy * dy + dz * dz).sqrt();
+        let (ndx, ndy, ndz) = if mag > 1e-10 {
+            (dx / mag, dy / mag, dz / mag)
+        } else {
+            (0.0, 0.0, -1.0)
+        };
+
+        for i in 0..num_samples {
+            let sample_line = match lines.next() {
+                Some(Ok(l)) => l,
+                _ => break,
+            };
+            let sv: Vec<&str> = sample_line.split_whitespace().collect();
+            if sv.is_empty() {
+                continue;
+            }
+            let depth: f64 = sv[0].parse().unwrap_or(0.0);
+            let pos = [
+                sx + depth * ndx,
+                sy + depth * ndy,
+                sz + depth * ndz,
+            ];
+            let values: Vec<Option<f64>> = (0..num_properties)
+                .map(|j| {
+                    sv.get(j + 1).and_then(|s| s.parse::<f64>().ok())
+                })
+                .collect();
+
+            all_samples.push(SampleRecord {
+                hole_id: hole_id.clone(),
+                sample_idx: i,
+                pos,
+                values,
+            });
+        }
+    }
+
+    let n = all_samples.len();
+    if n == 0 || num_properties == 0 {
+        let _ = writeln!(out, "0");
+        return;
+    }
+
+    // Compute bounding box to choose grid cell size
+    let mut min_p = all_samples[0].pos;
+    let mut max_p = all_samples[0].pos;
+    for s in &all_samples {
+        for k in 0..3 {
+            if s.pos[k] < min_p[k] { min_p[k] = s.pos[k]; }
+            if s.pos[k] > max_p[k] { max_p[k] = s.pos[k]; }
+        }
+    }
+
+    // Target ~20-50 samples per cell; cell_size chosen adaptively
+    let extent = [
+        max_p[0] - min_p[0],
+        max_p[1] - min_p[1],
+        max_p[2] - min_p[2],
+    ];
+    let volume = extent[0].max(1.0) * extent[1].max(1.0) * extent[2].max(1.0);
+    let target_samples_per_cell = 30.0_f64;
+    let cell_size = (volume / (n as f64 / target_samples_per_cell)).cbrt().max(1.0);
+
+    // Build grid
+    let mut grid: HashMap<(i64, i64, i64), Vec<usize>> = HashMap::new();
+    for (idx, s) in all_samples.iter().enumerate() {
+        let key = pos_to_cell(&s.pos, &min_p, cell_size);
+        grid.entry(key).or_default().push(idx);
+    }
+
+    // For each property, collect global stats for fallback
+    let mut global_vals: Vec<Vec<f64>> = vec![Vec::new(); num_properties];
+    for s in &all_samples {
+        for (pi, v) in s.values.iter().enumerate() {
+            if let Some(val) = v {
+                if val.is_finite() {
+                    global_vals[pi].push(*val);
+                }
+            }
+        }
+    }
+
+    let global_stats: Vec<Option<(f64, f64)>> = global_vals
+        .iter()
+        .map(|vals| compute_robust_stats(vals))
+        .collect();
+
+    // Neighbor search radius: search cells in a 3x3x3 neighborhood
+    // K nearest from those cells (up to K_MAX)
+    const K_MAX: usize = 20;
+    const MIN_NEIGHBORS: usize = 3;
+    // z-score threshold for flagging
+    const Z_THRESH: f64 = 3.5;
+    // Global outlier threshold (very extreme values)
+    const Z_GLOBAL_THRESH: f64 = 5.0;
+
+    let mut suspects: Vec<Suspect> = Vec::new();
+
+    for (idx, sample) in all_samples.iter().enumerate() {
+        let cell = pos_to_cell(&sample.pos, &min_p, cell_size);
+
+        // Gather candidates from neighboring cells
+        let mut candidates: Vec<(f64, usize)> = Vec::new();
+        for di in -1i64..=1 {
+            for dj in -1i64..=1 {
+                for dk in -1i64..=1 {
+                    let nkey = (cell.0 + di, cell.1 + dj, cell.2 + dk);
+                    if let Some(cell_indices) = grid.get(&nkey) {
+                        for &ci in cell_indices {
+                            if ci == idx { continue; }
+                            let dist2 = dist_sq(&all_samples[ci].pos, &sample.pos);
+                            candidates.push((dist2, ci));
+                        }
+                    }
+                }
+            }
+        }
+
+        // If too few neighbors in immediate cells, expand search
+        if candidates.len() < MIN_NEIGHBORS {
+            let expand = 2i64;
+            for di in -expand..=expand {
+                for dj in -expand..=expand {
+                    for dk in -expand..=expand {
+                        if di.abs() <= 1 && dj.abs() <= 1 && dk.abs() <= 1 { continue; }
+                        let nkey = (cell.0 + di, cell.1 + dj, cell.2 + dk);
+                        if let Some(cell_indices) = grid.get(&nkey) {
+                            for &ci in cell_indices {
+                                if ci == idx { continue; }
+                                let dist2 = dist_sq(&all_samples[ci].pos, &sample.pos);
+                                candidates.push((dist2, ci));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Sort by distance and take K_MAX nearest
+        candidates.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        candidates.truncate(K_MAX);
+
+        for (pi, prop_val) in sample.values.iter().enumerate() {
+            let val = match prop_val {
+                Some(v) if v.is_finite() => *v,
+                _ => continue,
+            };
+
+            // Try local neighbor-based outlier detection
+            let neighbor_vals: Vec<f64> = candidates
+                .iter()
+                .filter_map(|(_, ci)| {
+                    all_samples[*ci].values.get(pi).and_then(|v| *v)
+                        .filter(|v| v.is_finite())
+                })
+                .collect();
+
+            let confidence = if neighbor_vals.len() >= MIN_NEIGHBORS {
+                if let Some((median, mad)) = compute_robust_stats(&neighbor_vals) {
+                    if mad > 1e-10 {
+                        let z = (val - median).abs() / mad;
+                        if z > Z_THRESH {
+                            // Scale confidence 0..1 based on z above threshold
+                            let c = (z - Z_THRESH) / (Z_THRESH * 2.0) + 0.5;
+                            Some(c.min(1.0))
+                        } else {
+                            None
+                        }
+                    } else {
+                        // All neighbors same value; check if this sample differs
+                        if (val - median).abs() > 1e-10 {
+                            Some(0.95)
+                        } else {
+                            None
+                        }
+                    }
+                } else {
+                    None
+                }
+            } else {
+                // Fallback: global outlier detection
+                if let Some((g_med, g_mad)) = global_stats[pi] {
+                    if g_mad > 1e-10 {
+                        let z = (val - g_med).abs() / g_mad;
+                        if z > Z_GLOBAL_THRESH {
+                            Some(((z - Z_GLOBAL_THRESH) / (Z_GLOBAL_THRESH * 2.0) + 0.3).min(0.8))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            };
+
+            if let Some(conf) = confidence {
+                let prop_name = property_names
+                    .get(pi)
+                    .cloned()
+                    .unwrap_or_else(|| format!("prop{}", pi));
+                suspects.push(Suspect {
+                    hole_id: sample.hole_id.clone(),
+                    sample_idx: sample.sample_idx,
+                    property: prop_name,
+                    confidence: conf,
+                });
+            }
+        }
+    }
+
+    // Sort by confidence descending
+    suspects.sort_unstable_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap());
+
+    let _ = writeln!(out, "{}", suspects.len());
+    for s in &suspects {
+        let _ = writeln!(
+            out,
+            "{} {} {} {:.6}",
+            s.hole_id, s.sample_idx, s.property, s.confidence
+        );
+    }
+}
+
+#[inline]
+fn pos_to_cell(pos: &[f64; 3], min_p: &[f64; 3], cell_size: f64) -> (i64, i64, i64) {
+    (
+        ((pos[0] - min_p[0]) / cell_size).floor() as i64,
+        ((pos[1] - min_p[1]) / cell_size).floor() as i64,
+        ((pos[2] - min_p[2]) / cell_size).floor() as i64,
+    )
+}
+
+#[inline]
+fn dist_sq(a: &[f64; 3], b: &[f64; 3]) -> f64 {
+    let dx = a[0] - b[0];
+    let dy = a[1] - b[1];
+    let dz = a[2] - b[2];
+    dx * dx + dy * dy + dz * dz
+}
+
+/// Compute median and MAD (median absolute deviation) scaled to ~std dev
+fn compute_robust_stats(vals: &[f64]) -> Option<(f64, f64)> {
+    if vals.is_empty() {
+        return None;
+    }
+    let mut sorted = vals.to_vec();
+    sorted.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+    let median = median_sorted(&sorted);
+    let mut deviations: Vec<f64> = sorted.iter().map(|v| (v - median).abs()).collect();
+    deviations.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+    let mad = median_sorted(&deviations) * 1.4826; // scale to be consistent with std dev
+    Some((median, mad))
+}
+
+fn median_sorted(sorted: &[f64]) -> f64 {
+    let n = sorted.len();
+    if n == 0 {
+        return 0.0;
+    }
+    if n % 2 == 0 {
+        (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
+    } else {
+        sorted[n / 2]
+    }
+}

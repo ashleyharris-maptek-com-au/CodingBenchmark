@@ -1,1 +1,335 @@
-{'__exception__': "Can't run here - we're trying to get this working in codex."}
+```cpp
+#include <bits/stdc++.h>
+#undef NDEBUG
+using namespace std;
+
+/*
+  Simple real-time 3D Lunar Lander controller (reference implementation).
+
+  - Reads header and terrain path, loads terrain in a background thread.
+  - Spawns a state-reading thread that consumes 12 numbers per update from stdin
+    (after an initial "STATE" line has been consumed by the main thread).
+  - Main control loop runs at ~10 Hz and emits thrust/rotation commands.
+
+  Notes:
+  - This is a heuristic autopilot designed to work across scales.
+  - The terrain file format is read as width*depth entries of (a,b,c) as uint16_t LE.
+  - Ground collision rules: collision if z < a, or if b <= z < c for the column.
+  - The thrust direction is defined by (pitch, yaw) mapping:
+      thrust_dir = (-sin(pitch)*cos(yaw), -sin(pitch)*sin(yaw), cos(pitch))
+    with roll being cosmetic.
+  - Pitch is clamped to [-pi/2, pi/2], yaw unconstrained (handled by wrap).
+  - The code uses a separate thread for terrain loading and a separate reader thread
+    for state updates to avoid blocking the main control loop.
+
+  Build with MSVC (C++20) or any modern compiler.
+*/
+
+static const double PI = 3.141592653589793238462643383279502884;
+
+/* Helpers */
+inline double clamp(double v, double lo, double hi) { return v < lo ? lo : (v > hi ? hi : v); }
+inline double wrapPi(double a) {
+    while (a > PI) a -= 2*PI;
+    while (a < -PI) a += 2*PI;
+    return a;
+}
+inline double sqr(double x) { return x*x; }
+
+struct State {
+    // world state (meters, m/s, radians)
+    double x=0.0, y=0.0, z=0.0;
+    double vx=0.0, vy=0.0, vz=0.0;
+    double pitch=0.0, yaw=0.0, roll=0.0;
+    double pitch_rate=0.0, yaw_rate=0.0, roll_rate=0.0;
+    double fuel=0.0;
+};
+
+struct TerrainData {
+    int width = 0;
+    int depth = 0;
+    int height = 0;
+    std::vector<uint16_t> A; // ground top
+    std::vector<uint16_t> B; // floating rock bottom top
+    std::vector<uint16_t> C; // floating rock top
+    inline int idx(int ix, int iy) const { return ix*depth + iy; }
+};
+
+static std::mutex g_state_mtx;
+static State g_current_state;
+static bool g_has_state = false; // whether a new state has been read
+
+static std::mutex g_terrain_mtx;
+static std::unique_ptr<TerrainData> g_terrain;
+static bool g_terrain_ready = false;
+
+/* Ground collision check */
+static bool collision_at(double x, double y, double z) {
+    // Out of bounds or below z=0 is a collision
+    if (z < 0.0) return true;
+    // We'll also require bounds of terrain to be respected
+    int ix = (int)floor(x);
+    int iy = (int)floor(y);
+    {
+        std::lock_guard<std::mutex> lk(g_terrain_mtx);
+        if (!g_terrain_ready || !g_terrain) {
+            // If terrain not ready yet, conservatively allow movement (no collision)
+            return false;
+        }
+        if (ix < 0 || iy < 0 || ix >= g_terrain->width || iy >= g_terrain->depth) {
+            return true;
+        }
+        int idx = g_terrain->idx(ix, iy);
+        int a = static_cast<int>(g_terrain->A[idx]);
+        int b = static_cast<int>(g_terrain->B[idx]);
+        int c = static_cast<int>(g_terrain->C[idx]);
+        // Solid rock where: z < a  OR  b <= z < c
+        if (z < a) return true;
+        if (z >= b && z < c) return true;
+        // Otherwise open air
+    }
+    return false;
+}
+
+/* Terrain loader (background thread) */
+static void terrain_loader_thread(int width, int depth, int height, const string& path) {
+    // Read binary file: width*depth*6 bytes, as (a,b,c) each uint16_t LE
+    std::unique_ptr<TerrainData> t = std::make_unique<TerrainData>();
+    t->width = width;
+    t->depth = depth;
+    t->height = height;
+    size_t cells = static_cast<size_t>(width) * static_cast<size_t>(depth);
+    t->A.resize(cells);
+    t->B.resize(cells);
+    t->C.resize(cells);
+
+    std::ifstream fin(path, std::ios::binary);
+    if (!fin) {
+        // Could not read terrain; mark as not ready
+        std::lock_guard<std::mutex> lk(g_terrain_mtx);
+        g_terrain_ready = false;
+        g_terrain.reset();
+        return;
+    }
+
+    // Helper to read uint16 little-endian
+    auto read_u16_le = [&fin]() -> uint16_t {
+        unsigned char b[2];
+        fin.read(reinterpret_cast<char*>(b), 2);
+        if (fin.gcount() != 2) return 0;
+        return static_cast<uint16_t>(b[0]) | (static_cast<uint16_t>(b[1]) << 8);
+    };
+
+    for (size_t i = 0; i < cells; ++i) {
+        uint16_t a = read_u16_le();
+        uint16_t b = read_u16_le();
+        uint16_t c = read_u16_le();
+        t->A[i] = a;
+        t->B[i] = b;
+        t->C[i] = c;
+    }
+
+    // Publish terrain
+    {
+        std::lock_guard<std::mutex> lk(g_terrain_mtx);
+        g_terrain = std::move(t);
+        g_terrain_ready = true;
+    }
+}
+
+/* State reader thread (reads 12 values per update) */
+static void state_reader_thread() {
+    while (true) {
+        State st;
+        // Read 12 numeric tokens from stdin
+        if (!(cin >> st.x >> st.y >> st.z
+                  >> st.vx >> st.vy >> st.vz
+                  >> st.pitch >> st.yaw >> st.roll
+                  >> st.pitch_rate >> st.yaw_rate >> st.roll_rate
+                  >> st.fuel)) {
+            // End of input or error
+            break;
+        }
+        {
+            std::lock_guard<std::mutex> lk(g_state_mtx);
+            g_current_state = st;
+            g_has_state = true;
+        }
+    }
+}
+
+/* Main */
+int main() {
+    ios::sync_with_stdio(false);
+    cin.tie(nullptr);
+
+    // 1) Read header line
+    string line;
+    if (!getline(cin, line)) {
+        cerr << "Failed to read header line.\n";
+        return 0;
+    }
+    {
+        stringstream ss(line);
+        int width = 0, depth = 0, height = 0;
+        double gravity = 0.0;
+        double max_thrust = 0.0;
+        double fuel = 0.0;
+        if (!(ss >> width >> depth >> height >> gravity >> max_thrust >> fuel)) {
+            cerr << "Failed to parse header line.\n";
+            return 0;
+        }
+
+        // 2) Read start_x start_y start_z target_x target_y target_z
+        if (!getline(cin, line)) {
+            cerr << "Failed to read start/target line.\n";
+            return 0;
+        }
+        double start_x=0.0, start_y=0.0, start_z=0.0;
+        double target_x=0.0, target_y=0.0, target_z=0.0;
+        {
+            stringstream ss2(line);
+            if (!(ss2 >> start_x >> start_y >> start_z >> target_x >> target_y >> target_z)) {
+                cerr << "Failed to parse start/target line.\n";
+                return 0;
+            }
+        }
+
+        // 3) Terrain file path line
+        string terrain_path;
+        if (!getline(cin, terrain_path)) {
+            cerr << "Failed to read terrain path line.\n";
+            return 0;
+        }
+
+        // 4) Consume "STATE" line (if present)
+        // Try to read a line; if it's "STATE" fine, otherwise ignore for robustness
+        if (getline(cin, line)) {
+            // if line is not "STATE", it's possibly the first update token line; we will put it back
+            // However std::cin cannot unread easily. We'll handle by starting the state reader which expects tokens.
+            // To be safe, if line contains non-numeric, we just ignore (as environment typically provides "STATE" line).
+            // We can't push this back, so we simply disregard this line here.
+        }
+
+        // Print minimal setup info (not required, but helps debugging)
+        // cerr << "Terrain: w="<<width<<" d="<<depth<<" h="<<height<<", gravity="<<gravity<<", max_thrust="<<max_thrust<<", fuel="<<fuel<<"\n";
+
+        // 5) Start terrain loader in background
+        // Launch in a detached thread; it will populate terrain data when done
+        {
+            std::thread loader(terrain_loader_thread, width, depth, height, terrain_path);
+            loader.detach();
+        }
+
+        // 6) Start state reader thread
+        std::thread reader(state_reader_thread);
+        reader.detach();
+
+        // 7) Set up main loop variables
+        const double gravity = 1.62; // lunar gravity (as per description)
+        const double max_thrust = 1.0; // as per "fraction of max_thrust" (input line provides actual max_thrust; we treat in code as 1.0 for fraction)
+        // The input header provided "gravity max_thrust fuel" as numbers; we will use them in physics if desired.
+
+        // To simplify, we'll use the following: thrust fraction in 0..1; actual acceleration = thrust * max_thrust
+        // However since max_thrust is provided in header, we can use that for scaling:
+        // We'll keep a local variable (not strictly necessary for the heuristic).
+        // We'll use the target_z from input to guide landing.
+
+        // We'll print 4 numbers per line: thrust (0..1), pitch_cmd, yaw_cmd, roll_cmd
+        cout.setf(std::ios::fixed);
+        cout << setprecision(4);
+
+        // Basic autopilot loop at ~10 Hz
+        const double dt = 0.1;
+        while (true) {
+            // Copy latest state
+            State s;
+            bool have = false;
+            {
+                std::lock_guard<std::mutex> lk(g_state_mtx);
+                if (g_has_state) {
+                    s = g_current_state;
+                    have = true;
+                    // Do not clear has_state; we can reuse latest
+                }
+            }
+
+            // If terrain not ready yet, we can still emit a safe default command
+            double thrust_frac = 0.0;
+            double pitch_cmd = 0.0;
+            double yaw_cmd = 0.0;
+            double roll_cmd = 0.0;
+
+            if (have) {
+                // Compute simple autopilot toward target XY
+                double dx = target_x - s.x;
+                double dy = target_y - s.y;
+                double dist_xy = std::hypot(dx, dy);
+
+                // Desired yaw to face toward target (plus one pi to produce thrust toward target due to thrust mapping)
+                double yaw_target = std::atan2(dy, dx) + PI;
+                // Normalize
+                yaw_target = wrapPi(yaw_target);
+                double yaw_error = wrapPi(yaw_target - s.yaw);
+                // Simple proportional yaw command
+                yaw_cmd = clamp(yaw_error * 0.9, -1.0, 1.0);
+
+                // Determine desired pitch to create horizontal thrust toward target
+                // More horizontal thrust when far away, less when close
+                double desired_pitch = 0.0;
+                if (dist_xy > 10.0) desired_pitch = 0.6;
+                else if (dist_xy > 5.0) desired_pitch = 0.35;
+                else if (dist_xy > 2.0) desired_pitch = 0.20;
+                else desired_pitch = 0.10;
+
+                // Clip to valid range
+                desired_pitch = clamp(desired_pitch, -PI/2.0, PI/2.0);
+
+                double pitch_error = desired_pitch - s.pitch;
+                // Simple proportional pitch command
+                pitch_cmd = clamp(pitch_error * 1.0, -1.0, 1.0);
+
+                // Thrust control:
+                // Heuristic: if far from target XY or high altitude, use more thrust; descend gradually near target
+                double z_to_target = s.z - target_z;
+                double base = 0.25;
+                if (dist_xy > 12.0) base = 0.7;
+                else if (dist_xy > 6.0) base = 0.55;
+                else if (z_to_target > 6.0) base = 0.60;
+                else if (z_to_target > 2.0) base = 0.45;
+                else base = 0.30;
+
+                // If out of fuel, reduce thrust
+                if (s.fuel <= 0.0) base = 0.0;
+
+                thrust_frac = clamp(base, 0.0, 1.0);
+            }
+
+            // Collision safety: if we are already colliding or near ground and velocity too high, we could adjust
+            // We do a light safety check (not strictly required)
+            if (have) {
+                // If about to collide in next step (very rough), reduce thrust to descend slowly
+                // Not implementing full physics here; keep simple.
+                if (collision_at(s.x, s.y, s.z)) {
+                    // Very bad: try to stabilize (reduce thrust to zero to avoid pushing into terrain)
+                    thrust_frac = 0.0;
+                    pitch_cmd = clamp(pitch_cmd * 0.5, -1.0, 1.0);
+                    yaw_cmd = clamp(yaw_cmd * 0.5, -1.0, 1.0);
+                    roll_cmd = 0.0;
+                }
+            }
+
+            // Print command line
+            // The problem expects: thrust pitch_cmd yaw_cmd roll_cmd
+            // with 4 decimals for each
+            cout << thrust_frac << " " << pitch_cmd << " " << yaw_cmd << " " << roll_cmd << "\n";
+            cout.flush();
+
+            // Sleep ~dt
+            std::this_thread::sleep_for(std::chrono::duration<double>(dt));
+        }
+
+    } // end of try block
+    return 0;
+}
+```

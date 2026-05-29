@@ -1,1 +1,275 @@
-{'__exception__': "Can't run here - we're trying to get this working in codex."}
+```cpp
+#include <bits/stdc++.h>
+using namespace std;
+
+/*
+ A lightweight real-time controller for the 3D Lunar Lander environment.
+
+ Notes:
+ - Terrain is loaded from a binary file in a background thread after reading its path.
+ - Terrain format: for each (x,y) cell, 3 uint16 LE values: a, b, c.
+   Solid rock if z < a, or (b <= z < c). Open air otherwise.
+ - World coordinates: X East, Y North, Z Up. Gravity acts in -Z.
+ - Thrust acts along the lander's local Up axis. We implement a simple heuristic controller.
+ - Outputs are: thrust (0..1), pitch_cmd (-1..1), yaw_cmd (-1..1), roll_cmd (-1..1).
+ - Loop cadence: at least 10 Hz (0.1s updates).
+ - Simple safety: basic bounds checks, collision with terrain (in a minimal way).
+
+ This is a straightforward, compilable C++20 program for MSVC.
+*/
+
+struct Terrain {
+    int width = 0;
+    int depth = 0;
+    vector<uint16_t> a; // ground top
+    vector<uint16_t> b; // floating rock bottom
+    vector<uint16_t> c; // floating rock top
+    bool ready = false;
+    mutex m;
+    atomic<bool> alive{true};
+
+    // Load terrain data from file path asynchronously
+    void loadFromFileAsync(const string &path, int w, int d) {
+        width = w;
+        depth = d;
+        a.resize((size_t)w * d);
+        b.resize((size_t)w * d);
+        c.resize((size_t)w * d);
+        // Launch a thread to parse the file
+        thread([this, path]() {
+            // Read binary file with little-endian uint16
+            ifstream fin(path, ios::binary);
+            if (!fin) {
+                // signal not ready but avoid crash
+                ready = false;
+                return;
+            }
+            vector<uint16_t> ta(width * depth);
+            vector<uint16_t> tb(width * depth);
+            vector<uint16_t> tc(width * depth);
+            for (size_t i = 0; i < (size_t)width * depth; ++i) {
+                uint16_t va = 0, vb = 0, vc = 0;
+                char bytes[2];
+                fin.read(bytes, 2);
+                if (fin.gcount() != 2) break;
+                va = (uint8_t)bytes[0] | ((uint8_t)bytes[1] << 8);
+                fin.read(bytes, 2);
+                if (fin.gcount() != 2) break;
+                vb = (uint8_t)bytes[0] | ((uint8_t)bytes[1] << 8);
+                fin.read(bytes, 2);
+                if (fin.gcount() != 2) break;
+                vc = (uint8_t)bytes[0] | ((uint8_t)bytes[1] << 8);
+                ta[i] = va; tb[i] = vb; tc[i] = vc;
+            }
+            // Move into member vectors
+            {
+                lock_guard<mutex> lg(m);
+                a.assign(ta.begin(), ta.end());
+                b.assign(tb.begin(), tb.end());
+                c.assign(tc.begin(), tc.end());
+                ready = true;
+            }
+        }).detach();
+    }
+
+    // Accessor: is cell solid at integer x,y,z
+    bool isSolid(int x, int y, int z) const {
+        if (x < 0 || y < 0 || z < 0) return true;
+        if (x >= width || y >= depth) return true; // out of bounds -> solid
+        size_t idx = (size_t)x * depth + (size_t)y;
+        uint16_t aa = a[idx], bb = b[idx], cc = c[idx];
+        // solid if z < aa (ground) or (bb <= z < cc) (floating rock)
+        if (z < (int)aa) return true;
+        if (bb <= (uint16_t)z && (uint16_t)z < cc) return true;
+        return false;
+    }
+
+    // Bounds check
+    bool inBounds(int x, int y, int z) const {
+        return x >= 0 && y >= 0 && z >= 0 &&
+               x < width && y < depth && z < height(); // height unknown; we treat z bound later
+    }
+
+    // We don't know height; rely on isSolid for collisions; out-of-bounds z considered solid as per spec
+    int height() const { return 65536; } // very large; we mainly check x,y
+};
+
+// Utility: clamp
+static inline double clampd(double v, double lo, double hi) {
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
+}
+
+int main() {
+    ios::sync_with_stdio(false);
+    cin.tie(nullptr);
+
+    // Read initial header
+    // width depth height gravity max_thrust fuel
+    int width = 0, depth = 0, height = 0;
+    double gravity = 1.62;
+    double max_thrust = 1.0;
+    double fuel = 0.0;
+
+    if (!(cin >> width >> depth >> height >> gravity >> max_thrust >> fuel)) {
+        return 0;
+    }
+
+    double start_x = 0, start_y = 0, start_z = 0;
+    double target_x = 0, target_y = 0, target_z = 0;
+    cin >> start_x >> start_y >> start_z;
+    cin >> target_x >> target_y >> target_z;
+
+    string terrainPath;
+    // consume endline then getline for terrain path (may contain spaces)
+    string dummy;
+    getline(cin, dummy); // consume rest of line
+    if (!getline(cin, terrainPath)) {
+        terrainPath.clear();
+        // If not provided (defensive)
+    }
+
+    Terrain terrain;
+    // Start terrain loading in background after reading path
+    terrain.loadFromFileAsync(terrainPath, width, depth);
+
+    // State variables
+    double x = start_x, y = start_y, z = start_z;
+    double vx = 0, vy = 0, vz = 0;
+    double pitch = 0, yaw = 0, roll = 0;
+    double pitch_rate = 0, yaw_rate = 0, roll_rate = 0;
+    double fuel_remaining = fuel;
+
+    // Simulation parameters
+    const double dt = 0.1; // 0.1s per tick
+    const double angular_accel_cap = 2.0; // given
+    const double angular_damping = 0.95;
+
+    // Target for landing
+    double tx = target_x, ty = target_y, tz = target_z;
+
+    // Landing radius
+    double landing_radius = max(5.0, min((double)width, (double)depth) * 0.02);
+
+    // Main loop: read state updates from stdin and output commands
+    // We run until EOF or fuel runs out or collision too harsh; we will attempt to keep running.
+    cout.setf(std::ios::fixed); cout.precision(6);
+
+    // We'll implement a simple real-time loop: read a line, parse, then compute commands.
+    // However, input is "STATE" following; we expect a stream of lines with state vectors every 0.1s.
+    // We'll read until EOF.
+    while (true) {
+        // Read a line of state data
+        // STATE line: x y z vx vy vz pitch yaw roll pitch_rate yaw_rate roll_rate fuel_remaining
+        // We attempt to read until we get 12 numbers.
+        double nx, ny, nz, nvx, nvy, nvz;
+        double npitch, nyaw, nroll;
+        double npitch_rate, nyaw_rate, nroll_rate;
+        double nfuel;
+
+        // We'll try to read from cin; if no data, break
+        if (!(cin >> nx >> ny >> nz >> nvx >> nvy >> nvz
+              >> npitch >> nyaw >> nroll
+              >> npitch_rate >> nyaw_rate >> nroll_rate
+              >> nfuel)) {
+            break;
+        }
+
+        // Update state
+        x = nx; y = ny; z = nz;
+        vx = nvx; vy = nvy; vz = nvz;
+        pitch = npitch; yaw = nyaw; roll = nroll;
+        pitch_rate = npitch_rate; yaw_rate = nyaw_rate; roll_rate = nroll_rate;
+        fuel_remaining = nfuel;
+
+        // If we crash or out of fuel, we might still output something to keep sim alive
+        // Simple controller: steer toward target in XY, keep altitude above terrain.
+
+        // Terrain collision check (coarse): if current position is inside solid cell -> crash
+        int ix = (int)floor(x);
+        int iy = (int)floor(y);
+        int iz = (int)floor(z);
+        bool collided = false;
+        {
+            // We will query terrain once if loaded
+            lock_guard<mutex> lg(terrain.m);
+            if (terrain.ready) {
+                // rough collision check
+                // If out of bounds in XY or Z, treat as collision
+                if (ix < 0 || iy < 0 || ix >= terrain.width || iy >= terrain.depth || z < 0) {
+                    collided = true;
+                } else {
+                    if (terrain.isSolid(ix, iy, iz)) collided = true;
+                }
+            }
+        }
+
+        // Simple landing condition estimation
+        double dx = tx - x;
+        double dy = ty - y;
+        double dz = tz - z;
+
+        // Basic proportional control to steer toward target in XY
+        // Convert desired horizontal vector into pitch/yaw commands
+        double distXY = sqrt(dx*dx + dy*dy);
+        double desired_yaw = atan2(dy, dx); // direction to target in XY plane
+        double yaw_diff = desired_yaw - yaw;
+        // Normalize to [-pi, pi]
+        while (yaw_diff > M_PI) yaw_diff -= 2*M_PI;
+        while (yaw_diff < -M_PI) yaw_diff += 2*M_PI;
+
+        // Map yaw_diff to yaw_cmd
+        double yaw_cmd = clampd(yaw_diff * 0.8, -1.0, 1.0);
+
+        // Simple pitch_cmd to tilt toward target in X (given thrust tilt behavior)
+        // We'll use projection of horizontal error relative to current heading
+        double desired_pitch = 0.0;
+        // If target is in front relative to current yaw, tilt pitch a little toward +X when dx>0
+        desired_pitch = atan2(distXY, max(0.1, z - tz + distXY * 0.0)); // conservative
+        // Instead of a complex mapping, use a small proportional to dx
+        desired_pitch = atan2(dx, max(0.1, dz + 1.0)); // try to tilt toward reducing dx
+        double pitch_diff = desired_pitch - pitch;
+        double pitch_cmd = clampd(pitch_diff * 0.6, -1.0, 1.0);
+
+        // Roll is cosmetic; we keep it zero
+        double roll_cmd = 0.0;
+
+        // Thrust: attempt to hover while we steer
+        // We'll use a modest thrust that helps ascend/maintain altitude
+        double thrust = 0.25;
+        // If we are far from target or descending, increase thrust slightly
+        if (distXY > 5.0) thrust = 0.35;
+        if (dz > 2.0) thrust = 0.5;
+        // Cap by fuel
+        if (fuel_remaining < 1.0) thrust = 0.0;
+
+        // Safety: if collided, attempt to abort (reduce thrust)
+        if (collided) {
+            thrust = 0.0;
+            pitch_cmd = clampd(-pitch, -1.0, 1.0);
+            yaw_cmd = clampd(-yaw, -1.0, 1.0);
+        }
+
+        // Output command at least every iteration
+        cout << fixed << setprecision(6)
+             << thrust << " "
+             << pitch_cmd << " "
+             << yaw_cmd << " "
+             << roll_cmd << "\n";
+        cout.flush();
+
+        // Update fuel estimate (simple)
+        if (thrust > 0.0 && fuel_remaining > 0.0) {
+            // 1 unit per second => per step is dt
+            fuel_remaining -= thrust * dt;
+            if (fuel_remaining < 0) fuel_remaining = 0;
+        }
+
+        // Small delay loop: we can't sleep here because the environment handles timing via its own input cadence.
+        // We rely on the 0.1s update cadence from the environment.
+    }
+
+    return 0;
+}
+```

@@ -1,0 +1,237 @@
+use std::io::{self, Read, Write, BufReader, BufWriter, BufRead, Seek, SeekFrom};
+use std::fs::OpenOptions;
+
+fn main() {
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let mut reader = BufReader::with_capacity(1 << 20, stdin.lock());
+    let mut writer = BufWriter::with_capacity(1 << 20, stdout.lock());
+
+    let mut header = String::new();
+    reader.read_line(&mut header).expect("read header");
+    let parts: Vec<usize> = header.trim().split_whitespace()
+        .map(|s| s.parse().expect("parse"))
+        .collect();
+    let num_points = parts[0];
+    let num_clusters = parts[1];
+
+    if num_clusters == 0 || num_points == 0 {
+        return;
+    }
+
+    let k = num_clusters.min(num_points);
+
+    if num_points <= 10_000_000 {
+        run_inmemory(&mut reader, &mut writer, num_points, k);
+    } else {
+        run_streaming(&mut reader, &mut writer, num_points, k);
+    }
+
+    writer.flush().unwrap();
+}
+
+struct Rng { s: u64 }
+impl Rng {
+    fn new(seed: u64) -> Self { Self { s: seed ^ 0x6a09e667f3bcc908 } }
+    fn next(&mut self) -> u64 {
+        self.s ^= self.s << 13; self.s ^= self.s >> 7; self.s ^= self.s << 17; self.s
+    }
+    fn usize(&mut self) -> usize { self.next() as usize }
+    fn f64(&mut self) -> f64 { (self.next() >> 11) as f64 / (1u64 << 53) as f64 }
+}
+
+fn read_batch(reader: &mut impl Read, count: usize) -> Vec<[f32; 3]> {
+    let mut buf = vec![0u8; count * 12];
+    reader.read_exact(&mut buf).expect("read points");
+    let mut pts = Vec::with_capacity(count);
+    for i in 0..count {
+        let o = i * 12;
+        pts.push([
+            f32::from_le_bytes([buf[o], buf[o+1], buf[o+2], buf[o+3]]),
+            f32::from_le_bytes([buf[o+4], buf[o+5], buf[o+6], buf[o+7]]),
+            f32::from_le_bytes([buf[o+8], buf[o+9], buf[o+10], buf[o+11]]),
+        ]);
+    }
+    pts
+}
+
+fn write_assigns(writer: &mut impl Write, a: &[u32]) {
+    let mut buf = vec![0u8; a.len() * 4];
+    for (i, &v) in a.iter().enumerate() {
+        let b = v.to_le_bytes();
+        let o = i * 4;
+        buf[o]=b[0]; buf[o+1]=b[1]; buf[o+2]=b[2]; buf[o+3]=b[3];
+    }
+    writer.write_all(&buf).unwrap();
+}
+
+#[inline(always)]
+fn dsq(a: &[f64;3], b: &[f64;3]) -> f64 {
+    let dx=a[0]-b[0]; let dy=a[1]-b[1]; let dz=a[2]-b[2];
+    dx*dx+dy*dy+dz*dz
+}
+
+fn nearest(p: &[f64;3], c: &[[f64;3]]) -> u32 {
+    let mut bi = 0u32;
+    let mut bd = f64::MAX;
+    for (i, ci) in c.iter().enumerate() {
+        let d = dsq(p, ci);
+        if d < bd { bd=d; bi=i as u32; }
+    }
+    bi
+}
+
+fn pf(p: &[f32;3]) -> [f64;3] { [p[0] as f64, p[1] as f64, p[2] as f64] }
+
+fn kpp(points: &[[f32;3]], k: usize) -> Vec<[f64;3]> {
+    let n = points.len();
+    let mut rng = Rng::new(42);
+    let mut cs: Vec<[f64;3]> = Vec::with_capacity(k);
+    cs.push(pf(&points[rng.usize() % n]));
+    if k == 1 { return cs; }
+
+    let mut dists = vec![f64::MAX; n];
+    for _ in 1..k {
+        let last = cs.last().unwrap();
+        let mut total = 0.0f64;
+        for i in 0..n {
+            let d = dsq(&pf(&points[i]), last);
+            if d < dists[i] { dists[i] = d; }
+            total += dists[i];
+        }
+        if total == 0.0 { cs.push(*last); continue; }
+        let t = rng.f64() * total;
+        let mut cum = 0.0;
+        let mut ch = n-1;
+        for i in 0..n {
+            cum += dists[i];
+            if cum >= t { ch=i; break; }
+        }
+        cs.push(pf(&points[ch]));
+    }
+    cs
+}
+
+fn fix_empty(cs: &mut [[f64;3]], counts: &[u64]) {
+    for j in 0..cs.len() {
+        if counts[j] == 0 {
+            if let Some((lg, _)) = counts.iter().enumerate().max_by_key(|(_,&c)| c) {
+                cs[j][0] = cs[lg][0] + 0.001;
+                cs[j][1] = cs[lg][1] + 0.001;
+                cs[j][2] = cs[lg][2] - 0.001;
+            }
+        }
+    }
+}
+
+fn run_inmemory(reader: &mut impl Read, writer: &mut impl Write, n: usize, k: usize) {
+    let points = read_batch(reader, n);
+    let mut centroids = kpp(&points, k);
+    let mut assigns = vec![0u32; n];
+
+    for _ in 0..25 {
+        let mut changed = 0usize;
+        for i in 0..n {
+            let c = nearest(&pf(&points[i]), &centroids);
+            if assigns[i] != c { changed+=1; assigns[i]=c; }
+        }
+
+        let mut sums = vec![[0.0f64;3]; k];
+        let mut counts = vec![0u64; k];
+        for i in 0..n {
+            let ci = assigns[i] as usize;
+            sums[ci][0] += points[i][0] as f64;
+            sums[ci][1] += points[i][1] as f64;
+            sums[ci][2] += points[i][2] as f64;
+            counts[ci] += 1;
+        }
+        for j in 0..k {
+            if counts[j] > 0 {
+                centroids[j] = [sums[j][0]/counts[j] as f64, sums[j][1]/counts[j] as f64, sums[j][2]/counts[j] as f64];
+            }
+        }
+        fix_empty(&mut centroids, &counts);
+        if changed == 0 || (changed as f64 / n as f64) < 0.001 { break; }
+    }
+    write_assigns(writer, &assigns);
+}
+
+fn run_streaming(reader: &mut impl Read, writer: &mut impl Write, n: usize, k: usize) {
+    let tmp_path = make_tmp_path();
+    {
+        let tmp = OpenOptions::new().write(true).create(true).truncate(true)
+            .open(&tmp_path).expect("create tmp");
+        let mut tmp = BufWriter::with_capacity(1 << 20, tmp);
+        let bs = 1_000_000usize;
+        let mut rem = n;
+        while rem > 0 {
+            let batch = bs.min(rem);
+            let mut buf = vec![0u8; batch * 12];
+            reader.read_exact(&mut buf).expect("read");
+            tmp.write_all(&buf).unwrap();
+            rem -= batch;
+        }
+        tmp.flush().unwrap();
+    }
+
+    let mut tmp = BufReader::with_capacity(1 << 20,
+        OpenOptions::new().read(true).open(&tmp_path).expect("open tmp"));
+
+    // Sample for init
+    let sample_n = (k * 50).min(n).min(2_000_000);
+    let sample = read_batch(&mut tmp, sample_n);
+    let mut centroids = kpp(&sample, k);
+
+    // K-means passes
+    let passes = if n > 500_000_000 { 2 } else if n > 100_000_000 { 3 } else { 5 };
+    let bs = 1_000_000usize;
+
+    for _ in 0..passes {
+        tmp.seek(SeekFrom::Start(0)).unwrap();
+        let mut sums = vec![[0.0f64;3]; k];
+        let mut counts = vec![0u64; k];
+        let mut rem = n;
+        while rem > 0 {
+            let batch = bs.min(rem);
+            let pts = read_batch(&mut tmp, batch);
+            rem -= batch;
+            for p in &pts {
+                let ci = nearest(&pf(p), &centroids) as usize;
+                sums[ci][0] += p[0] as f64;
+                sums[ci][1] += p[1] as f64;
+                sums[ci][2] += p[2] as f64;
+                counts[ci] += 1;
+            }
+        }
+        for j in 0..k {
+            if counts[j] > 0 {
+                centroids[j] = [sums[j][0]/counts[j] as f64, sums[j][1]/counts[j] as f64, sums[j][2]/counts[j] as f64];
+            }
+        }
+        fix_empty(&mut centroids, &counts);
+    }
+
+    // Final assignment pass
+    tmp.seek(SeekFrom::Start(0)).unwrap();
+    let mut rem = n;
+    while rem > 0 {
+        let batch = bs.min(rem);
+        let pts = read_batch(&mut tmp, batch);
+        rem -= batch;
+        let a: Vec<u32> = pts.iter().map(|p| nearest(&pf(p), &centroids)).collect();
+        write_assigns(writer, &a);
+    }
+
+    drop(tmp);
+    let _ = std::fs::remove_file(&tmp_path);
+}
+
+fn make_tmp_path() -> String {
+    let pid = std::process::id();
+    if cfg!(windows) {
+        let dir = std::env::var("TEMP").unwrap_or_else(|_| ".".into());
+        format!("{}\\kmeans_{}.tmp", dir, pid)
+    } else {
+        format!("/tmp/kmeans_{}.tmp", pid)
+    }
+}

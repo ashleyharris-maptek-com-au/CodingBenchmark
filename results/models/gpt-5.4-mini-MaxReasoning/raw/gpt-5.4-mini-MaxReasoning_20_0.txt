@@ -1,0 +1,484 @@
+use std::collections::HashMap;
+use std::io::{self, Read, Write};
+
+const MAX_HOLE_WINDOW: usize = 32;
+const LOCAL_WINDOW_THRESHOLD_SMALL: usize = 20_000;
+const LOCAL_WINDOW_THRESHOLD_MEDIUM: usize = 200_000;
+const SMALL_MODE_THRESHOLD: usize = 50_000;
+
+#[derive(Clone, Copy)]
+struct Stats {
+    median: f64,
+    scale: f64,
+}
+
+#[derive(Clone)]
+struct HoleMeta {
+    id: String,
+    samples: Vec<usize>,
+    interval_est: f64,
+}
+
+#[derive(Clone, Copy)]
+struct Sample {
+    hole: usize,
+    depth: f64,
+    ordinal: usize,
+    x: f64,
+    y: f64,
+    z: f64,
+}
+
+#[derive(Clone, Copy)]
+struct Suspect {
+    hole: usize,
+    sample_idx: usize,
+    prop: usize,
+    confidence: f64,
+}
+
+struct Scanner {
+    input: Vec<u8>,
+    idx: usize,
+}
+
+impl Scanner {
+    fn new() -> io::Result<Self> {
+        let mut input = Vec::new();
+        io::stdin().read_to_end(&mut input)?;
+        Ok(Self { input, idx: 0 })
+    }
+
+    fn skip_ws(&mut self) {
+        while self.idx < self.input.len() && self.input[self.idx].is_ascii_whitespace() {
+            self.idx += 1;
+        }
+    }
+
+    fn next_token(&mut self) -> Option<&[u8]> {
+        self.skip_ws();
+        if self.idx >= self.input.len() {
+            return None;
+        }
+        let start = self.idx;
+        while self.idx < self.input.len() && !self.input[self.idx].is_ascii_whitespace() {
+            self.idx += 1;
+        }
+        Some(&self.input[start..self.idx])
+    }
+
+    fn next_string(&mut self) -> Option<String> {
+        self.next_token().map(|tok| String::from_utf8_lossy(tok).into_owned())
+    }
+
+    fn next_usize(&mut self) -> Option<usize> {
+        let tok = self.next_token()?;
+        std::str::from_utf8(tok).ok()?.parse::<usize>().ok()
+    }
+
+    fn next_f64(&mut self) -> Option<f64> {
+        let tok = self.next_token()?;
+        parse_f64_token(tok)
+    }
+}
+
+fn parse_f64_token(tok: &[u8]) -> Option<f64> {
+    let s = std::str::from_utf8(tok).ok()?;
+    let v = s.parse::<f64>().ok()?;
+    if v.is_finite() {
+        Some(v)
+    } else {
+        None
+    }
+}
+
+fn quantile_sorted(vals: &[f64], q: f64) -> f64 {
+    if vals.is_empty() {
+        return 0.0;
+    }
+    if vals.len() == 1 {
+        return vals[0];
+    }
+    let q = q.clamp(0.0, 1.0);
+    let pos = q * (vals.len() as f64 - 1.0);
+    let lo = pos.floor() as usize;
+    let hi = pos.ceil() as usize;
+    if lo == hi {
+        vals[lo]
+    } else {
+        let frac = pos - lo as f64;
+        vals[lo] * (1.0 - frac) + vals[hi] * frac
+    }
+}
+
+fn global_stats(col: &[f64]) -> Stats {
+    let mut vals: Vec<f64> = col.iter().copied().filter(|v| v.is_finite()).collect();
+    if vals.is_empty() {
+        return Stats {
+            median: 0.0,
+            scale: 1.0,
+        };
+    }
+    vals.sort_unstable_by(|a, b| a.total_cmp(b));
+    let median = quantile_sorted(&vals, 0.5);
+    let q1 = quantile_sorted(&vals, 0.25);
+    let q3 = quantile_sorted(&vals, 0.75);
+    let iqr_scale = (q3 - q1).abs() / 1.349;
+    let floor = (median.abs().max(1.0)) * 1e-12 + 1e-12;
+    let scale = iqr_scale.max(floor);
+    Stats { median, scale }
+}
+
+fn global_score(value: f64, global: Stats) -> f64 {
+    (((value - global.median).abs() / global.scale).min(1e12)).max(0.0)
+}
+
+fn robust_score_small_window(
+    value: f64,
+    vals: &mut [f64; MAX_HOLE_WINDOW],
+    count: usize,
+    global: Stats,
+) -> Option<f64> {
+    if count < 3 {
+        return None;
+    }
+    let slice = &mut vals[..count];
+    slice.sort_unstable_by(|a, b| a.total_cmp(b));
+    let med = quantile_sorted(slice, 0.5);
+    let mut devs = [0.0_f64; MAX_HOLE_WINDOW];
+    for i in 0..count {
+        devs[i] = (slice[i] - med).abs();
+    }
+    devs[..count].sort_unstable_by(|a, b| a.total_cmp(b));
+    let mad = quantile_sorted(&devs[..count], 0.5) * 1.4826;
+    let floor = (med.abs().max(global.median.abs()).max(1.0)) * 1e-12 + 1e-12;
+    let scale = mad.max(global.scale * 0.25).max(floor);
+    Some((((value - med).abs() / scale).min(1e12)).max(0.0))
+}
+
+fn robust_score_dynamic_window(value: f64, vals: &mut Vec<f64>, global: Stats) -> Option<f64> {
+    if vals.len() < 3 {
+        return None;
+    }
+    vals.sort_unstable_by(|a, b| a.total_cmp(b));
+    let med = quantile_sorted(vals, 0.5);
+    let mut devs: Vec<f64> = vals.iter().map(|v| (v - med).abs()).collect();
+    devs.sort_unstable_by(|a, b| a.total_cmp(b));
+    let mad = quantile_sorted(&devs, 0.5) * 1.4826;
+    let floor = (med.abs().max(global.median.abs()).max(1.0)) * 1e-12 + 1e-12;
+    let scale = mad.max(global.scale * 0.25).max(floor);
+    Some((((value - med).abs() / scale).min(1e12)).max(0.0))
+}
+
+fn hole_window_radius(hole_len: usize, total_samples: usize) -> usize {
+    if hole_len <= 1 {
+        return 0;
+    }
+    let base = if total_samples < LOCAL_WINDOW_THRESHOLD_SMALL {
+        4
+    } else if total_samples < LOCAL_WINDOW_THRESHOLD_MEDIUM {
+        3
+    } else {
+        2
+    };
+    let cap = (hole_len - 1) / 2;
+    base.min(cap).max(1)
+}
+
+fn median_interval(holes: &[HoleMeta]) -> f64 {
+    let mut vals: Vec<f64> = holes
+        .iter()
+        .map(|h| h.interval_est)
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .collect();
+    if vals.is_empty() {
+        return 1.0;
+    }
+    vals.sort_unstable_by(|a, b| a.total_cmp(b));
+    quantile_sorted(&vals, 0.5).max(1e-9)
+}
+
+fn cell_key(x: f64, y: f64, z: f64, cell: f64) -> (i64, i64, i64) {
+    let inv = 1.0 / cell;
+    (
+        (x * inv).floor() as i64,
+        (y * inv).floor() as i64,
+        (z * inv).floor() as i64,
+    )
+}
+
+fn build_small_mode_neighbors(
+    samples: &[Sample],
+    cell_size: f64,
+    radius2: f64,
+) -> Vec<Vec<usize>> {
+    let mut grid: HashMap<(i64, i64, i64), Vec<usize>> = HashMap::new();
+    for (idx, s) in samples.iter().enumerate() {
+        grid.entry(cell_key(s.x, s.y, s.z, cell_size))
+            .or_default()
+            .push(idx);
+    }
+
+    let mut neighbors: Vec<Vec<usize>> = Vec::with_capacity(samples.len());
+    for (idx, s) in samples.iter().enumerate() {
+        let (cx, cy, cz) = cell_key(s.x, s.y, s.z, cell_size);
+        let mut list = Vec::new();
+        for dx in -1..=1 {
+            for dy in -1..=1 {
+                for dz in -1..=1 {
+                    if let Some(bucket) = grid.get(&(cx + dx, cy + dy, cz + dz)) {
+                        for &other in bucket {
+                            if other == idx {
+                                continue;
+                            }
+                            let o = samples[other];
+                            let ddx = o.x - s.x;
+                            let ddy = o.y - s.y;
+                            let ddz = o.z - s.z;
+                            let dist2 = ddx * ddx + ddy * ddy + ddz * ddz;
+                            if dist2 <= radius2 {
+                                list.push(other);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        neighbors.push(list);
+    }
+    neighbors
+}
+
+fn main() {
+    let _ = run();
+}
+
+fn run() -> io::Result<()> {
+    let mut scanner = Scanner::new()?;
+    let num_holes = scanner.next_usize().unwrap_or(0);
+    let num_props = scanner.next_usize().unwrap_or(0);
+
+    let mut prop_names: Vec<String> = Vec::with_capacity(num_props);
+    for i in 0..num_props {
+        prop_names.push(
+            scanner
+                .next_string()
+                .unwrap_or_else(|| format!("prop_{}", i)),
+        );
+    }
+
+    let mut holes: Vec<HoleMeta> = Vec::with_capacity(num_holes);
+    let mut samples: Vec<Sample> = Vec::new();
+    let mut props: Vec<Vec<f64>> = (0..num_props).map(|_| Vec::new()).collect();
+
+    for _ in 0..num_holes {
+        let hole_id = match scanner.next_string() {
+            Some(v) => v,
+            None => break,
+        };
+        let sx = scanner.next_f64().unwrap_or(0.0);
+        let sy = scanner.next_f64().unwrap_or(0.0);
+        let sz = scanner.next_f64().unwrap_or(0.0);
+        let dx = scanner.next_f64().unwrap_or(0.0);
+        let dy = scanner.next_f64().unwrap_or(0.0);
+        let dz = scanner.next_f64().unwrap_or(0.0);
+        let length = scanner.next_f64().unwrap_or(0.0);
+        let num_samples = scanner.next_usize().unwrap_or(0);
+
+        let norm = (dx * dx + dy * dy + dz * dz).sqrt();
+        let (ux, uy, uz) = if norm > 0.0 {
+            (dx / norm, dy / norm, dz / norm)
+        } else {
+            (0.0, 0.0, 0.0)
+        };
+
+        for col in &mut props {
+            col.reserve(num_samples);
+        }
+        samples.reserve(num_samples);
+
+        let hole_idx = holes.len();
+        holes.push(HoleMeta {
+            id: hole_id,
+            samples: Vec::with_capacity(num_samples),
+            interval_est: if num_samples > 0 {
+                length.abs() / num_samples as f64
+            } else {
+                0.0
+            },
+        });
+
+        for sample_ord in 0..num_samples {
+            let depth = scanner.next_f64().unwrap_or(0.0);
+            let d = if depth.is_finite() {
+                if length.is_finite() && length > 0.0 {
+                    depth.max(0.0).min(length)
+                } else {
+                    depth.max(0.0)
+                }
+            } else {
+                0.0
+            };
+            let idx = samples.len();
+            let x = sx + ux * d;
+            let y = sy + uy * d;
+            let z = sz + uz * d;
+            samples.push(Sample {
+                hole: hole_idx,
+                depth: d,
+                ordinal: sample_ord,
+                x,
+                y,
+                z,
+            });
+            holes[hole_idx].samples.push(idx);
+
+            for p in 0..num_props {
+                let val = scanner.next_f64().unwrap_or(f64::NAN);
+                props[p].push(val);
+            }
+        }
+    }
+
+    let total_samples = samples.len();
+    let small_mode = total_samples <= SMALL_MODE_THRESHOLD;
+
+    let mut hole_order_pos = vec![0_usize; total_samples];
+    for hole in &mut holes {
+        hole.samples.sort_unstable_by(|&a, &b| {
+            samples[a]
+                .depth
+                .total_cmp(&samples[b].depth)
+                .then_with(|| samples[a].ordinal.cmp(&samples[b].ordinal))
+        });
+        for (rank, &idx) in hole.samples.iter().enumerate() {
+            hole_order_pos[idx] = rank;
+        }
+    }
+
+    let median_step = median_interval(&holes);
+    let spatial_neighbors = if small_mode && total_samples > 0 {
+        let cell_size = (if total_samples < 10_000 {
+            median_step * 2.0
+        } else {
+            median_step * 1.5
+        })
+        .max(1e-9);
+        let radius = median_step * if total_samples < 10_000 { 3.0 } else { 2.5 };
+        Some(build_small_mode_neighbors(
+            &samples,
+            cell_size,
+            radius * radius,
+        ))
+    } else {
+        None
+    };
+
+    let mut globals: Vec<Stats> = Vec::with_capacity(num_props);
+    for col in &props {
+        globals.push(global_stats(col));
+    }
+
+    let threshold = if total_samples < 2_000 {
+        3.25
+    } else if total_samples < 50_000 {
+        3.6
+    } else {
+        4.0
+    };
+
+    let mut suspects: Vec<Suspect> = Vec::new();
+    let mut small_spatial_buf: Vec<f64> = Vec::new();
+    let mut small_window_buf = [0.0_f64; MAX_HOLE_WINDOW];
+
+    for p in 0..num_props {
+        let global = globals[p];
+        let col = &props[p];
+
+        for idx in 0..total_samples {
+            let value = col[idx];
+            if !value.is_finite() {
+                continue;
+            }
+
+            let hole_idx = samples[idx].hole;
+            let order = &holes[hole_idx].samples;
+            let radius = hole_window_radius(order.len(), total_samples);
+
+            let mut local_count = 0usize;
+            if radius > 0 {
+                let rank = hole_order_pos[idx];
+                let start = rank.saturating_sub(radius);
+                let end = (rank + radius + 1).min(order.len());
+                for &other_idx in &order[start..end] {
+                    if other_idx == idx {
+                        continue;
+                    }
+                    let ov = col[other_idx];
+                    if ov.is_finite() && local_count < MAX_HOLE_WINDOW {
+                        small_window_buf[local_count] = ov;
+                        local_count += 1;
+                    }
+                }
+            }
+
+            let mut score = if let Some(s) =
+                robust_score_small_window(value, &mut small_window_buf, local_count, global)
+            {
+                s
+            } else {
+                global_score(value, global)
+            };
+
+            if small_mode {
+                if let Some(neighs) = spatial_neighbors.as_ref() {
+                    let neigh_list = &neighs[idx];
+                    if !neigh_list.is_empty() {
+                        small_spatial_buf.clear();
+                        small_spatial_buf.reserve(neigh_list.len());
+                        for &other_idx in neigh_list {
+                            let ov = col[other_idx];
+                            if ov.is_finite() {
+                                small_spatial_buf.push(ov);
+                            }
+                        }
+                        if let Some(spatial_score) =
+                            robust_score_dynamic_window(value, &mut small_spatial_buf, global)
+                        {
+                            score = score.max(spatial_score * 0.9);
+                        }
+                    }
+                }
+            }
+
+            if score >= threshold {
+                suspects.push(Suspect {
+                    hole: hole_idx,
+                    sample_idx: samples[idx].ordinal,
+                    prop: p,
+                    confidence: score,
+                });
+            }
+        }
+    }
+
+    suspects.sort_unstable_by(|a, b| {
+        b.confidence
+            .total_cmp(&a.confidence)
+            .then_with(|| holes[a.hole].id.cmp(&holes[b.hole].id))
+            .then_with(|| a.sample_idx.cmp(&b.sample_idx))
+            .then_with(|| prop_names[a.prop].cmp(&prop_names[b.prop]))
+    });
+
+    let mut out = io::BufWriter::new(io::stdout().lock());
+    writeln!(out, "{}", suspects.len())?;
+    for s in suspects {
+        writeln!(
+            out,
+            "{} {} {} {:.6}",
+            holes[s.hole].id, s.sample_idx, prop_names[s.prop], s.confidence
+        )?;
+    }
+    out.flush()?;
+    Ok(())
+}

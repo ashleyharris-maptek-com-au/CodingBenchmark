@@ -1,1 +1,710 @@
-{'__exception__': "Can't run here - we're trying to get this working in codex."}
+Below is a self-contained Rust program (edition 2021) that adapts its clustering strategy to the dataset scale, uses binary I/O, streams data with disk spillover when needed, and outputs little-endian `u32` cluster indices:
+
+```rust
+use std::cmp;
+use std::convert::TryInto;
+use std::env;
+use std::error::Error;
+use std::fs::{File, OpenOptions};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+const BYTES_PER_POINT: usize = 12;
+const DIM: usize = 3;
+
+fn main() {
+    if let Err(err) = run() {
+        eprintln!("error: {}", err);
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<(), Box<dyn Error>> {
+    let stdin = io::stdin();
+    let mut reader = BufReader::new(stdin.lock());
+    let (num_points, num_clusters_u32) = read_header(&mut reader)?;
+    if num_clusters_u32 == 0 {
+        return Err("num_clusters must be greater than zero".into());
+    }
+    let num_clusters: usize = num_clusters_u32 as usize;
+
+    let strategy = Strategy::select(num_points);
+    let sample_cap = if num_points == 0 {
+        0
+    } else {
+        usize::try_from(num_points.min(strategy.sample_cap as u64)).unwrap_or(strategy.sample_cap).max(1)
+    };
+
+    let mut sample_points = Vec::with_capacity(sample_cap);
+    let mut data_in_memory = if strategy.hold_in_memory {
+        Vec::with_capacity(num_points as usize)
+    } else {
+        Vec::new()
+    };
+    let mut bbox = BoundingBox::new();
+    let mut first_point: Option<[f32; DIM]> = None;
+
+    let seed = seed64(num_points, num_clusters_u32);
+    let mut rng = SplitMix64::new(seed);
+
+    let temp_guard = if strategy.spool {
+        Some(TempDataFile::new()?)
+    } else {
+        None
+    };
+    let mut spool_writer = if let Some(temp) = temp_guard.as_ref() {
+        Some(OpenOptions::new().create(true).write(true).truncate(true).open(temp.path())?)
+    } else {
+        None
+    };
+
+    let chunk_points = strategy.chunk_points.max(1);
+    let mut chunk_buf = vec![0u8; chunk_points * BYTES_PER_POINT];
+    let mut remaining = num_points;
+    let mut seen_points = 0u64;
+
+    while remaining > 0 {
+        let take = remaining.min(chunk_points as u64) as usize;
+        let bytes = take * BYTES_PER_POINT;
+        reader.read_exact(&mut chunk_buf[..bytes])?;
+
+        if let Some(writer) = spool_writer.as_mut() {
+            writer.write_all(&chunk_buf[..bytes])?;
+        }
+
+        for i in 0..take {
+            let offset = i * BYTES_PER_POINT;
+            let point = decode_point(&chunk_buf, offset);
+
+            if strategy.hold_in_memory {
+                data_in_memory.push(point);
+            }
+
+            bbox.update(point);
+            if first_point.is_none() {
+                first_point = Some(point);
+            }
+
+            seen_points += 1;
+            if sample_cap > 0 {
+                if sample_points.len() < sample_cap {
+                    sample_points.push(point);
+                } else {
+                    let r = rng.next_u64() % seen_points;
+                    if (r as usize) < sample_cap {
+                        sample_points[r as usize] = point;
+                    }
+                }
+            }
+        }
+
+        remaining -= take as u64;
+    }
+
+    if let Some(writer) = spool_writer.as_mut() {
+        writer.flush()?;
+    }
+    drop(spool_writer);
+
+    if num_points == 0 {
+        let stdout = io::stdout();
+        let mut out = BufWriter::new(stdout.lock());
+        out.flush()?;
+        return Ok(());
+    }
+
+    if sample_points.is_empty() {
+        if let Some(p) = first_point {
+            sample_points.push(p);
+        }
+    }
+
+    let fallback_point = first_point.unwrap_or([0.0; DIM]);
+
+    let mut centroids = initialize_centroids(&sample_points, num_clusters, &bbox, &mut rng);
+
+    if strategy.hold_in_memory {
+        lloyd_in_memory(
+            &data_in_memory,
+            &mut centroids,
+            strategy.max_iter_small,
+            strategy.tol,
+            &sample_points,
+            fallback_point,
+            &bbox,
+            &mut rng,
+        );
+    } else if let Some(temp) = temp_guard.as_ref() {
+        streaming_lloyd(
+            temp.path(),
+            num_points,
+            chunk_points,
+            strategy.passes,
+            &mut centroids,
+            &sample_points,
+            fallback_point,
+            &bbox,
+            strategy.tol,
+            &mut rng,
+        )?;
+    } else {
+        return Err("missing streaming storage".into());
+    }
+
+    let stdout = io::stdout();
+    let mut writer = BufWriter::new(stdout.lock());
+
+    if strategy.hold_in_memory {
+        write_assignments_from_memory(&data_in_memory, &centroids, &mut writer)?;
+    } else if let Some(temp) = temp_guard.as_ref() {
+        write_assignments_from_spool(temp.path(), num_points, chunk_points, &centroids, &mut writer)?;
+    } else {
+        return Err("no data available for assignment".into());
+    }
+
+    writer.flush()?;
+    Ok(())
+}
+
+fn read_header<R: BufRead>(reader: &mut R) -> io::Result<(u64, u32)> {
+    let num_points = read_next_number(reader)?.ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "missing num_points"))?;
+    let num_clusters_u64 = read_next_number(reader)?.ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "missing num_clusters"))?;
+    let num_clusters = u32::try_from(num_clusters_u64).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "num_clusters exceeds u32 range"))?;
+    Ok((num_points, num_clusters))
+}
+
+fn read_next_number<R: BufRead>(reader: &mut R) -> io::Result<Option<u64>> {
+    let mut acc = 0u64;
+    let mut in_token = false;
+    loop {
+        let buffer = reader.fill_buf()?;
+        if buffer.is_empty() {
+            return if in_token { Ok(Some(acc)) } else { Ok(None) };
+        }
+        let mut consumed = 0;
+        for byte in buffer {
+            consumed += 1;
+            if byte.is_ascii_whitespace() {
+                if in_token {
+                    reader.consume(consumed);
+                    return Ok(Some(acc));
+                } else {
+                    continue;
+                }
+            } else if (*byte as char).is_ascii_digit() {
+                in_token = true;
+                acc = acc * 10 + (byte - b'0') as u64;
+            } else {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "non-digit in header"));
+            }
+        }
+        reader.consume(consumed);
+    }
+}
+
+struct TempDataFile {
+    path: PathBuf,
+}
+
+impl TempDataFile {
+    fn new() -> io::Result<Self> {
+        let mut path = env::temp_dir();
+        let unique = format!(
+            "kmstream_{}_{}.bin",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or(Duration::from_secs(0))
+                .as_nanos()
+        );
+        path.push(unique);
+        Ok(Self { path })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempDataFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ScaleTier {
+    Small,
+    Medium,
+    Large,
+    Extreme,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Strategy {
+    tier: ScaleTier,
+    hold_in_memory: bool,
+    spool: bool,
+    chunk_points: usize,
+    sample_cap: usize,
+    passes: usize,
+    max_iter_small: usize,
+    tol: f64,
+}
+
+impl Strategy {
+    fn select(num_points: u64) -> Self {
+        if num_points <= 10_000_000 {
+            Strategy {
+                tier: ScaleTier::Small,
+                hold_in_memory: true,
+                spool: false,
+                chunk_points: 1 << 16,
+                sample_cap: 500_000,
+                passes: 0,
+                max_iter_small: 40,
+                tol: 1e-4,
+            }
+        } else if num_points <= 100_000_000 {
+            Strategy {
+                tier: ScaleTier::Medium,
+                hold_in_memory: false,
+                spool: true,
+                chunk_points: 1 << 15,
+                sample_cap: 350_000,
+                passes: 6,
+                max_iter_small: 0,
+                tol: 7e-4,
+            }
+        } else if num_points <= 1_000_000_000 {
+            Strategy {
+                tier: ScaleTier::Large,
+                hold_in_memory: false,
+                spool: true,
+                chunk_points: 1 << 14,
+                sample_cap: 250_000,
+                passes: 4,
+                max_iter_small: 0,
+                tol: 1.5e-3,
+            }
+        } else {
+            Strategy {
+                tier: ScaleTier::Extreme,
+                hold_in_memory: false,
+                spool: true,
+                chunk_points: 1 << 13,
+                sample_cap: 200_000,
+                passes: 2,
+                max_iter_small: 0,
+                tol: 3e-3,
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct BoundingBox {
+    min: [f32; DIM],
+    max: [f32; DIM],
+    initialized: bool,
+}
+
+impl BoundingBox {
+    fn new() -> Self {
+        Self {
+            min: [f32::INFINITY; DIM],
+            max: [f32::NEG_INFINITY; DIM],
+            initialized: false,
+        }
+    }
+
+    fn update(&mut self, point: [f32; DIM]) {
+        for d in 0..DIM {
+            if point[d] < self.min[d] {
+                self.min[d] = point[d];
+            }
+            if point[d] > self.max[d] {
+                self.max[d] = point[d];
+            }
+        }
+        self.initialized = true;
+    }
+
+    fn max_span(&self) -> f64 {
+        if !self.initialized {
+            return 1.0;
+        }
+        let mut span = 0.0f32;
+        for d in 0..DIM {
+            span = span.max(self.max[d] - self.min[d]);
+        }
+        span.max(1e-3) as f64
+    }
+}
+
+struct SplitMix64 {
+    state: u64,
+}
+
+impl SplitMix64 {
+    fn new(seed: u64) -> Self {
+        Self { state: seed }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.state = self.state.wrapping_add(0x9E3779B97F4A7C15);
+        let mut z = self.state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+        z ^ (z >> 31)
+    }
+
+    fn next_f64(&mut self) -> f64 {
+        let bits = self.next_u64() >> 11;
+        (bits as f64) * (1.0 / ((1u64 << 53) as f64))
+    }
+
+    fn next_usize(&mut self, upper: usize) -> usize {
+        if upper == 0 {
+            0
+        } else {
+            (self.next_u64() % (upper as u64)) as usize
+        }
+    }
+}
+
+fn seed64(num_points: u64, num_clusters: u32) -> u64 {
+    let time_part = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::from_secs(0))
+        .as_nanos() as u64;
+    time_part ^ num_points.rotate_left(13) ^ ((num_clusters as u64) << 32)
+}
+
+#[inline]
+fn read_f32_le(buf: &[u8], offset: usize) -> f32 {
+    debug_assert!(offset + 4 <= buf.len());
+    let mut bytes = [0u8; 4];
+    bytes.copy_from_slice(&buf[offset..offset + 4]);
+    f32::from_le_bytes(bytes)
+}
+
+#[inline]
+fn decode_point(buf: &[u8], offset: usize) -> [f32; DIM] {
+    [
+        read_f32_le(buf, offset),
+        read_f32_le(buf, offset + 4),
+        read_f32_le(buf, offset + 8),
+    ]
+}
+
+fn initialize_centroids(
+    sample: &[[f32; DIM]],
+    k: usize,
+    bbox: &BoundingBox,
+    rng: &mut SplitMix64,
+) -> Vec<[f64; DIM]> {
+    if k == 0 {
+        return Vec::new();
+    }
+    if sample.is_empty() {
+        return vec![[0.0; DIM]; k];
+    }
+    if sample.len() >= k && k <= 1024 {
+        kmeans_plus_plus(sample, k, rng)
+    } else {
+        spread_out_init(sample, k, bbox, rng)
+    }
+}
+
+fn kmeans_plus_plus(sample: &[[f32; DIM]], k: usize, rng: &mut SplitMix64) -> Vec<[f64; DIM]> {
+    let n = sample.len();
+    let mut centroids = Vec::with_capacity(k);
+    let first_idx = rng.next_usize(n);
+    centroids.push(point_to_f64(sample[first_idx]));
+
+    let mut dist_sq = vec![0.0f64; n];
+    for (i, point) in sample.iter().enumerate() {
+        dist_sq[i] = point_to_centroid_dist_sq(*point, &centroids[0]);
+    }
+
+    for _ in 1..k {
+        let total: f64 = dist_sq.iter().copied().sum();
+        let mut chosen_idx = rng.next_usize(n);
+        if total > 0.0 && total.is_finite() {
+            let mut target = rng.next_f64() * total;
+            for (i, d) in dist_sq.iter().enumerate() {
+                target -= *d;
+                if target <= 0.0 {
+                    chosen_idx = i;
+                    break;
+                }
+            }
+        }
+        centroids.push(point_to_f64(sample[chosen_idx]));
+        let last = centroids.last().unwrap();
+        for (i, point) in sample.iter().enumerate() {
+            let d = point_to_centroid_dist_sq(*point, last);
+            if d < dist_sq[i] {
+                dist_sq[i] = d;
+            }
+        }
+    }
+
+    centroids
+}
+
+fn spread_out_init(
+    sample: &[[f32; DIM]],
+    k: usize,
+    bbox: &BoundingBox,
+    rng: &mut SplitMix64,
+) -> Vec<[f64; DIM]> {
+    let mut centroids = Vec::with_capacity(k);
+    let n = sample.len();
+    let offset = if n > 0 { rng.next_usize(n) } else { 0 };
+    let jitter_scale = bbox.max_span() * 1e-3 + 1e-9;
+
+    for i in 0..k {
+        let idx = if n == 0 {
+            0
+        } else if k <= n {
+            (offset + (i * n) / k) % n
+        } else {
+            (offset + (i % n)) % n
+        };
+        let mut centroid = point_to_f64(sample[idx]);
+        for d in 0..DIM {
+            let noise = (rng.next_f64() - 0.5) * 2.0 * jitter_scale;
+            centroid[d] += noise;
+        }
+        centroids.push(centroid);
+    }
+    centroids
+}
+
+#[inline]
+fn point_to_f64(point: [f32; DIM]) -> [f64; DIM] {
+    [point[0] as f64, point[1] as f64, point[2] as f64]
+}
+
+#[inline]
+fn point_to_centroid_dist_sq(point: [f32; DIM], centroid: &[f64; DIM]) -> f64 {
+    let px = point[0] as f64 - centroid[0];
+    let py = point[1] as f64 - centroid[1];
+    let pz = point[2] as f64 - centroid[2];
+    px * px + py * py + pz * pz
+}
+
+fn lloyd_in_memory(
+    data: &[[f32; DIM]],
+    centroids: &mut [[f64; DIM]],
+    max_iter: usize,
+    tol: f64,
+    sample: &[[f32; DIM]],
+    fallback_point: [f32; DIM],
+    bbox: &BoundingBox,
+    rng: &mut SplitMix64,
+) {
+    if data.is_empty() || centroids.is_empty() {
+        return;
+    }
+    let k = centroids.len();
+    for _ in 0..max_iter {
+        let mut sums = vec![[0f64; DIM]; k];
+        let mut counts = vec![0u64; k];
+        for point in data {
+            let idx = nearest_centroid_idx(*point, centroids);
+            for d in 0..DIM {
+                sums[idx][d] += point[d] as f64;
+            }
+            counts[idx] += 1;
+        }
+        let mut max_shift = 0.0;
+        for idx in 0..k {
+            if counts[idx] > 0 {
+                let inv = 1.0 / (counts[idx] as f64);
+                let new_centroid = [
+                    sums[idx][0] * inv,
+                    sums[idx][1] * inv,
+                    sums[idx][2] * inv,
+                ];
+                let shift = centroid_distance(centroids[idx], new_centroid);
+                centroids[idx] = new_centroid;
+                if shift > max_shift {
+                    max_shift = shift;
+                }
+            } else {
+                reseed_centroid(idx, centroids, sample, fallback_point, bbox, rng);
+            }
+        }
+        if max_shift < tol {
+            break;
+        }
+    }
+}
+
+fn streaming_lloyd(
+    path: &Path,
+    total_points: u64,
+    chunk_points: usize,
+    passes: usize,
+    centroids: &mut [[f64; DIM]],
+    sample: &[[f32; DIM]],
+    fallback_point: [f32; DIM],
+    bbox: &BoundingBox,
+    tol: f64,
+    rng: &mut SplitMix64,
+) -> io::Result<()> {
+    if total_points == 0 || centroids.is_empty() {
+        return Ok(());
+    }
+    let pass_count = cmp::max(1, passes);
+    for _ in 0..pass_count {
+        let mut sums = vec![[0f64; DIM]; centroids.len()];
+        let mut counts = vec![0f64; centroids.len()];
+
+        process_file_points(path, total_points, chunk_points, |point| {
+            let idx = nearest_centroid_idx(point, centroids);
+            sums[idx][0] += point[0] as f64;
+            sums[idx][1] += point[1] as f64;
+            sums[idx][2] += point[2] as f64;
+            counts[idx] += 1.0;
+            Ok(())
+        })?;
+
+        let mut max_shift = 0.0;
+        for idx in 0..centroids.len() {
+            if counts[idx] > 0.0 {
+                let inv = 1.0 / counts[idx];
+                let new_centroid = [
+                    sums[idx][0] * inv,
+                    sums[idx][1] * inv,
+                    sums[idx][2] * inv,
+                ];
+                let shift = centroid_distance(centroids[idx], new_centroid);
+                centroids[idx] = new_centroid;
+                if shift > max_shift {
+                    max_shift = shift;
+                }
+            } else {
+                reseed_centroid(idx, centroids, sample, fallback_point, bbox, rng);
+            }
+        }
+
+        if max_shift < tol {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn process_file_points<F>(
+    path: &Path,
+    total_points: u64,
+    chunk_points: usize,
+    mut handler: F,
+) -> io::Result<()>
+where
+    F: FnMut([f32; DIM]) -> io::Result<()>,
+{
+    if total_points == 0 {
+        return Ok(());
+    }
+    let file = File::open(path)?;
+    let mut reader = BufReader::new(file);
+    let mut remaining = total_points;
+    let chunk_points = chunk_points.max(1);
+    let mut buf = vec![0u8; chunk_points * BYTES_PER_POINT];
+
+    while remaining > 0 {
+        let take = remaining.min(chunk_points as u64) as usize;
+        let bytes = take * BYTES_PER_POINT;
+        reader.read_exact(&mut buf[..bytes])?;
+
+        for i in 0..take {
+            let offset = i * BYTES_PER_POINT;
+            let point = decode_point(&buf, offset);
+            handler(point)?;
+        }
+
+        remaining -= take as u64;
+    }
+    Ok(())
+}
+
+fn write_assignments_from_memory(
+    data: &[[f32; DIM]],
+    centroids: &[[f64; DIM]],
+    writer: &mut BufWriter<io::StdoutLock<'_>>,
+) -> io::Result<()> {
+    for &point in data {
+        let idx = nearest_centroid_idx(point, centroids) as u32;
+        writer.write_all(&idx.to_le_bytes())?;
+    }
+    Ok(())
+}
+
+fn write_assignments_from_spool(
+    path: &Path,
+    total_points: u64,
+    chunk_points: usize,
+    centroids: &[[f64; DIM]],
+    writer: &mut BufWriter<io::StdoutLock<'_>>,
+) -> io::Result<()> {
+    process_file_points(path, total_points, chunk_points, |point| {
+        let idx = nearest_centroid_idx(point, centroids) as u32;
+        writer.write_all(&idx.to_le_bytes())?;
+        Ok(())
+    })
+}
+
+#[inline]
+fn nearest_centroid_idx(point: [f32; DIM], centroids: &[[f64; DIM]]) -> usize {
+    let mut best = 0usize;
+    let mut best_dist = f64::INFINITY;
+    let px = point[0] as f64;
+    let py = point[1] as f64;
+    let pz = point[2] as f64;
+    for (idx, centroid) in centroids.iter().enumerate() {
+        let dx = px - centroid[0];
+        let dy = py - centroid[1];
+        let dz = pz - centroid[2];
+        let dist = dx * dx + dy * dy + dz * dz;
+        if dist < best_dist {
+            best_dist = dist;
+            best = idx;
+        }
+    }
+    best
+}
+
+fn centroid_distance(a: [f64; DIM], b: [f64; DIM]) -> f64 {
+    let dx = a[0] - b[0];
+    let dy = a[1] - b[1];
+    let dz = a[2] - b[2];
+    (dx * dx + dy * dy + dz * dz).sqrt()
+}
+
+fn reseed_centroid(
+    idx: usize,
+    centroids: &mut [[f64; DIM]],
+    sample: &[[f32; DIM]],
+    fallback_point: [f32; DIM],
+    bbox: &BoundingBox,
+    rng: &mut SplitMix64,
+) {
+    let base = if !sample.is_empty() {
+        sample[rng.next_usize(sample.len())]
+    } else {
+        fallback_point
+    };
+    let mut new_centroid = point_to_f64(base);
+    let jitter = bbox.max_span() * 1e-4 + 1e-9;
+    for d in 0..DIM {
+        new_centroid[d] += (rng.next_f64() - 0.5) * 2.0 * jitter;
+    }
+    centroids[idx] = new_centroid;
+}
+```

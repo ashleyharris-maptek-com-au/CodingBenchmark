@@ -162,6 +162,7 @@ START_ORBIT, ORBITS = generate_random_orbits(seed=6, n=100)
 
 # Number of stations for each subpass
 STATION_COUNTS = [2, 3, 4, 5, 6, 8, 10, 15, 20, 50, 100]
+MAX_REPORT_VIZ_STATIONS = 20
 
 _DATASET_CACHE: Dict[int, Tuple[List[float], List[List[float]]]] = {}
 
@@ -1192,7 +1193,12 @@ def resultToNiceReport(result: dict, subPass: int, aiEngineName: str) -> str:
       order = None
 
   viz_data = _build_viz_data(start_orbit, orbits, num_stations, order)
-  html += _generate_orbital_viz_html(viz_data, name=f"{num_stations} stations (subpass {subPass})")
+  if num_stations <= MAX_REPORT_VIZ_STATIONS:
+    html += _generate_orbital_viz_html(viz_data,
+                                       name=f"{num_stations} stations (subpass {subPass})")
+  else:
+    html += ("<p style='color:#64748b'>3D orbital visualization omitted for this high subpass "
+             f"({num_stations} stations) to keep reports compact.</p>")
 
   return html
 
