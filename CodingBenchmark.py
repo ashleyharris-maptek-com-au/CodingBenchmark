@@ -15,6 +15,7 @@ This extends the abstract TestRunner framework with TSP-specific:
 
 import sys
 import os
+import re
 
 # Add LLMBenchCore to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'LLMBenchCore'))
@@ -22,6 +23,20 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'LLMBenchCore'))
 from LLMBenchCore import BenchmarkRunner, run_benchmark_main
 from LLMBenchCore.AiEnginePlacebo import set_placebo_data_provider
 from placebo_data import get_placebo_response
+
+_VOLATILE_PROMPT_LINE_RE = re.compile(
+  r"^(Platform|Architecture|CPU|Core count|Memory|SIMD|SIMD detail|Node\.js): .*$",
+  re.MULTILINE)
+_COMPILER_PROMPT_LINE_RE = re.compile(
+  r"^(\*\*(?:C\+\+|Rust|C#) Compiler(?: information)?(?::)?\*\*)\s*\r?\n[^\r\n]*",
+  re.MULTILINE)
+
+
+def _normalize_prompt_for_cache(prompt: str) -> str:
+  prompt = str(prompt)
+  prompt = _VOLATILE_PROMPT_LINE_RE.sub(lambda m: f"{m.group(1)}: <cache-ignored>", prompt)
+  prompt = _COMPILER_PROMPT_LINE_RE.sub(lambda m: f"{m.group(1)}\n<cache-ignored>", prompt)
+  return prompt.strip()
 
 
 class TSPBenchmarkRunner(BenchmarkRunner):
@@ -40,6 +55,9 @@ class TSPBenchmarkRunner(BenchmarkRunner):
   def get_benchmark_description(self) -> str:
     return """<p>Can LLMs design and optimize algorithms for complex software engineering tasks?</p>
         <p>The LLM must write efficient solutions that scale well and meet performance requirements.</p>"""
+
+  def normalize_prompt_for_cache(self, prompt: str) -> str:
+    return _normalize_prompt_for_cache(prompt)
 
 
 if __name__ == "__main__":

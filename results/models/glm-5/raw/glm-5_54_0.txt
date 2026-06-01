@@ -1,0 +1,414 @@
+```python
+import math
+
+# --- Module-level state for persistence across simulation steps ---
+# These are reset by the simulator between scenarios and go-around attempts
+
+# Phase flags
+_phase = 'APPROACH'
+_flare_engaged = False
+_touchdown = False
+
+# Autoland logic state
+_flare_reference_alt = 50.0
+_deployment_timer = 0.0
+_go_around_active = False
+
+# Control integrators (for PID I-term)
+_loc_integrator = 0.0
+_gs_integrator = 0.0
+_ias_integrator = 0.0
+_heading_integrator = 0.0
+
+# Previous error terms (for PID D-term)
+_last_loc_error = 0.0
+_last_gs_error = 0.0
+_last_ias_error = 0.0
+
+# Sensor Health & Voting
+_sensor_health = {
+    'gs_valid_count': 3,
+    'loc_valid_count': 3,
+    'baro_valid_count': 3,
+    'irs_valid_count': 3
+}
+
+# Control Gains (Tuned for A320-like dynamics)
+# Pitch / Glideslope
+KP_PITCH = 0.8
+KI_PITCH = 0.05
+KD_PITCH = 0.2
+
+# Roll / Localizer
+KP_ROLL = 0.6
+KI_ROLL = 0.02
+KD_ROLL = 0.1
+MAX_BANK = 25.0  # degrees
+
+# Speed / Throttle
+KP_IAS = 0.05
+KI_IAS = 0.005
+KD_IAS = 0.02
+
+# Flare Constants
+FLARE_ALTITUDE = 45.0
+FLARE_RATE = 0.6  # fpm/ft reduction target
+FLARE_ELEVATOR_GAIN = 0.015
+
+
+def _median_of_three(v1, valid1, v2, valid2, v3, valid3):
+    """Returns the median of valid sensor values, or None if < 2 valid."""
+    values = []
+    if valid1: values.append(v1)
+    if valid2: values.append(v2)
+    if valid3: values.append(v3)
+    
+    if not values: return None
+    values.sort()
+    return values[len(values) // 2]
+
+def _vote_glideslope(state):
+    return _median_of_three(
+        state.get('glideslope_1_dots'), state.get('glideslope_1_valid', False),
+        state.get('glideslope_2_dots'), state.get('glideslope_2_valid', False),
+        state.get('glideslope_3_dots'), state.get('glideslope_3_valid', False)
+    )
+
+def _vote_localizer(state):
+    return _median_of_three(
+        state.get('localizer_1_dots'), state.get('localizer_1_valid', False),
+        state.get('localizer_2_dots'), state.get('localizer_2_valid', False),
+        state.get('localizer_3_dots'), state.get('localizer_3_valid', False)
+    )
+
+def _vote_airspeed(state):
+    ias = _median_of_three(
+        state.get('ias_1_kt'), state.get('ias_1_valid', False),
+        state.get('ias_2_kt'), state.get('ias_2_valid', False),
+        state.get('ias_3_kt'), state.get('ias_3_valid', False)
+    )
+    return ias if ias is not None else state.get('target_ias_kt', 140)
+
+def _vote_attitude(state):
+    pitch = _median_of_three(
+        state.get('irs_1_pitch_deg'), state.get('irs_1_valid', False),
+        state.get('irs_2_pitch_deg'), state.get('irs_2_valid', False),
+        state.get('irs_3_pitch_deg'), state.get('irs_3_valid', False)
+    )
+    roll = _median_of_three(
+        state.get('irs_1_roll_deg'), state.get('irs_1_valid', False),
+        state.get('irs_2_roll_deg'), state.get('irs_2_valid', False),
+        state.get('irs_3_roll_deg'), state.get('irs_3_valid', False)
+    )
+    heading = _median_of_three(
+        state.get('irs_1_heading_deg'), state.get('irs_1_valid', False),
+        state.get('irs_2_heading_deg'), state.get('irs_2_valid', False),
+        state.get('irs_3_heading_deg'), state.get('irs_3_valid', False)
+    )
+    # Default to 0/0/360 if all IRUs fail (fallback)
+    return pitch or 0.0, roll or 0.0, heading or 0.0
+
+def _detect_failures(state):
+    """Analyzes sensor health to adjust control laws."""
+    global _sensor_health
+    _sensor_health['gs_valid_count'] = sum([
+        state.get('glideslope_1_valid', False),
+        state.get('glideslope_2_valid', False),
+        state.get('glideslope_3_valid', False)
+    ])
+    # Similar logic for other sensors...
+
+def _check_stability(state, radio_alt):
+    """Checks if approach is stable. Returns True if GO-AROUND required."""
+    ias = _vote_airspeed(state)
+    vref = state.get('target_vref_kt', 137)
+    
+    # Speed check: Vref + 20 max
+    if ias > vref + 25: # Slightly strict margin
+        return True
+        
+    # Glideslope check (if available and high enough to matter)
+    if radio_alt > 100:
+        gs = _vote_glideslope(state)
+        if gs is not None and abs(gs) > 2.5: # Excessive deviation
+            return True
+            
+    # Localizer check
+    loc = _vote_localizer(state)
+    if loc is not None and abs(loc) > 2.5:
+        return True
+        
+    return False
+
+
+def autopilot_step(state: dict, dt: float) -> dict:
+    global _phase, _flare_engaged, _touchdown, _flare_reference_alt
+    global _loc_integrator, _gs_integrator, _ias_integrator, _heading_integrator
+    global _last_loc_error, _last_gs_error, _last_ias_error
+    global _deployment_timer, _go_around_active
+    
+    # --- 1. Sensor Fusion & State Estimation ---
+    _detect_failures(state)
+    
+    radio_alt = state.get('radio_alt_ft', 0)
+    on_ground = state.get('on_ground', False)
+    wow = state.get('weight_on_wheels', False)
+    
+    gs_dots = _vote_glideslope(state)
+    loc_dots = _vote_localizer(state)
+    ias = _vote_airspeed(state)
+    pitch, roll, heading = _vote_attitude(state)
+    
+    # Groundspeed for rollout logic
+    gs_kt = state.get('groundspeed_kt', ias) # Fallback to IAS if GS unavailable
+    
+    # --- 2. Mode Logic ---
+    
+    # Go-Around Trigger
+    # Note: Once _go_around_active is True, we stay in that mode until reset
+    if not _go_around_active:
+        if radio_alt > 50 and radio_alt < 1000:
+            if _check_stability(state, radio_alt):
+                _go_around_active = True
+    
+    # Phase Transitions (Normal)
+    if not _go_around_active:
+        if not _touchdown:
+            if radio_alt < FLARE_ALTITUDE and radio_alt > 0:
+                if not _flare_engaged:
+                    _flare_reference_alt = radio_alt
+                    _flare_engaged = True
+                    _phase = 'FLARE'
+            elif radio_alt >= FLARE_ALTITUDE:
+                _phase = 'APPROACH'
+        
+        if on_ground or wow:
+            _touchdown = True
+            _phase = 'ROLLOUT'
+
+    # --- 3. Control Laws ---
+
+    # Initialize outputs
+    elevator = 0.0
+    aileron = 0.0
+    rudder = 0.0
+    throttle_1 = 0.0
+    throttle_2 = 0.0
+    flaps = 0.0
+    gear = 1.0 # Keep gear down once called
+    spoiler = 0.0
+    speedbrake = 0.0
+    autobrake = 0.0
+    reverse_1 = 0.0
+    reverse_2 = 0.0
+    
+    target_vref = state.get('target_vref_kt', 137)
+    target_ias = state.get('target_ias_kt', target_vref + 5)
+
+    # -- GO-AROUND MODE --
+    if _go_around_active:
+        # TOGA Thrust
+        throttle_1 = 1.0
+        throttle_2 = 1.0
+        
+        # Pitch up to climb (Target VS ~ 2000 fpm or Pitch 15 deg)
+        target_pitch = 15.0
+        pitch_error = target_pitch - pitch
+        elevator = pitch_error * 0.1 # Simple P-controller
+        
+        # Wings Level
+        aileron = -roll * 0.1
+        
+        # Clean up config
+        gear = 0.0
+        flaps = 20.0 # Intermediate flap setting
+        
+        return {
+            'elevator': max(-1.0, min(1.0, elevator)),
+            'aileron': max(-1.0, min(1.0, aileron)),
+            'rudder': rudder,
+            'throttle_1': throttle_1,
+            'throttle_2': throttle_2,
+            'flaps': flaps,
+            'gear': gear,
+            'speedbrake': 0.0,
+            'spoiler': 0.0,
+            'autobrake': 0.0
+        }
+
+    # -- APPROACH MODE (ILS Tracking) --
+    elif _phase == 'APPROACH':
+        
+        # Pitch / Glideslope Control
+        # Target: Keep glideslope dots near 0.
+        # If GS signal lost, revert to VS (Target VS from state or calculated)
+        if gs_dots is not None:
+            _gs_integrator += gs_dots * dt
+            _gs_integrator = max(-10.0, min(10.0, _gs_integrator)) # Anti-windup
+            
+            d_error = (gs_dots - _last_gs_error) / dt if dt > 0 else 0
+            elevator = (KP_PITCH * gs_dots) + (KI_PITCH * _gs_integrator) + (KD_PITCH * d_error)
+            _last_gs_error = gs_dots
+        else:
+            # Fallback: Baro VS hold (Simple)
+            target_vs = state.get('target_vs_fpm', -700)
+            current_vs = state.get('irs_1_vs_fpm', 0) # Single source fallback
+            vs_error = target_vs - current_vs
+            elevator = vs_error * 0.002
+        
+        # Roll / Localizer Control
+        # Target: Keep localizer dots near 0. Roll out of deviation.
+        if loc_dots is not None:
+            _loc_integrator += loc_dots * dt
+            _loc_integrator = max(-10.0, min(10.0, _loc_integrator))
+            
+            d_error = (loc_dots - _last_loc_error) / dt if dt > 0 else 0
+            
+            # Desired bank angle to correct
+            # Note: loc_dots is signed (+Right/-Left). 
+            # If loc is Right (+), we need to bank Left (-).
+            # Wait, standard: Positive Localizer = Right of Course.
+            # To correct, we need to turn Left. Bank Left (-).
+            # Formula: desired_roll = -Kp * error
+            
+            target_roll = -1.0 * ( (KP_ROLL * loc_dots) + (KI_ROLL * _loc_integrator) + (KD_ROLL * d_error) )
+            target_roll = max(-MAX_BANK, min(MAX_BANK, target_roll))
+            
+            aileron = (target_roll - roll) * 0.1 # Roll rate feedback approximation
+            
+            _last_loc_error = loc_dots
+        else:
+            # Fallback: Heading hold
+            target_hdg = state.get('target_hdg_deg', heading)
+            hdg_error = target_hdg - heading
+            # Normalize
+            while hdg_error > 180: hdg_error -= 360
+            while hdg_error < -180: hdg_error += 360
+            target_roll = max(-MAX_BANK, min(MAX_BANK, hdg_error * 0.3))
+            aileron = (target_roll - roll) * 0.1
+
+        # Throttle / Speed Control
+        ias_error = target_ias - ias
+        _ias_integrator += ias_error * dt
+        _ias_integrator = max(-20.0, min(20.0, _ias_integrator)) # Anti-windup
+        
+        d_ias_error = (ias_error - _last_ias_error) / dt if dt > 0 else 0
+        throttle_base = (KP_IAS * ias_error) + (KI_IAS * _ias_integrator) + (KD_IAS * d_ias_error)
+        throttle_cmd = max(0.0, min(1.0, throttle_base))
+        
+        throttle_1 = throttle_cmd
+        throttle_2 = throttle_cmd
+        _last_ias_error = ias_error
+        
+        # Flaps/Gear
+        gear = 1.0
+        flaps = 40.0 # Full flaps for approach
+        speedbrake = 0.0
+
+    # -- FLARE MODE --
+    elif _phase == 'FLARE':
+        # Objectives: 
+        # 1. Reduce VS to < 100 fpm at touchdown.
+        # 2. Reduce Throttle to Idle.
+        # 3. Maintain Centerline.
+        
+        # Pitch Control
+        # Target Pitch: slightly nose up (2-3 deg).
+        # As altitude decreases, ease the stick back.
+        
+        # Heuristic Flare Law:
+        # Elevator command increases as altitude drops.
+        # elevator += K_flare * (Ref_Alt - Current_Alt)
+        
+        # Target a reduction in VS.
+        current_vs = state.get('irs_1_vs_fpm', -700)
+        
+        # Relax glideslope tracking, focus on attitude and VS
+        # If we are high (above ref), flare less.
+        # If we are low, flare earlier/stronger (ground proximity).
+        
+        alt_error = _flare_reference_alt - radio_alt
+        
+        # Base elevator from Approach (to maintain continuity) decays
+        # Add Flare term
+        # Flare term: Pull back on stick. Positive elevator.
+        flare_input = FLARE_ELEVATOR_GAIN * alt_error
+        
+        # Pitch Target logic
+        target_pitch = 5.0
+        pitch_error = target_pitch - pitch
+        
+        elevator = (pitch_error * 0.08) + flare_input
+        
+        # Roll Control (Continue Localizer tracking but dampen)
+        if loc_dots is not None:
+            aileron = -loc_dots * 0.3 # Simple P-control
+        aileron += -roll * 0.05 # Damping
+        
+        # Throttle: Idle
+        throttle_1 = 0.0
+        throttle_2 = 0.0
+        
+        flaps = 40.0
+
+    # -- ROLLOUT MODE --
+    elif _phase == 'ROLLOUT':
+        # Controls Logic
+        
+        # Pitch: Neutral / Nose down prevention
+        elevator = -0.1 # Hold nose down slightly or neutral
+        
+        # Roll: Wings level
+        aileron = -roll * 0.1
+        
+        # Yaw: Keep centerline (Rudder)
+        # Use heading error if localizer not reliable on ground
+        if loc_dots is not None:
+             rudder = -loc_dots * 0.2 # Steer into deviation
+        else:
+             rudder = 0.0
+             
+        # Throttle: Idle
+        throttle_1 = 0.0
+        throttle_2 = 0.0
+        
+        # Decel Devices
+        _deployment_timer += dt
+        
+        if _deployment_timer > 0.5: # Slight delay for weight on wheels settle
+            spoiler = 1.0
+            autobrake = 1.0 # Max braking
+            
+            # Reverse Thrust (Check engine health)
+            # Logic: Use reverse if engines are healthy
+            eng1_ok = state.get('engine_1_running', True) and not state.get('engine_1_fire', False)
+            eng2_ok = state.get('engine_2_running', True) and not state.get('engine_2_fire', False)
+            
+            if eng1_ok:
+                reverse_1 = 1.0
+            if eng2_ok:
+                reverse_2 = 1.0
+
+    # -- Construction of Output Dict --
+    # Clamping
+    elevator = max(-1.0, min(1.0, elevator))
+    aileron = max(-1.0, min(1.0, aileron))
+    rudder = max(-1.0, min(1.0, rudder))
+    
+    output = {
+        'elevator': elevator,
+        'aileron': aileron,
+        'rudder': rudder,
+        'throttle_1': throttle_1,
+        'throttle_2': throttle_2,
+        'flaps': flaps,
+        'gear': gear,
+        'speedbrake': speedbrake,
+        'spoiler': spoiler,
+        'autobrake': autobrake,
+        'reverse_1': reverse_1,
+        'reverse_2': reverse_2
+    }
+    
+    return output
+```

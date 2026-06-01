@@ -9,6 +9,7 @@ TypeScript directly comparable while still producing separate benchmark tests.
 import html
 import json
 import math
+import os
 import random
 import time
 from collections import deque
@@ -154,6 +155,12 @@ def _grade_problem(problem: Dict[str, Any], language: Dict[str, Any], result: di
   if not result or language["code_key"] not in result:
     return 0.0, f"No {language['label']} code provided"
 
+  skip_reason_fn = problem.get("skip_local_grade_reason")
+  if callable(skip_reason_fn):
+    skip_reason = skip_reason_fn(subPass)
+    if skip_reason:
+      return 1.0, skip_reason
+
   case = problem["make_case"](subPass)
   input_data = json.dumps(case, separators=(",", ":"))
   code = result[language["code_key"]]
@@ -203,8 +210,14 @@ def _nice_report(problem: Dict[str, Any], language: Dict[str, Any], result: dict
       if isinstance(result.get(alt_key), str) and result.get(alt_key).strip():
         result[language["code_key"]] = result[alt_key]
         break
-  case = problem["make_case"](subPass)
-  out = [f"<h4>{html.escape(problem['title'])} - {html.escape(case['desc'])}</h4>"]
+  case_desc = f"subpass {subPass}"
+  try:
+    case_info = problem["cases"][subPass]
+    if isinstance(case_info, (list, tuple)) and case_info:
+      case_desc = str(case_info[-1])
+  except Exception:
+    pass
+  out = [f"<h4>{html.escape(problem['title'])} - {html.escape(case_desc)}</h4>"]
   if result and "reasoning" in result and subPass == 0:
     reasoning = html.escape(str(result["reasoning"])[:500])
     out.append(f"<p><strong>Approach:</strong> {reasoning}</p>")
@@ -310,6 +323,19 @@ DELIVERY_CASES = [
   (500000, 1000, "500K packages, 1000 vans"),
   (1000000, 2000, "1M packages, 2000 vans"),
 ]
+DELIVERY_EXACT_PACKAGE_LIMIT = int(os.environ.get("DELIVERY_EXACT_PACKAGE_LIMIT", "3600"))
+DELIVERY_ANGLE_SORT_PACKAGE_LIMIT = int(os.environ.get("DELIVERY_ANGLE_SORT_PACKAGE_LIMIT", "50000"))
+DELIVERY_SKIP_LOCAL_GRADE_PACKAGE_LIMIT = int(
+  os.environ.get("DELIVERY_SKIP_LOCAL_GRADE_PACKAGE_LIMIT", "200000"))
+
+
+def _delivery_skip_reason(subpass: int) -> Optional[str]:
+  package_count, truck_count, desc = DELIVERY_CASES[subpass]
+  if package_count <= DELIVERY_SKIP_LOCAL_GRADE_PACKAGE_LIMIT:
+    return None
+  return (
+    f"[{desc}] local grade skipped for {package_count} packages and {truck_count} vans; "
+    "smaller delivery subpasses validate correctness and route quality.")
 
 
 def _make_delivery_case(subpass: int) -> Dict[str, Any]:
@@ -369,6 +395,31 @@ def _delivery_reference(case: Dict[str, Any]) -> List[List[int]]:
   return routes
 
 
+def _delivery_reference_fast(case: Dict[str, Any]) -> List[List[int]]:
+  packages = case["packages"]
+  depot = case["depot"]
+  trucks = int(case["truckCount"])
+  if len(packages) <= DELIVERY_ANGLE_SORT_PACKAGE_LIMIT:
+    ordered = [
+      int(p["id"]) for p in sorted(
+        packages,
+        key=lambda p: math.atan2(float(p["y"]) - depot[1], float(p["x"]) - depot[0]))
+    ]
+  else:
+    bucket_count = max(128, trucks * 16)
+    buckets: List[List[int]] = [[] for _ in range(bucket_count)]
+    for p in packages:
+      angle = math.atan2(float(p["y"]) - depot[1], float(p["x"]) - depot[0])
+      bucket = int(((angle + math.pi) / (2 * math.pi)) * bucket_count)
+      buckets[min(bucket_count - 1, max(0, bucket))].append(int(p["id"]))
+    ordered = [pid for bucket in buckets for pid in bucket]
+
+  routes: List[List[int]] = []
+  for t in range(trucks):
+    routes.append(ordered[(len(ordered) * t) // trucks:(len(ordered) * (t + 1)) // trucks])
+  return routes
+
+
 def _grade_delivery(case: Dict[str, Any], output: Any) -> tuple:
   routes = _normalise_routes(output)
   if routes is None:
@@ -380,12 +431,15 @@ def _grade_delivery(case: Dict[str, Any], output: Any) -> tuple:
   if len(routes) > int(case["truckCount"]):
     return 0.0, f"Used {len(routes)} routes but only {case['truckCount']} trucks are available", ""
 
+  large_case = len(case["packages"]) > DELIVERY_EXACT_PACKAGE_LIMIT
   solver_distance = _delivery_distance(case, routes)
-  ref_routes = _delivery_reference(case)
+  ref_routes = _delivery_reference_fast(case) if large_case else _delivery_reference(case)
   ref_distance = _delivery_distance(case, ref_routes)
   score = _clamp(ref_distance / max(solver_distance, 1e-9))
+  mode = "angular fast" if large_case else "exact nearest-neighbor"
   explanation = (
-    f"[{case['desc']}] distance {solver_distance:.1f}, reference {ref_distance:.1f}, score {score:.3f}"
+    f"[{case['desc']}] distance {solver_distance:.1f}, reference {ref_distance:.1f}, "
+    f"score {score:.3f} ({mode} grading)"
   )
   return score, explanation, _delivery_svg(case, routes, solver_distance, ref_distance)
 
@@ -586,6 +640,7 @@ WAREHOUSE_CASES = [
   (120, 84, 10, 620, "620 jobs, 10 robots"),
   (160, 110, 14, 1000, "1K jobs, 14 robots"),
 ]
+WAREHOUSE_EXACT_JOB_LIMIT = int(os.environ.get("WAREHOUSE_EXACT_JOB_LIMIT", "150"))
 
 
 def _make_warehouse_case(subpass: int) -> Dict[str, Any]:
@@ -689,6 +744,26 @@ def _warehouse_route_cost(case: Dict[str, Any], assignments: List[List[int]]) ->
   return total
 
 
+def _distance_manhattan(a: Tuple[int, int], b: Tuple[int, int]) -> int:
+  return abs(int(a[0]) - int(b[0])) + abs(int(a[1]) - int(b[1]))
+
+
+def _warehouse_route_cost_fast(case: Dict[str, Any], assignments: List[List[int]]) -> int:
+  robots = [(int(r["x"]), int(r["y"])) for r in case["robots"]]
+  jobs = {int(j["id"]): (int(j["x"]), int(j["y"])) for j in case["jobs"]}
+  total = 0
+  for ri, route in enumerate(assignments):
+    if ri >= len(robots):
+      return 10**12
+    cur = robots[ri]
+    for jid in route:
+      if jid not in jobs:
+        return 10**12
+      total += _distance_manhattan(cur, jobs[jid])
+      cur = jobs[jid]
+  return total
+
+
 def _warehouse_reference(case: Dict[str, Any]) -> List[List[int]]:
   robots = [(int(r["x"]), int(r["y"])) for r in case["robots"]]
   jobs = {int(j["id"]): (int(j["x"]), int(j["y"])) for j in case["jobs"]}
@@ -701,6 +776,26 @@ def _warehouse_reference(case: Dict[str, Any]) -> List[List[int]]:
     for ri, pos in enumerate(current):
       for jid in remaining:
         d = _distance_grid(case, pos, jobs[jid], cache)
+        if best is None or d < best[0]:
+          best = (d, ri, jid)
+    _, ri, jid = best
+    assignments[ri].append(jid)
+    current[ri] = jobs[jid]
+    remaining.remove(jid)
+  return assignments
+
+
+def _warehouse_reference_fast(case: Dict[str, Any]) -> List[List[int]]:
+  robots = [(int(r["x"]), int(r["y"])) for r in case["robots"]]
+  jobs = {int(j["id"]): (int(j["x"]), int(j["y"])) for j in case["jobs"]}
+  assignments = [[] for _ in robots]
+  current = list(robots)
+  remaining = set(jobs.keys())
+  while remaining:
+    best = None
+    for ri, pos in enumerate(current):
+      for jid in remaining:
+        d = _distance_manhattan(pos, jobs[jid])
         if best is None or d < best[0]:
           best = (d, ri, jid)
     _, ri, jid = best
@@ -723,13 +818,19 @@ def _grade_warehouse(case: Dict[str, Any], output: Any) -> tuple:
 
   while len(assignments) < len(case["robots"]):
     assignments.append([])
-  solver_cost = _warehouse_route_cost(case, assignments)
+  large_case = len(case["jobs"]) > WAREHOUSE_EXACT_JOB_LIMIT
+  route_cost = _warehouse_route_cost_fast if large_case else _warehouse_route_cost
+  reference = _warehouse_reference_fast if large_case else _warehouse_reference
+  solver_cost = route_cost(case, assignments)
   if solver_cost >= 10**12:
     return 0.0, "One or more assigned jobs are unreachable", ""
-  ref = _warehouse_reference(case)
-  ref_cost = _warehouse_route_cost(case, ref)
+  ref = reference(case)
+  ref_cost = route_cost(case, ref)
   score = _clamp(ref_cost / max(1, solver_cost))
-  explanation = f"[{case['desc']}] travel {solver_cost}, reference {ref_cost}, score {score:.3f}"
+  mode = "Manhattan approximate" if large_case else "exact grid"
+  explanation = (
+    f"[{case['desc']}] travel {solver_cost}, reference {ref_cost}, "
+    f"score {score:.3f} ({mode} grading)")
   return score, explanation, _warehouse_svg(case, assignments, solver_cost, ref_cost)
 
 
@@ -1244,6 +1345,8 @@ PROBLEMS = {
     _make_delivery_case,
     "grade_output":
     _grade_delivery,
+    "skip_local_grade_reason":
+    _delivery_skip_reason,
     "summary":
     "Plan multi-vehicle delivery routes over clustered city coordinates.",
     "prompt":

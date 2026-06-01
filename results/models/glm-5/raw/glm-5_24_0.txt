@@ -1,0 +1,503 @@
+```cpp
+#include <iostream>
+#include <fstream>
+#include <sstream>
+#include <vector>
+#include <string>
+#include <thread>
+#include <atomic>
+#include <mutex>
+#include <cmath>
+#include <cstdint>
+#include <algorithm>
+#include <chrono>
+#include <condition_variable>
+#include <deque>
+#include <iomanip>
+
+// Constants
+const double PI = 3.14159265358979323846;
+const double GRAVITY = 1.62;
+const double DT = 0.1;
+const double EPSILON = 1e-6;
+
+// Structs for state and control
+struct State {
+    double x = 0, y = 0, z = 0;
+    double vx = 0, vy = 0, vz = 0;
+    double pitch = 0, yaw = 0, roll = 0;
+    double pitch_rate = 0, yaw_rate = 0, roll_rate = 0;
+    double fuel = 0;
+    uint64_t timestamp = 0; // logic tick
+};
+
+struct Control {
+    double thrust = 0;
+    double pitch_cmd = 0;
+    double yaw_cmd = 0;
+    double roll_cmd = 0;
+};
+
+struct TerrainColumn {
+    uint16_t ground_top;
+    uint16_t float_bottom;
+    uint16_t float_top;
+};
+
+// Global State
+std::atomic<bool> g_running(true);
+std::atomic<bool> g_terrain_loaded(false);
+std::atomic<uint64_t> g_current_tick(0);
+
+// Parameters
+int g_width = 0, g_depth = 0, g_height = 0;
+double g_max_thrust = 0;
+double g_start_x = 0, g_start_y = 0, g_start_z = 0;
+double g_target_x = 0, g_target_y = 0, g_target_z = 0;
+
+// Terrain Data (protected or single-threaded after load)
+// Flat array for cache efficiency
+std::vector<TerrainColumn> g_terrain;
+
+// State Buffer (Producer-Consumer)
+std::mutex g_state_mutex;
+std::condition_variable g_state_cv;
+std::deque<State> g_state_queue;
+
+// Control Output
+std::mutex g_output_mutex; // Ensure atomic writes if needed, though usually line-buffered is fine.
+
+// Utility Functions
+uint16_t read_uint16_le(std::ifstream& file) {
+    char buffer[2];
+    file.read(buffer, 2);
+    return static_cast<uint16_t>(static_cast<uint8_t>(buffer[0])) |
+           (static_cast<uint16_t>(static_cast<uint8_t>(buffer[1])) << 8);
+}
+
+void load_terrain(const std::string& path) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file) {
+        // Handle error - maybe exit
+        g_terrain_loaded = false; 
+        return;
+    }
+    
+    g_terrain.resize(static_cast<long long>(g_width) * g_depth);
+    
+    // Reading in chunks might be faster, but element-wise is safer for structure
+    // Optimizing for potential huge files:
+    // If the vector is huge, the allocation might take time.
+    // The file reading is the bottleneck.
+    
+    // Simple loop
+    for (int i = 0; i < g_width * g_depth; ++i) {
+        // Check for interruptions? 
+        // We are in a background thread, so we can just read.
+        // If file is huge, this takes time.
+        g_terrain[i].ground_top = read_uint16_le(file);
+        g_terrain[i].float_bottom = read_uint16_le(file);
+        g_terrain[i].float_top = read_uint16_le(file);
+    }
+    g_terrain_loaded = true;
+}
+
+// Function to check terrain collision (optimized)
+bool check_collision(double x, double y, double z) {
+    if (!g_terrain_loaded) return false; // Or true for safety? Assume open if not loaded? Risky.
+    
+    // Bounds check
+    if (x < 0 || x >= g_width || y < 0 || y >= g_depth || z < 0 || z >= g_height) {
+        return true;
+    }
+
+    int ix = static_cast<int>(std::floor(x));
+    int iy = static_cast<int>(std::floor(y));
+    int iz = static_cast<int>(std::floor(z));
+
+    // Clamp indices just in case
+    ix = std::max(0, std::min(g_width - 1, ix));
+    iy = std::max(0, std::min(g_depth - 1, iy));
+
+    const auto& col = g_terrain[ix * g_depth + iy];
+
+    if (iz < col.ground_top) return true;
+    if (iz >= col.float_bottom && iz < col.float_top) return true;
+    
+    return false;
+}
+
+// Simple PID or P controller logic for landing
+class LandingController {
+public:
+    Control compute_control(const State& current) {
+        Control ctrl;
+        
+        // 1. Calculate vector to target
+        double dx = g_target_x - current.x;
+        double dy = g_target_y - current.y;
+        double dz = g_target_z - current.z;
+        
+        double dist_horiz = std::sqrt(dx*dx + dy*dy);
+        double dist_vert = dz; // positive if target is above
+        
+        // 2. Determine desired velocity
+        // Simple strategy: 
+        // - If far away, come to a stop above the target.
+        // - Then descend.
+        
+        // Horizontal control logic
+        // Max braking distance: v^2 / (2*a). 
+        // Assume max horizontal accel is roughly (Thrust/Mass) - Gravity. 
+        // Since we don't know mass, we use a heuristic.
+        // Available thrust for horizontal control is limited by tilt.
+        
+        double vx_target = 0, vy_target = 0;
+        
+        // Arrival speed requirement: < 3 m/s.
+        // Let's try to keep horizontal speed < 1 m/s near target.
+        
+        if (dist_horiz > 1.0) {
+            // Move towards target, but slow down if close
+            double speed_factor = std::min(dist_horiz, 20.0); // Max 20 m/s approach?
+            // Check braking distance
+            // if (current_v * current_v > 2 * accel * dist) brake;
+            
+            // Simple P controller for velocity
+            // Desired velocity points to target, magnitude scales with distance but capped
+            double desired_speed = std::min(dist_horiz * 0.5, 10.0); 
+            if (dist_horiz < 10.0) desired_speed = std::min(dist_horiz * 0.3, 2.0);
+
+            vx_target = (dx / dist_horiz) * desired_speed;
+            vy_target = (dy / dist_horiz) * desired_speed;
+        } else {
+            vx_target = 0;
+            vy_target = 0;
+        }
+        
+        // Vertical control logic
+        double vz_target = 0;
+        if (dist_horiz < 5.0) { // Close enough horizontally
+            if (current.z > g_target_z + 2.0) {
+                vz_target = -1.0; // Descent speed 1 m/s
+            } else {
+                vz_target = 0; // Hover/land
+            }
+        } else {
+            // Maintain altitude or climb to avoid terrain?
+            // For now, maintain altitude or correct slightly.
+            if (dist_vert < -5.0) vz_target = 1.0; // Climb if below target altitude significantly
+            else if (dist_vert > 5.0) vz_target = -0.5;
+            else vz_target = 0;
+        }
+
+        // 3. Compute required acceleration to achieve target velocities
+        double ax = (vx_target - current.vx) / DT; // Naive P
+        double ay = (vy_target - current.vy) / DT;
+        double az = (vz_target - current.vz) / DT + GRAVITY; // Compensate for gravity
+
+        // 4. Translate acceleration to Thrust and Orientation
+        // Thrust vector direction
+        double a_mag = std::sqrt(ax*ax + ay*ay + az*az);
+        
+        if (a_mag < EPSILON) {
+            ctrl.thrust = 0;
+            ctrl.pitch_cmd = 0;
+            ctrl.yaw_cmd = 0;
+            return ctrl;
+        }
+
+        // Thrust magnitude (acceleration)
+        // We need thrust acceleration >= a_mag.
+        // F/M = Thrust. We don't know M.
+        // We assume 'max_thrust' is actually max_acceleration? 
+        // Re-reading prompt: "thrust is 0.0 to 1.0 (fraction of max_thrust)".
+        // "100% thrust burns 1 unit of fuel per second."
+        // Physics usually F=ma. If we output fraction, we assume the engine handles the rest?
+        // Wait, "100% thrust burns 1 unit of fuel". 
+        // "Fuel: 100% thrust burns 1 unit of fuel per second."
+        // This implies the 'fuel' variable is the duration we can burn at 100%.
+        // It doesn't give mass. 
+        // However, gravity is 1.62.
+        // If thrust == 1.0 gives acceleration > gravity, we can hover.
+        // Let's assume max_thrust is an acceleration value provided in header?
+        // Prompt says: "width depth height gravity max_thrust fuel"
+        // So max_thrust is a value.
+        
+        // If a_mag > g_max_thrust, we can't satisfy the request. We saturate.
+        ctrl.thrust = std::min(1.0, a_mag / g_max_thrust);
+        
+        // 5. Compute Orientation
+        // We want the thrust vector (0,0,1) rotated to align with (ax, ay, az).
+        // Rotation is defined by Yaw (around Z) and Pitch (around Y? No).
+        // Pitch: tilts forward. +Pitch -> thrust into -X.
+        // Yaw: rotates around Z.
+        
+        // Target thrust vector (normalized)
+        double tx = ax / a_mag;
+        double ty = ay / a_mag;
+        double tz = az / a_mag;
+        
+        // Deriving Pitch and Yaw from vector
+        // Yaw (heading): angle in XY plane.
+        double target_yaw = std::atan2(ty, tx); // Returns angle from X axis.
+        // Wait, standard yaw is from X axis towards Y.
+        // If thrust is (0,0,1), yaw is irrelevant?
+        // When pitched, thrust is (sin(pitch), 0, cos(pitch)) rotated by yaw?
+        // Let's check definitions:
+        // Pitch + -> -X. So thrust X component is -sin(pitch).
+        // Yaw rotates heading.
+        // So: Thrust_Vector = R_yaw * R_pitch * (0,0,1).
+        // R_pitch (around Y axis? No, pitch is usually around X? But here it tilts towards X).
+        // If +Pitch tilts forward (towards -X), it's a rotation around Y axis?
+        // Let's assume pitch rotation axis is Y.
+        // Pitch angle p: X = -sin(p), Z = cos(p).
+        // Then Yaw rotation around Z:
+        // X' = X*cos(yaw) - Y*sin(yaw) ? No, Y is 0.
+        // X' = -sin(p)*cos(yaw)
+        // Y' = -sin(p)*sin(yaw)  <-- Should check sign.
+        // Z' = cos(p)
+        
+        // Wait, Pitch + tilts forward. Forward is usually -X or +X?
+        // "Pitch: tilts the lander. +pitch tilts forward, redirecting thrust partially into -X."
+        // So if pitch > 0, thrust_x < 0.
+        // This matches X' = -sin(p).
+        // Yaw rotates the lander.
+        // If yaw = 0, pitch = pi/2 -> thrust is -X.
+        // If yaw = pi/2, pitch = pi/2 -> thrust is -Y?
+        // Let's check.
+        // Rotate (X, 0, Z) by yaw around Z.
+        // New X = X*cos(yaw) - 0*sin(yaw) = X*cos(yaw)
+        // New Y = X*sin(yaw) + 0*cos(yaw) = X*sin(yaw)
+        // If thrust is (-1, 0, 0) (pitch=pi/2, yaw=0).
+        // If yaw = pi/2:
+        // X' = -1 * cos(pi/2) = 0.
+        // Y' = -1 * sin(pi/2) = -1.
+        // So thrust is -Y. Matches.
+        
+        // So:
+        // Thrust_X = -sin(pitch) * cos(yaw)
+        // Thrust_Y = -sin(pitch) * sin(yaw)
+        // Thrust_Z = cos(pitch)
+        
+        // We want (Thrust_X, Thrust_Y, Thrust_Z) proportional to (ax, ay, az).
+        // From Z component: pitch = acos(tz).
+        // From X/Y: yaw = atan2(Thrust_Y, Thrust_X).
+        // Thrust_Y/Thrust_X = tan(yaw).
+        // (-sin(pitch)*sin(yaw)) / (-sin(pitch)*cos(yaw)) = tan(yaw).
+        // So target_yaw = atan2(ty, tx).
+        // Note: ty and tx are the normalized components.
+        // Wait, we used (ax, ay, az) -> (tx, ty, tz).
+        // So yaw = atan2(ty, tx).
+        // Pitch = acos(tz).
+        // However, we need to handle the sign of pitch.
+        // Since pitch is clamped [-pi/2, pi/2], cos(pitch) >= 0.
+        // So tz must be >= 0.
+        // This means we can only thrust upwards (Z>=0). This makes sense for lunar lander usually.
+        // If we need to accelerate downwards (az < 0), we can't.
+        // This is fine, we shouldn't accelerate down if gravity is there, just reduce thrust.
+        
+        double target_pitch = std::acos(tz);
+        // Logic check: if tx < 0, target_yaw should be such that thrust points left?
+        // Example: need thrust +X (tx=1). target_yaw=0.
+        // Thrust_X = -sin(pitch). This is negative.
+        // Contradiction.
+        // If we need +X thrust, we need -sin(pitch)*cos(yaw) > 0.
+        // Since pitch > 0 for tilt, sin(pitch) > 0.
+        // So -cos(yaw) > 0 => cos(yaw) < 0 => yaw is approx PI.
+        // Let's re-evaluate.
+        // We want Thrust vector T.
+        // |T| = 1.
+        // Tz = cos(pitch).
+        // Tx = -sin(pitch)cos(yaw)
+        // Ty = -sin(pitch)sin(yaw)
+        // We want T proportional to A.
+        // If Ax > 0, we need Tx > 0.
+        // -sin(pitch)cos(yaw) > 0 => cos(yaw) < 0 => yaw in 2nd/3rd quadrant.
+        // So target_yaw = atan2(Ay, Ax) + PI ?
+        
+        // Let's solve:
+        // yaw = atan2(Ty, Tx).
+        // We want (Tx, Ty) proportional to (Ax, Ay).
+        // Let k = sin(pitch) = sqrt(1 - Tz^2).
+        // (Tx, Ty) = (-k cos(yaw), -k sin(yaw)).
+        // (-k cos(yaw), -k sin(yaw)) should be parallel to (Ax, Ay).
+        // Let (Ax, Ay) = (r cos(phi), r sin(phi)) where phi = atan2(Ay, Ax).
+        // We need (-cos(yaw), -sin(yaw)) parallel to (cos(phi), sin(phi)).
+        // This means the vector -(cos(yaw), sin(yaw)) points in direction phi.
+        // So (cos(yaw), sin(yaw)) points in direction phi + PI.
+        // So yaw = phi + PI.
+        
+        // Correct Yaw calculation:
+        double phi = std::atan2(ay, ax);
+        double target_yaw_corrected = phi + PI;
+        
+        // Normalize angles
+        while (target_yaw_corrected > PI) target_yaw_corrected -= 2*PI;
+        while (target_yaw_corrected < -PI) target_yaw_corrected += 2*PI;
+        
+        // Pitch
+        // Tz = cos(pitch). Since we need upward thrust mostly, pitch in [-pi/2, pi/2].
+        // pitch = acos(tz). But tz = az / |a|.
+        // Actually we should use the required T_z to find pitch.
+        // pitch = acos(az / a_mag).
+        
+        // 6. Compute Rotation Commands
+        // We need to get from current (pitch, yaw) to target.
+        // Use angular acceleration control.
+        // Rate control:
+        // error = target - current.
+        // command = P * error - D * rate.
+        
+        // Yaw
+        double yaw_error = target_yaw_corrected - current.yaw;
+        // Normalize error
+        while (yaw_error > PI) yaw_error -= 2*PI;
+        while (yaw_error < -PI) yaw_error += 2*PI;
+        
+        // Simple P controller for rate
+        double target_yaw_rate = 2.0 * yaw_error; // P gain
+        double yaw_rate_error = target_yaw_rate - current.yaw_rate;
+        ctrl.yaw_cmd = std::clamp(5.0 * yaw_rate_error, -1.0, 1.0);
+        
+        // Pitch
+        double pitch_error = target_pitch - current.pitch;
+        double target_pitch_rate = 2.0 * pitch_error;
+        double pitch_rate_error = target_pitch_rate - current.pitch_rate;
+        ctrl.pitch_cmd = std::clamp(5.0 * pitch_rate_error, -1.0, 1.0);
+        
+        // Roll (keep 0)
+        double roll_error = 0 - current.roll;
+        double target_roll_rate = 2.0 * roll_error;
+        double roll_rate_error = target_roll_rate - current.roll_rate;
+        ctrl.roll_cmd = std::clamp(5.0 * roll_rate_error, -1.0, 1.0);
+        
+        return ctrl;
+    }
+};
+
+// IO Thread: Reads stdin and pushes to queue
+void input_thread_func() {
+    std::string line;
+    bool reading_state = false;
+    
+    while (g_running && std::cin) {
+        if (!reading_state) {
+            // Read header
+            // Use getline for the terrain path line
+            std::string header_line;
+            
+            // We can't easily mix cin>> and getline without care.
+            // Header:
+            // width depth height gravity max_thrust fuel
+            // start_x start_y start_z target_x target_y target_z
+            // terrain_file_path
+            
+            std::cin >> g_width >> g_depth >> g_height; 
+            double gravity_unused; // We use constant 1.62
+            std::cin >> gravity_unused >> g_max_thrust; // Read gravity to skip
+            double fuel_unused;
+            std::cin >> fuel_unused; // Initial fuel, maybe useful
+            
+            std::cin >> g_start_x >> g_start_y >> g_start_z;
+            std::cin >> g_target_x >> g_target_y >> g_target_z;
+            
+            std::cin.ignore(); // Ignore newline before path
+            
+            std::string terrain_path;
+            std::getline(std::cin, terrain_path);
+            
+            // Start terrain loading in background
+            std::thread terrain_loader(load_terrain, terrain_path);
+            terrain_loader.detach(); // Let it run independent
+            
+            // Wait for "STATE"
+            std::string marker;
+            std::cin >> marker;
+            if (marker == "STATE") {
+                reading_state = true;
+            } else {
+                // Error
+                g_running = false;
+                return;
+            }
+        }
+        
+        if (reading_state) {
+            State s;
+            if (std::cin >> s.x >> s.y >> s.z >> s.vx >> s.vy >> s.vz 
+                         >> s.pitch >> s.yaw >> s.roll 
+                         >> s.pitch_rate >> s.yaw_rate >> s.roll_rate 
+                         >> s.fuel) {
+                
+                s.timestamp = ++g_current_tick;
+                
+                {
+                    std::lock_guard<std::mutex> lock(g_state_mutex);
+                    g_state_queue.push_back(s);
+                    // Limit queue size to prevent memory bloat if processing is slow
+                    if (g_state_queue.size() > 10) {
+                        // Keep only the latest
+                        while (g_state_queue.size() > 1) g_state_queue.pop_front();
+                    }
+                }
+                g_state_cv.notify_one();
+            } else {
+                // EOF or error
+                g_running = false;
+            }
+        }
+    }
+}
+
+// Control Thread: Pops state, computes control, writes stdout
+void control_thread_func() {
+    LandingController controller;
+    
+    while (g_running) {
+        State current_state;
+        {
+            std::unique_lock<std::mutex> lock(g_state_mutex);
+            // Wait for data with timeout to allow checking g_running
+            if (g_state_cv.wait_for(lock, std::chrono::milliseconds(100), []{ return !g_state_queue.empty(); })) {
+                // Get the latest state, discard old ones
+                while (g_state_queue.size() > 1) {
+                    g_state_queue.pop_front();
+                }
+                current_state = g_state_queue.front();
+                g_state_queue.pop_front();
+            } else {
+                continue; // No data, loop again
+            }
+        }
+        
+        Control c = controller.compute_control(current_state);
+        
+        // Output
+        // Use printf for speed or cout with sync
+        std::cout << std::fixed << std::setprecision(5) 
+                  << c.thrust << " " 
+                  << c.pitch_cmd << " " 
+                  << c.yaw_cmd << " " 
+                  << c.roll_cmd << std::endl;
+    }
+}
+
+int main() {
+    // Optimize I/O
+    std::ios_base::sync_with_stdio(false);
+    std::cin.tie(nullptr);
+    
+    // Launch threads
+    std::thread input_thread(input_thread_func);
+    std::thread control_thread(control_thread_func);
+    
+    // Join threads (wait for them to finish)
+    if (input_thread.joinable()) input_thread.join();
+    
+    g_running = false; // Ensure control thread exits
+    if (control_thread.joinable()) control_thread.join();
+    
+    return 0;
+}
+```

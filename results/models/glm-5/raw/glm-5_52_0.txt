@@ -1,0 +1,281 @@
+```python
+import math
+
+# Module-level persistence for state filtering and PID controllers
+_prev_speed = 0.0
+_prev_steering = 0.0
+_speed_integral = 0.0
+_prev_speed_error = 0.0
+_steering_integral = 0.0
+_obstacle_state = None # 'clear', 'approaching', 'critical'
+_state_timer = 0.0
+_estimated_mu = 1.0
+
+def autopilot_step(state: dict, dt: float) -> dict:
+    # --- Persistent State ---
+    global _prev_speed, _prev_steering, _speed_integral, _prev_speed_error
+    global _steering_integral, _obstacle_state, _state_timer, _estimated_mu
+    
+    # --- Helper Functions ---
+    def get_median(values):
+        valid = [v for v in values if v is not None]
+        if not valid: return None
+        valid.sort()
+        n = len(valid)
+        mid = n // 2
+        if n % 2 == 1: return valid[mid]
+        return (valid[mid-1] + valid[mid]) / 2.0
+
+    def safe_avg(vals):
+        valid = [v for v in vals if v is not None]
+        return sum(valid) / len(valid) if valid else None
+
+    # --- 1. Sensor Fusion ---
+    
+    # Wheel Speeds (km/h)
+    ws_vals = [
+        state.get('wheel_speed_fl_kmh') if state.get('wheel_speed_fl_valid') else None,
+        state.get('wheel_speed_fr_kmh') if state.get('wheel_speed_fr_valid') else None,
+        state.get('wheel_speed_rl_kmh') if state.get('wheel_speed_rl_valid') else None,
+        state.get('wheel_speed_rr_kmh') if state.get('wheel_speed_rr_valid') else None
+    ]
+    speed_ws = get_median(ws_vals)
+
+    # Vehicle Speed Sensors
+    vs_vals = [
+        state.get('vehicle_speed_1_kmh'),
+        state.get('vehicle_speed_2_kmh')
+    ]
+    speed_vs = safe_avg(vs_vals)
+
+    # GPS Speed
+    speed_gps = None
+    if state.get('gps_1_valid'): speed_gps = state.get('gps_1_speed_kmh')
+    if state.get('gps_2_valid'):
+        s2 = state.get('gps_2_speed_kmh')
+        if speed_gps is None: speed_gps = s2
+        else: speed_gps = (speed_gps + s2) / 2.0
+
+    # Fuse Speed (Priority: WS > VS > GPS)
+    speed_kmh = speed_ws
+    if speed_kmh is None: speed_kmh = speed_vs
+    if speed_kmh is None: speed_kmh = speed_gps
+    if speed_kmh is None: speed_kmh = _prev_speed # Fallback to last known
+    
+    speed_ms = speed_kmh / 3.6 if speed_kmh is not None else 0.0
+
+    # Gyroscopes (Yaw Rate deg/s)
+    gyro_vals = []
+    if state.get('gyro_1_valid'): gyro_vals.append(state.get('gyro_1_yaw_rate_dps'))
+    if state.get('gyro_2_valid'): gyro_vals.append(state.get('gyro_2_yaw_rate_dps'))
+    if state.get('gyro_3_valid'): gyro_vals.append(state.get('gyro_3_yaw_rate_dps'))
+    yaw_rate = get_median(gyro_vals)
+    if yaw_rate is None: yaw_rate = 0.0
+
+    # Steering Angle (deg)
+    sa_vals = []
+    if state.get('steering_angle_1_valid'): sa_vals.append(state.get('steering_angle_1_deg'))
+    if state.get('steering_angle_2_valid'): sa_vals.append(state.get('steering_angle_2_deg'))
+    steering_angle = safe_avg(sa_vals)
+    if steering_angle is None: steering_angle = _prev_steering * 45.0 # Rough estimate
+
+    # Traction
+    _estimated_mu = state.get('estimated_mu', 1.0)
+    rain = state.get('rain_sensor', False)
+    
+    # --- 2. Environment Perception ---
+    
+    # Lane Keeping (Vision)
+    lane_offsets = []
+    left_lines = []
+    right_lines = []
+    curvatures = []
+    
+    for i in range(1, 4):
+        prefix = f'vision_{i}_'
+        if state.get(prefix + 'left_line_valid') and state.get(prefix + 'left_line_dist_m') is not None:
+            left_lines.append(state.get(prefix + 'left_line_dist_m'))
+        if state.get(prefix + 'right_line_valid') and state.get(prefix + 'right_line_dist_m') is not None:
+            right_lines.append(state.get(prefix + 'right_line_dist_m'))
+        if state.get(prefix + 'lane_offset_m') is not None: # Often valid even if lines flicker
+            lane_offsets.append(state.get(prefix + 'lane_offset_m'))
+        curv = state.get(prefix + 'road_curvature_1pm')
+        if curv is not None and abs(curv) < 0.1: # Filter noise
+            curvatures.append(curv)
+            
+    lane_offset = get_median(lane_offsets)
+    if lane_offset is None: lane_offset = 0.0
+    
+    # Speed Limit
+    limits = []
+    for i in range(1, 4):
+        if state.get(f'vision_{i}_speed_limit_valid'):
+            limits.append(state.get(f'vision_{i}_speed_limit_kmh'))
+    speed_limit = get_median(limits)
+
+    # Obstacles (Vision + Lidar)
+    obstacles = []
+    
+    # Vision Obstacles
+    for i in range(1, 4):
+        prefix = f'vision_{i}_'
+        if state.get(prefix + 'obstacle_valid') and state.get(prefix + 'obstacle_detected'):
+            d = state.get(prefix + 'obstacle_dist_m')
+            v = state.get(prefix + 'obstacle_rel_speed_kmh')
+            if d is not None:
+                obstacles.append({'dist': d, 'rel_v': v if v is not None else 0.0, 'source': 'vision'})
+
+    # Lidar Obstacles
+    lidar_angles = [5, 15, 30, 45, 60, 90, -5, -15, -30, -45, -60, -90]
+    for ang in lidar_angles:
+        key = f'lidar_{"+" if ang >= 0 else ""}{ang:03d}_deg_'
+        if state.get(key + 'valid'):
+            r = state.get(key + 'range_m')
+            if r is not None and r < 150.0: # Max reliable range
+                # Lateral distance estimate
+                # Simple trig: y = r * sin(ang), x = r * cos(ang)
+                lat = r * math.sin(math.radians(ang))
+                lon = r * math.cos(math.radians(ang))
+                
+                # Check if in lane (approx width 3.5m)
+                if abs(lat) < 2.0: 
+                    obstacles.append({'dist': lon, 'rel_v': 0.0, 'source': 'lidar'}) # Lidar doesn't give speed
+
+    # Determine closest obstacle
+    closest_obs = None
+    if obstacles:
+        closest_obs = min(obstacles, key=lambda o: o['dist'])
+
+    # --- 3. Decision Logic ---
+    
+    target_speed = state.get('target_speed_kmh', 100.0)
+    target_lane = state.get('target_lane', 1)
+    
+    # Speed Logic
+    # Cruise speed: Target vs Limit
+    desired_speed = target_speed
+    if speed_limit is not None:
+        desired_speed = min(desired_speed, speed_limit)
+    
+    # Traction Limit
+    if _estimated_mu < 0.5:
+        desired_speed = min(desired_speed, 60.0) # Slow down on ice/wet
+        
+    # Obstacle Logic
+    throttle_cmd = 0.0
+    brake_cmd = 0.0
+    
+    obs_dist = closest_obs['dist'] if closest_obs else 100.0
+    obs_rel_v = closest_obs['rel_v'] if closest_obs else 0.0
+    
+    # Calculate TTC (Time To Collision)
+    # Positive rel_v means we are closing the gap (we are faster)
+    ttc = float('inf')
+    if obs_rel_v > 0.5: # Closing speed > 0.5 km/h to avoid noise
+        ttc = (obs_dist * 3.6) / obs_rel_v # (m) / (km/h / 3.6)
+    
+    # Safety Distance logic
+    safe_dist = max(10.0, speed_kmh / 3.6 * 2.0) # 2 seconds headway
+    
+    # State Machine for Obstacles
+    if obs_dist < 5.0:
+        _obstacle_state = 'critical'
+    elif ttc < 4.0 or obs_dist < safe_dist:
+        _obstacle_state = 'approaching'
+    else:
+        _obstacle_state = 'clear'
+        
+    if _obstacle_state == 'critical':
+        # Emergency Brake
+        # On low mu, ABS logic is handled by 'brake' command abstraction usually, 
+        # but we modulate if we need to steer.
+        brake_cmd = 1.0
+        desired_speed = 0.0
+    elif _obstacle_state == 'approaching':
+        # Follow or prepare lane change?
+        # If we have a target lane change, we might try to steer around.
+        # But primarily, manage speed.
+        # Simple ACC logic: match speed of obstacle
+        target_speed_obs = (speed_kmh - obs_rel_v) # Approximation
+        desired_speed = max(0.0, min(desired_speed, target_speed_obs - 5.0))
+        
+        if obs_dist < safe_dist * 0.7:
+            brake_cmd = 0.3 # Light drag brake
+
+    # --- 4. Control Loops ---
+    
+    # Speed PID
+    # Anti-windup: clamp integral
+    speed_error = desired_speed - speed_kmh
+    
+    Kp_s, Ki_s, Kd_s = 0.5, 0.05, 0.1
+    
+    _speed_integral += speed_error * dt
+    _speed_integral = max(-10.0, min(10.0, _speed_integral))
+    
+    speed_deriv = (speed_error - _prev_speed_error) / dt if dt > 0 else 0.0
+    
+    pid_out = Kp_s * speed_error + Ki_s * _speed_integral + Kd_s * speed_deriv
+    
+    _prev_speed_error = speed_error
+    
+    if brake_cmd > 0:
+        throttle_cmd = 0.0
+        # If brake_cmd wasn't set by logic, release it
+        if _obstacle_state == 'clear': brake_cmd = 0.0
+    else:
+        if pid_out > 0:
+            # Traction control: reduce throttle on low mu
+            throttle_cmd = min(1.0, pid_out)
+            if _estimated_mu < 0.6:
+                throttle_cmd *= _estimated_mu # Reduce torque
+        else:
+            # Engine braking
+            throttle_cmd = 0.0
+
+    # Steering PID
+    # Goal: lane_offset -> 0
+    # Feed-forward: Curvature
+    # Correction: Yaw rate?
+    
+    Kp_str, Kd_str = 0.8, 0.2 # Aggressive lane keeping
+    
+    # If we have curvature info, add feedforward steering
+    road_curve = get_median(curvatures) if curvatures else 0.0
+    # Steer angle = arc length relation? 
+    # Simple approximation: target yaw rate = v * curvature
+    # We can add a term to steering.
+    
+    # Steering command normalized [-1, 1]. 
+    # Let's assume 1.0 = ~45 deg steering angle.
+    
+    steering_cmd = -Kp_str * lane_offset
+    
+    # Add curvature feedforward (Ackeermann geometry approx)
+    # wheelbase ~ 2.7m
+    # steer_angle_rad = L * curvature
+    # convert to normalized command
+    if speed_ms > 1.0:
+        steer_angle_ff = 2.7 * road_curve # rad
+        steering_cmd += steer_angle_ff * 2.0 # scaling factor
+    
+    # Damping
+    steering_cmd -= Kd_str * yaw_rate * 0.1
+    
+    # Saturation
+    steering_cmd = max(-1.0, min(1.0, steering_cmd))
+    
+    # Safety: Reduce speed in curves
+    if abs(road_curve) > 0.005:
+        desired_speed = min(desired_speed, 80.0)
+        
+    # --- 5. Update Persistence ---
+    _prev_speed = speed_kmh
+    _prev_steering = steering_cmd
+    
+    return {
+        "steering": steering_cmd,
+        "throttle": throttle_cmd,
+        "brake": brake_cmd
+    }
+```

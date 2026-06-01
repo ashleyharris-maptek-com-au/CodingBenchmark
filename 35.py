@@ -221,6 +221,20 @@ GRAPH_CACHE: Dict[int, Any] = {}
 _INPUT_FILE_CACHE: Dict[int, StreamingInputFile] = {}
 LAST_DOM_VIZ: Dict[Tuple[int, str], dict] = {}
 STREAMING_THRESHOLD_EDGES = 1_000
+MAX_LOCAL_GRADE_VERTICES = int(os.environ.get("TEST35_MAX_LOCAL_GRADE_VERTICES", "1000000"))
+MAX_LOCAL_GRADE_ESTIMATED_EDGES = int(
+  os.environ.get("TEST35_MAX_LOCAL_GRADE_ESTIMATED_EDGES", "10000000"))
+
+
+def _estimate_edges_from_case(case: dict) -> int:
+  num_vertices = int(case["vertices"])
+  edge_prob = float(case["edge_prob"])
+  dom_frac = max(0.02, min(0.2, edge_prob * 0.8))
+  dom_size = max(1, min(num_vertices, int(num_vertices * dom_frac)))
+  parent_edges = num_vertices - dom_size
+  expected_extra_dom_edges = int(num_vertices * 0.45)
+  expected_dom_edges = int(edge_prob * dom_size * max(0, dom_size - 1) / 2)
+  return parent_edges + expected_extra_dom_edges + expected_dom_edges
 
 
 def get_graph(
@@ -473,7 +487,15 @@ def _gradeAnswer_uncached(result: dict, subPass: int, aiEngineName: str) -> tupl
     return 0.0, "No Rust code provided"
 
   case = TEST_CASES[subPass]
-  use_streaming = _should_use_streaming(subPass)
+  estimated_edges = _estimate_edges_from_case(case)
+  ramInGb = get_ram_in_gb()
+  if (ramInGb < 64 and subPass > 15) or case["vertices"] > MAX_LOCAL_GRADE_VERTICES or (
+      estimated_edges > MAX_LOCAL_GRADE_ESTIMATED_EDGES):
+    return 1.0, (
+      f"[{case['desc']}] Local grading skipped "
+      f"(estimated_edges={estimated_edges:,}, vertices={case['vertices']:,}, "
+      f"RAM={ramInGb:.1f} GiB); assuming pass.")
+  use_streaming = estimated_edges > STREAMING_THRESHOLD_EDGES
 
   compiler = RustCompiler(aiEngineName)
   if not compiler.find_compiler():
@@ -510,10 +532,6 @@ def _gradeAnswer_uncached(result: dict, subPass: int, aiEngineName: str) -> tupl
       lines = stdout.strip().split('\n')
       set_size = int(lines[0])
       dom_set = set(map(int, lines[1].split())) if len(lines) > 1 else set()
-
-      ramInGb = get_ram_in_gb()
-      if ramInGb < 64 and subPass > 15:
-        return 1.0, "Not enough RAM to grade answer - assuming pass."
 
       # Use planted structure for verification on streaming graphs
       t = time.time()

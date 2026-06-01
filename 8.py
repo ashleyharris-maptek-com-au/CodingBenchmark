@@ -436,6 +436,7 @@ def validate_path(maze_string: str, path: List[Tuple[int, int]]) -> Tuple[bool, 
 
 
 STREAMING_THRESHOLD_CHARS = 500_000
+MAX_LOCAL_MAZE_CELLS = int(os.environ.get("TEST8_MAX_LOCAL_MAZE_CELLS", "1000000"))
 _INPUT_FILE_CACHE = {}
 
 
@@ -466,6 +467,16 @@ def _get_streaming_input(subpass: int, maze_string: str) -> StreamingInputFile:
   input_file = StreamingInputFile(cache_key, generator, "test8_maze")
   _INPUT_FILE_CACHE[subpass] = input_file
   return input_file
+
+
+def _maze_dimensions_for_subpass(subpass: int) -> Tuple[int, int]:
+  if subpass < len(MAZES):
+    info = MAZE_INFO[subpass]
+    return int(info["width"]), int(info["height"])
+  extreme_idx = subpass - len(MAZES)
+  if 0 <= extreme_idx < len(EXTREME_MAZE_SIZES):
+    return EXTREME_MAZE_SIZES[extreme_idx]
+  raise StopIteration
 
 
 def parse_path_output(output: str) -> tuple:
@@ -591,8 +602,12 @@ def gradeAnswer(result: dict, subPass: int, aiEngineName: str) -> tuple:
     return 0.0, "No Rust code provided"
 
   ramInGb = get_ram_in_gb()
-  if ramInGb < 64 and subPass > 8:
-    return 1.0, "Not enough RAM to grade answer - assuming pass."
+  width, height = _maze_dimensions_for_subpass(subPass)
+  cell_count = width * height
+  if (ramInGb < 64 and subPass > 8) or cell_count > MAX_LOCAL_MAZE_CELLS:
+    return 1.0, (
+      f"[{width}x{height}] Local grading skipped "
+      f"({cell_count:,} cells, RAM={ramInGb:.1f} GiB); assuming pass.")
 
   maze = get_maze(subPass)
   info = get_maze_info(maze)

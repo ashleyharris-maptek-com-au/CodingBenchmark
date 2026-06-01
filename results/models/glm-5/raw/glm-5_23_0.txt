@@ -1,0 +1,405 @@
+```rust
+use std::io::{self, BufRead, BufWriter, Write, BufReader};
+use std::sync::mpsc::{channel, Receiver, Sender};
+use std::thread;
+use std::time::{Duration, Instant};
+
+/// Represents the parsed game configuration from stdin
+#[derive(Debug, Clone)]
+struct GameConfig {
+    gravity: f64,
+    max_thrust: f64,
+    initial_fuel: f64,
+    start_x: f64,
+    start_y: f64,
+    target_x: f64,
+    target_y: f64,
+    width: usize,
+    height: usize,
+}
+
+/// Represents the current state of the lander received each tick
+#[derive(Debug, Clone, Copy)]
+struct LanderState {
+    x: f64,
+    y: f64,
+    vx: f64,
+    vy: f64,
+    angle: f64,
+    angular_vel: f64,
+    fuel: f64,
+}
+
+/// Output command for the lander
+#[derive(Debug, Clone, Copy)]
+struct Command {
+    thrust: f64,
+    turn: f64,
+}
+
+impl Default for Command {
+    fn default() -> Self {
+        Command { thrust: 0.0, turn: 0.0 }
+    }
+}
+
+/// Shared state between IO and control threads
+struct SharedState {
+    config: Option<GameConfig>,
+    state: Option<LanderState>,
+    last_update: Option<Instant>,
+}
+
+impl SharedState {
+    fn new() -> Self {
+        SharedState {
+            config: None,
+            state: None,
+            last_update: None,
+        }
+    }
+}
+
+/// Main control loop - receives state via channel, outputs commands
+fn control_loop(rx: Receiver<LanderState>, config_rx: Receiver<GameConfig>, tx: Sender<Command>) {
+    // Wait for config
+    let config = match config_rx.recv() {
+        Ok(cfg) => cfg,
+        Err(_) => return,
+    };
+    
+    let mut state = LanderState {
+        x: config.start_x,
+        y: config.start_y,
+        vx: 0.0,
+        vy: 0.0,
+        angle: 0.0,
+        angular_vel: 0.0,
+        fuel: config.initial_fuel,
+    };
+    
+    // PID-like control parameters
+    let kp_angle = 3.0;
+    let kd_angle = 2.0;
+    let kp_pos = 0.5;
+    let kd_pos = 0.8;
+    let kp_vel = 1.5;
+    
+    // Landing parameters
+    let target_vy = -2.0; // Target descent rate (m/s, negative = up)
+    let hover_vy = 0.0;
+    
+    let mut last_time = Instant::now();
+    let mut has_state = false;
+    
+    loop {
+        // Non-blocking check for new state
+        match rx.try_recv() {
+            Ok(new_state) => {
+                state = new_state;
+                last_time = Instant::now();
+                has_state = true;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                // No new state, continue with last known state
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                return;
+            }
+        }
+        
+        if !has_state {
+            thread::sleep(Duration::from_millis(1));
+            continue;
+        }
+        
+        // Calculate control
+        let cmd = compute_control(&config, &state, kp_angle, kd_angle, kp_pos, kd_pos, kp_vel, target_vy);
+        
+        // Send command
+        if tx.send(cmd).is_err() {
+            return;
+        }
+        
+        // Control loop rate - run faster than input rate
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Compute thrust and turn commands based on current state
+fn compute_control(
+    config: &GameConfig,
+    state: &LanderState,
+    kp_angle: f64,
+    kd_angle: f64,
+    kp_pos: f64,
+    kd_pos: f64,
+    kp_vel: f64,
+    target_vy: f64,
+) -> Command {
+    let g = config.gravity;
+    let max_thrust = config.max_thrust;
+    let fuel = state.fuel;
+    
+    // Target position
+    let tx = config.target_x;
+    let ty = config.target_y;
+    
+    // Current state
+    let x = state.x;
+    let y = state.y;
+    let vx = state.vx;
+    let vy = state.vy;
+    let angle = state.angle;
+    let angular_vel = state.angular_vel;
+    
+    // Distance to target
+    let dx = tx - x;
+    let dy = ty - y;
+    let dist = (dx * dx + dy * dy).sqrt();
+    
+    // Desired approach phase
+    let horizontal_error = dx;
+    let vertical_error = dy;
+    
+    // Phase detection based on distance and velocity
+    let speed = (vx * vx + vy * vy).sqrt();
+    let is_close = dist < 50.0;
+    let is_very_close = dist < 10.0;
+    let is_final_approach = dist < 5.0 && speed < 5.0;
+    
+    // Compute desired heading based on phase
+    let desired_angle = if is_final_approach {
+        // Final approach: point straight up, let gravity bring us down
+        0.0
+    } else if is_very_close {
+        // Very close: gentle correction toward target
+        let correction_angle = horizontal_error.atan2(-vertical_error);
+        correction_angle.max(-0.3).min(0.3) // Limit tilt
+    } else if is_close {
+        // Close: balance approach and correction
+        let approach_angle = horizontal_error.atan2(-vertical_error);
+        approach_angle.max(-0.5).min(0.5)
+    } else {
+        // Far away: more aggressive navigation
+        let nav_angle = horizontal_error.atan2(-vertical_error);
+        nav_angle.max(-0.8).min(0.8)
+    };
+    
+    // Angle control (PID-like)
+    let angle_error = desired_angle - angle;
+    let turn_cmd = kp_angle * angle_error - kd_angle * angular_vel;
+    let turn = turn_cmd.clamp(-1.0, 1.0);
+    
+    // Thrust control
+    // Calculate thrust needed to counteract gravity plus corrections
+    let base_thrust = g / max_thrust; // Thrust to hover
+    
+    // Vertical velocity control
+    let vy_error = if is_final_approach {
+        // In final approach, aim for slow descent
+        if vy < 1.0 { 
+            target_vy - vy // Slow down if too fast
+        } else {
+            hover_vy - vy // Hover if slow enough
+        }
+    } else {
+        // During approach, maintain reasonable descent
+        (-2.0 - vy).min(0.0) // Don't go too fast
+    };
+    
+    // Horizontal velocity correction (via tilt)
+    let vx_correction = kp_pos * horizontal_error - kd_pos * vx;
+    
+    // Combined thrust calculation
+    let mut thrust = base_thrust + kp_vel * vy_error;
+    
+    // Add extra thrust for horizontal correction when tilted
+    let tilt_effect = angle.sin().abs() * 0.3;
+    thrust += tilt_effect;
+    
+    // Fuel conservation: reduce thrust if fuel is low
+    if fuel < 5.0 {
+        thrust *= (fuel / 5.0).max(0.3);
+    }
+    
+    // Safety: ensure minimum thrust during descent
+    if vy > 5.0 {
+        thrust = (thrust + 0.3).min(1.0);
+    }
+    
+    // Emergency braking
+    if vy > 10.0 || speed > 15.0 {
+        thrust = 1.0;
+    }
+    
+    let thrust = thrust.clamp(0.0, 1.0);
+    
+    Command { thrust, turn }
+}
+
+/// Parse the initial map configuration
+fn parse_config(input: &mut BufReader<io::Stdin>) -> io::Result<GameConfig> {
+    let mut line = String::new();
+    
+    // Read first line: width height gravity max_thrust fuel
+    input.read_line(&mut line)?;
+    let parts: Vec<f64> = line
+        .split_whitespace()
+        .map(|s| s.parse().unwrap_or(0.0))
+        .collect();
+    
+    let width = parts[0] as usize;
+    let height = parts[1] as usize;
+    let gravity = parts[2];
+    let max_thrust = parts[3];
+    let initial_fuel = parts[4];
+    
+    line.clear();
+    
+    // Read second line: start_x start_y target_x target_y
+    input.read_line(&mut line)?;
+    let pos_parts: Vec<f64> = line
+        .split_whitespace()
+        .map(|s| s.parse().unwrap_or(0.0))
+        .collect();
+    
+    let start_x = pos_parts[0];
+    let start_y = pos_parts[1];
+    let target_x = pos_parts[2];
+    let target_y = pos_parts[3];
+    
+    line.clear();
+    
+    // Skip map rows (we don't need to store them for basic control)
+    // But we need to read them to get to the state updates
+    for _ in 0..height {
+        input.read_line(&mut line)?;
+        line.clear();
+    }
+    
+    Ok(GameConfig {
+        gravity,
+        max_thrust,
+        initial_fuel,
+        start_x,
+        start_y,
+        target_x,
+        target_y,
+        width,
+        height,
+    })
+}
+
+/// Parse state update line
+fn parse_state(line: &str) -> Option<LanderState> {
+    let parts: Vec<f64> = line
+        .split_whitespace()
+        .map(|s| s.parse().ok())
+        .collect::<Option<Vec<_>>>()?;
+    
+    if parts.len() < 7 {
+        return None;
+    }
+    
+    Some(LanderState {
+        x: parts[0],
+        y: parts[1],
+        vx: parts[2],
+        vy: parts[3],
+        angle: parts[4],
+        angular_vel: parts[5],
+        fuel: parts[6],
+    })
+}
+
+fn main() {
+    // Create channels for communication
+    let (state_tx, state_rx) = channel::<LanderState>();
+    let (config_tx, config_rx) = channel::<GameConfig>();
+    let (cmd_tx, cmd_rx) = channel::<Command>();
+    
+    // Spawn control thread
+    let control_handle = thread::spawn(move || {
+        control_loop(state_rx, config_rx, cmd_tx);
+    });
+    
+    // Main thread handles IO
+    let stdin = io::stdin();
+    let mut input = BufReader::new(stdin);
+    let stdout = io::stdout();
+    let mut output = BufWriter::new(stdout.lock());
+    
+    // Parse initial configuration
+    let config = match parse_config(&mut input) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            eprintln!("Failed to parse config: {}", e);
+            return;
+        }
+    };
+    
+    // Send config to control thread
+    if config_tx.send(config.clone()).is_err() {
+        eprintln!("Failed to send config");
+        return;
+    }
+    
+    // Buffer for state lines
+    let mut line = String::new();
+    let mut last_cmd = Command::default();
+    
+    // Main IO loop
+    loop {
+        line.clear();
+        
+        // Read state update (blocking)
+        match input.read_line(&mut line) {
+            Ok(0) => break, // EOF
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("Read error: {}", e);
+                break;
+            }
+        }
+        
+        // Parse state
+        if let Some(state) = parse_state(&line) {
+            // Send state to control thread (non-blocking)
+            let _ = state_tx.send(state);
+        }
+        
+        // Get latest command from control thread
+        match cmd_rx.try_recv() {
+            Ok(cmd) => {
+                last_cmd = cmd;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                // Use last command
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                break;
+            }
+        }
+        
+        // Output command
+        let thrust = last_cmd.thrust.clamp(0.0, 1.0);
+        let turn = last_cmd.turn.clamp(-1.0, 1.0);
+        
+        if write!(output, "{:.6} {:.6}\n", thrust, turn).is_err() {
+            break;
+        }
+        
+        if output.flush().is_err() {
+            break;
+        }
+    }
+    
+    // Clean up
+    drop(state_tx);
+    drop(config_tx);
+    drop(cmd_rx);
+    
+    let _ = control_handle.join();
+}
+```
