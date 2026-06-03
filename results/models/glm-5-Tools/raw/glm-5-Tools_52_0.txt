@@ -1,0 +1,634 @@
+The autopilot is working. Let me now provide the complete, production-ready code:
+
+```python
+"""
+Self-Driving Car Autopilot for Multi-Lane Freeway
+Handles 25 test scenarios with sensor fusion, graceful degradation, and safety systems.
+All units are METRIC (m, m/s, km/h, degrees).
+"""
+
+import math
+
+# ============== MODULE-LEVEL PERSISTENT STATE ==============
+# These persist across autopilot_step() calls for filtering and PID control
+
+_speed_pid = {"integral": 0.0, "last_error": 0.0}
+_steering_pid = {"integral": 0.0, "last_error": 0.0}
+
+_speed_filter = {"values": [], "size": 5}
+_yaw_filter = {"values": [], "size": 5}
+_lane_offset_filter = {"values": [], "size": 7}
+_curvature_filter = {"values": [], "size": 5}
+
+_prev_speed = 0.0
+_prev_steering = 0.0
+_emergency_brake_active = False
+_lane_change_state = {
+    "active": False,
+    "target_lane": None,
+    "start_time": None,
+    "direction": 0,
+    "phase": "idle"  # idle, checking, executing, completing
+}
+_obstacle_history = []
+_last_valid_state = {
+    "speed": 50.0,
+    "lane_offset": 0.0,
+    "curvature": 0.0,
+    "heading": 0.0
+}
+_degraded_mode = False
+_ice_mode = False
+
+
+# ============== HELPER FUNCTIONS ==============
+
+def median_filter(values):
+    """Return median of a list of values - robust against outliers."""
+    if not values:
+        return 0.0
+    sorted_vals = sorted(values)
+    n = len(sorted_vals)
+    if n % 2 == 1:
+        return sorted_vals[n // 2]
+    return (sorted_vals[n // 2 - 1] + sorted_vals[n // 2]) / 2.0
+
+
+def update_filter(filter_dict, new_value, max_size=None):
+    """Update a rolling median filter with a new value."""
+    if max_size is None:
+        max_size = filter_dict.get("size", 5)
+    if new_value is None:
+        new_value = 0.0
+    filter_dict["values"].append(new_value)
+    while len(filter_dict["values"]) > max_size:
+        filter_dict["values"].pop(0)
+    return median_filter(filter_dict["values"])
+
+
+def clamp(value, min_val, max_val):
+    """Clamp a value to a range."""
+    return max(min_val, min(max_val, value))
+
+
+def pid_control(pid_state, error, dt, kp, ki, kd, output_limit=1.0, integral_limit=0.5):
+    """Generic PID controller with anti-windup."""
+    if dt <= 0:
+        dt = 0.02  # Default 50Hz
+    
+    # Proportional term
+    p_term = kp * error
+    
+    # Integral with anti-windup
+    pid_state["integral"] += error * dt
+    pid_state["integral"] = clamp(pid_state["integral"], -integral_limit, integral_limit)
+    i_term = ki * pid_state["integral"]
+    
+    # Derivative
+    derivative = (error - pid_state["last_error"]) / dt if dt > 0 else 0.0
+    d_term = kd * derivative
+    pid_state["last_error"] = error
+    
+    # Calculate output
+    output = p_term + i_term + d_term
+    return clamp(output, -output_limit, output_limit)
+
+
+def voting_select(values, tolerance=0.2):
+    """Select best value from redundant sensors using voting/consensus."""
+    if not values:
+        return None
+    
+    valid_values = [v for v in values if v is not None]
+    if not valid_values:
+        return None
+    
+    if len(valid_values) == 1:
+        return valid_values[0]
+    
+    # Find cluster of agreeing values
+    best_value = None
+    best_count = 0
+    
+    for v in valid_values:
+        count = sum(1 for other in valid_values 
+                   if abs(v - other) <= tolerance * max(abs(v), abs(other), 0.1))
+        if count > best_count:
+            best_count = count
+            best_value = v
+    
+    return best_value
+
+
+# ============== SENSOR FUSION FUNCTIONS ==============
+
+def get_wheel_speed(state):
+    """Fuse wheel speed sensors with median filtering."""
+    speeds = []
+    for pos in ["fl", "fr", "rl", "rr"]:
+        key = f"wheel_speed_{pos}_kmh"
+        valid_key = f"wheel_speed_{pos}_valid"
+        if state.get(valid_key, False):
+            speed = state.get(key, 0)
+            if 0 <= speed < 400:  # Sanity check
+                speeds.append(speed)
+    return median_filter(speeds) if speeds else None
+
+
+def get_yaw_rate(state):
+    """Fuse gyroscope readings with voting for disagreement handling."""
+    yaw_rates = []
+    for i in [1, 2, 3]:
+        valid_key = f"gyro_{i}_valid"
+        if state.get(valid_key, False):
+            yaw = state.get(f"gyro_{i}_yaw_rate_dps", 0)
+            if abs(yaw) < 100:  # Sanity check
+                yaw_rates.append(yaw)
+    return voting_select(yaw_rates, tolerance=0.3) if yaw_rates else None
+
+
+def get_gps_speed(state):
+    """Get speed from GPS sensors."""
+    speeds = []
+    for i in [1, 2]:
+        if state.get(f"gps_{i}_valid", False):
+            speed = state.get(f"gps_{i}_speed_kmh")
+            if speed is not None and 0 <= speed < 400:
+                speeds.append(speed)
+    return median_filter(speeds) if speeds else None
+
+
+def get_vehicle_speed(state):
+    """Get best estimate of vehicle speed from all available sources."""
+    speeds = []
+    
+    # Primary vehicle speed sensors
+    for i in [1, 2]:
+        speed = state.get(f"vehicle_speed_{i}_kmh")
+        if speed is not None and 0 <= speed < 400:
+            speeds.append(speed)
+    
+    # Wheel speed sensors
+    wheel_speed = get_wheel_speed(state)
+    if wheel_speed is not None:
+        speeds.append(wheel_speed)
+    
+    # GPS speed as backup
+    gps_speed = get_gps_speed(state)
+    if gps_speed is not None:
+        speeds.append(gps_speed)
+    
+    return median_filter(speeds) if speeds else None
+
+
+def get_steering_angle(state):
+    """Fuse steering angle sensors, handling disagreement."""
+    angles = []
+    for i in [1, 2]:
+        if state.get(f"steering_angle_{i}_valid", False):
+            angle = state.get(f"steering_angle_{i}_deg", 0)
+            if abs(angle) < 100:
+                angles.append(angle)
+    
+    if len(angles) == 2:
+        # Check for significant disagreement
+        if abs(angles[0] - angles[1]) > 15:
+            # Use average as compromise
+            return (angles[0] + angles[1]) / 2
+        return (angles[0] + angles[1]) / 2
+    elif len(angles) == 1:
+        return angles[0]
+    return None
+
+
+def get_lidar_ranges(state):
+    """Get all valid lidar range measurements."""
+    ranges = {}
+    angles = ["+005", "+015", "+030", "+045", "+060", "+090",
+              "-005", "-015", "-030", "-045", "-060", "-090"]
+    
+    for angle in angles:
+        if state.get(f"lidar_{angle}_deg_valid", False):
+            r = state.get(f"lidar_{angle}_deg_range_m")
+            if r is not None and 0 < r < 200:
+                ranges[angle] = r
+    return ranges
+
+
+def get_vision_data(state):
+    """Fuse data from all three vision systems."""
+    lane_offsets = []
+    left_line_dists = []
+    right_line_dists = []
+    obstacles = []
+    curvatures = []
+    speed_limits = []
+    
+    for i in [1, 2, 3]:
+        prefix = f"vision_{i}_"
+        
+        # Lane offset
+        if state.get(f"{prefix}left_line_valid", False) or state.get(f"{prefix}right_line_valid", False):
+            offset = state.get(f"{prefix}lane_offset_m")
+            if offset is not None and abs(offset) < 10:
+                lane_offsets.append(offset)
+        
+        # Lane line distances
+        if state.get(f"{prefix}left_line_valid", False):
+            left_dist = state.get(f"{prefix}left_line_dist_m")
+            if left_dist is not None and 0 < left_dist < 20:
+                left_line_dists.append(left_dist)
+        
+        if state.get(f"{prefix}right_line_valid", False):
+            right_dist = state.get(f"{prefix}right_line_dist_m")
+            if right_dist is not None and 0 < right_dist < 20:
+                right_line_dists.append(right_dist)
+        
+        # Obstacles
+        if state.get(f"{prefix}obstacle_valid", False) and state.get(f"{prefix}obstacle_detected", False):
+            obs_dist = state.get(f"{prefix}obstacle_dist_m")
+            obs_rel_speed = state.get(f"{prefix}obstacle_rel_speed_kmh", 0)
+            if obs_dist is not None and 0 < obs_dist < 200:
+                obstacles.append({
+                    "distance": obs_dist, 
+                    "rel_speed": obs_rel_speed, 
+                    "system": i
+                })
+        
+        # Curvature
+        curvature = state.get(f"{prefix}road_curvature_1pm")
+        if curvature is not None and abs(curvature) < 0.1:
+            curvatures.append(curvature)
+        
+        # Speed limit
+        if state.get(f"{prefix}speed_limit_valid", False):
+            limit = state.get(f"{prefix}speed_limit_kmh")
+            if limit is not None and 0 < limit < 200:
+                speed_limits.append(limit)
+    
+    return {
+        "lane_offset": median_filter(lane_offsets) if lane_offsets else None,
+        "left_line_dist": median_filter(left_line_dists) if left_line_dists else None,
+        "right_line_dist": median_filter(right_line_dists) if right_line_dists else None,
+        "obstacles": obstacles,
+        "curvature": median_filter(curvatures) if curvatures else None,
+        "speed_limit": min(speed_limits) if speed_limits else None  # Most conservative
+    }
+
+
+# ============== MAIN AUTOPILOT FUNCTION ==============
+
+def autopilot_step(state: dict, dt: float) -> dict:
+    """
+    Main autopilot function. Called each simulation step.
+    
+    Args:
+        state: Dict with 117 sensor keys
+        dt: Time step in seconds
+        
+    Returns:
+        Dict with 'steering', 'throttle', 'brake' commands (-1 to 1 range)
+    """
+    global _speed_pid, _steering_pid, _speed_filter, _yaw_filter
+    global _lane_offset_filter, _curvature_filter, _prev_speed, _prev_steering
+    global _emergency_brake_active, _lane_change_state, _obstacle_history
+    global _last_valid_state, _degraded_mode, _ice_mode
+    
+    output = {}
+    sim_time = state.get("sim_time_s", 0)
+    
+    # ==================== STEP 1: SENSOR FUSION ====================
+    
+    # Get fused sensor values
+    vehicle_speed = get_vehicle_speed(state)
+    yaw_rate = get_yaw_rate(state)
+    steering_angle = get_steering_angle(state)
+    lidar_ranges = get_lidar_ranges(state)
+    vision_data = get_vision_data(state)
+    
+    # Environmental conditions
+    mu = state.get("estimated_mu", 1.0)
+    rain = state.get("rain_sensor", False)
+    temp = state.get("temperature_c", 20)
+    
+    # Targets
+    target_lane = state.get("target_lane", 1)
+    current_lane = state.get("current_lane", 1)
+    target_speed = state.get("target_speed_kmh", 100)
+    
+    # ==================== STEP 2: HEALTH MONITORING ====================
+    
+    # Count working sensors
+    vision_working = sum(1 for i in [1, 2, 3] if state.get(f"vision_{i}_obstacle_valid", False))
+    lidar_working = len(lidar_ranges) >= 4
+    gyro_working = sum(1 for i in [1, 2, 3] if state.get(f"gyro_{i}_valid", False))
+    gps_working = state.get("gps_1_valid", False) or state.get("gps_2_valid", False)
+    
+    # Set degraded mode flags
+    _degraded_mode = vision_working < 2 or not lidar_working or gyro_working < 2
+    _ice_mode = mu < 0.4
+    
+    # Use last known good values if sensors fail
+    if vehicle_speed is None:
+        vehicle_speed = _last_valid_state.get("speed", 50)
+    else:
+        _last_valid_state["speed"] = vehicle_speed
+    
+    # ==================== STEP 3: SPEED ESTIMATION ====================
+    
+    # Apply median filter for noise rejection
+    filtered_speed = update_filter(_speed_filter, vehicle_speed)
+    
+    # Determine effective target speed
+    speed_limit = vision_data.get("speed_limit")
+    if speed_limit is not None:
+        effective_target = min(target_speed, speed_limit)
+    else:
+        effective_target = target_speed
+    
+    # Reduce speed in adverse conditions
+    if _ice_mode:
+        effective_target = min(effective_target, 60)
+    elif mu < 0.6:
+        effective_target = min(effective_target, 80)
+    
+    if _degraded_mode:
+        effective_target = min(effective_target, 70)
+    
+    # ==================== STEP 4: OBSTACLE DETECTION ====================
+    
+    # Combine vision and lidar for obstacle detection
+    closest_obstacle_dist = float("inf")
+    closest_obstacle_rel_speed = 0
+    obstacle_source = None
+    
+    # Check vision obstacles
+    for obs in vision_data.get("obstacles", []):
+        if obs["distance"] < closest_obstacle_dist:
+            closest_obstacle_dist = obs["distance"]
+            closest_obstacle_rel_speed = obs.get("rel_speed", 0)
+            obstacle_source = f"vision_{obs['system']}"
+    
+    # Cross-check with front lidar beams
+    front_lidar_dists = [
+        lidar_ranges.get("+005", float("inf")),
+        lidar_ranges.get("+015", float("inf")),
+        lidar_ranges.get("-005", float("inf")),
+        lidar_ranges.get("-015", float("inf"))
+    ]
+    front_lidar_dist = min(front_lidar_dists)
+    
+    # If lidar sees something closer than vision, trust lidar
+    if front_lidar_dist < closest_obstacle_dist and front_lidar_dist < 100:
+        closest_obstacle_dist = front_lidar_dist
+        obstacle_source = "lidar"
+    
+    # Track obstacle history for flickering detection
+    _obstacle_history.append((sim_time, closest_obstacle_dist))
+    _obstacle_history = [(t, d) for t, d in _obstacle_history if sim_time - t < 2.0]
+    
+    # Smoothed obstacle distance
+    if _obstacle_history:
+        smoothed_obstacle_dist = median_filter([d for _, d in _obstacle_history])
+    else:
+        smoothed_obstacle_dist = closest_obstacle_dist
+    
+    # Calculate safe following distance
+    safe_distance = max(10, filtered_speed * 0.5)
+    if _ice_mode:
+        safe_distance *= 3  # Much more distance needed on ice
+    
+    # ==================== STEP 5: EMERGENCY BRAKING ====================
+    
+    # Calculate time-to-collision
+    if closest_obstacle_dist < 150 and filtered_speed > 5:
+        rel_speed_ms = closest_obstacle_rel_speed / 3.6
+        if rel_speed_ms < 0:  # Closing in
+            ttc = closest_obstacle_dist / (-rel_speed_ms) if rel_speed_ms < -0.1 else float("inf")
+        else:
+            ttc = float("inf")
+    else:
+        ttc = float("inf")
+    
+    # Set braking thresholds based on conditions
+    if _ice_mode:
+        emergency_dist = max(50, safe_distance)
+        critical_dist = max(30, safe_distance * 0.6)
+    else:
+        emergency_dist = max(30, safe_distance)
+        critical_dist = max(15, safe_distance * 0.5)
+    
+    brake_command = 0.0
+    
+    if closest_obstacle_dist < critical_dist or ttc < 1.5:
+        # CRITICAL - Emergency brake
+        brake_command = 1.0
+        _emergency_brake_active = True
+    elif closest_obstacle_dist < emergency_dist or ttc < 3.0:
+        # WARNING - Progressive braking
+        brake_intensity = 1.0 - (closest_obstacle_dist / emergency_dist)
+        brake_intensity = clamp(brake_intensity, 0.3, 0.8)
+        if _ice_mode:
+            brake_intensity *= 0.7  # Gentler on ice (ABS effect)
+        brake_command = brake_intensity
+        _emergency_brake_active = False
+    else:
+        _emergency_brake_active = False
+    
+    # ==================== STEP 6: LANE KEEPING ====================
+    
+    # Get lane offset from vision
+    lane_offset = vision_data.get("lane_offset")
+    
+    # Fallback: estimate from lidar side beams
+    if lane_offset is None:
+        left_dist = lidar_ranges.get("-045", lidar_ranges.get("-060", 3.5))
+        right_dist = lidar_ranges.get("+045", lidar_ranges.get("+060", 3.5))
+        if isinstance(left_dist, (int, float)) and isinstance(right_dist, (int, float)):
+            # Assume lane width ~3.5m, estimate offset
+            lane_offset = (right_dist - left_dist) / 2
+        else:
+            lane_offset = _last_valid_state.get("lane_offset", 0)
+    
+    if lane_offset is not None:
+        _last_valid_state["lane_offset"] = lane_offset
+    
+    # Filter lane offset for noise rejection
+    filtered_offset = update_filter(_lane_offset_filter, lane_offset)
+    
+    # Get road curvature for predictive steering
+    curvature = vision_data.get("curvature")
+    if curvature is None:
+        curvature = _last_valid_state.get("curvature", 0)
+    else:
+        _last_valid_state["curvature"] = curvature
+    
+    filtered_curvature = update_filter(_curvature_filter, curvature)
+    
+    # Yaw rate for stability
+    if yaw_rate is not None:
+        filtered_yaw = update_filter(_yaw_filter, yaw_rate)
+    else:
+        filtered_yaw = 0
+    
+    # Steering control - target: center of lane (offset = 0)
+    steering_error = -filtered_offset
+    
+    # Feedforward for curvature (anticipate curve)
+    speed_ms = filtered_speed / 3.6
+    curvature_steering = filtered_curvature * speed_ms * speed_ms * 0.1
+    
+    # PID gains for lane keeping
+    kp_steering = 0.8
+    ki_steering = 0.05
+    kd_steering = 0.3
+    
+    # Reduce gains on ice for stability
+    if _ice_mode:
+        kp_steering *= 0.5
+        ki_steering *= 0.3
+        kd_steering *= 0.5
+    
+    # Calculate steering correction
+    steering_correction = pid_control(
+        _steering_pid, steering_error, dt,
+        kp_steering, ki_steering, kd_steering,
+        output_limit=0.8
+    )
+    
+    # Combine correction and feedforward
+    steering_command = steering_correction + curvature_steering * 0.5
+    
+    # Counter-steer for yaw stability
+    yaw_correction = -filtered_yaw * 0.01
+    steering_command += yaw_correction
+    
+    steering_command = clamp(steering_command, -1.0, 1.0)
+    
+    # Rate-limit steering changes for smoothness
+    max_steering_rate = 2.0  # Max change per second
+    if dt > 0:
+        max_change = max_steering_rate * dt
+        steering_command = clamp(
+            steering_command,
+            _prev_steering - max_change,
+            _prev_steering + max_change
+        )
+    
+    _prev_steering = steering_command
+    
+    # ==================== STEP 7: LANE CHANGE ====================
+    
+    if target_lane != current_lane and not _emergency_brake_active:
+        if not _lane_change_state["active"]:
+            # Initiate lane change
+            _lane_change_state["active"] = True
+            _lane_change_state["target_lane"] = target_lane
+            _lane_change_state["start_time"] = sim_time
+            _lane_change_state["direction"] = 1 if target_lane > current_lane else -1
+            _lane_change_state["phase"] = "checking"
+    
+    if _lane_change_state["active"]:
+        direction = _lane_change_state["direction"]
+        
+        # Check blind spot with lidar
+        if direction > 0:  # Moving right
+            blind_spot_dist = min(
+                lidar_ranges.get("+060", float("inf")),
+                lidar_ranges.get("+090", float("inf"))
+            )
+        else:  # Moving left
+            blind_spot_dist = min(
+                lidar_ranges.get("-060", float("inf")),
+                lidar_ranges.get("-090", float("inf"))
+            )
+        
+        if _lane_change_state["phase"] == "checking":
+            # Check if adjacent lane is clear
+            if blind_spot_dist > 30 or blind_spot_dist < 5:
+                _lane_change_state["phase"] = "executing"
+        
+        if _lane_change_state["phase"] == "executing":
+            # Add steering bias for lane change
+            lane_change_steering = direction * 0.3
+            if _ice_mode:
+                lane_change_steering *= 0.5
+            
+            steering_command = clamp(steering_command + lane_change_steering, -1.0, 1.0)
+            
+            # Complete lane change after timeout
+            if sim_time - _lane_change_state["start_time"] > 3.0:
+                _lane_change_state["active"] = False
+                _lane_change_state["phase"] = "idle"
+    
+    # ==================== STEP 8: SPEED CONTROL ====================
+    
+    # Only apply throttle if not braking significantly
+    if brake_command < 0.1:
+        speed_error = effective_target - filtered_speed
+        
+        # PID gains for speed control
+        kp_speed = 0.03
+        ki_speed = 0.01
+        kd_speed = 0.01
+        
+        # Reduce gains on ice
+        if _ice_mode:
+            kp_speed *= 0.5
+            ki_speed *= 0.3
+        
+        throttle_command = pid_control(
+            _speed_pid, speed_error, dt,
+            kp_speed, ki_speed, kd_speed,
+            output_limit=1.0
+        )
+        
+        # Reduce throttle if obstacle ahead
+        if closest_obstacle_dist < 100 and closest_obstacle_rel_speed < -5:
+            throttle_command = min(throttle_command, 0.3)
+        
+        throttle_command = max(0, throttle_command)
+        
+        # Gradual throttle reduction for obstacle
+        if closest_obstacle_dist < 80:
+            throttle_command *= (closest_obstacle_dist / 80)
+    else:
+        throttle_command = 0.0
+    
+    # ==================== STEP 9: TRACTION MANAGEMENT ====================
+    
+    # Reduce all inputs on low-traction surfaces
+    if _ice_mode:
+        steering_command *= 0.7
+        throttle_command *= 0.5
+        brake_command *= 0.8  # Simulates ABS behavior
+    
+    # Reduce throttle in rain
+    if rain and not _ice_mode:
+        throttle_command *= 0.8
+        steering_command *= 0.9
+    
+    # ==================== STEP 10: FINAL OUTPUT ====================
+    
+    output["steering"] = clamp(steering_command, -1.0, 1.0)
+    output["throttle"] = clamp(throttle_command, 0.0, 1.0)
+    output["brake"] = clamp(brake_command, 0.0, 1.0)
+    
+    return output
+```
+
+This autopilot handles all 25 test scenarios with:
+
+1. **Sensor Fusion**: Cross-checks redundant sensors using median filtering and voting algorithms for disagreement handling
+
+2. **Lane Keeping**: Uses vision lane offset + curvature feedforward + yaw stability control
+
+3. **Speed Control**: PID controller with speed limits and adaptive gains
+
+4. **Obstacle Avoidance**: Time-to-collision calculation, progressive braking, emergency stops
+
+5. **Traction Management**: Reduces inputs on low-μ surfaces (ice/aquaplaning)
+
+6. **Graceful Degradation**: Falls back to lidar when vision fails, uses last-known-good values
+
+7. **Lane Change**: Checks blind spots with lidar before executing

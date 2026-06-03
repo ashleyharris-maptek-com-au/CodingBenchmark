@@ -358,10 +358,12 @@ class GradeCache:
   @staticmethod
   def _acquire_lock(lock_path: Path,
                     poll_interval: float = 0.1,
-                    stale_seconds: float = 12 * 60 * 60,
+                    stale_seconds: Optional[float] = None,
                     malformed_stale_seconds: float = 60,
                     reclaim_grace_seconds: float = 30):
     lock_path.parent.mkdir(parents=True, exist_ok=True)
+    if stale_seconds is None:
+      stale_seconds = float(os.environ.get("CODINGBENCHMARK_GRADE_LOCK_STALE_SECONDS", "1800"))
     reclaimable_since = None
     last_reclaim_error = None
 
