@@ -36,9 +36,10 @@ title = "Can your write a chess bot? (C++)"
 
 tags = [
   "cpp",
-  "freeform response",
   "game ai",
-  "algorithm design",
+  "game tree search",
+  "heuristic search",
+  "time management",
 ]
 
 # ---------------------------------------------------------------------------

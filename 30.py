@@ -30,9 +30,10 @@ title = "3-SAT Solver (Python)"
 
 tags = [
   "python",
-  "freeform response",
-  "np hard",
-  "constraint satisfaction",
+  "np-hard",
+  "constraint solving",
+  "boolean logic",
+  "backtracking",
 ]
 TIMEOUT_SECONDS = 300
 RANDOM_SEED = 30303030

@@ -43,9 +43,11 @@ title = "2D Fluid Simulation - Lattice Boltzmann (SPIR-V ASM Compute)"
 
 tags = [
   "spirv",
-  "freeform response",
   "gpu compute",
-  "simulation",
+  "fluid simulation",
+  "parallel algorithms",
+  "assembly",
+  "numerical methods",
 ]
 
 RANDOM_SEED = 48484848

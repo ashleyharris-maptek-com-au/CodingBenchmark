@@ -19,10 +19,11 @@ title = "Hamiltonian Path on Grid with Obstacles (Rust)"
 
 tags = [
   "rust",
-  "freeform response",
-  "np hard",
-  "graph theory",
-  "algorithm design",
+  "np-hard",
+  "grid problems",
+  "pathfinding",
+  "backtracking",
+  "constraint solving",
 ]
 
 # Seed for reproducibility

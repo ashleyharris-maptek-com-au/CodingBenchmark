@@ -26,9 +26,10 @@ title = "1D Cutting Stock - Minimum Waste (C#)"
 
 tags = [
   "csharp",
-  "freeform response",
-  "optimization",
-  "packing",
+  "np-hard",
+  "combinatorial optimization",
+  "cutting stock",
+  "bin packing",
 ]
 
 TIMEOUT_SECONDS = 300

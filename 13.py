@@ -22,9 +22,9 @@ title = "Longest Common Substring (C++)"
 
 tags = [
   "cpp",
-  "freeform response",
   "string algorithms",
-  "algorithm design",
+  "exact algorithms",
+  "large-scale input",
 ]
 
 # Timeout in seconds (0.5 minutes)

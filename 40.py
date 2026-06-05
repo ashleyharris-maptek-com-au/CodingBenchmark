@@ -19,9 +19,11 @@ title = "Integer Linear Programming (C++)"
 
 tags = [
   "cpp",
-  "freeform response",
-  "np hard",
-  "optimization",
+  "np-hard",
+  "integer problems",
+  "branch and bound",
+  "linear constraints",
+  "combinatorial optimization",
 ]
 TIMEOUT_SECONDS = 30
 RANDOM_SEED = 40404040

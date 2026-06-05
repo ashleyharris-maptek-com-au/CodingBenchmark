@@ -18,9 +18,10 @@ title = "Exact Cover (Python)"
 
 tags = [
   "python",
-  "freeform response",
-  "np hard",
-  "constraint satisfaction",
+  "np-hard",
+  "constraint solving",
+  "exact cover",
+  "backtracking",
 ]
 TIMEOUT_SECONDS = 30
 RANDOM_SEED = 38383838

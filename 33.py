@@ -22,9 +22,10 @@ title = "Quadratic Assignment Problem (C#)"
 
 tags = [
   "csharp",
-  "freeform response",
-  "np hard",
-  "optimization",
+  "np-hard",
+  "combinatorial optimization",
+  "local search",
+  "heuristics",
 ]
 TIMEOUT_SECONDS = 30
 RANDOM_SEED = 33333333

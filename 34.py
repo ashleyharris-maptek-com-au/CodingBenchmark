@@ -21,9 +21,11 @@ title = "Vehicle Routing Problem (Python)"
 
 tags = [
   "python",
-  "freeform response",
-  "np hard",
-  "optimization",
+  "np-hard",
+  "vehicle routing",
+  "route planning",
+  "capacity constraints",
+  "heuristics",
 ]
 TIMEOUT_SECONDS = 30
 RANDOM_SEED = 34343434

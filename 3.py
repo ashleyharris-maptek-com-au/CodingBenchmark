@@ -11,9 +11,10 @@ title = "Graph Layout - Edge Crossing Minimization (Rust)"
 
 tags = [
   "rust",
-  "freeform response",
-  "graph theory",
-  "optimization",
+  "graph algorithms",
+  "combinatorial optimization",
+  "heuristic search",
+  "visualization",
 ]
 
 # Seed for reproducible graph generation

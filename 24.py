@@ -28,9 +28,10 @@ title = "3D Lunar Lander Game (C++)"
 
 tags = [
   "cpp",
-  "freeform response",
-  "game ai",
-  "simulation",
+  "control systems",
+  "physics simulation",
+  "3d geometry",
+  "real-time decisions",
 ]
 
 # Timeout in seconds

@@ -21,9 +21,10 @@ title = "Asteroid Interception (C#)"
 
 tags = [
   "csharp",
-  "freeform response",
-  "simulation",
-  "algorithm design",
+  "orbital mechanics",
+  "trajectory optimization",
+  "physics simulation",
+  "numerical methods",
 ]
 
 # Timeout in seconds (5 minutes)

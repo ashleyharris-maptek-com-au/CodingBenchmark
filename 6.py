@@ -27,9 +27,10 @@ title = "Orbital TSP - Space Station Route Planning (C#)"
 
 tags = [
   "csharp",
-  "freeform response",
-  "np hard",
-  "optimization",
+  "np-hard",
+  "route planning",
+  "orbital mechanics",
+  "physics simulation",
 ]
 
 # Timeout in seconds (5 minutes)

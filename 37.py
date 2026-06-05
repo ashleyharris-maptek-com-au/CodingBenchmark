@@ -21,9 +21,10 @@ title = "Feedback Vertex Set (C#)"
 
 tags = [
   "csharp",
-  "freeform response",
-  "np hard",
-  "graph theory",
+  "np-hard",
+  "graph algorithms",
+  "directed graphs",
+  "constraint solving",
 ]
 TIMEOUT_SECONDS = 30
 RANDOM_SEED = 37373737

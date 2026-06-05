@@ -55,9 +55,11 @@ title = "Geometry Shaders (SPIR-V Assembly)"
 
 tags = [
   "spirv",
-  "freeform response",
-  "shader",
-  "gpu",
+  "gpu shaders",
+  "geometry shader",
+  "vulkan",
+  "assembly",
+  "visual synthesis",
 ]
 
 TIMEOUT_SECONDS = 60

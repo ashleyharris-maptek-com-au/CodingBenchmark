@@ -23,10 +23,11 @@ title = "3D Bin Packing - Polyhedra in Box (C#)"
 
 tags = [
   "csharp",
-  "freeform response",
-  "optimization",
+  "np-hard",
+  "computational geometry",
+  "3d geometry",
   "packing",
-  "geometry",
+  "collision detection",
 ]
 
 # Timeout in seconds (5 minutes)

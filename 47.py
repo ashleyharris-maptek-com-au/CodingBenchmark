@@ -36,9 +36,10 @@ title = "Hash Mining / Proof of Work (WGSL Compute)"
 
 tags = [
   "wgsl",
-  "freeform response",
   "gpu compute",
-  "algorithm design",
+  "parallel algorithms",
+  "parallel search",
+  "hashing",
 ]
 
 RANDOM_SEED = 47474747

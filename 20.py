@@ -46,8 +46,10 @@ title = "Drillhole Data Validation (Rust)"
 
 tags = [
   "rust",
-  "freeform response",
-  "algorithm design",
+  "data analysis",
+  "data validation",
+  "spatial data",
+  "robustness",
 ]
 
 # Timeout in seconds (5 minutes)

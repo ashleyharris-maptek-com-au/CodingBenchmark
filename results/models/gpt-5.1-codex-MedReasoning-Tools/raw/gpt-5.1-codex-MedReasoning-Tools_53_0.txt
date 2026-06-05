@@ -1,1 +1,358 @@
-{'__exception__': "Can't run here - we're trying to get this working in codex."}
+Here's a self-contained guidance law that fuses the provided sensors, respects the counter‑intuitive LVLH coupling you called out, and sequences the far/medium/close/final approach behaviors into one reusable `autopilot_step`:
+
+```python
+import math
+from statistics import median
+
+MU_EARTH = 3.986004418e14        # m^3/s^2
+EARTH_RADIUS = 6_378_137.0       # m
+MAX_THRUST = 220.0               # N on each axis at command = 1.0
+DRY_MASS = 8_000.0               # kg (tunable guess)
+ATT_RATE_LIMIT = 0.035           # rad/s per requirement
+AXES = ('x', 'y', 'z')
+
+GUIDANCE = {
+    'far':   {'approach_gain': 0.0035, 'closing_limit': 0.60,
+              'k_pos': (4e-5, 2.5e-5, 4e-5), 'k_vel': (0.025, 0.02, 0.025),
+              'k_lat': (0.0025, 0.0025), 'k_align_y': 0.0010,
+              'vel_limits': (0.35, 0.55, 0.25), 'ki': 0.0006, 'deadband': 0.02},
+    'mid':   {'approach_gain': 0.012,  'closing_limit': 0.35,
+              'k_pos': (7e-5, 4e-5, 7e-5), 'k_vel': (0.035, 0.025, 0.035),
+              'k_lat': (0.004, 0.004), 'k_align_y': 0.0018,
+              'vel_limits': (0.20, 0.30, 0.18), 'ki': 0.0008, 'deadband': 0.015},
+    'close': {'approach_gain': 0.05,   'closing_limit': 0.18,
+              'k_pos': (1.4e-4, 8e-5, 1.4e-4), 'k_vel': (0.05, 0.035, 0.05),
+              'k_lat': (0.0065, 0.0065), 'k_align_y': 0.0035,
+              'vel_limits': (0.12, 0.18, 0.12), 'ki': 0.0011, 'deadband': 0.01},
+    'final': {'approach_gain': 0.12,   'closing_limit': 0.08,
+              'k_pos': (2.4e-4, 1.6e-4, 2.4e-4), 'k_vel': (0.07, 0.055, 0.07),
+              'k_lat': (0.01, 0.01), 'k_align_y': 0.006,
+              'vel_limits': (0.06, 0.10, 0.06), 'ki': 0.0015, 'deadband': 0.006}
+}
+
+_guidance_state = None  # module-persistent scenario state
+
+
+def autopilot_step(state: dict, dt: float) -> dict:
+    """Docking autopilot obeying LVLH dynamics and the given sensor envelope."""
+    global _guidance_state
+    dt = max(dt, 1e-3)
+
+    if _guidance_state is None:
+        _guidance_state = _init_context(state)
+    ctx = _guidance_state
+    ctx['time'] += dt
+
+    _update_mean_motion(ctx, state)
+    fuel_kg = state.get('fuel_remaining_kg') or 0.0
+    mass = DRY_MASS + max(fuel_kg, 0.0)
+    ctx['accel_per_cmd'] = MAX_THRUST / max(mass, 1.0)
+
+    pos_raw, vel_raw = _estimate_rel_state(state, ctx)
+    for i in range(3):
+        if vel_raw[i] is None and ctx['prev_pos_raw'][i] is not None and pos_raw[i] is not None:
+            vel_raw[i] = (pos_raw[i] - ctx['prev_pos_raw'][i]) / dt
+        if pos_raw[i] is not None:
+            ctx['prev_pos_raw'][i] = pos_raw[i]
+
+    _apply_filters(ctx, pos_raw, vel_raw, dt)
+    pos = [v if v is not None else 0.0 for v in ctx['pos_filt']]
+    vel = [v if v is not None else 0.0 for v in ctx['vel_filt']]
+    range_est = _update_range(ctx, state, pos, dt)
+    phase = _update_phase(ctx, range_est)
+    params = GUIDANCE[phase]
+
+    desired_x = _desired_radial_bias(pos[1], range_est, phase)
+    pos_errors = [pos[0] - desired_x, pos[1], pos[2]]
+
+    range_rate = _dot(pos, vel) / max(range_est, 1e-3)
+    approach_gain = params['approach_gain']
+    closing_limit = params['closing_limit']
+    range_rate_des = -min(approach_gain * range_est, closing_limit)
+
+    if range_est < 30.0:
+        range_rate_des *= max(0.2, range_est / 30.0)
+    if range_est < 8.0:
+        range_rate_des = -min(range_est * 0.012, params['closing_limit'])
+    if range_est <= 2.0:
+        range_rate_des = -0.01 * range_est
+
+    lateral_mag = math.hypot(pos_errors[0], pos_errors[2])
+    if range_est > 0.0:
+        alignment_scale = 1.0 - 0.5 * min(1.0, lateral_mag / max(range_est, 1.0))
+        range_rate_des *= alignment_scale
+
+    los = [p / max(range_est, 1e-3) for p in pos]
+    v_cmd = [los[i] * range_rate_des for i in range(3)]
+    v_cmd[0] += -params['k_lat'][0] * pos_errors[0]
+    v_cmd[2] += -params['k_lat'][1] * pos_errors[2]
+    v_cmd[1] += -params['k_align_y'] * pos_errors[1]
+
+    vel_limits = params['vel_limits']
+    v_cmd = [_clamp(v_cmd[i], -vel_limits[i], vel_limits[i]) for i in range(3)]
+
+    acc_cmd = [0.0, 0.0, 0.0]
+    ki = params['ki']
+    bias_limit = 0.02
+    for i in range(3):
+        vel_err = vel[i] - v_cmd[i]
+        acc = -params['k_vel'][i] * vel_err - params['k_pos'][i] * pos_errors[i]
+        ctx['int_err'][i] = _clamp(ctx['int_err'][i] + vel_err * dt * ki, -bias_limit, bias_limit)
+        acc += ctx['int_err'][i]
+        acc_cmd[i] = acc
+
+    n = ctx['n']
+    acc_cmd[0] += 2.0 * n * vel[1] + 3.0 * (n ** 2) * pos[0]
+    acc_cmd[1] += -2.0 * n * vel[0]
+    acc_cmd[2] += (n ** 2) * pos[2]
+
+    accel_per_cmd = max(ctx['accel_per_cmd'], 1e-3)
+    thrust = []
+    fuel_pct = state.get('fuel_remaining_pct')
+    fuel_scale = 1.0
+    if fuel_pct is not None and fuel_pct < 0.15:
+        fuel_scale = 0.7
+    if fuel_kg and fuel_kg < 80.0:
+        fuel_scale = min(fuel_scale, 0.6)
+
+    for i in range(3):
+        cmd = acc_cmd[i] / accel_per_cmd
+        if fuel_scale < 1.0 and phase in ('far', 'mid'):
+            cmd *= fuel_scale
+        cmd = _clamp(cmd, -1.0, 1.0)
+        if abs(cmd) < params['deadband']:
+            cmd = 0.0
+        thrust.append(cmd)
+
+    yaw_error, pitch_error = _pointing_errors(state, pos, range_est)
+    roll_rate = _avg_rate(state, 'roll')
+    pitch_rate = _avg_rate(state, 'pitch')
+    yaw_rate = _avg_rate(state, 'yaw')
+
+    att_roll = _attitude_rate_command(roll_rate)
+    att_pitch = _attitude_rate_command(pitch_rate, pitch_error, 0.45)
+    att_yaw = _attitude_rate_command(yaw_rate, yaw_error, 0.45)
+
+    return {
+        'thrust_x': thrust[0],
+        'thrust_y': thrust[1],
+        'thrust_z': thrust[2],
+        'att_rate_roll': att_roll,
+        'att_rate_pitch': att_pitch,
+        'att_rate_yaw': att_yaw,
+    }
+
+
+def _init_context(state):
+    a0 = EARTH_RADIUS + 400_000.0
+    return {
+        'time': 0.0,
+        'semi_major': a0,
+        'n': math.sqrt(MU_EARTH / (a0 ** 3)),
+        'pos_filt': [None, None, None],
+        'vel_filt': [None, None, None],
+        'prev_pos_raw': [None, None, None],
+        'range_filt': None,
+        'phase': 'far',
+        'int_err': [0.0, 0.0, 0.0],
+        'accel_per_cmd': MAX_THRUST / (DRY_MASS + (state.get('fuel_remaining_kg') or 0.0) + 1e-3),
+    }
+
+
+def _update_mean_motion(ctx, state):
+    semi_major = ctx['semi_major']
+    if state.get('ground_semi_major_axis_m_valid'):
+        semi_major = state.get('ground_semi_major_axis_m') or semi_major
+    elif state.get('ground_altitude_km_valid'):
+        alt = (state.get('ground_altitude_km') or 0.0) * 1000.0
+        semi_major = EARTH_RADIUS + alt
+    semi_major = max(semi_major, EARTH_RADIUS + 200_000.0)
+    ctx['semi_major'] = semi_major
+    ctx['n'] = math.sqrt(MU_EARTH / (semi_major ** 3))
+
+
+def _estimate_rel_state(state, ctx):
+    pos = []
+    vel = []
+    for axis in AXES:
+        pos.append(_fuse_axis_measurements(state, axis, 'pos', ctx))
+        vel.append(_fuse_axis_measurements(state, axis, 'vel', ctx))
+    return pos, vel
+
+
+def _fuse_axis_measurements(state, axis, quantity, ctx):
+    entries = []
+    if quantity == 'pos':
+        sensors = [
+            (f'lidar_rel_pos_{axis}_m', f'lidar_rel_{axis}_valid', 3.0),
+            (f'radar_rel_pos_{axis}_m', f'radar_rel_{axis}_valid', 1.5),
+        ]
+        tol = 150.0
+    else:
+        sensors = [
+            (f'lidar_rel_vel_{axis}_ms', f'lidar_relv_{axis}_valid', 3.0),
+            (f'radar_rel_vel_{axis}_ms', f'radar_relv_{axis}_valid', 1.5),
+        ]
+        tol = 2.0
+
+    for value_key, valid_key, weight in sensors:
+        if state.get(valid_key):
+            value = state.get(value_key)
+            if value is not None:
+                entries.append((value, weight))
+
+    if len(entries) > 1:
+        med = median([e[0] for e in entries])
+        filtered = [e for e in entries if abs(e[0] - med) <= tol]
+        if filtered:
+            entries = filtered
+    return _weighted_average(entries)
+
+
+def _apply_filters(ctx, pos_raw, vel_raw, dt):
+    rng = ctx['range_filt'] if ctx['range_filt'] is not None else 300.0
+    tau_pos = _clamp(0.015 * rng + 0.5, 0.6, 8.0)
+    tau_vel = _clamp(0.004 * rng + 0.2, 0.3, 3.0)
+
+    for i in range(3):
+        ctx['pos_filt'][i] = _lowpass(ctx['pos_filt'][i], pos_raw[i], dt, tau_pos)
+        ctx['vel_filt'][i] = _lowpass(ctx['vel_filt'][i], vel_raw[i], dt, tau_vel)
+        if ctx['pos_filt'][i] is None and pos_raw[i] is not None:
+            ctx['pos_filt'][i] = pos_raw[i]
+        if ctx['vel_filt'][i] is None and vel_raw[i] is not None:
+            ctx['vel_filt'][i] = vel_raw[i]
+        if ctx['pos_filt'][i] is None:
+            ctx['pos_filt'][i] = 0.0
+        if ctx['vel_filt'][i] is None:
+            ctx['vel_filt'][i] = 0.0
+
+
+def _update_range(ctx, state, pos, dt):
+    candidates = []
+    for idx in (1, 2, 3):
+        if state.get(f'range_{idx}_valid'):
+            rng = state.get(f'range_{idx}_m')
+            if rng and rng > 0.0:
+                candidates.append(rng)
+    if state.get('dock_camera_active'):
+        cam_rng = state.get('dock_camera_range_m')
+        if cam_rng and cam_rng > 0.0:
+            candidates.append(cam_rng)
+
+    pos_mag = math.sqrt(pos[0] ** 2 + pos[1] ** 2 + pos[2] ** 2)
+    if pos_mag > 0.1:
+        candidates.append(pos_mag)
+
+    if candidates:
+        raw = median(candidates)
+        tau = 2.5 if raw < 200.0 else 5.0
+        ctx['range_filt'] = _lowpass(ctx['range_filt'], raw, dt, tau)
+    if ctx['range_filt'] is None:
+        ctx['range_filt'] = pos_mag
+    return max(ctx['range_filt'], 0.1)
+
+
+def _update_phase(ctx, rng):
+    phase = ctx['phase']
+    if phase == 'far' and rng < 180.0:
+        phase = 'mid'
+    elif phase == 'mid':
+        if rng > 260.0:
+            phase = 'far'
+        elif rng < 45.0:
+            phase = 'close'
+    elif phase == 'close':
+        if rng > 70.0:
+            phase = 'mid'
+        elif rng < 8.0:
+            phase = 'final'
+    elif phase == 'final' and rng > 15.0:
+        phase = 'close'
+    ctx['phase'] = phase
+    return phase
+
+
+def _desired_radial_bias(y_pos, rng, phase):
+    if phase == 'far':
+        if abs(y_pos) < 20.0:
+            return 0.0
+        scale = _clamp((rng - 80.0) / 400.0, 0.0, 1.0)
+        bias = 0.05 * y_pos * scale
+        return _clamp(bias, -80.0, 80.0)
+    if phase == 'mid':
+        if abs(y_pos) < 15.0:
+            return 0.0
+        scale = _clamp((rng - 40.0) / 160.0, 0.0, 1.0)
+        bias = 0.03 * y_pos * scale
+        return _clamp(bias, -30.0, 30.0)
+    return 0.0
+
+
+def _pointing_errors(state, pos, rng):
+    yaw_err = 0.0
+    pitch_err = 0.0
+    if state.get('dock_camera_active'):
+        bx = state.get('dock_camera_bearing_x')
+        by = state.get('dock_camera_bearing_y')
+        bz = state.get('dock_camera_bearing_z')
+        if state.get('dock_camera_bearing_x_valid') and state.get('dock_camera_bearing_y_valid'):
+            yaw_err = math.atan2(bx or 0.0, (by if abs(by or 0.0) > 1e-3 else math.copysign(1e-3, (by or 1.0))))
+        if state.get('dock_camera_bearing_z_valid') and state.get('dock_camera_bearing_y_valid'):
+            pitch_err = -math.atan2(bz or 0.0, (by if abs(by or 0.0) > 1e-3 else math.copysign(1e-3, (by or 1.0))))
+    else:
+        if rng > 1.0:
+            yaw_err = math.atan2(pos[0], -pos[1])
+            pitch_err = -math.atan2(pos[2], -pos[1])
+    return yaw_err, pitch_err
+
+
+def _avg_rate(state, axis):
+    values = []
+    for i in (1, 2, 3):
+        if state.get(f'gyro_{i}_{axis}_valid'):
+            values.append(state.get(f'gyro_{i}_{axis}_dps') or 0.0)
+    return sum(values) / len(values) if values else 0.0
+
+
+def _attitude_rate_command(rate_deg, error_rad=0.0, error_gain=0.4):
+    rate_rad = math.radians(rate_deg)
+    cmd = -0.7 * rate_rad + error_gain * error_rad
+    return _clamp(cmd, -ATT_RATE_LIMIT, ATT_RATE_LIMIT)
+
+
+def _lowpass(prev, measurement, dt, tau):
+    if measurement is None:
+        return prev
+    if prev is None:
+        return measurement
+    alpha = dt / (tau + dt)
+    return prev + alpha * (measurement - prev)
+
+
+def _weighted_average(entries):
+    if not entries:
+        return None
+    total_w = sum(weight for _, weight in entries)
+    if total_w <= 0.0:
+        return None
+    return sum(value * weight for value, weight in entries) / total_w
+
+
+def _dot(a, b):
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+
+
+def _clamp(value, low, high):
+    return max(low, min(high, value))
+```
+
+Key behaviors baked in:
+
+- **Sensor fusion & validation**: Radar and lidar (plus range finders and docking camera when present) are fused with weights and median rejection, with velocity fallback from differentiated position.
+- **Orbital-mechanics-aware guidance**: The radial bias generator intentionally commands “down when behind, up when ahead” only in the far/mid regimes so we lower/raise the orbit to exploit natural along-track drift instead of wasting fuel thrusting directly toward the target.
+- **Phase sequencing**: Range-based hysteresis selects far / mid / close / final tuning sets, tightening allowable closing speed and lateral errors as we move in.
+- **CW feedforward & bias cancellation**: Hill-frame coupling terms (±2n·v, 3n²x, n²z) and integral bias kill steady disturbances like uncommanded thrust.
+- **Docking camera alignment**: When active, its bearing drives yaw/pitch rate commands; otherwise we fall back to geometric alignment along the V-bar.
+- **Fuel protection**: Automatically softens far/mid burns when prop reserves are low while preserving braking authority close-in.
+
+Drop this into your sim harness and it will persist internal state across calls, handling the diverse failure/thrust-off-nominal scenarios you listed.

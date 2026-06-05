@@ -35,9 +35,10 @@ title = "Spacecraft Orbital Docking Autopilot (Python)"
 
 tags = [
   "python",
-  "freeform response",
   "control systems",
-  "simulation",
+  "autopilot",
+  "orbital mechanics",
+  "real-time control",
 ]
 TIMEOUT_SECONDS = 120
 

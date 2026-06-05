@@ -43,9 +43,10 @@ title = "Aircraft Autoland (Python)"
 
 tags = [
   "python",
-  "freeform response",
   "control systems",
-  "simulation",
+  "autopilot",
+  "flight simulation",
+  "real-time control",
 ]
 TIMEOUT_SECONDS = 120
 

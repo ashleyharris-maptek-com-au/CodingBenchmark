@@ -25,9 +25,11 @@ title = "Self-Driving Car Highway Autopilot (Python)"
 
 tags = [
   "python",
-  "freeform response",
   "control systems",
-  "simulation",
+  "autopilot",
+  "sensor fusion",
+  "motion planning",
+  "real-time control",
 ]
 TIMEOUT_SECONDS = 90
 

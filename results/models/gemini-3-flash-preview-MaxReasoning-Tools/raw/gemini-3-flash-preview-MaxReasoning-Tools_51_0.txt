@@ -1,1 +1,180 @@
-{'__exception__': "'utf-8' codec can't decode byte 0xff in position 0: invalid start byte"}
+import math
+
+# --- Persistent State ---
+class PID:
+    def __init__(self, kp, ki, kd, out_min=-1.0, out_max=1.0, i_limit=1.0):
+        self.kp = kp
+        self.ki = ki
+        self.kd = kd
+        self.out_min = out_min
+        self.out_max = out_max
+        self.i_limit = i_limit
+        self.integral = 0.0
+        self.last_error = 0.0
+
+    def update(self, error, dt):
+        if dt <= 0:
+            return 0.0
+        self.integral += error * dt
+        # Anti-windup
+        self.integral = max(min(self.integral, self.i_limit), -self.i_limit)
+        
+        derivative = (error - self.last_error) / dt
+        self.last_error = error
+        
+        output = (self.kp * error) + (self.ki * self.integral) + (self.kd * derivative)
+        return max(min(output, self.out_max), self.out_min)
+
+    def reset(self):
+        self.integral = 0.0
+        self.last_error = 0.0
+
+# Controllers
+# Pitch: Target Alt -> VS -> Pitch -> Elevator
+vs_pid = PID(0.01, 0.001, 0.0, out_min=-2500, out_max=2500) # Target VS from Alt error
+pitch_pid = PID(0.05, 0.005, 0.01, out_min=-15, out_max=20) # Target Pitch from VS error
+elevator_pid = PID(0.1, 0.02, 0.05, out_min=-1.0, out_max=1.0) # Elevator from Pitch error
+
+# Roll: Target Hdg -> Bank -> Aileron
+bank_pid = PID(1.5, 0.0, 0.0, out_min=-30, out_max=30) # Target Bank from Hdg error
+aileron_pid = PID(0.05, 0.01, 0.02, out_min=-1.0, out_max=1.0) # Aileron from Bank error
+
+# Throttle: Target IAS -> Throttle
+throttle_pid = PID(0.05, 0.005, 0.01, out_min=0.0, out_max=1.0, i_limit=10.0)
+
+# Yaw Damper
+rudder_pid = PID(0.1, 0.0, 0.05, out_min=-0.5, out_max=0.5)
+
+# --- Helper Functions ---
+
+def get_median(v1, v2, v3):
+    return sorted([v1, v2, v3])[1]
+
+def normalize_angle(angle):
+    """Normalize angle to [-180, 180]."""
+    while angle > 180: angle -= 360
+    while angle < -180: angle += 360
+    return angle
+
+def autopilot_step(state: dict, dt: float) -> dict:
+    # 1. Sensor Fusion & Integrity Check
+    def get_voted_val(prefix, key_suffix, state):
+        v1 = state.get(f"{prefix}_1_{key_suffix}", state.get(f"{prefix}_1", 0))
+        v2 = state.get(f"{prefix}_2_{key_suffix}", state.get(f"{prefix}_2", 0))
+        v3 = state.get(f"{prefix}_3_{key_suffix}", state.get(f"{prefix}_3", 0))
+        return get_median(v1, v2, v3)
+
+    # Altitude Fusion
+    alt_baro = get_voted_val("baro_alt", "ft", state)
+    alt_radar = get_voted_val("radar_alt", "ft", state)
+    current_alt = alt_radar if (alt_radar < 2500 and state.get('radar_alt_1_valid', True)) else alt_baro
+    
+    # Airspeed cross-check (Pitot protection)
+    ias_1 = state.get('ias_1_kt', 0)
+    ias_2 = state.get('ias_2_kt', 0)
+    ias_3 = state.get('ias_3_kt', 0)
+    gs = state.get('ground_speed_kt', 0)
+    
+    ias = get_median(ias_1, ias_2, ias_3)
+    if max(abs(ias_1-ias_2), abs(ias_2-ias_3), abs(ias_1-ias_3)) > 50:
+        if abs(ias - gs) > 100:
+            ias = gs # Fallback to Ground Speed if Pitots disagree wildly
+            
+    mach = get_voted_val("mach", "", state)
+    aoa = get_voted_val("aoa", "deg", state)
+    
+    # IRS data
+    pitch = get_median(state.get('irs_1_pitch_deg', 0), state.get('irs_2_pitch_deg', 0), state.get('irs_3_pitch_deg', 0))
+    roll = get_median(state.get('irs_1_roll_deg', 0), state.get('irs_2_roll_deg', 0), state.get('irs_3_roll_deg', 0))
+    heading = get_median(state.get('irs_1_heading_deg', 0), state.get('irs_2_heading_deg', 0), state.get('irs_3_heading_deg', 0))
+    vs = get_median(state.get('irs_1_vs_fpm', 0), state.get('irs_2_vs_fpm', 0), state.get('irs_3_vs_fpm', 0))
+    yaw_rate = get_median(state.get('gyro_1_yaw_rate_dps', 0), state.get('gyro_2_yaw_rate_dps', 0), state.get('gyro_3_yaw_rate_dps', 0))
+
+    # Engine Status
+    eng1_running = state.get('engine_1_running', True)
+    eng2_running = state.get('engine_2_running', True)
+    n1_1 = state.get('engine_1_n1_pct', 0)
+    n1_2 = state.get('engine_2_n1_pct', 0)
+
+    # Targets
+    target_alt = state.get('target_alt_ft', current_alt)
+    target_hdg = state.get('target_hdg_deg', heading)
+    target_ias = state.get('target_ias_kt', ias)
+    target_vs = state.get('target_vs_fpm', 0)
+    
+    ap_engaged = state.get('ap_engaged', False)
+    at_engaged = state.get('at_engaged', False)
+
+    controls = {}
+
+    # 2. Auto-throttle
+    if at_engaged:
+        ias_error = target_ias - ias
+        thr_out = throttle_pid.update(ias_error, dt)
+        
+        # Overspeed protection
+        if ias > 355 or mach > 0.82:
+            thr_out = 0.1 
+        
+        # Alpha-floor (Stall protection thrust)
+        if aoa > 10:
+            thr_out = 1.0
+            
+        controls['throttle_1'] = thr_out if eng1_running else 0.0
+        controls['throttle_2'] = thr_out if eng2_running else 0.0
+    else:
+        throttle_pid.reset()
+
+    # 3. Lateral Control (Heading Hold)
+    if ap_engaged:
+        hdg_error = normalize_angle(target_hdg - heading)
+        target_bank = bank_pid.update(hdg_error, dt)
+        
+        bank_error = target_bank - roll
+        aileron_out = aileron_pid.update(bank_error, dt)
+        controls['aileron'] = aileron_out
+        
+        # Yaw Damper / Turn Coordination / Engine-out Compensation
+        rudder_out = -rudder_pid.update(yaw_rate, dt)
+        thrust_diff = n1_1 - n1_2
+        rudder_out += thrust_diff * 0.005 
+        rudder_out += roll * 0.01
+        
+        controls['rudder'] = max(min(rudder_out, 1.0), -1.0)
+    else:
+        bank_pid.reset()
+        aileron_pid.reset()
+        rudder_pid.reset()
+
+    # 4. Vertical Control (Altitude / VS Hold)
+    if ap_engaged:
+        if abs(target_vs) > 100:
+            cmd_vs = target_vs
+        else:
+            alt_error = target_alt - current_alt
+            cmd_vs = vs_pid.update(alt_error, dt)
+        
+        vs_error = cmd_vs - vs
+        target_pitch = pitch_pid.update(vs_error, dt)
+        
+        # Stall protection (Alpha-prot)
+        if aoa > 10:
+            target_pitch = -2.0 
+        if aoa > 14:
+            target_pitch = -10.0
+        
+        pitch_error = target_pitch - pitch
+        elevator_out = elevator_pid.update(pitch_error, dt)
+        controls['elevator'] = elevator_out
+        
+        # 5. Auto-trim
+        current_trim = state.get('elevator_trim_deg', 0)
+        if abs(elevator_out) > 0.02:
+            trim_adj = elevator_out * 0.05 * dt
+            controls['elevator_trim'] = current_trim + trim_adj
+    else:
+        vs_pid.reset()
+        pitch_pid.reset()
+        elevator_pid.reset()
+
+    return controls

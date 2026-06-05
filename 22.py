@@ -16,9 +16,10 @@ title = "Tetris Game (C#)"
 
 tags = [
   "csharp",
-  "freeform response",
   "game ai",
-  "algorithm design",
+  "heuristic search",
+  "grid problems",
+  "real-time decisions",
 ]
 
 # Timeout in seconds (5 minutes)

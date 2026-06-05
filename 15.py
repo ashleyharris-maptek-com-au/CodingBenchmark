@@ -33,9 +33,10 @@ title = "Tetrahedron Shadow Covering (Rust)"
 
 tags = [
   "rust",
-  "freeform response",
-  "geometry",
-  "optimization",
+  "computational geometry",
+  "coverage planning",
+  "set cover",
+  "combinatorial optimization",
 ]
 
 # Timeout in seconds (5 minutes)

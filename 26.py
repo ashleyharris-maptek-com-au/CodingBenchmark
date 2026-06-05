@@ -40,9 +40,10 @@ title = "3D Point Clustering (Rust)"
 
 tags = [
   "rust",
-  "freeform response",
-  "algorithm design",
-  "optimization",
+  "data analysis",
+  "spatial data",
+  "3d geometry",
+  "clustering",
 ]
 
 # Timeout in seconds (5 minutes)

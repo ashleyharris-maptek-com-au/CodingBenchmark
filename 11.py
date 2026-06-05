@@ -25,10 +25,11 @@ title = "2D Polygon Cutting Stock (Rust)"
 
 tags = [
   "rust",
-  "freeform response",
-  "optimization",
+  "np-hard",
+  "computational geometry",
+  "cutting stock",
   "packing",
-  "geometry",
+  "2d geometry",
 ]
 
 # Timeout in seconds (30 seconds for testing)

@@ -47,9 +47,11 @@ title = "Airliner Autopilot (Python)"
 
 tags = [
   "python",
-  "freeform response",
   "control systems",
-  "simulation",
+  "autopilot",
+  "flight simulation",
+  "sensor fusion",
+  "real-time control",
 ]
 
 TIMEOUT_SECONDS = 120  # generous for 30 subpasses

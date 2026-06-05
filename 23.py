@@ -23,9 +23,10 @@ title = "Lunar Lander Game"
 
 tags = [
   "rust",
-  "freeform response",
-  "game ai",
-  "simulation",
+  "control systems",
+  "physics simulation",
+  "feedback control",
+  "real-time decisions",
 ]
 
 # Timeout in seconds (60 minutes)

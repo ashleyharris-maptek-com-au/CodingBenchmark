@@ -87,7 +87,7 @@ def configure_problem(problem_key: str,
 
   return {
     "title": f"{problem['title']} ({language['label']})",
-    "tags": _merge_tags(language["tags"], ["freeform response"], problem["tags"], extra_tags or []),
+    "tags": _merge_tags(language["tags"], problem["tags"], extra_tags or []),
     "TIMEOUT_SECONDS": TIMEOUT_SECONDS,
     "structure": None,
     "prepareSubpassPrompt": prepareSubpassPrompt,
@@ -1332,12 +1332,11 @@ PROBLEMS = {
     "title":
     "Delivery Route Planner",
     "tags": [
-      "algorithm design",
-      "optimization",
-      "routing",
+      "combinatorial optimization",
+      "route planning",
       "vehicle routing",
-      "geometry",
-      "packing",
+      "spatial data",
+      "heuristics",
     ],
     "cases":
     DELIVERY_CASES,
@@ -1370,11 +1369,11 @@ The score compares your total distance to a deterministic reference planner.""",
     "title":
     "Wildfire Firebreak Planner",
     "tags": [
-      "algorithm design",
-      "optimization",
+      "grid problems",
       "simulation",
-      "grid",
+      "resource allocation",
       "pathfinding",
+      "risk optimization",
     ],
     "cases":
     WILDFIRE_CASES,
@@ -1407,12 +1406,11 @@ The score is the fraction of otherwise-burned town value saved.""",
     "title":
     "Warehouse Robot Job Planner",
     "tags": [
-      "algorithm design",
-      "optimization",
-      "graph theory",
-      "grid",
+      "multi-agent planning",
+      "warehouse logistics",
+      "grid problems",
       "pathfinding",
-      "routing",
+      "route planning",
     ],
     "cases":
     WAREHOUSE_CASES,
@@ -1444,12 +1442,11 @@ to a deterministic greedy reference.""",
     "title":
     "Drone Search Coverage Planner",
     "tags": [
-      "algorithm design",
-      "optimization",
-      "simulation",
-      "grid",
-      "pathfinding",
       "coverage planning",
+      "grid problems",
+      "pathfinding",
+      "multi-agent planning",
+      "resource allocation",
     ],
     "cases":
     DRONE_CASES,
@@ -1481,11 +1478,11 @@ unique probability covered compared with a greedy reference search.""",
     "title":
     "Space Mission Work Schedule",
     "tags": [
-      "algorithm design",
-      "optimization",
-      "constraint satisfaction",
       "scheduling",
-      "graph theory",
+      "precedence constraints",
+      "constraint solving",
+      "parallel machines",
+      "combinatorial optimization",
     ],
     "cases":
     SCHEDULE_CASES,

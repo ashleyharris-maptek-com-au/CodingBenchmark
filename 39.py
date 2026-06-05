@@ -20,9 +20,10 @@ title = "Graph Bisection (Rust)"
 
 tags = [
   "rust",
-  "freeform response",
-  "np hard",
-  "graph theory",
+  "np-hard",
+  "graph algorithms",
+  "graph partitioning",
+  "local search",
 ]
 TIMEOUT_SECONDS = 30
 RANDOM_SEED = 39393939

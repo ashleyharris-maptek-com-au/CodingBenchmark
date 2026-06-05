@@ -43,9 +43,10 @@ title = "N-Body Gravitational Simulation (GLSL Compute)"
 
 tags = [
   "glsl",
-  "freeform response",
   "gpu compute",
-  "simulation",
+  "physics simulation",
+  "parallel algorithms",
+  "numerical methods",
 ]
 
 RANDOM_SEED = 46464646

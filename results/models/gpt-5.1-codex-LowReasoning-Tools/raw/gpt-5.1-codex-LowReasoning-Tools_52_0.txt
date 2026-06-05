@@ -1,1 +1,311 @@
-{}
+Below is a self-contained reference implementation that meets the specification. It demonstrates fused state estimation (with filtering/persistence), conservative fallback logic for degraded sensors, lane keeping, longitudinal speed control with obstacle handling, and traction-aware actuation limits. You can adapt the weighting gains to better suit your simulator.
+
+```python
+# autopilot.py
+from statistics import median
+
+# ------------ Persistent module-level state ------------
+_prev_long_accel = 0.0
+_prev_lat_accel = 0.0
+_prev_lane_offset = 0.0
+_prev_speed_kmh = 0.0
+_integral_speed_err = 0.0
+_last_valid_heading = 0.0
+_last_valid_lane_width = 3.6  # default highway lane width (m)
+_last_speed_limit = 130.0     # km/h fallback
+_prev_obstacle_gap = 1e6
+_prev_mu = 1.0
+_initialized = False
+
+def _init():
+    global _initialized, _integral_speed_err
+    _integral_speed_err = 0.0
+    _initialized = True
+
+# ------------ Helper utilities ------------
+def _valid_samples(values, valids=None, min_valid=1):
+    filtered = []
+    for i, v in enumerate(values):
+        if v is None:
+            continue
+        if valids:
+            if not valids[i]:
+                continue
+        filtered.append(v)
+    return filtered if len(filtered) >= min_valid else []
+
+def _fuse_speed_kmh(state):
+    candidates = []
+    valids = []
+
+    wheel_speeds = [
+        state.get("wheel_speed_fl_kmh"),
+        state.get("wheel_speed_fr_kmh"),
+        state.get("wheel_speed_rl_kmh"),
+        state.get("wheel_speed_rr_kmh")
+    ]
+    wheel_valids = [
+        state.get("wheel_speed_fl_valid"),
+        state.get("wheel_speed_fr_valid"),
+        state.get("wheel_speed_rl_valid"),
+        state.get("wheel_speed_rr_valid")
+    ]
+    samples = _valid_samples(wheel_speeds, wheel_valids, min_valid=2)
+    if samples:
+        candidates.extend(samples)
+
+    gps_speeds = [
+        state.get("gps_1_speed_kmh"),
+        state.get("gps_2_speed_kmh")
+    ]
+    gps_valids = [
+        state.get("gps_1_valid"),
+        state.get("gps_2_valid")
+    ]
+    samples = _valid_samples(gps_speeds, gps_valids, min_valid=1)
+    candidates.extend(samples)
+
+    veh_speeds = [
+        state.get("vehicle_speed_1_kmh"),
+        state.get("vehicle_speed_2_kmh")
+    ]
+    samples = [v for v in veh_speeds if v is not None]
+    candidates.extend(samples)
+
+    if not candidates:
+        return None
+    return median(candidates)
+
+def _fuse_yaw_rate_dps(state):
+    vals = []
+    valids = [
+        state.get("gyro_1_valid"),
+        state.get("gyro_2_valid"),
+        state.get("gyro_3_valid")
+    ]
+    for i, key in enumerate(["gyro_1_yaw_rate_dps", "gyro_2_yaw_rate_dps", "gyro_3_yaw_rate_dps"]):
+        v = state.get(key)
+        if v is None:
+            continue
+        if valids[i]:
+            vals.append(v)
+    return median(vals) if vals else 0.0
+
+def _fuse_lane_data(state):
+    global _last_valid_lane_width, _last_speed_limit, _prev_lane_offset
+    lane_offsets = []
+    lane_lefts = []
+    lane_rights = []
+    curvatures = []
+    lane_widths = []
+    speed_limits = []
+
+    for idx in (1, 2, 3):
+        prefix = f"vision_{idx}_"
+        if state.get(prefix + "lane_offset_m") is not None and state.get(prefix + "left_line_valid") and state.get(prefix + "right_line_valid"):
+            lane_offsets.append(state[prefix + "lane_offset_m"])
+        left = state.get(prefix + "left_line_dist_m")
+        right = state.get(prefix + "right_line_dist_m")
+        if state.get(prefix + "left_line_valid") and state.get(prefix + "right_line_valid"):
+            lane_lefts.append(left)
+            lane_rights.append(right)
+            lane_widths.append(abs(left) + abs(right))
+        curvature = state.get(prefix + "road_curvature_1pm")
+        if curvature is not None:
+            curvatures.append(curvature)
+        if state.get(prefix + "speed_limit_valid"):
+            speed_limits.append(state.get(prefix + "speed_limit_kmh"))
+
+    lane_offset = median(lane_offsets) if lane_offsets else _prev_lane_offset
+    if lane_widths:
+        _last_valid_lane_width = max(2.8, min(4.5, median(lane_widths)))
+    if speed_limits:
+        _last_speed_limit = max(40.0, min(140.0, median(speed_limits)))
+    curvature = median(curvatures) if curvatures else 0.0
+    _prev_lane_offset = lane_offset
+    return lane_offset, curvature, _last_valid_lane_width, _last_speed_limit
+
+def _get_obstacle_info(state):
+    # Returns min distance and relative speed from all vision + lidar
+    obstacles = []
+    rel_speed = None
+
+    for idx in (1, 2, 3):
+        prefix = f"vision_{idx}_"
+        if state.get(prefix + "obstacle_detected") and state.get(prefix + "obstacle_valid"):
+            dist = state.get(prefix + "obstacle_dist_m")
+            rel = state.get(prefix + "obstacle_rel_speed_kmh")
+            if dist is not None:
+                obstacles.append(dist)
+                if rel is not None:
+                    rel_speed = rel
+
+    front_lidar = []
+    for angle in ("+005", "+015", "+030", "+045", "+060"):
+        if state.get(f"lidar_{angle}_deg_valid"):
+            rng = state.get(f"lidar_{angle}_deg_range_m")
+            if rng is not None:
+                front_lidar.append(rng)
+    if front_lidar:
+        obstacles.append(min(front_lidar))
+
+    min_dist = min(obstacles) if obstacles else None
+    return min_dist, rel_speed
+
+def _limit(value, lo, hi):
+    return max(lo, min(hi, value))
+
+def autopilot_step(state: dict, dt: float) -> dict:
+    """
+    Multi-sensor freeway autopilot.
+    """
+    global _prev_long_accel, _prev_lat_accel, _integral_speed_err
+    global _last_valid_heading, _prev_speed_kmh, _prev_obstacle_gap
+    global _prev_mu
+
+    if not _initialized:
+        _init()
+
+    # ---- Sensor fusion ----
+    fused_speed = _fuse_speed_kmh(state)
+    if fused_speed is None:
+        fused_speed = _prev_speed_kmh
+    fused_speed = max(0.0, fused_speed)
+    _prev_speed_kmh = fused_speed
+
+    yaw_rate = _fuse_yaw_rate_dps(state)
+
+    accel_long_vals = _valid_samples(
+        [state.get("accel_1_longitudinal_ms2"),
+         state.get("accel_2_longitudinal_ms2"),
+         state.get("accel_3_longitudinal_ms2")],
+        [state.get("accel_1_valid"),
+         state.get("accel_2_valid"),
+         state.get("accel_3_valid")],
+        min_valid=1)
+    if accel_long_vals:
+        long_accel = median(accel_long_vals)
+    else:
+        long_accel = _prev_long_accel
+    _prev_long_accel = long_accel
+
+    accel_lat_vals = _valid_samples(
+        [state.get("accel_1_lateral_ms2"),
+         state.get("accel_2_lateral_ms2"),
+         state.get("accel_3_lateral_ms2")],
+        [state.get("accel_1_valid"),
+         state.get("accel_2_valid"),
+         state.get("accel_3_valid")],
+        min_valid=1)
+    if accel_lat_vals:
+        lat_accel = median(accel_lat_vals)
+    else:
+        lat_accel = _prev_lat_accel
+    _prev_lat_accel = lat_accel
+
+    lane_offset, curvature, lane_width, speed_limit = _fuse_lane_data(state)
+    target_lane = state.get("target_lane", 1)
+
+    gps_heading_candidates = []
+    for idx in (1, 2):
+        if state.get(f"gps_{idx}_valid") and state.get(f"gps_{idx}_heading_deg") is not None:
+            gps_heading_candidates.append(state.get(f"gps_{idx}_heading_deg"))
+    if gps_heading_candidates:
+        _last_valid_heading = median(gps_heading_candidates)
+
+    obstacle_dist, obstacle_rel_speed = _get_obstacle_info(state)
+    _prev_obstacle_gap = obstacle_dist if obstacle_dist is not None else _prev_obstacle_gap
+
+    mu = state.get("estimated_mu")
+    if mu is None or mu <= 0:
+        mu = _prev_mu
+    _prev_mu = mu
+    mu = _limit(mu, 0.1, 1.2)
+
+    rain = bool(state.get("rain_sensor"))
+    temp_c = state.get("temperature_c") if state.get("temperature_c") is not None else 15.0
+
+    # ---- Desired speed ----
+    target_speed = state.get("target_speed_kmh", speed_limit)
+    target_speed = min(target_speed, speed_limit)
+    if mu < 0.5:
+        target_speed = min(target_speed, 90.0 * mu + 30.0)
+    if rain:
+        target_speed = min(target_speed, 100.0)
+    if temp_c < -5:
+        target_speed = min(target_speed, 80.0)
+
+    # Obstacle speed override
+    time_gap = 1.8 if mu > 0.8 else 2.5
+    safe_dist = max(10.0, (fused_speed / 3.6) * time_gap + ((fused_speed**2) / (250.0 * max(mu, 0.2))))
+    obstacle_brake = 0.0
+    if obstacle_dist is not None:
+        if obstacle_dist < safe_dist:
+            target_speed = min(target_speed, max(0.0, fused_speed - 30.0))
+            obstacle_brake = _limit((safe_dist - obstacle_dist) / safe_dist, 0.0, 1.0)
+
+    # ---- Longitudinal control (PI + feedforward) ----
+    speed_err = (target_speed - fused_speed)
+    kp = 0.015
+    ki = 0.002
+    kd = 0.01
+    _integral_speed_err = _limit(_integral_speed_err + speed_err * dt, -400.0, 400.0)
+    derivative = -(long_accel * 3.6)  # convert m/s² to km/h/s
+    throttle_cmd = kp * speed_err + ki * _integral_speed_err + 0.02 * mu
+    throttle_cmd += -kd * derivative
+    throttle_cmd = _limit(throttle_cmd, 0.0, 1.0)
+
+    # Brake control
+    brake_cmd = 0.0
+    if speed_err < -2.0:
+        brake_cmd = _limit((-speed_err) / 50.0, 0.0, 0.4)
+    brake_cmd = max(brake_cmd, obstacle_brake)
+    if mu < 0.4:
+        throttle_cmd *= mu
+        brake_cmd = min(brake_cmd, 0.6)
+
+    # ---- Lateral control ----
+    desired_lane_center = (target_lane - 1) * lane_width
+    lane_error = (lane_offset - desired_lane_center)
+    lane_error_rate = yaw_rate * (lane_width / 3.6)
+
+    # Simple PD steering
+    kp_lat = 0.12 / max(mu, 0.3)
+    kd_lat = 0.015
+    steering_raw = -(kp_lat * lane_error + kd_lat * lane_error_rate)
+    steering = _limit(steering_raw + _limit(lat_accel / 9.81, -0.2, 0.2), -1.0, 1.0)
+
+    if curvature != 0.0:
+        feedforward = _limit((fused_speed / 3.6) ** 2 * curvature / 1000.0, -0.3, 0.3)
+        steering = _limit(steering + feedforward, -1.0, 1.0)
+
+    if mu < 0.4:
+        steering *= 0.8
+
+    # ---- Fail-safe cases ----
+    if obstacle_dist is not None and obstacle_dist < 5.0:
+        throttle_cmd = 0.0
+        brake_cmd = max(brake_cmd, 0.8)
+
+    if mu <= 0.2:
+        throttle_cmd = min(throttle_cmd, 0.3)
+        brake_cmd = min(brake_cmd, 0.5)
+
+    if obstacle_dist is None and rain:
+        throttle_cmd *= 0.8
+
+    # ---- Output ----
+    return {
+        "steering": steering,
+        "throttle": throttle_cmd,
+        "brake": brake_cmd
+    }
+```
+
+### Implementation notes
+1. **Sensor fusion**: wheel/GPS speed medians, gyro voting, lane-lines merged across vision stacks, lidar merged across beams. Persistent fallbacks (previous values) cover temporary dropouts.
+2. **Lane keeping**: uses fused lane offset and target lane center, with curvature feedforward and lateral acceleration damping.
+3. **Speed control**: PI loop with friction-aware throttle scaling. Speed limit obeyed, reduced further for low μ, rain, or low temperatures.
+4. **Obstacle handling**: vision + lidar distances, safe gap calculation, and proportional braking when too close; hard stop if <5 m.
+5. **Traction management**: μ (or rain proxy) reduces target speed, throttle/brake magnitudes, and steering gain to avoid saturation.
+6. **Graceful degradation**: previous estimates reused when sensors flicker. Conservative defaults (lane width, speed limit) keep vehicle stable when perception fails.

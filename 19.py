@@ -35,9 +35,11 @@ title = "3D Voxel Mining (C#)"
 
 tags = [
   "csharp",
-  "freeform response",
-  "optimization",
-  "geometry",
+  "mining",
+  "resource allocation",
+  "3d geometry",
+  "precedence constraints",
+  "combinatorial optimization",
 ]
 
 TIMEOUT_SECONDS = 300

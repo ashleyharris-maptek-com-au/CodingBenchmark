@@ -1,1 +1,319 @@
-{}
+Below is a compact, self-contained example of a resilient (but still simplified) “all-in-one” autopilot loop that fuses the redundant sensors, watches for obvious faults, and drives the primary flight controls toward the selected targets. It keeps a small module-level state so the controllers can accumulate error over time. This won’t match certified avionics, but it hits the major behaviors you requested (speed, altitude, and heading hold; trim management; flap/gear automation; stall and overspeed protection; asymmetric thrust compensation).
+
+```python
+# --- persistent controller memory -----------------------------------------
+_autopilot_memory = {
+    "initialized": False,
+    "alt_int": 0.0,
+    "vs_int": 0.0,
+    "spd_int": 0.0,
+    "hdg_int": 0.0,
+    "last_alt_err": 0.0,
+    "last_vs_err": 0.0,
+    "last_spd_err": 0.0,
+    "last_hdg_err": 0.0,
+}
+
+
+def _median(values):
+    clean = sorted(v for v in values if v is not None)
+    if not clean:
+        return None
+    n = len(clean)
+    mid = n // 2
+    return clean[mid] if n % 2 else 0.5 * (clean[mid - 1] + clean[mid])
+
+
+def _plausible(value, minimum=None, maximum=None):
+    if value is None:
+        return False
+    if minimum is not None and value < minimum:
+        return False
+    if maximum is not None and value > maximum:
+        return False
+    return True
+
+
+def _vote_triplex(values, tol=None):
+    """Return fused value plus a confidence score [0..1]."""
+    usable = [v for v in values if v is not None]
+    if not usable:
+        return None, 0.0
+    med = _median(usable)
+    if tol is None or med is None:
+        return med, min(1.0, len(usable) / 3.0)
+    agree = sum(1 for v in usable if abs(v - med) <= tol)
+    return med, agree / 3.0
+
+
+def _get_valid(state, key):
+    v = state.get(key)
+    if isinstance(v, (int, float)):
+        return v
+    return None
+
+
+def _fuse_altitude(state):
+    baros = [
+        _get_valid(state, "baro_alt_1_ft"),
+        _get_valid(state, "baro_alt_2_ft"),
+        _get_valid(state, "baro_alt_3_ft"),
+    ]
+    radars = [
+        _get_valid(state, "radar_alt_1_ft"),
+        _get_valid(state, "radar_alt_2_ft"),
+        _get_valid(state, "radar_alt_3_ft"),
+    ]
+    gps = [
+        _get_valid(state, "gps_1_alt_ft"),
+        _get_valid(state, "gps_2_alt_ft"),
+        _get_valid(state, "gps_3_alt_ft"),
+    ]
+
+    baro_alt, baro_conf = _vote_triplex(baros, tol=75)
+    radar_alt, radar_conf = _vote_triplex(radars, tol=10)
+    gps_alt, gps_conf = _vote_triplex(gps, tol=150)
+
+    # radar only useful below ~2500 ft agl; fall back to baro/gps otherwise
+    if radar_alt is not None and baro_alt is not None and radar_alt > 2500:
+        radar_conf = 0.2  # down-weight out-of-range readings
+
+    weighted = []
+    if baro_alt is not None:
+        weighted.append((baro_alt, 0.5 + 0.4 * baro_conf))
+    if radar_alt is not None:
+        weighted.append((radar_alt, 0.3 + 0.6 * radar_conf))
+    if gps_alt is not None:
+        weighted.append((gps_alt, 0.2 + 0.4 * gps_conf))
+
+    if not weighted:
+        return None
+
+    num = sum(val * w for val, w in weighted)
+    den = sum(w for _, w in weighted)
+    return num / den if den else None
+
+
+def _fuse_ias(state):
+    ias = [
+        _get_valid(state, "ias_1_kt"),
+        _get_valid(state, "ias_2_kt"),
+        _get_valid(state, "ias_3_kt"),
+    ]
+    return _vote_triplex(ias, tol=10)[0]
+
+
+def _fuse_vs(state):
+    vs = [
+        _get_valid(state, "irs_1_vs_fpm"),
+        _get_valid(state, "irs_2_vs_fpm"),
+        _get_valid(state, "irs_3_vs_fpm"),
+        _get_valid(state, "vertical_speed_fpm"),
+    ]
+    return _median([v for v in vs if v is not None])
+
+
+def _fuse_pitch_roll(state):
+    pitch = _vote_triplex(
+        [_get_valid(state, "irs_1_pitch_deg"),
+         _get_valid(state, "irs_2_pitch_deg"),
+         _get_valid(state, "irs_3_pitch_deg")],
+        tol=1.5
+    )[0]
+    roll = _vote_triplex(
+        [_get_valid(state, "irs_1_roll_deg"),
+         _get_valid(state, "irs_2_roll_deg"),
+         _get_valid(state, "irs_3_roll_deg")],
+        tol=1.5
+    )[0]
+    return pitch, roll
+
+
+def _fuse_heading(state):
+    headings = [
+        _get_valid(state, "irs_1_heading_deg"),
+        _get_valid(state, "irs_2_heading_deg"),
+        _get_valid(state, "irs_3_heading_deg"),
+        _get_valid(state, "true_heading_deg"),
+    ]
+    # simple wrap-safe median
+    usable = [h for h in headings if h is not None]
+    if not usable:
+        return None
+    base = usable[0]
+    wrapped = [((h - base + 180) % 360) - 180 for h in usable]
+    med = _median(wrapped)
+    return (med + base) % 360 if med is not None else None
+
+
+def _wrap180(angle):
+    return ((angle + 180.0) % 360.0) - 180.0
+
+
+def autopilot_step(state: dict, dt: float) -> dict:
+    global _autopilot_memory
+    if not _autopilot_memory["initialized"] or abs(dt - _autopilot_memory.get("dt", dt)) > 0.02:
+        _autopilot_memory = {
+            "initialized": True,
+            "dt": dt,
+            "alt_int": 0.0,
+            "vs_int": 0.0,
+            "spd_int": 0.0,
+            "hdg_int": 0.0,
+            "last_alt_err": 0.0,
+            "last_vs_err": 0.0,
+            "last_spd_err": 0.0,
+            "last_hdg_err": 0.0,
+        }
+
+    outputs = {}
+
+    ap_on = bool(state.get("ap_engaged"))
+    at_on = bool(state.get("at_engaged"))
+    if not ap_on and not at_on:
+        return outputs  # manual flight
+
+    altitude = _fuse_altitude(state)
+    ias = _fuse_ias(state)
+    vs = _fuse_vs(state)
+    pitch_deg, roll_deg = _fuse_pitch_roll(state)
+    heading = _fuse_heading(state)
+
+    target_alt = state.get("target_alt_ft")
+    target_vs = state.get("target_vs_fpm")
+    target_spd = state.get("target_ias_kt")
+    target_hdg = state.get("target_hdg_deg")
+
+    # basic protections -----------------------------------------------------
+    stall = ias is not None and ias < 140 or (
+        _plausible(state.get("aoa_1_deg"), -5, 25) and state["aoa_1_deg"] > 12
+    )
+    overspeed = ias is not None and (ias > 360 or state.get("mach_1", 0.0) > 0.81)
+
+    # ---------- throttle (autothrust) --------------------------------------
+    if at_on and ias is not None and target_spd:
+        spd_err = target_spd - ias
+        _autopilot_memory["spd_int"] += spd_err * dt * 0.02
+        _autopilot_memory["spd_int"] = max(-0.3, min(0.3, _autopilot_memory["spd_int"]))
+        thrust_cmd = 0.5 + 0.0025 * spd_err + 0.8 * _autopilot_memory["spd_int"]
+
+        if stall:
+            thrust_cmd = max(thrust_cmd, 0.95)
+        if overspeed:
+            thrust_cmd = min(thrust_cmd, 0.25)
+
+        thrust_cmd = max(0.05, min(0.98, thrust_cmd))
+        outputs["throttle_1"] = thrust_cmd
+        outputs["throttle_2"] = thrust_cmd
+
+    # handle asymmetric running engines if autothrust off or failure
+    elif at_on:
+        # fallback to 70% thrust if speed or target unavailable
+        outputs["throttle_1"] = 0.7
+        outputs["throttle_2"] = 0.7
+
+    # ---------- vertical channel (altitude + vertical speed + pitch) -------
+    if ap_on and altitude is not None and target_alt:
+        alt_err = target_alt - altitude
+        vs_target = target_vs if target_vs is not None else max(min(alt_err * 0.5, 2000), -2000)
+
+        if vs is not None:
+            vs_err = vs_target - vs
+        else:
+            vs_err = alt_err * 0.1  # fallback
+
+        # integrate altitude error slowly to avoid wind-up
+        _autopilot_memory["alt_int"] += alt_err * dt * 0.0005
+        _autopilot_memory["alt_int"] = max(-0.3, min(0.3, _autopilot_memory["alt_int"]))
+
+        elevator_cmd = 0.0
+        elevator_cmd += 0.0004 * vs_err
+        elevator_cmd += 0.05 * _wrap180(pitch_deg or 0.0)  # damp pitch attitude
+        elevator_cmd += _autopilot_memory["alt_int"]
+
+        if stall:
+            elevator_cmd = min(elevator_cmd, -0.4)  # unload nose to recover
+        if overspeed:
+            elevator_cmd = max(elevator_cmd, 0.3)   # pull up gently
+
+        elevator_cmd = max(-0.9, min(0.9, elevator_cmd))
+        outputs["elevator"] = elevator_cmd
+
+        # trim slowly toward elevator command
+        trim_rate = 0.02 * elevator_cmd
+        new_trim = max(-1.0, min(1.0, trim_rate))
+        outputs["elevator_trim"] = new_trim
+
+    # ---------- lateral channel (heading / roll / yaw) ----------------------
+    if ap_on and heading is not None and target_hdg is not None:
+        hdg_err = _wrap180(target_hdg - heading)
+        _autopilot_memory["hdg_int"] += hdg_err * dt * 0.002
+        _autopilot_memory["hdg_int"] = max(-0.3, min(0.3, _autopilot_memory["hdg_int"]))
+
+        bank_cmd = max(-25.0, min(25.0, hdg_err * 0.5 + 5.0 * _autopilot_memory["hdg_int"]))
+        roll_err = bank_cmd - (roll_deg or 0.0)
+        aileron_cmd = max(-1.0, min(1.0, 0.04 * roll_err))
+
+        outputs["aileron"] = aileron_cmd
+
+        # simple dutch-roll / yaw damping using roll rate & sideslip proxy
+        drift = _wrap180(state.get("drift_angle_deg", 0.0))
+        rudder_cmd = max(-0.4, min(0.4, -0.05 * drift - 0.02 * (state.get("gyro_1_yaw_rate_dps") or 0.0)))
+        outputs["rudder"] = rudder_cmd
+
+    # ---------- flaps, gear, speedbrakes -----------------------------------
+    # minimal logic: retract above 210 KIAS and 1000 ft AGL, extend for low speed
+    agl = min(
+        v for v in [
+            _get_valid(state, "radar_alt_1_ft"),
+            _get_valid(state, "radar_alt_2_ft"),
+            _get_valid(state, "radar_alt_3_ft"),
+        ] if v is not None
+    ) if any(_get_valid(state, k) is not None for k in ["radar_alt_1_ft", "radar_alt_2_ft", "radar_alt_3_ft"]) else altitude
+
+    current_flap = max(state.get("flap_pos_left_deg", 0.0), state.get("flap_pos_right_deg", 0.0))
+    commanded_flap = current_flap
+
+    if ias is not None and agl is not None:
+        if ias < 180 and agl < 2000:
+            commanded_flap = min(20.0, current_flap + dt * 6.0)
+        elif ias > 210 or agl > 3000:
+            commanded_flap = max(0.0, current_flap - dt * 8.0)
+
+    outputs["flaps"] = round(commanded_flap, 1)
+
+    # gear logic
+    gear_down = 1 if (agl is not None and agl < 1500 and ias is not None and ias < 220) else 0
+    outputs["gear"] = gear_down
+
+    # speedbrake for overspeed or steep descents
+    if overspeed or (vs is not None and vs < -3000 and ias > (target_spd or 250)):
+        outputs["speedbrake"] = 0.7
+    elif stall:
+        outputs["speedbrake"] = 0.0
+
+    # ---------- asymmetry handling -----------------------------------------
+    eng1 = state.get("engine_1_running", True)
+    eng2 = state.get("engine_2_running", True)
+    if eng1 and not eng2:
+        outputs["rudder"] = max(outputs.get("rudder", 0.0) + 0.2, -1.0)
+        outputs["throttle_1"] = max(outputs.get("throttle_1", 0.7), 0.8)
+        outputs["throttle_2"] = 0.0
+    elif eng2 and not eng1:
+        outputs["rudder"] = min(outputs.get("rudder", 0.0) - 0.2, 1.0)
+        outputs["throttle_2"] = max(outputs.get("throttle_2", 0.7), 0.8)
+        outputs["throttle_1"] = 0.0
+
+    return outputs
+```
+
+**How it works (and why it’s safe-ish):**
+
+1. **Sensor fusion:** Every redundant triplet is median-voted and assigned a confidence weight before blending. Radar altitude is prioritized close to the ground; otherwise baro/GPS dominate.
+2. **Protections:** Basic stall and overspeed detectors override the normal PID terms—e.g., rapid thrust-up + nose-down in a stall, low thrust + nose-up in overspeed.
+3. **Vertical channel:** Altitude error drives a vertical-speed target, which then feeds a pitch/elevator command. Integrators are aggressively clamped to avoid runaway trim.
+4. **Lateral channel:** Heading error becomes a roll command, then aileron deflection. Rudder gets gentle dutch-roll damping plus asymmetric-thrust compensation if an engine fails.
+5. **Envelope logic:** Automatic flap/gear handling follows simple schedule gates on airspeed and radio altitude. Speedbrakes deploy only when really needed (overspeed or steep >3,000 fpm descent).
+6. **Persistence:** `_autopilot_memory` stores integrator states; it resets automatically if `dt` jumps (e.g., sim reload).
+
+Feel free to tune gains, add more sophisticated fault detection, or plug in a full flight-mode annunciator, but this should give you a robust starting point that honors the “single function handles every scenario” requirement.

@@ -29,9 +29,10 @@ title = "Maximum Clique (C#)"
 
 tags = [
   "csharp",
-  "freeform response",
-  "np hard",
-  "graph theory",
+  "np-hard",
+  "graph algorithms",
+  "branch and bound",
+  "combinatorial search",
 ]
 TIMEOUT_SECONDS = 300
 RANDOM_SEED = 29292929

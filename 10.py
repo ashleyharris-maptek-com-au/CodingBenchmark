@@ -22,9 +22,11 @@ title = "2D Cutting Stock - Rectangle Packing (C++)"
 
 tags = [
   "cpp",
-  "freeform response",
-  "optimization",
+  "np-hard",
+  "combinatorial optimization",
+  "cutting stock",
   "packing",
+  "2d geometry",
 ]
 
 # Timeout in seconds (30 seconds)

@@ -44,9 +44,11 @@ title = "Fragment Shaders (GLSL)"
 
 tags = [
   "glsl",
-  "freeform response",
-  "shader",
-  "gpu",
+  "gpu shaders",
+  "fragment shader",
+  "vulkan",
+  "shader portability",
+  "visual synthesis",
 ]
 
 TIMEOUT_SECONDS = 60

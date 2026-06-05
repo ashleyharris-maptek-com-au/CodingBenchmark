@@ -28,9 +28,10 @@ title = "Job-Shop Scheduling (C++)"
 
 tags = [
   "cpp",
-  "freeform response",
-  "np hard",
-  "optimization",
+  "np-hard",
+  "scheduling",
+  "constraint solving",
+  "combinatorial optimization",
 ]
 
 # Timeout in seconds (5 minutes)

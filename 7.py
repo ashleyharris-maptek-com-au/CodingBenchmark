@@ -24,9 +24,10 @@ title = "CSG Union of Two Polyhedra (C++)"
 
 tags = [
   "cpp",
-  "freeform response",
-  "geometry",
-  "algorithm design",
+  "computational geometry",
+  "3d geometry",
+  "mesh geometry",
+  "collision detection",
 ]
 
 # Timeout in seconds (30 seconds for testing)

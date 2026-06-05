@@ -13,10 +13,10 @@ title = "Travelling Salesman Problem Solver (C++)"
 
 tags = [
   "cpp",
-  "np hard",
-  "freeform response",
-  "algorithm design",
-  "optimization",
+  "np-hard",
+  "combinatorial optimization",
+  "route planning",
+  "large-scale input",
 ]
 
 # Seed for reproducible city generation

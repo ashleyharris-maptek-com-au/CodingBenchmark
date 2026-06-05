@@ -43,9 +43,11 @@ title = "Fragment Shaders (SPIRV)"
 
 tags = [
   "spirv",
-  "freeform response",
-  "shader",
-  "gpu",
+  "gpu shaders",
+  "fragment shader",
+  "vulkan",
+  "binary encoding",
+  "visual synthesis",
 ]
 
 TIMEOUT_SECONDS = 60

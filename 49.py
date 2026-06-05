@@ -36,9 +36,10 @@ title = "Parallel Prefix Sum (SPIR-V Binary Compute)"
 
 tags = [
   "spirv",
-  "freeform response",
   "gpu compute",
-  "algorithm design",
+  "parallel algorithms",
+  "prefix sum",
+  "binary encoding",
 ]
 
 RANDOM_SEED = 49494949

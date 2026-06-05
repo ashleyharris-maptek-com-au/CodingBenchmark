@@ -45,9 +45,10 @@ title = "Minimum Cut Problem (C++)"
 
 tags = [
   "cpp",
-  "freeform response",
-  "graph theory",
-  "algorithm design",
+  "graph algorithms",
+  "network flow",
+  "exact algorithms",
+  "large-scale input",
 ]
 
 # Timeout in seconds (5 minutes)

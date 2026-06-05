@@ -26,9 +26,10 @@ title = "Minimum Dominating Set (Rust)"
 
 tags = [
   "rust",
-  "freeform response",
-  "np hard",
-  "graph theory",
+  "np-hard",
+  "graph algorithms",
+  "set cover",
+  "approximation algorithms",
 ]
 TIMEOUT_SECONDS = 30
 RANDOM_SEED = 35353535

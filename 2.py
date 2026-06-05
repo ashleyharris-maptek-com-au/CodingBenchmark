@@ -12,9 +12,10 @@ title = "Chinese Postman Problem Solver (C#)"
 
 tags = [
   "csharp",
-  "freeform response",
-  "graph theory",
-  "optimization",
+  "graph algorithms",
+  "route planning",
+  "shortest paths",
+  "combinatorial optimization",
 ]
 
 # Seed for reproducible graph generation

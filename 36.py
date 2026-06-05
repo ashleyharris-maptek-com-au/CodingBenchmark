@@ -23,9 +23,10 @@ title = "Maximum Independent Set (C++)"
 
 tags = [
   "cpp",
-  "freeform response",
-  "np hard",
-  "graph theory",
+  "np-hard",
+  "graph algorithms",
+  "branch and bound",
+  "combinatorial search",
 ]
 TIMEOUT_SECONDS = 30
 RANDOM_SEED = 36363636

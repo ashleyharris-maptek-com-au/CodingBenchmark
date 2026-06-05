@@ -53,9 +53,11 @@ title = "N-Dimensional Snake Game (C++)"
 
 tags = [
   "cpp",
-  "freeform response",
   "game ai",
-  "algorithm design",
+  "pathfinding",
+  "grid problems",
+  "heuristic search",
+  "real-time decisions",
 ]
 
 # Timeout in seconds (5 minutes)

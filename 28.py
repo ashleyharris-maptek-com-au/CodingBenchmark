@@ -20,9 +20,10 @@ title = "Minimum Vertex Cover (Rust)"
 
 tags = [
   "rust",
-  "freeform response",
-  "np hard",
-  "graph theory",
+  "np-hard",
+  "graph algorithms",
+  "branch and bound",
+  "approximation algorithms",
 ]
 TIMEOUT_SECONDS = 30
 RANDOM_SEED = 28282828

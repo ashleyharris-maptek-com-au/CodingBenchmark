@@ -23,10 +23,11 @@ title = "3D AABB Bin Packing (C#)"
 
 tags = [
   "csharp",
-  "freeform response",
-  "optimization",
+  "np-hard",
+  "3d geometry",
   "packing",
-  "geometry",
+  "bin packing",
+  "spatial data",
 ]
 
 # Timeout in seconds (5 minutes)

@@ -18,9 +18,10 @@ title = "Subset Sum (Rust)"
 
 tags = [
   "rust",
-  "freeform response",
-  "np hard",
-  "algorithm design",
+  "np-hard",
+  "combinatorial search",
+  "dynamic programming",
+  "integer problems",
 ]
 TIMEOUT_SECONDS = 300
 RANDOM_SEED = 31313131

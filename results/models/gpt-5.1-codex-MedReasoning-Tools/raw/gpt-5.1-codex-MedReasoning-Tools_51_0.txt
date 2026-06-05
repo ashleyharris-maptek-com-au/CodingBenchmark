@@ -1,1 +1,352 @@
-{'__exception__': "Can't run here - we're trying to get this working in codex."}
+```python
+import math
+
+_VNE_KT = 365.0
+_MAX_MACH = 0.82
+_MIN_TARGET_IAS = 120.0
+_MAX_CLIMB_VS = 3200.0
+_MAX_DESCENT_VS = -3600.0
+_MAX_BANK_DEG = 25.0
+_MAX_ROLL_RATE_DPS = 25.0
+_THRUST_RATE_PER_S = 0.35
+_SPEEDBRAKE_RATE_PER_S = 1.2
+
+def _new_persist():
+    return {
+        "last_time": -1.0,
+        "pitch_int": 0.0,
+        "roll_int": 0.0,
+        "ias_int": 0.0,
+        "trim_cmd": 0.0,
+        "last_alt": None,
+        "last_ias": None,
+        "last_throttle_cmd": None,
+        "speedbrake": 0.0,
+        "gear_state": None,
+    }
+
+_AUTO_STATE = _new_persist()
+
+def _is_finite(val):
+    return isinstance(val, (int, float)) and math.isfinite(val)
+
+def _clip(val, lo, hi):
+    return max(lo, min(hi, val))
+
+def _median(seq):
+    data = sorted(seq)
+    n = len(data)
+    m = n // 2
+    return data[m] if n % 2 else 0.5 * (data[m - 1] + data[m])
+
+def _fuse_linear(samples, max_spread=None, default=None):
+    filtered = [(float(v), float(w)) for v, w in samples if _is_finite(v) and w > 0]
+    if not filtered:
+        return default
+    values = [v for v, _ in filtered]
+    med = _median(values)
+    if max_spread is not None:
+        narrowed = [(v, w) for v, w in filtered if abs(v - med) <= max_spread]
+        if narrowed:
+            filtered = narrowed
+    total_w = sum(w for _, w in filtered)
+    if total_w <= 0:
+        return med
+    return sum(v * w for v, w in filtered) / total_w
+
+def _fuse_angle(samples, default=None):
+    filtered = [(math.radians(v % 360.0), float(w)) for v, w in samples if _is_finite(v) and w > 0]
+    if not filtered:
+        return default
+    x = sum(math.cos(a) * w for a, w in filtered)
+    y = sum(math.sin(a) * w for a, w in filtered)
+    if x == 0 and y == 0:
+        return default
+    ang = math.degrees(math.atan2(y, x)) % 360.0
+    return ang
+
+def _wrap180(angle):
+    if angle is None:
+        return None
+    return (angle + 180.0) % 360.0 - 180.0
+
+def _series_triplet(state, stem, suffix, valid_suffix=None, good_w=1.0, bad_w=0.25):
+    samples = []
+    for idx in (1, 2, 3):
+        key = f"{stem}_{idx}_{suffix}"
+        val = state.get(key)
+        if not _is_finite(val):
+            continue
+        weight = good_w
+        if valid_suffix:
+            valid_key = f"{stem}_{idx}_{valid_suffix}"
+            if valid_key in state and not state.get(valid_key, True):
+                weight = bad_w
+        samples.append((val, weight))
+    return samples
+
+def _series_direct(state, keys, weight=1.0):
+    return [(state[k], weight) for k in keys if _is_finite(state.get(k))]
+
+def _blend(prev, target, rate, dt):
+    if prev is None:
+        return target
+    max_delta = rate * dt
+    delta = target - prev
+    if delta > max_delta:
+        return prev + max_delta
+    if delta < -max_delta:
+        return prev - max_delta
+    return target
+
+def _engine_alive(state, idx):
+    running = state.get(f"engine_{idx}_running")
+    fire = state.get(f"engine_{idx}_fire")
+    n1 = state.get(f"engine_{idx}_n1_pct", 0.0) or 0.0
+    oil = state.get(f"engine_{idx}_oil_press_psi", 0.0) or 0.0
+    return bool(running) and not fire and n1 > 5.0 and oil > 5.0
+
+def _compute_fused(state):
+    fused = {}
+    ias = _fuse_linear(_series_triplet(state, "ias", "kt", "valid"), max_spread=20.0)
+    tas = _fuse_linear(_series_triplet(state, "tas", "kt", None), max_spread=30.0)
+    if ias is None:
+        ias = tas
+    fused["ias"] = ias
+    fused["tas"] = tas
+    fused["mach"] = _fuse_linear(_series_direct(state, ("mach_1", "mach_2", "mach_3")), max_spread=0.05)
+    fused["aoa"] = _fuse_linear(_series_triplet(state, "aoa", "deg", "valid"), max_spread=2.0)
+    baro_alt = _fuse_linear(_series_triplet(state, "baro_alt", "ft", "valid"), max_spread=200.0)
+    adc_alt = _fuse_linear(_series_triplet(state, "adc", "pressure_alt_ft", "valid"), max_spread=250.0)
+    gps_alt = _fuse_linear(_series_triplet(state, "gps", "alt_ft", "valid"), max_spread=400.0)
+    radar_alt = _fuse_linear(_series_triplet(state, "radar_alt", "ft", "valid"), max_spread=25.0)
+    altitude = baro_alt if baro_alt is not None else adc_alt
+    if altitude is None:
+        altitude = gps_alt
+    elif gps_alt is not None:
+        diff = abs(gps_alt - altitude)
+        if diff < 800:
+            altitude = 0.75 * altitude + 0.25 * gps_alt
+        else:
+            last_alt = _AUTO_STATE.get("last_alt")
+            if last_alt is not None and abs(gps_alt - last_alt) < abs(altitude - last_alt):
+                altitude = gps_alt
+    fused["altitude"] = altitude
+    fused["baro_alt"] = baro_alt
+    fused["gps_alt"] = gps_alt
+    fused["radar_alt"] = radar_alt
+    vs_samples = []
+    nav_vs = state.get("vertical_speed_fpm")
+    if _is_finite(nav_vs):
+        vs_samples.append((nav_vs, 0.6))
+    vs_samples.extend(_series_triplet(state, "irs", "vs_fpm", "valid"))
+    fused["vertical_speed"] = _fuse_linear(vs_samples, max_spread=300.0)
+    pitch = _fuse_linear(_series_triplet(state, "irs", "pitch_deg", "valid"), max_spread=2.5)
+    roll = _fuse_linear(_series_triplet(state, "irs", "roll_deg", "valid"), max_spread=2.5)
+    fused["pitch"] = pitch
+    fused["roll"] = roll
+    heading_samples = _series_triplet(state, "irs", "heading_deg", "valid")
+    if _is_finite(state.get("magnetic_heading_deg")):
+        heading_samples.append((state["magnetic_heading_deg"], 0.7))
+    if _is_finite(state.get("true_heading_deg")):
+        heading_samples.append((state["true_heading_deg"], 0.4))
+    fused["heading"] = _fuse_angle(heading_samples)
+    track_samples = _series_triplet(state, "irs", "track_deg", "valid")
+    if _is_finite(state.get("track_deg")):
+        track_samples.append((state["track_deg"], 0.7))
+    track_samples.extend(_series_direct(state, ("gps_1_track_deg", "gps_2_track_deg", "gps_3_track_deg"), 0.5))
+    fused["track"] = _fuse_angle(track_samples)
+    gs_samples = []
+    if _is_finite(state.get("ground_speed_kt")):
+        gs_samples.append((state["ground_speed_kt"], 0.7))
+    gs_samples.extend(_series_triplet(state, "irs", "gs_kt", "valid"))
+    gs_samples.extend(_series_triplet(state, "gps", "gs_kt", "valid"))
+    fused["ground_speed"] = _fuse_linear(gs_samples, max_spread=25.0)
+    gyro_pitch = _fuse_linear(_series_triplet(state, "gyro", "pitch_rate_dps", "valid"), max_spread=2.0)
+    gyro_roll = _fuse_linear(_series_triplet(state, "gyro", "roll_rate_dps", "valid"), max_spread=2.0)
+    gyro_yaw = _fuse_linear(_series_triplet(state, "gyro", "yaw_rate_dps", "valid"), max_spread=2.0)
+    fused["pitch_rate"] = gyro_pitch
+    fused["roll_rate"] = gyro_roll
+    fused["yaw_rate"] = gyro_yaw
+    drift = state.get("drift_angle_deg")
+    if not _is_finite(drift):
+        if fused["track"] is not None and fused["heading"] is not None:
+            drift = _wrap180(fused["track"] - fused["heading"])
+    fused["drift"] = drift
+    return fused
+
+def autopilot_step(state: dict, dt: float) -> dict:
+    global _AUTO_STATE
+    sim_time = state.get("sim_time_s", 0.0) or 0.0
+    dt = dt if _is_finite(dt) and dt > 0 else state.get("dt", 0.05) or 0.05
+    dt = _clip(dt, 0.01, 0.25)
+    if sim_time < _AUTO_STATE.get("last_time", -1.0):
+        _AUTO_STATE = _new_persist()
+    _AUTO_STATE["last_time"] = sim_time
+    fused = _compute_fused(state)
+    if fused["vertical_speed"] is None and fused["altitude"] is not None and _AUTO_STATE["last_alt"] is not None:
+        fused["vertical_speed"] = (fused["altitude"] - _AUTO_STATE["last_alt"]) / dt * 60.0
+    if fused["vertical_speed"] is None:
+        fused["vertical_speed"] = 0.0
+    _AUTO_STATE["last_alt"] = fused["altitude"]
+    ias_prev = _AUTO_STATE["last_ias"]
+    _AUTO_STATE["last_ias"] = fused["ias"]
+    ap_on = bool(state.get("ap_engaged"))
+    at_on = bool(state.get("at_engaged"))
+    target_alt = state.get("target_alt_ft")
+    if not _is_finite(target_alt):
+        target_alt = fused["altitude"] or 0.0
+    target_ias = state.get("target_ias_kt")
+    if not _is_finite(target_ias):
+        target_ias = fused["ias"] or 250.0
+    target_ias = _clip(target_ias, _MIN_TARGET_IAS, _VNE_KT - 5.0)
+    target_vs = state.get("target_vs_fpm")
+    if not _is_finite(target_vs):
+        target_vs = 0.0
+    target_vs = _clip(target_vs, _MAX_DESCENT_VS, _MAX_CLIMB_VS)
+    target_hdg = state.get("target_hdg_deg")
+    if not _is_finite(target_hdg):
+        target_hdg = fused["heading"] or fused["track"] or 0.0
+    target_hdg = target_hdg % 360.0
+    commands = {}
+    altitude = fused["altitude"]
+    ias = fused["ias"]
+    mach = fused["mach"]
+    vs_meas = fused["vertical_speed"]
+    pitch_rate = fused["pitch_rate"] or 0.0
+    roll_rate = fused["roll_rate"] or 0.0
+    yaw_rate = fused["yaw_rate"] or 0.0
+    pitch = fused["pitch"] or 0.0
+    roll = fused["roll"] or 0.0
+    heading = fused["heading"] if fused["heading"] is not None else fused["track"]
+    track = fused["track"] if fused["track"] is not None else heading
+    drift = fused["drift"] or 0.0
+
+    low_speed = False
+    high_speed = False
+    if _is_finite(ias):
+        low_speed_threshold = max(110.0, target_ias - 35.0)
+        if ias < low_speed_threshold:
+            low_speed = True
+        overspeed_threshold = min(_VNE_KT - 5.0, target_ias + 25.0)
+        if ias > overspeed_threshold or (mach and mach > _MAX_MACH):
+            high_speed = True
+
+    vs_cmd = target_vs
+    if altitude is not None and target_alt is not None:
+        alt_error = _clip(target_alt - altitude, -6000.0, 6000.0)
+        vs_cmd += _clip(0.35 * alt_error, -2000.0, 2000.0)
+    vs_cmd = _clip(vs_cmd, _MAX_DESCENT_VS, _MAX_CLIMB_VS)
+
+    elevator_cmd = 0.0
+    trim_cmd = _AUTO_STATE["trim_cmd"]
+    if ap_on:
+        vs_error = vs_cmd - vs_meas
+        vs_error_norm = vs_error / 1000.0
+        _AUTO_STATE["pitch_int"] = _clip(_AUTO_STATE["pitch_int"] + vs_error_norm * 0.2 * dt, -0.5, 0.5)
+        pitch_target = _clip(vs_cmd / 400.0, -6.0, 12.0)
+        if low_speed and pitch_target > 2.0:
+            pitch_target = min(pitch_target, 5.0)
+        pitch_error = (pitch_target - pitch) if pitch is not None else 0.0
+        elevator_cmd = (
+            _clip(vs_error_norm * 0.9, -0.9, 0.9)
+            + _AUTO_STATE["pitch_int"]
+            + _clip(pitch_error * 0.05, -0.3, 0.3)
+            - pitch_rate * 0.02
+        )
+        elevator_cmd = _clip(elevator_cmd, -0.95, 0.95)
+        if abs(vs_error) < 200 and abs(elevator_cmd) > 0.05:
+            trim_delta = _clip(elevator_cmd * 0.08 * dt, -0.01, 0.01)
+            trim_cmd = _clip(trim_cmd + trim_delta, -0.8, 0.8)
+        _AUTO_STATE["trim_cmd"] = trim_cmd
+        heading_error = _wrap180(target_hdg - (heading if heading is not None else target_hdg))
+        track_error = _wrap180(target_hdg - (track if track is not None else target_hdg))
+        bank_target = _clip(heading_error * 0.5 + track_error * 0.2, -_MAX_BANK_DEG, _MAX_BANK_DEG)
+        if low_speed:
+            bank_target = _clip(bank_target, -15.0, 15.0)
+        roll_error = bank_target - roll
+        _AUTO_STATE["roll_int"] = _clip(_AUTO_STATE["roll_int"] + roll_error * 0.02 * dt, -0.3, 0.3)
+        aileron_cmd = (
+            _clip(roll_error / 30.0 * 1.4, -1.0, 1.0)
+            + _AUTO_STATE["roll_int"]
+            - roll_rate * 0.03
+        )
+        aileron_cmd = _clip(aileron_cmd, -1.0, 1.0)
+        slip = drift if _is_finite(drift) else 0.0
+        thrust_diff = (state.get("engine_1_thrust_pct", 0.0) or 0.0) - (state.get("engine_2_thrust_pct", 0.0) or 0.0)
+        rudder_cmd = _clip(-0.02 * slip - 0.01 * yaw_rate + 0.002 * thrust_diff, -0.4, 0.4)
+        commands["elevator"] = _clip(elevator_cmd, -1.0, 1.0)
+        commands["elevator_trim"] = trim_cmd
+        commands["aileron"] = aileron_cmd
+        commands["rudder"] = rudder_cmd
+    else:
+        _AUTO_STATE["pitch_int"] *= 0.9
+        _AUTO_STATE["roll_int"] *= 0.9
+
+    avg_throttle = (_clip(state.get("throttle_1_pos", 0.5), 0.0, 1.0) + _clip(state.get("throttle_2_pos", 0.5), 0.0, 1.0)) * 0.5
+    if _AUTO_STATE["last_throttle_cmd"] is None:
+        _AUTO_STATE["last_throttle_cmd"] = avg_throttle
+    throttle_cmd = _AUTO_STATE["last_throttle_cmd"]
+    ias_error = 0.0
+    ias_rate = 0.0
+    if _is_finite(ias):
+        ias_error = target_ias - ias
+        if ias_prev is not None:
+            ias_rate = (ias - ias_prev) / dt
+    throttle_target = throttle_cmd
+    if _is_finite(ias):
+        _AUTO_STATE["ias_int"] = _clip(_AUTO_STATE["ias_int"] + (ias_error / 50.0) * 0.15 * dt, -0.5, 0.5)
+        throttle_target = avg_throttle + 0.04 * ias_error + _AUTO_STATE["ias_int"] - 0.002 * ias_rate
+    throttle_target = _clip(throttle_target, 0.0, 1.0)
+    if low_speed:
+        throttle_target = max(throttle_target, 0.95)
+    if high_speed:
+        throttle_target = min(throttle_target, 0.1)
+    throttle_cmd = _blend(throttle_cmd, throttle_target, _THRUST_RATE_PER_S, dt)
+    _AUTO_STATE["last_throttle_cmd"] = throttle_cmd
+
+    engine1_alive = _engine_alive(state, 1)
+    engine2_alive = _engine_alive(state, 2)
+    throttle_override = at_on or low_speed or high_speed
+    if throttle_override:
+        commands["throttle_1"] = throttle_cmd if engine1_alive and not high_speed else 0.0 if high_speed else throttle_cmd if engine1_alive else 0.0
+        commands["throttle_2"] = throttle_cmd if engine2_alive and not high_speed else 0.0 if high_speed else throttle_cmd if engine2_alive else 0.0
+
+    speedbrake_target = 0.0
+    if high_speed:
+        speedbrake_target = _clip(0.3 + 0.01 * (ias - target_ias) if _is_finite(ias) else 0.4, 0.0, 0.8)
+    elif vs_cmd < -2200 and _is_finite(ias) and ias > target_ias + 8:
+        speedbrake_target = 0.25
+    if low_speed:
+        speedbrake_target = 0.0
+    sb_last = _AUTO_STATE["speedbrake"]
+    speedbrake_cmd = _clip(_blend(sb_last, speedbrake_target, _SPEEDBRAKE_RATE_PER_S, dt), 0.0, 1.0)
+    _AUTO_STATE["speedbrake"] = speedbrake_cmd
+    commands["speedbrake"] = speedbrake_cmd
+
+    radar_alt = fused["radar_alt"]
+    on_ground = any(bool(state.get(k)) for k in ("weight_on_wheels_left", "weight_on_wheels_right", "weight_on_wheels_nose"))
+    desired_gear = _AUTO_STATE.get("gear_state")
+    if on_ground:
+        desired_gear = 1
+    else:
+        landing_mode = (
+            (radar_alt is not None and radar_alt < 1200.0)
+            or (target_alt is not None and target_alt < 1500.0 and altitude is not None and altitude < 2500.0)
+        )
+        climb_mode = altitude is not None and altitude > 2500.0 and target_alt is not None and target_alt > 2500.0
+        if landing_mode and _is_finite(ias) and ias < 220.0 and vs_cmd <= 0.0:
+            desired_gear = 1
+        elif climb_mode:
+            desired_gear = 0
+    if desired_gear is not None:
+        _AUTO_STATE["gear_state"] = desired_gear
+        commands["gear"] = desired_gear
+
+    if low_speed and ap_on:
+        commands["elevator"] = min(commands.get("elevator", 0.0), -0.35)
+    if high_speed and ap_on:
+        commands["elevator"] = max(commands.get("elevator", 0.0), 0.25)
+
+    return commands
+```

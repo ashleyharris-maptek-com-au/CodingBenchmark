@@ -26,10 +26,10 @@ title = "Regular Tetrahedron Packing in Polyhedra (C++)"
 
 tags = [
   "cpp",
-  "freeform response",
-  "geometry",
+  "computational geometry",
+  "3d geometry",
   "packing",
-  "optimization",
+  "collision detection",
 ]
 
 # Seed for reproducibility

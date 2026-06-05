@@ -44,9 +44,10 @@ title = "Boid Flocking Simulation (GLSL Compute)"
 
 tags = [
   "glsl",
-  "freeform response",
   "gpu compute",
   "simulation",
+  "parallel algorithms",
+  "spatial data",
 ]
 
 RANDOM_SEED = 50505050

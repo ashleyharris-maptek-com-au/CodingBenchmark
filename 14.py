@@ -26,9 +26,10 @@ title = "Minesweeper Solver (C#)"
 
 tags = [
   "csharp",
-  "freeform response",
-  "constraint satisfaction",
+  "constraint solving",
   "game ai",
+  "grid problems",
+  "probabilistic reasoning",
 ]
 
 # Timeout in seconds (5 minutes)

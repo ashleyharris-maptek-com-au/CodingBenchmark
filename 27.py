@@ -28,9 +28,10 @@ title = "Graph Coloring (C++)"
 
 tags = [
   "cpp",
-  "freeform response",
-  "np hard",
-  "graph theory",
+  "np-hard",
+  "graph algorithms",
+  "constraint solving",
+  "heuristic search",
 ]
 TIMEOUT_SECONDS = 30
 RANDOM_SEED = 27272727

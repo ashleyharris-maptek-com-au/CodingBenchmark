@@ -22,9 +22,10 @@ title = "Steiner Tree (C++)"
 
 tags = [
   "cpp",
-  "freeform response",
-  "np hard",
-  "graph theory",
+  "np-hard",
+  "graph algorithms",
+  "shortest paths",
+  "approximation algorithms",
 ]
 TIMEOUT_SECONDS = 30
 RANDOM_SEED = 32323232

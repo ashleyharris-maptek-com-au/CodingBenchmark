@@ -12,8 +12,10 @@ title = "Maze Solver (Rust)"
 
 tags = [
   "rust",
-  "freeform response",
-  "algorithm design",
+  "grid problems",
+  "pathfinding",
+  "shortest paths",
+  "large-scale input",
 ]
 
 # Timeout in seconds (30 seconds)
