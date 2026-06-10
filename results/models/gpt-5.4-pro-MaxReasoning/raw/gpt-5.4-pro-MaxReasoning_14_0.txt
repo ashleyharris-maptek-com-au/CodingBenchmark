@@ -1,1 +1,1437 @@
-{'__exception__': "Can't run here - we're trying to get this working in codex."}
+```csharp
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Text;
+
+public static class Program
+{
+    private const byte UnknownCell = 0;
+    private const byte KnownMineCell = 1;
+    private const byte ProvenSafeCell = 2;
+    private const byte NumberBase = 10;
+    private const int MaxAdj = 8;
+
+    private const int ExactComponentVarPreprocessLimit = 8000;
+    private const int ExactComponentConstraintPreprocessLimit = 2048;
+
+    private static int H;
+    private static int W;
+    private static byte[] board = Array.Empty<byte>();
+
+    private static List<int> numbers = new List<int>();
+    private static List<int> unknowns = new List<int>();
+    private static List<int> safeFound = new List<int>();
+
+    // Incremental queue for number re-evaluation after new safe/mine deductions.
+    private static List<int> pendingNumbers = new List<int>();
+    private static int pendingHead = 0;
+
+    private static long currentUnknownCount = 0;
+
+    public static void Main()
+    {
+        StreamReader reader = new StreamReader(Console.OpenStandardInput(), Encoding.ASCII, false, 1 << 20);
+
+        string? first = reader.ReadLine();
+        if (string.IsNullOrWhiteSpace(first))
+        {
+            Console.WriteLine(0);
+            return;
+        }
+
+        string[] parts = first.Split(new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length < 2)
+        {
+            Console.WriteLine(0);
+            return;
+        }
+
+        if (!int.TryParse(parts[0], out H) || !int.TryParse(parts[1], out W) || H < 0 || W < 0)
+        {
+            Console.WriteLine(0);
+            return;
+        }
+
+        long totalCellsLong = (long)H * W;
+        if (totalCellsLong > int.MaxValue)
+        {
+            // Out of scope for this flat-int-index implementation.
+            Console.WriteLine(0);
+            return;
+        }
+
+        int totalCells = (int)totalCellsLong;
+        board = new byte[totalCells];
+
+        int initialCap = (int)Math.Min(totalCellsLong, 1_000_000L);
+        numbers = new List<int>(Math.Max(16, initialCap / 2));
+        unknowns = new List<int>(Math.Max(16, initialCap / 2));
+        safeFound = new List<int>();
+        pendingNumbers = new List<int>();
+        pendingHead = 0;
+        currentUnknownCount = 0;
+
+        for (int y = 0; y < H; y++)
+        {
+            string line = reader.ReadLine() ?? string.Empty;
+            int rowBase = y * W;
+
+            for (int x = 0; x < W; x++)
+            {
+                char ch = x < line.Length ? line[x] : ' ';
+                int idx = rowBase + x;
+
+                if (ch == ' ')
+                {
+                    board[idx] = UnknownCell;
+                    unknowns.Add(idx);
+                    currentUnknownCount++;
+                }
+                else if (ch == '*')
+                {
+                    board[idx] = KnownMineCell;
+                }
+                else if (ch >= '0' && ch <= '8')
+                {
+                    board[idx] = (byte)(NumberBase + (ch - '0'));
+                    numbers.Add(idx);
+                }
+                else
+                {
+                    // Robust fallback: treat unknown unexpected cells as unrevealed.
+                    board[idx] = UnknownCell;
+                    unknowns.Add(idx);
+                    currentUnknownCount++;
+                }
+            }
+        }
+
+        // No unrevealed cells or no numbered constraints => nothing provably safe.
+        if (currentUnknownCount == 0 || numbers.Count == 0)
+        {
+            WriteOutput();
+            return;
+        }
+
+        // Strategy 1: cheap local propagation to a fixpoint.
+        InitialLocalPropagation();
+
+        if (currentUnknownCount == 0)
+        {
+            WriteOutput();
+            return;
+        }
+
+        SolverSettings settings = BuildSettings(totalCellsLong, numbers.Count, currentUnknownCount);
+        long exactNodeBudgetRemaining = settings.TotalExactNodeBudget;
+
+        for (int round = 0; round < settings.MaxOuterRounds; round++)
+        {
+            if (currentUnknownCount == 0)
+                break;
+
+            bool roundChanged = false;
+
+            List<int>? frontierNumbers = null;
+            bool frontierTooMany = false;
+
+            if (settings.EnablePairwise || (settings.EnableExact && exactNodeBudgetRemaining > 0))
+            {
+                int frontierLimit = settings.EnablePairwise
+                    ? settings.PairwiseFrontierLimit
+                    : settings.ExactConstraintBuildLimit;
+
+                frontierNumbers = BuildFrontierNumbersAdaptive(frontierLimit, out frontierTooMany);
+            }
+
+            // Strategy 2: local overlap / subset-like reasoning using nearby constraints.
+            if (settings.EnablePairwise && !frontierTooMany && frontierNumbers != null && frontierNumbers.Count > 1)
+            {
+                if (PairwiseOverlapPass(frontierNumbers))
+                {
+                    ProcessPendingNumbers();
+                    roundChanged = true;
+                }
+            }
+
+            if (currentUnknownCount == 0)
+                break;
+
+            // Strategy 3: exact CSP on manageable frontier components, with symmetry grouping.
+            if (settings.EnableExact && exactNodeBudgetRemaining > 0 && !frontierTooMany && frontierNumbers != null && frontierNumbers.Count > 0)
+            {
+                if (ExactComponentReasoning(frontierNumbers, settings, ref exactNodeBudgetRemaining))
+                {
+                    ProcessPendingNumbers();
+                    roundChanged = true;
+                }
+            }
+
+            if (!roundChanged)
+                break;
+        }
+
+        WriteOutput();
+    }
+
+    private static SolverSettings BuildSettings(long totalCells, int numberCount, long unknownCount)
+    {
+        SolverSettings s = new SolverSettings();
+        s.EnablePairwise = true;
+        s.EnableExact = true;
+
+        if (unknownCount <= 0 || numberCount <= 0)
+        {
+            s.EnablePairwise = false;
+            s.EnableExact = false;
+            s.PairwiseFrontierLimit = 0;
+            s.ExactVarBuildLimit = 0;
+            s.ExactConstraintBuildLimit = 0;
+            s.TotalExactNodeBudget = 0;
+            s.MaxOuterRounds = 1;
+            return s;
+        }
+
+        if (totalCells <= 200_000)
+        {
+            s.MaxOuterRounds = 48;
+            s.PairwiseFrontierLimit = 2_000_000;
+            s.ExactVarBuildLimit = 250_000;
+            s.ExactConstraintBuildLimit = 250_000;
+            s.TotalExactNodeBudget = 20_000_000;
+        }
+        else if (totalCells <= 2_000_000)
+        {
+            s.MaxOuterRounds = 24;
+            s.PairwiseFrontierLimit = 1_500_000;
+            s.ExactVarBuildLimit = 180_000;
+            s.ExactConstraintBuildLimit = 180_000;
+            s.TotalExactNodeBudget = 8_000_000;
+        }
+        else if (totalCells <= 20_000_000)
+        {
+            s.MaxOuterRounds = 12;
+            s.PairwiseFrontierLimit = 800_000;
+            s.ExactVarBuildLimit = 120_000;
+            s.ExactConstraintBuildLimit = 120_000;
+            s.TotalExactNodeBudget = 3_000_000;
+        }
+        else
+        {
+            s.MaxOuterRounds = 4;
+            s.PairwiseFrontierLimit = 250_000;
+            s.ExactVarBuildLimit = 40_000;
+            s.ExactConstraintBuildLimit = 40_000;
+            s.TotalExactNodeBudget = 500_000;
+        }
+
+        // If the unresolved region is small, allow more advanced work even on giant boards.
+        if (unknownCount <= 100_000)
+        {
+            s.MaxOuterRounds = Math.Max(s.MaxOuterRounds, 64);
+            s.PairwiseFrontierLimit = Math.Max(s.PairwiseFrontierLimit, 1_200_000);
+            s.ExactVarBuildLimit = Math.Max(s.ExactVarBuildLimit, 220_000);
+            s.ExactConstraintBuildLimit = Math.Max(s.ExactConstraintBuildLimit, 220_000);
+            s.TotalExactNodeBudget = Math.Max(s.TotalExactNodeBudget, 10_000_000);
+        }
+
+        // On very dense gigantic boards, stick to linear-time local reasoning.
+        if (totalCells > 50_000_000L && numberCount > 10_000_000 && unknownCount > 300_000)
+        {
+            s.EnablePairwise = false;
+            s.EnableExact = false;
+            s.PairwiseFrontierLimit = 0;
+            s.ExactVarBuildLimit = 0;
+            s.ExactConstraintBuildLimit = 0;
+            s.TotalExactNodeBudget = 0;
+            s.MaxOuterRounds = 1;
+        }
+
+        return s;
+    }
+
+    private static void InitialLocalPropagation()
+    {
+        bool useUnknownCentric =
+            unknowns.Count > 0 &&
+            unknowns.Count <= 1_500_000 &&
+            unknowns.Count * 4L < numbers.Count;
+
+        if (useUnknownCentric)
+        {
+            bool tooMany;
+            HashSet<int>? set = BuildAdjacentNumberSetFromUnknowns(2_000_000, out tooMany);
+            if (set != null && !tooMany)
+            {
+                foreach (int idx in set)
+                    EvaluateNumberCell(idx);
+            }
+            else
+            {
+                for (int i = 0; i < numbers.Count; i++)
+                    EvaluateNumberCell(numbers[i]);
+            }
+        }
+        else
+        {
+            for (int i = 0; i < numbers.Count; i++)
+                EvaluateNumberCell(numbers[i]);
+        }
+
+        ProcessPendingNumbers();
+    }
+
+    private static bool IsNumber(byte state)
+    {
+        return state >= NumberBase;
+    }
+
+    private static int NumberValue(byte state)
+    {
+        return state - NumberBase;
+    }
+
+    private static void EvaluateNumberCell(int idx)
+    {
+        byte state = board[idx];
+        if (!IsNumber(state))
+            return;
+
+        int needed = NumberValue(state);
+
+        int y = idx / W;
+        int x = idx - y * W;
+
+        int y0 = y > 0 ? y - 1 : y;
+        int y1 = y + 1 < H ? y + 1 : y;
+        int x0 = x > 0 ? x - 1 : x;
+        int x1 = x + 1 < W ? x + 1 : x;
+
+        int unknownCount = 0;
+
+        for (int ny = y0; ny <= y1; ny++)
+        {
+            int rowBase = ny * W;
+            for (int nx = x0; nx <= x1; nx++)
+            {
+                int nidx = rowBase + nx;
+                if (nidx == idx)
+                    continue;
+
+                byte s = board[nidx];
+                if (s == KnownMineCell)
+                    needed--;
+                else if (s == UnknownCell)
+                    unknownCount++;
+            }
+        }
+
+        if (unknownCount == 0)
+            return;
+
+        if (needed < 0 || needed > unknownCount)
+            return;
+
+        if (needed == 0)
+        {
+            for (int ny = y0; ny <= y1; ny++)
+            {
+                int rowBase = ny * W;
+                for (int nx = x0; nx <= x1; nx++)
+                {
+                    int nidx = rowBase + nx;
+                    if (nidx != idx && board[nidx] == UnknownCell)
+                        TryMarkSafe(nidx);
+                }
+            }
+        }
+        else if (needed == unknownCount)
+        {
+            for (int ny = y0; ny <= y1; ny++)
+            {
+                int rowBase = ny * W;
+                for (int nx = x0; nx <= x1; nx++)
+                {
+                    int nidx = rowBase + nx;
+                    if (nidx != idx && board[nidx] == UnknownCell)
+                        TryMarkMine(nidx);
+                }
+            }
+        }
+    }
+
+    private static bool TryMarkSafe(int idx)
+    {
+        if (board[idx] != UnknownCell)
+            return false;
+
+        board[idx] = ProvenSafeCell;
+        safeFound.Add(idx);
+        currentUnknownCount--;
+        EnqueueAdjacentNumbers(idx);
+        return true;
+    }
+
+    private static bool TryMarkMine(int idx)
+    {
+        if (board[idx] != UnknownCell)
+            return false;
+
+        board[idx] = KnownMineCell;
+        currentUnknownCount--;
+        EnqueueAdjacentNumbers(idx);
+        return true;
+    }
+
+    private static void EnqueueAdjacentNumbers(int idx)
+    {
+        int y = idx / W;
+        int x = idx - y * W;
+
+        int y0 = y > 0 ? y - 1 : y;
+        int y1 = y + 1 < H ? y + 1 : y;
+        int x0 = x > 0 ? x - 1 : x;
+        int x1 = x + 1 < W ? x + 1 : x;
+
+        for (int ny = y0; ny <= y1; ny++)
+        {
+            int rowBase = ny * W;
+            for (int nx = x0; nx <= x1; nx++)
+            {
+                int nidx = rowBase + nx;
+                if (nidx == idx)
+                    continue;
+
+                if (IsNumber(board[nidx]))
+                    pendingNumbers.Add(nidx);
+            }
+        }
+    }
+
+    private static void ProcessPendingNumbers()
+    {
+        while (pendingHead < pendingNumbers.Count)
+        {
+            int idx = pendingNumbers[pendingHead++];
+            EvaluateNumberCell(idx);
+        }
+
+        pendingNumbers.Clear();
+        pendingHead = 0;
+    }
+
+    private static bool HasUnknownNeighbor(int idx)
+    {
+        int y = idx / W;
+        int x = idx - y * W;
+
+        int y0 = y > 0 ? y - 1 : y;
+        int y1 = y + 1 < H ? y + 1 : y;
+        int x0 = x > 0 ? x - 1 : x;
+        int x1 = x + 1 < W ? x + 1 : x;
+
+        for (int ny = y0; ny <= y1; ny++)
+        {
+            int rowBase = ny * W;
+            for (int nx = x0; nx <= x1; nx++)
+            {
+                int nidx = rowBase + nx;
+                if (nidx != idx && board[nidx] == UnknownCell)
+                    return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static bool GetConstraint(int idx, int[] vars, out int count, out int remainingMines)
+    {
+        count = 0;
+        remainingMines = 0;
+
+        byte state = board[idx];
+        if (!IsNumber(state))
+            return false;
+
+        remainingMines = NumberValue(state);
+
+        int y = idx / W;
+        int x = idx - y * W;
+
+        int y0 = y > 0 ? y - 1 : y;
+        int y1 = y + 1 < H ? y + 1 : y;
+        int x0 = x > 0 ? x - 1 : x;
+        int x1 = x + 1 < W ? x + 1 : x;
+
+        for (int ny = y0; ny <= y1; ny++)
+        {
+            int rowBase = ny * W;
+            for (int nx = x0; nx <= x1; nx++)
+            {
+                int nidx = rowBase + nx;
+                if (nidx == idx)
+                    continue;
+
+                byte s = board[nidx];
+                if (s == KnownMineCell)
+                {
+                    remainingMines--;
+                }
+                else if (s == UnknownCell)
+                {
+                    vars[count++] = nidx;
+                }
+            }
+        }
+
+        if (count == 0)
+            return false;
+
+        if (remainingMines < 0 || remainingMines > count)
+        {
+            count = 0;
+            return false;
+        }
+
+        return true;
+    }
+
+    private static HashSet<int>? BuildAdjacentNumberSetFromUnknowns(int limit, out bool tooMany)
+    {
+        tooMany = false;
+        HashSet<int> set = new HashSet<int>();
+
+        for (int i = 0; i < unknowns.Count; i++)
+        {
+            int idx = unknowns[i];
+            if (board[idx] != UnknownCell)
+                continue;
+
+            int y = idx / W;
+            int x = idx - y * W;
+
+            int y0 = y > 0 ? y - 1 : y;
+            int y1 = y + 1 < H ? y + 1 : y;
+            int x0 = x > 0 ? x - 1 : x;
+            int x1 = x + 1 < W ? x + 1 : x;
+
+            for (int ny = y0; ny <= y1; ny++)
+            {
+                int rowBase = ny * W;
+                for (int nx = x0; nx <= x1; nx++)
+                {
+                    int nidx = rowBase + nx;
+                    if (IsNumber(board[nidx]))
+                    {
+                        if (set.Add(nidx) && set.Count > limit)
+                        {
+                            tooMany = true;
+                            return null;
+                        }
+                    }
+                }
+            }
+        }
+
+        return set;
+    }
+
+    private static List<int>? BuildFrontierNumbersAdaptive(int limit, out bool tooMany)
+    {
+        tooMany = false;
+        if (limit <= 0)
+            return new List<int>(0);
+
+        bool useUnknownCentric =
+            unknowns.Count > 0 &&
+            unknowns.Count <= (long)limit * 8L &&
+            currentUnknownCount <= (long)limit * 4L &&
+            unknowns.Count * 3L < numbers.Count;
+
+        if (useUnknownCentric)
+        {
+            HashSet<int>? set = BuildAdjacentNumberSetFromUnknowns(limit, out tooMany);
+            if (tooMany || set == null)
+                return null;
+
+            return new List<int>(set);
+        }
+
+        List<int> list = new List<int>();
+        for (int i = 0; i < numbers.Count; i++)
+        {
+            int idx = numbers[i];
+            if (HasUnknownNeighbor(idx))
+            {
+                list.Add(idx);
+                if (list.Count > limit)
+                {
+                    tooMany = true;
+                    return null;
+                }
+            }
+        }
+
+        return list;
+    }
+
+    private static bool PairwiseOverlapPass(List<int> frontierNumbers)
+    {
+        HashSet<int> safeCandidates = new HashSet<int>();
+        HashSet<int> mineCandidates = new HashSet<int>();
+
+        int[] aVars = new int[MaxAdj];
+        int[] bVars = new int[MaxAdj];
+        int[] onlyA = new int[MaxAdj];
+        int[] onlyB = new int[MaxAdj];
+        int[] inter = new int[MaxAdj];
+
+        for (int i = 0; i < frontierNumbers.Count; i++)
+        {
+            int idxA = frontierNumbers[i];
+            int aCount;
+            int aRem;
+
+            if (!GetConstraint(idxA, aVars, out aCount, out aRem))
+                continue;
+
+            int ay = idxA / W;
+            int ax = idxA - ay * W;
+
+            int y0 = ay > 1 ? ay - 2 : 0;
+            int y1 = ay + 2 < H ? ay + 2 : H - 1;
+            int x0 = ax > 1 ? ax - 2 : 0;
+            int x1 = ax + 2 < W ? ax + 2 : W - 1;
+
+            for (int ny = y0; ny <= y1; ny++)
+            {
+                int rowBase = ny * W;
+                for (int nx = x0; nx <= x1; nx++)
+                {
+                    int idxB = rowBase + nx;
+                    if (idxB <= idxA)
+                        continue;
+
+                    if (!IsNumber(board[idxB]))
+                        continue;
+
+                    int bCount;
+                    int bRem;
+                    if (!GetConstraint(idxB, bVars, out bCount, out bRem))
+                        continue;
+
+                    int onlyACount = 0;
+                    int onlyBCount = 0;
+                    int interCount = 0;
+
+                    for (int av = 0; av < aCount; av++)
+                    {
+                        int cell = aVars[av];
+                        if (Contains(bVars, bCount, cell))
+                            inter[interCount++] = cell;
+                        else
+                            onlyA[onlyACount++] = cell;
+                    }
+
+                    if (interCount == 0)
+                        continue;
+
+                    for (int bv = 0; bv < bCount; bv++)
+                    {
+                        int cell = bVars[bv];
+                        if (!Contains(aVars, aCount, cell))
+                            onlyB[onlyBCount++] = cell;
+                    }
+
+                    int lowerX = aRem - onlyACount;
+                    if (bRem - onlyBCount > lowerX) lowerX = bRem - onlyBCount;
+                    if (0 > lowerX) lowerX = 0;
+
+                    int upperX = aRem;
+                    if (bRem < upperX) upperX = bRem;
+                    if (interCount < upperX) upperX = interCount;
+
+                    if (lowerX > upperX)
+                        continue;
+
+                    // A-only cells.
+                    if (onlyACount > 0)
+                    {
+                        // y = aRem - x
+                        if (lowerX == aRem)
+                            AddAll(safeCandidates, onlyA, onlyACount);
+                        if (upperX == aRem - onlyACount)
+                            AddAll(mineCandidates, onlyA, onlyACount);
+                    }
+
+                    // B-only cells.
+                    if (onlyBCount > 0)
+                    {
+                        // z = bRem - x
+                        if (lowerX == bRem)
+                            AddAll(safeCandidates, onlyB, onlyBCount);
+                        if (upperX == bRem - onlyBCount)
+                            AddAll(mineCandidates, onlyB, onlyBCount);
+                    }
+
+                    // Intersection cells.
+                    if (interCount > 0)
+                    {
+                        if (upperX == 0)
+                            AddAll(safeCandidates, inter, interCount);
+                        if (lowerX == interCount)
+                            AddAll(mineCandidates, inter, interCount);
+                    }
+                }
+            }
+        }
+
+        bool changed = false;
+
+        foreach (int idx in mineCandidates)
+        {
+            if (!safeCandidates.Contains(idx))
+                changed |= TryMarkMine(idx);
+        }
+
+        foreach (int idx in safeCandidates)
+        {
+            if (!mineCandidates.Contains(idx))
+                changed |= TryMarkSafe(idx);
+        }
+
+        return changed;
+    }
+
+    private static bool Contains(int[] arr, int count, int value)
+    {
+        for (int i = 0; i < count; i++)
+        {
+            if (arr[i] == value)
+                return true;
+        }
+
+        return false;
+    }
+
+    private static void AddAll(HashSet<int> set, int[] arr, int count)
+    {
+        for (int i = 0; i < count; i++)
+            set.Add(arr[i]);
+    }
+
+    private static bool ExactComponentReasoning(List<int> frontierNumbers, SolverSettings settings, ref long exactNodeBudgetRemaining)
+    {
+        if (frontierNumbers.Count == 0 || exactNodeBudgetRemaining <= 0)
+            return false;
+
+        Dictionary<int, int> varMap = new Dictionary<int, int>(Math.Min(settings.ExactVarBuildLimit, 16384));
+        List<int> varIdToCell = new List<int>();
+        List<int[]> constraints = new List<int[]>();
+        List<int> rhs = new List<int>();
+        List<List<int>> varToConstraints = new List<List<int>>();
+
+        int[] buf = new int[MaxAdj];
+
+        for (int i = 0; i < frontierNumbers.Count; i++)
+        {
+            int numIdx = frontierNumbers[i];
+
+            int count;
+            int rem;
+            if (!GetConstraint(numIdx, buf, out count, out rem))
+                continue;
+
+            if (constraints.Count >= settings.ExactConstraintBuildLimit)
+                return false;
+
+            int[] vids = new int[count];
+
+            for (int j = 0; j < count; j++)
+            {
+                int cellIdx = buf[j];
+                int vid;
+                if (!varMap.TryGetValue(cellIdx, out vid))
+                {
+                    vid = varIdToCell.Count;
+                    if (vid >= settings.ExactVarBuildLimit)
+                        return false;
+
+                    varMap[cellIdx] = vid;
+                    varIdToCell.Add(cellIdx);
+                    varToConstraints.Add(new List<int>(4));
+                }
+
+                vids[j] = vid;
+            }
+
+            int cid = constraints.Count;
+            constraints.Add(vids);
+            rhs.Add(rem);
+
+            for (int j = 0; j < vids.Length; j++)
+                varToConstraints[vids[j]].Add(cid);
+        }
+
+        int totalVars = varIdToCell.Count;
+        int totalConstraints = constraints.Count;
+
+        if (totalVars == 0 || totalConstraints == 0)
+            return false;
+
+        bool[] varVisited = new bool[totalVars];
+        bool[] conVisited = new bool[totalConstraints];
+
+        Queue<int> qVars = new Queue<int>();
+        Queue<int> qCons = new Queue<int>();
+
+        bool changed = false;
+
+        for (int startC = 0; startC < totalConstraints; startC++)
+        {
+            if (conVisited[startC])
+                continue;
+
+            List<int> compVars = new List<int>();
+            List<int> compCons = new List<int>();
+
+            conVisited[startC] = true;
+            qCons.Enqueue(startC);
+
+            while (qCons.Count > 0 || qVars.Count > 0)
+            {
+                while (qCons.Count > 0)
+                {
+                    int c = qCons.Dequeue();
+                    compCons.Add(c);
+
+                    int[] vars = constraints[c];
+                    for (int i = 0; i < vars.Length; i++)
+                    {
+                        int v = vars[i];
+                        if (!varVisited[v])
+                        {
+                            varVisited[v] = true;
+                            qVars.Enqueue(v);
+                        }
+                    }
+                }
+
+                while (qVars.Count > 0)
+                {
+                    int v = qVars.Dequeue();
+                    compVars.Add(v);
+
+                    List<int> cons = varToConstraints[v];
+                    for (int i = 0; i < cons.Count; i++)
+                    {
+                        int c = cons[i];
+                        if (!conVisited[c])
+                        {
+                            conVisited[c] = true;
+                            qCons.Enqueue(c);
+                        }
+                    }
+                }
+            }
+
+            if (compCons.Count <= 1)
+                continue;
+
+            if (compVars.Count > ExactComponentVarPreprocessLimit || compCons.Count > ExactComponentConstraintPreprocessLimit)
+                continue;
+
+            if (exactNodeBudgetRemaining <= 0)
+                break;
+
+            if (SolveExactComponentGrouped(compVars, compCons, constraints, rhs, varToConstraints, varIdToCell, ref exactNodeBudgetRemaining))
+                changed = true;
+        }
+
+        return changed;
+    }
+
+    private static bool SolveExactComponentGrouped(
+        List<int> compVars,
+        List<int> compCons,
+        List<int[]> constraints,
+        List<int> rhs,
+        List<List<int>> varToConstraints,
+        List<int> varIdToCell,
+        ref long exactNodeBudgetRemaining)
+    {
+        Dictionary<int, int> cLocal = new Dictionary<int, int>(compCons.Count);
+        for (int i = 0; i < compCons.Count; i++)
+            cLocal[compCons[i]] = i;
+
+        Dictionary<string, int> signatureToGroup = new Dictionary<string, int>();
+        List<ComponentGroup> groups = new List<ComponentGroup>();
+        Dictionary<int, int> varToGroup = new Dictionary<int, int>(compVars.Count);
+
+        for (int i = 0; i < compVars.Count; i++)
+        {
+            int globalVar = compVars[i];
+            List<int> cons = varToConstraints[globalVar];
+
+            int[] localTouches = new int[cons.Count];
+            int touchCount = 0;
+
+            for (int k = 0; k < cons.Count; k++)
+            {
+                int localC;
+                if (cLocal.TryGetValue(cons[k], out localC))
+                    localTouches[touchCount++] = localC;
+            }
+
+            if (touchCount == 0)
+                continue;
+
+            string key = BuildSignatureKey(localTouches, touchCount);
+
+            int gid;
+            if (!signatureToGroup.TryGetValue(key, out gid))
+            {
+                int[] groupConstraints = new int[touchCount];
+                Array.Copy(localTouches, groupConstraints, touchCount);
+                gid = groups.Count;
+                groups.Add(new ComponentGroup(groupConstraints));
+                signatureToGroup[key] = gid;
+            }
+
+            groups[gid].Members.Add(varIdToCell[globalVar]);
+            varToGroup[globalVar] = gid;
+        }
+
+        int groupCount = groups.Count;
+        if (groupCount == 0)
+            return false;
+
+        long componentBudget = GetComponentNodeBudget(groupCount, exactNodeBudgetRemaining);
+        if (componentBudget <= 0)
+            return false;
+
+        int[][] conToGroups = new int[compCons.Count][];
+        int[] required = new int[compCons.Count];
+
+        for (int i = 0; i < compCons.Count; i++)
+        {
+            int globalC = compCons[i];
+            required[i] = rhs[globalC];
+
+            int[] cVars = constraints[globalC];
+            int[] tmp = new int[cVars.Length];
+            int gc = 0;
+
+            for (int j = 0; j < cVars.Length; j++)
+            {
+                int gid = varToGroup[cVars[j]];
+                bool seen = false;
+                for (int t = 0; t < gc; t++)
+                {
+                    if (tmp[t] == gid)
+                    {
+                        seen = true;
+                        break;
+                    }
+                }
+
+                if (!seen)
+                    tmp[gc++] = gid;
+            }
+
+            int[] arr = new int[gc];
+            Array.Copy(tmp, arr, gc);
+            conToGroups[i] = arr;
+        }
+
+        int[][] groupToConstraints = new int[groupCount][];
+        int[] groupSizes = new int[groupCount];
+        for (int g = 0; g < groupCount; g++)
+        {
+            groupToConstraints[g] = groups[g].Constraints;
+            groupSizes[g] = groups[g].Members.Count;
+        }
+
+        GroupedExactSolver solver = new GroupedExactSolver(
+            conToGroups,
+            required,
+            groupToConstraints,
+            groupSizes,
+            componentBudget);
+
+        solver.Solve();
+        exactNodeBudgetRemaining -= solver.NodesExplored;
+        if (exactNodeBudgetRemaining < 0)
+            exactNodeBudgetRemaining = 0;
+
+        if (solver.Aborted || solver.SolutionsFound == 0)
+            return false;
+
+        bool changed = false;
+
+        for (int g = 0; g < groupCount; g++)
+        {
+            if (!solver.SeenMine[g])
+            {
+                List<int> members = groups[g].Members;
+                for (int i = 0; i < members.Count; i++)
+                    changed |= TryMarkSafe(members[i]);
+            }
+            else if (!solver.SeenSafe[g])
+            {
+                List<int> members = groups[g].Members;
+                for (int i = 0; i < members.Count; i++)
+                    changed |= TryMarkMine(members[i]);
+            }
+        }
+
+        return changed;
+    }
+
+    private static string BuildSignatureKey(int[] values, int count)
+    {
+        if (count <= 0)
+            return string.Empty;
+
+        Array.Sort(values, 0, count);
+
+        StringBuilder sb = new StringBuilder(count * 4);
+        for (int i = 0; i < count; i++)
+        {
+            if (i > 0)
+                sb.Append(',');
+            sb.Append(values[i]);
+        }
+
+        return sb.ToString();
+    }
+
+    private static long GetComponentNodeBudget(int groupCount, long remainingBudget)
+    {
+        long budget;
+
+        if (groupCount <= 18)
+            budget = 5_000_000;
+        else if (groupCount <= 24)
+            budget = 2_000_000;
+        else if (groupCount <= 30)
+            budget = 800_000;
+        else if (groupCount <= 36)
+            budget = 250_000;
+        else if (groupCount <= 42)
+            budget = 80_000;
+        else
+            budget = 0;
+
+        if (budget > remainingBudget)
+            budget = remainingBudget;
+
+        return budget;
+    }
+
+    private static void WriteOutput()
+    {
+        StreamWriter writer = new StreamWriter(Console.OpenStandardOutput(), Encoding.ASCII, 1 << 20);
+        writer.NewLine = "\n";
+        writer.WriteLine(safeFound.Count);
+
+        for (int i = 0; i < safeFound.Count; i++)
+        {
+            int idx = safeFound[i];
+            int y = idx / W;
+            int x = idx - y * W;
+            writer.Write(x);
+            writer.Write(' ');
+            writer.WriteLine(y);
+        }
+
+        writer.Flush();
+    }
+
+    private sealed class SolverSettings
+    {
+        public bool EnablePairwise;
+        public bool EnableExact;
+        public int PairwiseFrontierLimit;
+        public int ExactVarBuildLimit;
+        public int ExactConstraintBuildLimit;
+        public long TotalExactNodeBudget;
+        public int MaxOuterRounds;
+    }
+
+    private sealed class ComponentGroup
+    {
+        public readonly int[] Constraints;
+        public readonly List<int> Members;
+
+        public ComponentGroup(int[] constraints)
+        {
+            Constraints = constraints;
+            Members = new List<int>();
+        }
+    }
+
+    // Exhaustive solver on grouped (symmetry-compressed) frontier components.
+    // Safe/mine deductions are only trusted if the search finishes without aborting.
+    private sealed class GroupedExactSolver
+    {
+        private readonly int[][] constraintGroups;
+        private readonly int[] required;
+        private readonly int[][] groupConstraints;
+        private readonly int[] groupSizes;
+        private readonly long maxNodes;
+
+        private readonly int[] assigned;       // -1 = unassigned, else mine count in group
+        private readonly int[] currentSum;     // assigned mines in each constraint
+        private readonly int[] remainingCap;   // sum of sizes of unassigned groups in constraint
+        private readonly int[] remainingGroups;
+
+        private readonly bool[] seenMine;
+        private readonly bool[] seenSafe;
+        private readonly List<int> trail;
+
+        private bool aborted;
+        private bool stopSearch;
+        private long nodesExplored;
+        private long solutionsFound;
+
+        public GroupedExactSolver(
+            int[][] constraintGroups,
+            int[] required,
+            int[][] groupConstraints,
+            int[] groupSizes,
+            long maxNodes)
+        {
+            this.constraintGroups = constraintGroups;
+            this.required = required;
+            this.groupConstraints = groupConstraints;
+            this.groupSizes = groupSizes;
+            this.maxNodes = maxNodes;
+
+            int gCount = groupSizes.Length;
+            int cCount = required.Length;
+
+            assigned = new int[gCount];
+            for (int i = 0; i < gCount; i++)
+                assigned[i] = -1;
+
+            currentSum = new int[cCount];
+            remainingCap = new int[cCount];
+            remainingGroups = new int[cCount];
+
+            for (int c = 0; c < cCount; c++)
+            {
+                int cap = 0;
+                int[] groups = constraintGroups[c];
+                for (int i = 0; i < groups.Length; i++)
+                    cap += groupSizes[groups[i]];
+
+                remainingCap[c] = cap;
+                remainingGroups[c] = groups.Length;
+            }
+
+            seenMine = new bool[gCount];
+            seenSafe = new bool[gCount];
+            trail = new List<int>(gCount);
+        }
+
+        public bool Aborted { get { return aborted; } }
+        public long NodesExplored { get { return nodesExplored; } }
+        public long SolutionsFound { get { return solutionsFound; } }
+        public bool[] SeenMine { get { return seenMine; } }
+        public bool[] SeenSafe { get { return seenSafe; } }
+
+        public void Solve()
+        {
+            int mark = trail.Count;
+            Dfs();
+            UndoTo(mark);
+        }
+
+        private void Dfs()
+        {
+            if (aborted || stopSearch)
+                return;
+
+            nodesExplored++;
+            if (nodesExplored > maxNodes)
+            {
+                aborted = true;
+                return;
+            }
+
+            while (true)
+            {
+                int bestGroup = -1;
+                int bestLb = 0;
+                int bestUb = 0;
+                int bestDomainSpan = int.MaxValue;
+                int bestDegree = -1;
+                int bestSize = -1;
+
+                bool forcedProgress = false;
+
+                for (int g = 0; g < assigned.Length; g++)
+                {
+                    if (assigned[g] != -1)
+                        continue;
+
+                    int lb;
+                    int ub;
+                    if (!ComputeBounds(g, out lb, out ub))
+                        return;
+
+                    if (lb == ub)
+                    {
+                        int mark = trail.Count;
+                        if (!AssignGroup(g, lb))
+                        {
+                            UndoTo(mark);
+                            return;
+                        }
+
+                        forcedProgress = true;
+                        break;
+                    }
+
+                    int domainSpan = ub - lb;
+                    int degree = groupConstraints[g].Length;
+                    int size = groupSizes[g];
+
+                    if (domainSpan < bestDomainSpan ||
+                        (domainSpan == bestDomainSpan && degree > bestDegree) ||
+                        (domainSpan == bestDomainSpan && degree == bestDegree && size > bestSize))
+                    {
+                        bestGroup = g;
+                        bestLb = lb;
+                        bestUb = ub;
+                        bestDomainSpan = domainSpan;
+                        bestDegree = degree;
+                        bestSize = size;
+                    }
+                }
+
+                if (forcedProgress)
+                    continue;
+
+                if (bestGroup == -1)
+                {
+                    RecordSolution();
+                    return;
+                }
+
+                int full = groupSizes[bestGroup];
+
+                if (bestLb <= 0 && 0 <= bestUb)
+                {
+                    int mark = trail.Count;
+                    if (AssignGroup(bestGroup, 0))
+                        Dfs();
+                    UndoTo(mark);
+
+                    if (aborted || stopSearch)
+                        return;
+                }
+
+                if (bestLb <= full && full <= bestUb && full != 0)
+                {
+                    int mark = trail.Count;
+                    if (AssignGroup(bestGroup, full))
+                        Dfs();
+                    UndoTo(mark);
+
+                    if (aborted || stopSearch)
+                        return;
+                }
+
+                for (int value = bestLb; value <= bestUb; value++)
+                {
+                    if (value == 0 || value == full)
+                        continue;
+
+                    int mark = trail.Count;
+                    if (AssignGroup(bestGroup, value))
+                        Dfs();
+                    UndoTo(mark);
+
+                    if (aborted || stopSearch)
+                        return;
+                }
+
+                return;
+            }
+        }
+
+        private bool ComputeBounds(int g, out int lb, out int ub)
+        {
+            int size = groupSizes[g];
+            lb = 0;
+            ub = size;
+
+            int[] cons = groupConstraints[g];
+            for (int i = 0; i < cons.Length; i++)
+            {
+                int c = cons[i];
+                int need = required[c] - currentSum[c];
+                int othersCap = remainingCap[c] - size;
+
+                int localLb = need - othersCap;
+                int localUb = need;
+
+                if (localLb > lb) lb = localLb;
+                if (localUb < ub) ub = localUb;
+
+                if (lb > ub)
+                    return false;
+            }
+
+            if (lb < 0) lb = 0;
+            if (ub > size) ub = size;
+
+            return lb <= ub;
+        }
+
+        private bool AssignGroup(int g, int value)
+        {
+            int cur = assigned[g];
+            if (cur != -1)
+                return cur == value;
+
+            if (value < 0 || value > groupSizes[g])
+                return false;
+
+            assigned[g] = value;
+            trail.Add(g);
+
+            int[] cons = groupConstraints[g];
+            int gSize = groupSizes[g];
+
+            for (int i = 0; i < cons.Length; i++)
+            {
+                int c = cons[i];
+                currentSum[c] += value;
+                remainingCap[c] -= gSize;
+                remainingGroups[c]--;
+            }
+
+            for (int i = 0; i < cons.Length; i++)
+            {
+                if (!PropagateConstraint(cons[i]))
+                    return false;
+            }
+
+            return true;
+        }
+
+        private bool PropagateConstraint(int c)
+        {
+            int need = required[c] - currentSum[c];
+            int cap = remainingCap[c];
+
+            if (need < 0 || need > cap)
+                return false;
+
+            int rg = remainingGroups[c];
+            if (rg == 0)
+                return need == 0;
+
+            int[] groups = constraintGroups[c];
+
+            if (need == 0)
+            {
+                for (int i = 0; i < groups.Length; i++)
+                {
+                    int g = groups[i];
+                    if (assigned[g] == -1 && !AssignGroup(g, 0))
+                        return false;
+                }
+
+                return true;
+            }
+
+            if (need == cap)
+            {
+                for (int i = 0; i < groups.Length; i++)
+                {
+                    int g = groups[i];
+                    if (assigned[g] == -1 && !AssignGroup(g, groupSizes[g]))
+                        return false;
+                }
+
+                return true;
+            }
+
+            if (rg == 1)
+            {
+                int last = -1;
+                for (int i = 0; i < groups.Length; i++)
+                {
+                    int g = groups[i];
+                    if (assigned[g] == -1)
+                    {
+                        last = g;
+                        break;
+                    }
+                }
+
+                if (last != -1 && !AssignGroup(last, need))
+                    return false;
+            }
+
+            return true;
+        }
+
+        private void UndoTo(int mark)
+        {
+            for (int i = trail.Count - 1; i >= mark; i--)
+            {
+                int g = trail[i];
+                int value = assigned[g];
+                int[] cons = groupConstraints[g];
+                int gSize = groupSizes[g];
+
+                for (int j = 0; j < cons.Length; j++)
+                {
+                    int c = cons[j];
+                    currentSum[c] -= value;
+                    remainingCap[c] += gSize;
+                    remainingGroups[c]++;
+                }
+
+                assigned[g] = -1;
+            }
+
+            if (trail.Count > mark)
+                trail.RemoveRange(mark, trail.Count - mark);
+        }
+
+        private void RecordSolution()
+        {
+            solutionsFound++;
+
+            for (int g = 0; g < assigned.Length; g++)
+            {
+                int value = assigned[g];
+                if (value > 0)
+                    seenMine[g] = true;
+                if (value < groupSizes[g])
+                    seenSafe[g] = true;
+            }
+
+            bool allOpen = true;
+            for (int g = 0; g < assigned.Length; g++)
+            {
+                if (!(seenMine[g] && seenSafe[g]))
+                {
+                    allOpen = false;
+                    break;
+                }
+            }
+
+            if (allOpen)
+                stopSearch = true;
+        }
+    }
+}
+```

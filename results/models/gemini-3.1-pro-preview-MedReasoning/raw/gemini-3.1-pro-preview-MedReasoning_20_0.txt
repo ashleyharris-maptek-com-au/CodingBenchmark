@@ -1,0 +1,724 @@
+use std::io::{self, Read, Write};
+use std::thread;
+
+#[derive(Debug, Clone, Copy)]
+enum Strategy {
+    GlobalKdTree,
+    TwoLevel,
+}
+
+struct Hole {
+    id: String,
+    start_x: f32,
+    start_y: f32,
+    start_z: f32,
+    ux: f32,
+    uy: f32,
+    uz: f32,
+    _length: f32,
+    sample_start_idx: usize,
+    num_samples: usize,
+}
+
+struct Sample {
+    hole_idx: usize,
+    sample_idx: usize,
+    depth: f32,
+    x: f32,
+    y: f32,
+    z: f32,
+}
+
+struct KdNode {
+    point_idx: usize,
+    left: Option<usize>,
+    right: Option<usize>,
+}
+
+struct KdTree {
+    nodes: Vec<KdNode>,
+    root: Option<usize>,
+}
+
+impl KdTree {
+    fn build(points: &[[f32; 3]]) -> Self {
+        let mut indices: Vec<usize> = (0..points.len()).collect();
+        let mut nodes = Vec::with_capacity(points.len());
+        let root = Self::build_recursive(&mut indices, points, 0, &mut nodes);
+        Self { nodes, root }
+    }
+
+    fn build_recursive(
+        indices: &mut [usize],
+        points: &[[f32; 3]],
+        depth: usize,
+        nodes: &mut Vec<KdNode>,
+    ) -> Option<usize> {
+        if indices.is_empty() {
+            return None;
+        }
+
+        let axis = depth % 3;
+        let median_idx = indices.len() / 2;
+        indices.select_nth_unstable_by(median_idx, |&a, &b| {
+            points[a][axis]
+                .partial_cmp(&points[b][axis])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        let node_idx = nodes.len();
+        nodes.push(KdNode {
+            point_idx: indices[median_idx],
+            left: None,
+            right: None,
+        });
+
+        let left = Self::build_recursive(&mut indices[..median_idx], points, depth + 1, nodes);
+        let right = Self::build_recursive(&mut indices[median_idx + 1..], points, depth + 1, nodes);
+
+        nodes[node_idx].left = left;
+        nodes[node_idx].right = right;
+
+        Some(node_idx)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct KnnItem {
+    idx: usize,
+    dist_sq: f32,
+}
+
+struct BoundedKnn {
+    items: Vec<KnnItem>,
+    capacity: usize,
+}
+
+impl BoundedKnn {
+    fn new(capacity: usize) -> Self {
+        Self {
+            items: Vec::with_capacity(capacity + 1),
+            capacity,
+        }
+    }
+
+    fn insert(&mut self, idx: usize, dist_sq: f32) {
+        let pos = match self.items.binary_search_by(|x| {
+            x.dist_sq
+                .partial_cmp(&dist_sq)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        }) {
+            Ok(p) => p,
+            Err(p) => p,
+        };
+        if pos < self.capacity {
+            self.items.insert(pos, KnnItem { idx, dist_sq });
+            if self.items.len() > self.capacity {
+                self.items.pop();
+            }
+        }
+    }
+
+    fn max_dist_sq(&self) -> f32 {
+        if self.items.len() < self.capacity {
+            f32::INFINITY
+        } else {
+            self.items.last().unwrap().dist_sq
+        }
+    }
+}
+
+fn knn_search<F>(
+    node_idx: Option<usize>,
+    nodes: &[KdNode],
+    points: &[[f32; 3]],
+    query_pos: [f32; 3],
+    depth: usize,
+    knn: &mut BoundedKnn,
+    exclude: &F,
+) where
+    F: Fn(usize) -> bool,
+{
+    let node_idx = match node_idx {
+        Some(idx) => idx,
+        None => return,
+    };
+
+    let node = &nodes[node_idx];
+    let pt_idx = node.point_idx;
+    let pt = points[pt_idx];
+    let axis = depth % 3;
+
+    let dx = query_pos[0] - pt[0];
+    let dy = query_pos[1] - pt[1];
+    let dz = query_pos[2] - pt[2];
+    let dist_sq = dx * dx + dy * dy + dz * dz;
+
+    if !exclude(pt_idx) {
+        knn.insert(pt_idx, dist_sq);
+    }
+
+    let query_val = query_pos[axis];
+    let pt_val = pt[axis];
+
+    let (near_child, far_child) = if query_val < pt_val {
+        (node.left, node.right)
+    } else {
+        (node.right, node.left)
+    };
+
+    knn_search(near_child, nodes, points, query_pos, depth + 1, knn, exclude);
+
+    let plane_dist = query_val - pt_val;
+    let plane_dist_sq = plane_dist * plane_dist;
+    if plane_dist_sq < knn.max_dist_sq() {
+        knn_search(far_child, nodes, points, query_pos, depth + 1, knn, exclude);
+    }
+}
+
+struct Suspect {
+    hole_idx: usize,
+    sample_idx: usize,
+    prop_idx: usize,
+    confidence: f32,
+}
+
+// Custom parser helpers
+fn parse_usize(bytes: &[u8], pos: &mut usize) -> usize {
+    while *pos < bytes.len() && bytes[*pos].is_ascii_whitespace() {
+        *pos += 1;
+    }
+    let mut val = 0;
+    while *pos < bytes.len() && bytes[*pos].is_ascii_digit() {
+        val = val * 10 + (bytes[*pos] - b'0') as usize;
+        *pos += 1;
+    }
+    val
+}
+
+fn parse_string<'a>(bytes: &'a [u8], pos: &mut usize) -> &'a str {
+    while *pos < bytes.len() && bytes[*pos].is_ascii_whitespace() {
+        *pos += 1;
+    }
+    let start = *pos;
+    while *pos < bytes.len() && !bytes[*pos].is_ascii_whitespace() {
+        *pos += 1;
+    }
+    std::str::from_utf8(&bytes[start..*pos]).unwrap_or("")
+}
+
+fn parse_next_token<'a>(bytes: &'a [u8], pos: &mut usize) -> &'a [u8] {
+    while *pos < bytes.len() && bytes[*pos].is_ascii_whitespace() {
+        *pos += 1;
+    }
+    let start = *pos;
+    while *pos < bytes.len() && !bytes[*pos].is_ascii_whitespace() {
+        *pos += 1;
+    }
+    &bytes[start..*pos]
+}
+
+fn token_to_f32(token: &[u8]) -> f32 {
+    if token.is_empty() {
+        return f32::NAN;
+    }
+    if token.eq_ignore_ascii_case(b"nan")
+        || token.eq_ignore_ascii_case(b"null")
+        || token.eq_ignore_ascii_case(b"na")
+        || token.eq_ignore_ascii_case(b"n/a")
+        || token.eq_ignore_ascii_case(b"none")
+        || token.eq_ignore_ascii_case(b"-")
+    {
+        return f32::NAN;
+    }
+
+    let mut pos = 0;
+    let mut neg = false;
+    if pos < token.len() && token[pos] == b'-' {
+        neg = true;
+        pos += 1;
+    } else if pos < token.len() && token[pos] == b'+' {
+        pos += 1;
+    }
+
+    let mut val = 0.0f64;
+    let mut has_digits = false;
+    while pos < token.len() && token[pos].is_ascii_digit() {
+        val = val * 10.0 + (token[pos] - b'0') as f64;
+        has_digits = true;
+        pos += 1;
+    }
+
+    if pos < token.len() && token[pos] == b'.' {
+        pos += 1;
+        let mut div = 1.0f64;
+        while pos < token.len() && token[pos].is_ascii_digit() {
+            div *= 10.0;
+            val += (token[pos] - b'0') as f64 / div;
+            has_digits = true;
+            pos += 1;
+        }
+    }
+
+    if pos < token.len() && (token[pos] == b'e' || token[pos] == b'E') {
+        pos += 1;
+        let mut e_neg = false;
+        if pos < token.len() && token[pos] == b'-' {
+            e_neg = true;
+            pos += 1;
+        } else if pos < token.len() && token[pos] == b'+' {
+            pos += 1;
+        }
+        let mut exp = 0;
+        while pos < token.len() && token[pos].is_ascii_digit() {
+            exp = exp * 10 + (token[pos] - b'0') as i32;
+            pos += 1;
+        }
+        if e_neg {
+            val /= 10.0f64.powi(exp);
+        } else {
+            val *= 10.0f64.powi(exp);
+        }
+    }
+
+    if !has_digits {
+        return f32::NAN;
+    }
+
+    let res = if neg { -val } else { val };
+    if res == -999.0 || res == -9999.0 {
+        return f32::NAN;
+    }
+    res as f32
+}
+
+fn compute_weighted_median_mad(vals: &mut [f32], weights: &[f32]) -> (f32, f32) {
+    let mut pairs: Vec<(f32, f32)> = vals.iter().copied().zip(weights.iter().copied()).collect();
+    pairs.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    let total_w: f32 = weights.iter().sum();
+    if total_w <= 0.0 {
+        let mid = vals.len() / 2;
+        vals.select_nth_unstable_by(mid, |a, b| {
+            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let med = vals[mid];
+
+        let mut devs: Vec<f32> = vals.iter().map(|&x| (x - med).abs()).collect();
+        devs.select_nth_unstable_by(mid, |a, b| {
+            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let mad = devs[mid];
+        return (med, mad);
+    }
+
+    let target = total_w / 2.0;
+    let mut cum_w = 0.0;
+    let mut med = pairs[0].0;
+    for &(v, w) in &pairs {
+        cum_w += w;
+        if cum_w >= target {
+            med = v;
+            break;
+        }
+    }
+
+    let mut dev_pairs: Vec<(f32, f32)> = pairs.iter().map(|&(v, w)| ((v - med).abs(), w)).collect();
+    dev_pairs.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut cum_w = 0.0;
+    let mut mad = dev_pairs[0].0;
+    for &(d, w) in &dev_pairs {
+        cum_w += w;
+        if cum_w >= target {
+            mad = d;
+            break;
+        }
+    }
+
+    (med, mad)
+}
+
+fn main() -> io::Result<()> {
+    // Read stdin into memory
+    let mut input_bytes = Vec::new();
+    io::stdin().read_to_end(&mut input_bytes)?;
+
+    let mut pos = 0;
+    let num_holes = parse_usize(&input_bytes, &mut pos);
+    let num_properties = parse_usize(&input_bytes, &mut pos);
+    if num_holes == 0 || num_properties == 0 {
+        println!("0");
+        return Ok(());
+    }
+
+    let mut property_names = Vec::with_capacity(num_properties);
+    for i in 0..num_properties {
+        let mut name = parse_string(&input_bytes, &mut pos).to_string();
+        if name.is_empty() {
+            name = format!("prop_{}", i);
+        }
+        property_names.push(name);
+    }
+
+    let mut holes = Vec::with_capacity(num_holes);
+    let mut samples = Vec::new();
+    let mut prop_values = Vec::new();
+
+    for hole_idx in 0..num_holes {
+        let hole_id = parse_string(&input_bytes, &mut pos);
+        if hole_id.is_empty() {
+            break;
+        }
+
+        let start_x = token_to_f32(parse_next_token(&input_bytes, &mut pos));
+        let start_y = token_to_f32(parse_next_token(&input_bytes, &mut pos));
+        let start_z = token_to_f32(parse_next_token(&input_bytes, &mut pos));
+        let dir_x = token_to_f32(parse_next_token(&input_bytes, &mut pos));
+        let dir_y = token_to_f32(parse_next_token(&input_bytes, &mut pos));
+        let dir_z = token_to_f32(parse_next_token(&input_bytes, &mut pos));
+        let length = token_to_f32(parse_next_token(&input_bytes, &mut pos));
+        let num_samples = parse_usize(&input_bytes, &mut pos);
+
+        let d_len = (dir_x * dir_x + dir_y * dir_y + dir_z * dir_z).sqrt();
+        let (ux, uy, uz) = if d_len > 0.0 {
+            (dir_x / d_len, dir_y / d_len, dir_z / d_len)
+        } else {
+            (0.0, 0.0, 0.0)
+        };
+
+        let sample_start_idx = samples.len();
+
+        for sample_idx in 0..num_samples {
+            let depth = token_to_f32(parse_next_token(&input_bytes, &mut pos));
+            let x = start_x + depth * ux;
+            let y = start_y + depth * uy;
+            let z = start_z + depth * uz;
+
+            samples.push(Sample {
+                hole_idx,
+                sample_idx,
+                depth,
+                x,
+                y,
+                z,
+            });
+
+            for _ in 0..num_properties {
+                let val = token_to_f32(parse_next_token(&input_bytes, &mut pos));
+                prop_values.push(val);
+            }
+        }
+
+        holes.push(Hole {
+            id: hole_id.to_string(),
+            start_x,
+            start_y,
+            start_z,
+            ux,
+            uy,
+            uz,
+            _length: length,
+            sample_start_idx,
+            num_samples,
+        });
+    }
+
+    let total_samples = samples.len();
+    if total_samples == 0 {
+        println!("0");
+        return Ok(());
+    }
+
+    // Compute global stats for each property
+    let mut global_stats = Vec::with_capacity(num_properties);
+    for prop_idx in 0..num_properties {
+        let mut valid_vals: Vec<f32> = (0..total_samples)
+            .map(|i| prop_values[i * num_properties + prop_idx])
+            .filter(|&v| !v.is_nan())
+            .collect();
+
+        if valid_vals.is_empty() {
+            global_stats.push((0.0, 0.0, 0.0));
+            continue;
+        }
+
+        if valid_vals.len() > 200_000 {
+            let step = valid_vals.len() / 100_000;
+            let mut sampled = Vec::with_capacity(100_000);
+            for i in 0..100_000 {
+                sampled.push(valid_vals[i * step]);
+            }
+            valid_vals = sampled;
+        }
+
+        let mid = valid_vals.len() / 2;
+        valid_vals.select_nth_unstable_by(mid, |a, b| {
+            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let median = valid_vals[mid];
+
+        let mut devs: Vec<f32> = valid_vals.iter().map(|&x| (x - median).abs()).collect();
+        devs.select_nth_unstable_by(mid, |a, b| {
+            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let mad = devs[mid];
+
+        let mut abs_vals: Vec<f32> = valid_vals.iter().map(|&x| x.abs()).collect();
+        abs_vals.select_nth_unstable_by(mid, |a, b| {
+            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let med_abs = abs_vals[mid];
+
+        global_stats.push((median, mad, med_abs));
+    }
+
+    // Determine Strategy
+    let strategy = if total_samples <= 2_000_000 {
+        Strategy::GlobalKdTree
+    } else {
+        Strategy::TwoLevel
+    };
+
+    // Prepare global sample coordinates for KD Tree (if strategy is GlobalKdTree)
+    let mut global_kd_tree = None;
+    let mut global_points = Vec::new();
+    if let Strategy::GlobalKdTree = strategy {
+        global_points = samples.iter().map(|s| [s.x, s.y, s.z]).collect();
+        global_kd_tree = Some(KdTree::build(&global_points));
+    }
+
+    // Prepare hole KD tree and precomputed neighbor holes (if strategy is TwoLevel)
+    let mut hole_neighbors = Vec::new();
+    if let Strategy::TwoLevel = strategy {
+        let hole_points: Vec<[f32; 3]> = holes
+            .iter()
+            .map(|h| [h.start_x, h.start_y, h.start_z])
+            .collect();
+        let hole_kd_tree = KdTree::build(&hole_points);
+
+        hole_neighbors = vec![Vec::new(); holes.len()];
+        for i in 0..holes.len() {
+            let h = &holes[i];
+            let mut knn = BoundedKnn::new(4);
+            knn_search(
+                hole_kd_tree.root,
+                &hole_kd_tree.nodes,
+                &hole_points,
+                [h.start_x, h.start_y, h.start_z],
+                0,
+                &mut knn,
+                &|idx| idx == i,
+            );
+            hole_neighbors[i] = knn.items.iter().map(|item| item.idx).collect();
+        }
+    }
+
+    // Parallel processing using scoped threads
+    let num_cpus = thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let chunk_size = (total_samples + num_cpus - 1) / num_cpus;
+
+    let mut suspects = Vec::new();
+    thread::scope(|s| {
+        let mut handles = Vec::new();
+        // We chunk the samples
+        for (chunk_idx, chunk) in samples.chunks(chunk_size).enumerate() {
+            let chunk_start_idx = chunk_idx * chunk_size;
+            let all_samples_ref = &samples;
+            let prop_values_ref = &prop_values;
+            let global_stats_ref = &global_stats;
+            let holes_ref = &holes;
+            let hole_neighbors_ref = &hole_neighbors;
+            let global_kd_tree_ref = global_kd_tree.as_ref();
+            let global_points_ref = &global_points;
+
+            handles.push(s.spawn(move || {
+                let k_same = 3;
+                let mut chunk_suspects = Vec::new();
+
+                for (local_idx, sample) in chunk.iter().enumerate() {
+                    let global_sample_idx = chunk_start_idx + local_idx;
+                    let query_pos = [sample.x, sample.y, sample.z];
+                    let query_hole_idx = sample.hole_idx;
+                    let query_sample_idx = sample.sample_idx;
+
+                    // 1. Get same-hole neighbors
+                    let hole = &holes_ref[query_hole_idx];
+                    let mut same_hole_neighbors = Vec::with_capacity(2 * k_same);
+                    for offset in 1..=k_same {
+                        if query_sample_idx >= offset {
+                            same_hole_neighbors.push(hole.sample_start_idx + query_sample_idx - offset);
+                        }
+                        if query_sample_idx + offset < hole.num_samples {
+                            same_hole_neighbors
+                                .push(hole.sample_start_idx + query_sample_idx + offset);
+                        }
+                    }
+
+                    // 2. Get other-hole neighbors
+                    let mut other_hole_neighbors = Vec::new();
+                    match strategy {
+                        Strategy::GlobalKdTree => {
+                            if let Some(kd) = global_kd_tree_ref {
+                                let mut knn = BoundedKnn::new(12);
+                                knn_search(
+                                    kd.root,
+                                    &kd.nodes,
+                                    global_points_ref,
+                                    query_pos,
+                                    0,
+                                    &mut knn,
+                                    &|pt_idx| all_samples_ref[pt_idx].hole_idx == query_hole_idx,
+                                );
+                                for item in knn.items {
+                                    other_hole_neighbors.push(item.idx);
+                                }
+                            }
+                        }
+                        Strategy::TwoLevel => {
+                            let neigh_holes = &hole_neighbors_ref[query_hole_idx];
+                            for &nh_idx in neigh_holes {
+                                let nh = &holes_ref[nh_idx];
+                                if nh.num_samples == 0 {
+                                    continue;
+                                }
+                                let dx = sample.x - nh.start_x;
+                                let dy = sample.y - nh.start_y;
+                                let dz = sample.z - nh.start_z;
+                                let proj_depth = dx * nh.ux + dy * nh.uy + dz * nh.uz;
+
+                                let mut low = 0;
+                                let mut high = nh.num_samples - 1;
+                                let mut closest_s_idx = 0;
+                                let mut min_diff = f32::INFINITY;
+
+                                while low <= high {
+                                    let mid = (low + high) / 2;
+                                    let s_depth = all_samples_ref[nh.sample_start_idx + mid].depth;
+                                    let diff = (s_depth - proj_depth).abs();
+                                    if diff < min_diff {
+                                        min_diff = diff;
+                                        closest_s_idx = mid;
+                                    }
+                                    if s_depth < proj_depth {
+                                        low = mid + 1;
+                                    } else if s_depth > proj_depth {
+                                        if mid == 0 {
+                                            break;
+                                        }
+                                        high = mid - 1;
+                                    } else {
+                                        break;
+                                    }
+                                }
+
+                                other_hole_neighbors.push(nh.sample_start_idx + closest_s_idx);
+                                if closest_s_idx > 0 {
+                                    other_hole_neighbors.push(nh.sample_start_idx + closest_s_idx - 1);
+                                }
+                                if closest_s_idx + 1 < nh.num_samples {
+                                    other_hole_neighbors
+                                        .push(nh.sample_start_idx + closest_s_idx + 1);
+                                }
+                            }
+                        }
+                    }
+
+                    // Combine neighbors
+                    let mut neighbors = Vec::with_capacity(
+                        same_hole_neighbors.len() + other_hole_neighbors.len(),
+                    );
+                    for &n_idx in &same_hole_neighbors {
+                        let n_s = &all_samples_ref[n_idx];
+                        let dist = ((sample.x - n_s.x).powi(2)
+                            + (sample.y - n_s.y).powi(2)
+                            + (sample.z - n_s.z).powi(2))
+                        .sqrt();
+                        neighbors.push((n_idx, dist));
+                    }
+                    for &n_idx in &other_hole_neighbors {
+                        let n_s = &all_samples_ref[n_idx];
+                        let dist = ((sample.x - n_s.x).powi(2)
+                            + (sample.y - n_s.y).powi(2)
+                            + (sample.z - n_s.z).powi(2))
+                        .sqrt();
+                        neighbors.push((n_idx, dist));
+                    }
+
+                    for prop_idx in 0..num_properties {
+                        let val = prop_values_ref[global_sample_idx * num_properties + prop_idx];
+                        if val.is_nan() {
+                            continue;
+                        }
+
+                        let (_g_median, g_mad, g_med_abs) = global_stats_ref[prop_idx];
+                        let min_diff = 1e-4 * (g_med_abs + 1.0);
+
+                        let mut neigh_vals = Vec::new();
+                        let mut weights = Vec::new();
+                        for &(n_idx, dist) in &neighbors {
+                            let n_val =
+                                prop_values_ref[n_idx * num_properties + prop_idx];
+                            if !n_val.is_nan() {
+                                neigh_vals.push(n_val);
+                                weights.push(1.0 / (dist + 0.5));
+                            }
+                        }
+
+                        if neigh_vals.len() < 3 {
+                            continue;
+                        }
+
+                        let (w_med, w_mad) =
+                            compute_weighted_median_mad(&mut neigh_vals, &weights);
+
+                        let diff = (val - w_med).abs();
+                        if diff < min_diff {
+                            continue;
+                        }
+
+                        let score = diff / (w_mad + 0.05 * g_mad + 1e-5);
+                        if score >= 5.0 {
+                            chunk_suspects.push(Suspect {
+                                hole_idx: query_hole_idx,
+                                sample_idx: query_sample_idx,
+                                prop_idx,
+                                confidence: score,
+                            });
+                        }
+                    }
+                }
+
+                chunk_suspects
+            }));
+        }
+
+        for handle in handles {
+            let chunk_suspects = handle.join().unwrap();
+            suspects.extend(chunk_suspects);
+        }
+    });
+
+    // Sort suspects by confidence desc
+    suspects.sort_unstable_by(|a, b| {
+        b.confidence
+            .partial_cmp(&a.confidence)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    // Print results
+    println!("{}", suspects.len());
+    let stdout = io::stdout();
+    let mut writer = io::BufWriter::new(stdout.lock());
+    for s in suspects {
+        writeln!(
+            writer,
+            "{} {} {} {:.4}",
+            holes[s.hole_idx].id, s.sample_idx, property_names[s.prop_idx], s.confidence
+        )?;
+    }
+
+    Ok(())
+}

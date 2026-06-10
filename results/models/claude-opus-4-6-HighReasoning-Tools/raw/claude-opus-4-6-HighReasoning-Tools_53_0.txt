@@ -1,1 +1,496 @@
-{}
+import math
+
+# Persistent state across calls within a scenario
+_prev_pos = None
+_prev_vel = None
+_prev_time = 0.0
+_total_time = 0.0
+_sensor_history = []
+_phase = "approach"
+_coast_timer = 0.0
+_burn_done = False
+_initial_range = None
+_vel_estimate = None
+_pos_estimate = None
+_ewma_pos = None
+_ewma_vel = None
+
+MU_EARTH = 3.986004418e14  # m^3/s^2
+R_EARTH = 6371000.0  # m
+
+
+def _reset_state():
+    global _prev_pos, _prev_vel, _prev_time, _total_time
+    global _sensor_history, _phase, _coast_timer, _burn_done
+    global _initial_range, _vel_estimate, _pos_estimate
+    global _ewma_pos, _ewma_vel
+    _prev_pos = None
+    _prev_vel = None
+    _prev_time = 0.0
+    _total_time = 0.0
+    _sensor_history = []
+    _phase = "approach"
+    _coast_timer = 0.0
+    _burn_done = False
+    _initial_range = None
+    _vel_estimate = None
+    _pos_estimate = None
+    _ewma_pos = None
+    _ewma_vel = None
+
+
+def _median_valid(values):
+    valid = [v for v in values if v is not None]
+    if not valid:
+        return None
+    valid.sort()
+    n = len(valid)
+    if n % 2 == 1:
+        return valid[n // 2]
+    return (valid[n // 2 - 1] + valid[n // 2]) / 2.0
+
+
+def _fuse_sensor_pair(s, prefix1, prefix2, axes):
+    result = {}
+    for axis_key, valid_key in axes:
+        vals = []
+        for prefix in [prefix1, prefix2]:
+            full_key = prefix + axis_key
+            full_valid = prefix + valid_key
+            if s.get(full_valid, False):
+                vals.append(s.get(full_key, 0.0))
+        result[axis_key] = _median_valid(vals) if vals else None
+    return result
+
+
+def _get_relative_pos(s):
+    pos_axes = [
+        ("rel_pos_x_m", "rel_x_valid"),
+        ("rel_pos_y_m", "rel_y_valid"),
+        ("rel_pos_z_m", "rel_z_valid"),
+    ]
+    radar_pos = {}
+    lidar_pos = {}
+    for axis_key, valid_key in pos_axes:
+        rk = "radar_" + axis_key
+        rv = "radar_" + valid_key
+        if s.get(rv, False):
+            radar_pos[axis_key] = s[rk]
+        lk = "lidar_" + axis_key
+        lv = "lidar_" + valid_key
+        if s.get(lv, False):
+            lidar_pos[axis_key] = s[lk]
+
+    pos = {}
+    for axis_key, _ in pos_axes:
+        vals = []
+        if axis_key in radar_pos:
+            vals.append(radar_pos[axis_key])
+        if axis_key in lidar_pos:
+            vals.append(lidar_pos[axis_key])
+        pos[axis_key] = _median_valid(vals) if vals else None
+
+    x = pos.get("rel_pos_x_m")
+    y = pos.get("rel_pos_y_m")
+    z = pos.get("rel_pos_z_m")
+    return x, y, z
+
+
+def _get_relative_vel(s):
+    vel_axes = [
+        ("rel_vel_x_ms", "relv_x_valid"),
+        ("rel_vel_y_ms", "relv_y_valid"),
+        ("rel_vel_z_ms", "relv_z_valid"),
+    ]
+    radar_vel = {}
+    lidar_vel = {}
+    for axis_key, valid_key in vel_axes:
+        rk = "radar_" + axis_key
+        rv = "radar_" + valid_key
+        if s.get(rv, False):
+            radar_vel[axis_key] = s[rk]
+        lk = "lidar_" + axis_key
+        lv = "lidar_" + valid_key
+        if s.get(lv, False):
+            lidar_vel[axis_key] = s[lk]
+
+    vel = {}
+    for axis_key, _ in vel_axes:
+        vals = []
+        if axis_key in radar_vel:
+            vals.append(radar_vel[axis_key])
+        if axis_key in lidar_vel:
+            vals.append(lidar_vel[axis_key])
+        vel[axis_key] = _median_valid(vals) if vals else None
+
+    vx = vel.get("rel_vel_x_ms")
+    vy = vel.get("rel_vel_y_ms")
+    vz = vel.get("rel_vel_z_ms")
+    return vx, vy, vz
+
+
+def _get_range(s):
+    vals = []
+    for i in range(1, 4):
+        if s.get(f"range_{i}_valid", False):
+            vals.append(s[f"range_{i}_m"])
+    if not vals:
+        return None
+    if len(vals) >= 3:
+        vals.sort()
+        median = vals[1]
+        filtered = [v for v in vals if abs(v - median) < median * 0.5 + 5.0]
+        if filtered:
+            return sum(filtered) / len(filtered)
+    return sum(vals) / len(vals)
+
+
+def _get_orbital_params(s):
+    alt = None
+    if s.get("ground_altitude_km_valid", False):
+        alt = s["ground_altitude_km"] * 1000.0
+    sma = None
+    if s.get("ground_semi_major_axis_m_valid", False):
+        sma = s["ground_semi_major_axis_m"]
+    speed = None
+    if s.get("ground_speed_ms_valid", False):
+        speed = s["ground_speed_ms"]
+    return alt, sma, speed
+
+
+def _get_orbital_rate(s):
+    alt, sma, speed = _get_orbital_params(s)
+    if sma and sma > R_EARTH:
+        n = math.sqrt(MU_EARTH / (sma ** 3))
+        return n
+    if alt and alt > 0:
+        r = R_EARTH + alt
+        n = math.sqrt(MU_EARTH / (r ** 3))
+        return n
+    # Default ~400km orbit
+    r = R_EARTH + 400000.0
+    return math.sqrt(MU_EARTH / (r ** 3))
+
+
+def _clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+
+def autopilot_step(state: dict, dt: float) -> dict:
+    global _prev_pos, _prev_vel, _prev_time, _total_time
+    global _sensor_history, _phase, _coast_timer, _burn_done
+    global _initial_range, _vel_estimate, _pos_estimate
+    global _ewma_pos, _ewma_vel
+
+    s = state
+
+    if _total_time == 0.0 and dt > 0:
+        _reset_state()
+
+    _total_time += dt
+
+    out = {
+        "thrust_x": 0.0,
+        "thrust_y": 0.0,
+        "thrust_z": 0.0,
+        "att_rate_roll": 0.0,
+        "att_rate_pitch": 0.0,
+        "att_rate_yaw": 0.0,
+    }
+
+    # Fuse sensors for position and velocity
+    px, py, pz = _get_relative_pos(s)
+    vx, vy, vz = _get_relative_vel(s)
+    rng = _get_range(s)
+    n = _get_orbital_rate(s)
+
+    # Use docking camera as fallback position source
+    if s.get("dock_camera_active", False) and s.get("dock_camera_range_m", 0) > 0:
+        cam_range = s["dock_camera_range_m"]
+        bx = s.get("dock_camera_bearing_x", 0) if s.get("dock_camera_bearing_x_valid", False) else 0
+        by = s.get("dock_camera_bearing_y", 0) if s.get("dock_camera_bearing_y_valid", False) else 0
+        bz = s.get("dock_camera_bearing_z", 0) if s.get("dock_camera_bearing_z_valid", False) else 0
+        bmag = math.sqrt(bx*bx + by*by + bz*bz)
+        if bmag > 0.01:
+            cam_px = bx / bmag * cam_range
+            cam_py = by / bmag * cam_range
+            cam_pz = bz / bmag * cam_range
+            if px is None:
+                px = cam_px
+            if py is None:
+                py = cam_py
+            if pz is None:
+                pz = cam_pz
+
+    # If we have range but no 3D position, estimate
+    if rng is not None and (px is None or py is None):
+        if px is None and py is None and pz is None:
+            # Assume mostly along-track (behind station)
+            py = -rng
+            px = 0.0
+            pz = 0.0
+        elif py is None:
+            # Reconstruct y from range and known components
+            x2 = (px or 0.0) ** 2
+            z2 = (pz or 0.0) ** 2
+            r2 = rng * rng - x2 - z2
+            if r2 > 0:
+                py = -math.sqrt(r2)  # assume behind
+            else:
+                py = 0.0
+            if px is None:
+                px = 0.0
+            if pz is None:
+                pz = 0.0
+
+    # Default to zero if still None
+    if px is None:
+        px = _ewma_pos[0] if _ewma_pos else 0.0
+    if py is None:
+        py = _ewma_pos[1] if _ewma_pos else 0.0
+    if pz is None:
+        pz = _ewma_pos[2] if _ewma_pos else 0.0
+
+    # EWMA smoothing for position
+    alpha_p = 0.3
+    if _ewma_pos is None:
+        _ewma_pos = [px, py, pz]
+    else:
+        _ewma_pos[0] = alpha_p * px + (1 - alpha_p) * _ewma_pos[0]
+        _ewma_pos[1] = alpha_p * py + (1 - alpha_p) * _ewma_pos[1]
+        _ewma_pos[2] = alpha_p * pz + (1 - alpha_p) * _ewma_pos[2]
+
+    px, py, pz = _ewma_pos[0], _ewma_pos[1], _ewma_pos[2]
+
+    # Estimate velocity from position differences if sensors fail
+    if vx is None or vy is None or vz is None:
+        if _prev_pos is not None and dt > 0:
+            est_vx = (px - _prev_pos[0]) / dt if vx is None else vx
+            est_vy = (py - _prev_pos[1]) / dt if vy is None else vy
+            est_vz = (pz - _prev_pos[2]) / dt if vz is None else vz
+            vx = est_vx if vx is None else vx
+            vy = est_vy if vy is None else vy
+            vz = est_vz if vz is None else vz
+        else:
+            vx = vx or 0.0
+            vy = vy or 0.0
+            vz = vz or 0.0
+
+    # EWMA smoothing for velocity
+    alpha_v = 0.3
+    if _ewma_vel is None:
+        _ewma_vel = [vx, vy, vz]
+    else:
+        _ewma_vel[0] = alpha_v * vx + (1 - alpha_v) * _ewma_vel[0]
+        _ewma_vel[1] = alpha_v * vy + (1 - alpha_v) * _ewma_vel[1]
+        _ewma_vel[2] = alpha_v * vz + (1 - alpha_v) * _ewma_vel[2]
+
+    vx, vy, vz = _ewma_vel[0], _ewma_vel[1], _ewma_vel[2]
+
+    _prev_pos = [px, py, pz]
+    _prev_vel = [vx, vy, vz]
+
+    # Current range and speed
+    dist = math.sqrt(px*px + py*py + pz*pz)
+    speed = math.sqrt(vx*vx + vy*vy + vz*vz)
+
+    if _initial_range is None and dist > 1.0:
+        _initial_range = dist
+
+    # Fuel conservation factor
+    fuel_pct = s.get("fuel_remaining_pct", 100.0)
+    fuel_kg = s.get("fuel_remaining_kg", 500.0)
+    fuel_factor = 1.0
+    if fuel_kg < 30:
+        fuel_factor = 0.3
+    elif fuel_kg < 80:
+        fuel_factor = 0.6
+    elif fuel_pct < 20:
+        fuel_factor = 0.5
+
+    # Already docked check
+    if dist < 2.0 and speed < 0.3:
+        return out
+
+    # ---- CONTROL LOGIC ----
+    # The key insight: in LVLH frame with CW equations
+    # x = radial, y = along-track, z = cross-track
+    # CW coupling: radial motion couples to along-track via Coriolis
+    #
+    # Strategy by distance:
+    # Far (>200m): orbital mechanics approach - retrograde burn to lower orbit if behind
+    # Medium (50-200m): gentle CW-based corrections
+    # Close (<50m): direct proportional-derivative control
+    # Final (<10m): very gentle approach
+
+    tx = 0.0
+    ty = 0.0
+    tz = 0.0
+
+    if dist > 200.0:
+        # FAR RANGE: Orbital mechanics regime
+        # Use CW-informed approach
+        # If behind (py < 0), need to go faster → thrust retrograde to lower orbit
+        # If ahead (py > 0), need to slow down → thrust prograde to raise orbit
+
+        # Along-track control (most important - orbital mechanics)
+        # To close along-track gap: thrust OPPOSITE to what you'd think
+        # Behind station (py < 0): thrust retrograde (-y) to lower orbit → drift forward
+        # Ahead of station (py > 0): thrust prograde (+y) to raise orbit → drift backward
+
+        # Target approach velocity based on distance
+        target_approach_speed = min(2.0, dist * 0.005)
+        if fuel_kg < 80:
+            target_approach_speed = min(1.0, dist * 0.003)
+
+        # Along-track: CW equations say dy/dt depends on x and vy
+        # For Hohmann-like: we want a specific delta-v
+        # Simplified: use proportional control with correct sign
+
+        # Desired closing velocity (along track)
+        # py < 0 means behind, want vy > 0 (moving toward station)
+        # py > 0 means ahead, want vy < 0
+        desired_vy = -py / dist * target_approach_speed
+
+        vy_err = desired_vy - vy
+
+        # CW correction: to change vy, we need thrust_y
+        # But orbital mechanics couples x and y
+        # For along-track closing: use the CW-aware approach
+        # thrust_y retrograde lowers orbit → increases mean motion → catches up
+
+        # Along-track thrust - use orbital mechanics insight
+        # The CW equations tell us that a retrograde burn (-y) when behind
+        # will lower the orbit and cause forward drift
+        # But we need to account for the CW coupling
+
+        # Simple approach: desired delta-v along track
+        # Apply it as impulsive-ish burn
+        vy_gain = 0.4 * fuel_factor
+        ty = _clamp(vy_err * vy_gain, -0.8, 0.8) * fuel_factor
+
+        # Radial control: CW shows radial oscillation at orbital frequency
+        # Want to null radial position and velocity
+        # CW: x_dot_dot - 2n*vy - 3n^2*x = fx/m
+        # Compensate CW drift terms
+        kp_x = 0.003 * fuel_factor
+        kd_x = 0.15 * fuel_factor
+        # CW compensation: add 3n^2*x (gravity gradient) and 2n*vy (Coriolis)
+        cw_x_accel = 3 * n * n * px + 2 * n * vy
+        tx = _clamp(-kp_x * px - kd_x * vx + cw_x_accel * 0.01, -0.5, 0.5) * fuel_factor
+
+        # Cross-track: simple harmonic at orbital frequency
+        # z_dot_dot + n^2*z = fz/m
+        kp_z = 0.003 * fuel_factor
+        kd_z = 0.15 * fuel_factor
+        tz = _clamp(-kp_z * pz - kd_z * vz, -0.5, 0.5) * fuel_factor
+
+    elif dist > 50.0:
+        # MEDIUM RANGE: Transition to V-bar approach
+        # Use CW-informed PD control with gentle gains
+
+        target_speed = min(1.0, dist * 0.008)
+        if fuel_kg < 80:
+            target_speed = min(0.5, dist * 0.004)
+
+        # Desired velocity: move toward target at controlled speed
+        if dist > 0.1:
+            desired_vx = px / dist * (-target_speed)
+            desired_vy = py / dist * (-target_speed)
+            desired_vz = pz / dist * (-target_speed)
+        else:
+            desired_vx = desired_vy = desired_vz = 0.0
+
+        vx_err = desired_vx - vx
+        vy_err = desired_vy - vy
+        vz_err = desired_vz - vz
+
+        kv = 0.5 * fuel_factor
+
+        # Add CW compensation terms
+        cw_comp_x = (3 * n * n * px + 2 * n * vy) * 0.005
+        cw_comp_y = (-2 * n * vx) * 0.005
+
+        tx = _clamp(vx_err * kv + cw_comp_x, -0.6, 0.6) * fuel_factor
+        ty = _clamp(vy_err * kv + cw_comp_y, -0.6, 0.6) * fuel_factor
+        tz = _clamp(vz_err * kv, -0.6, 0.6) * fuel_factor
+
+    elif dist > 10.0:
+        # CLOSE RANGE: Linear regime, direct PD control
+        target_speed = min(0.5, dist * 0.01)
+        if fuel_kg < 80:
+            target_speed = min(0.3, dist * 0.008)
+
+        if dist > 0.1:
+            desired_vx = px / dist * (-target_speed)
+            desired_vy = py / dist * (-target_speed)
+            desired_vz = pz / dist * (-target_speed)
+        else:
+            desired_vx = desired_vy = desired_vz = 0.0
+
+        kp = 0.02 * fuel_factor
+        kd = 0.8 * fuel_factor
+
+        tx = _clamp(-kp * px + kd * (desired_vx - vx), -0.4, 0.4) * fuel_factor
+        ty = _clamp(-kp * py + kd * (desired_vy - vy), -0.4, 0.4) * fuel_factor
+        tz = _clamp(-kp * pz + kd * (desired_vz - vz), -0.4, 0.4) * fuel_factor
+
+    else:
+        # FINAL APPROACH: Very gentle, < 0.1 m/s
+        target_speed = min(0.08, dist * 0.015)
+
+        if dist > 0.1:
+            desired_vx = px / dist * (-target_speed)
+            desired_vy = py / dist * (-target_speed)
+            desired_vz = pz / dist * (-target_speed)
+        else:
+            desired_vx = desired_vy = desired_vz = 0.0
+
+        kp = 0.03 * fuel_factor
+        kd = 1.2 * fuel_factor
+
+        tx = _clamp(-kp * px + kd * (desired_vx - vx), -0.15, 0.15) * fuel_factor
+        ty = _clamp(-kp * py + kd * (desired_vy - vy), -0.15, 0.15) * fuel_factor
+        tz = _clamp(-kp * pz + kd * (desired_vz - vz), -0.15, 0.15) * fuel_factor
+
+    # Speed limiting: if closing too fast, prioritize braking
+    # Closing speed: component of velocity toward target
+    if dist > 0.1:
+        closing_speed = -(px * vx + py * vy + pz * vz) / dist
+    else:
+        closing_speed = speed
+
+    max_closing = 0.08 if dist < 10 else (0.3 if dist < 50 else (1.5 if dist < 200 else 3.0))
+    if fuel_kg < 80:
+        max_closing *= 0.7
+
+    if closing_speed > max_closing * 1.5 and dist < 500:
+        # Emergency braking - thrust away from target
+        brake_strength = min(1.0, (closing_speed - max_closing) * 2.0)
+        if dist > 0.1:
+            tx = (px / dist) * brake_strength
+            ty = (py / dist) * brake_strength
+            tz = (pz / dist) * brake_strength
+
+    # Attitude control - damp angular rates
+    gyro_vals = {"pitch": [], "roll": [], "yaw": []}
+    for i in range(1, 4):
+        for axis in ["pitch", "roll", "yaw"]:
+            if s.get(f"gyro_{i}_{axis}_valid", False):
+                gyro_vals[axis].append(s[f"gyro_{i}_{axis}_dps"])
+
+    att_kd = 0.5
+    for axis, key in [("pitch", "att_rate_pitch"), ("roll", "att_rate_roll"), ("yaw", "att_rate_yaw")]:
+        vals = gyro_vals[axis]
+        if vals:
+            rate_dps = _median_valid(vals)
+            if rate_dps is not None:
+                rate_rads = math.radians(rate_dps)
+                correction = -att_kd * rate_rads
+                out[key] = _clamp(correction, -0.035, 0.035)
+
+    out["thrust_x"] = _clamp(tx, -1.0, 1.0)
+    out["thrust_y"] = _clamp(ty, -1.0, 1.0)
+    out["thrust_z"] = _clamp(tz, -1.0, 1.0)
+
+    return out

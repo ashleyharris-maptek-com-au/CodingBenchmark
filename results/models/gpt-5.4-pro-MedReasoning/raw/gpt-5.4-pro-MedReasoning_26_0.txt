@@ -1,0 +1,1347 @@
+Below is a complete Rust 2021 program.
+
+```rust
+use std::env;
+use std::fs::{remove_file, File, OpenOptions};
+use std::io::{self, BufRead, BufReader, BufWriter, ErrorKind, Read, Write};
+use std::path::{Path, PathBuf};
+use std::process;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+const POINT_BYTES: usize = 12;
+const BATCH_POINTS: usize = 65_536;
+const IO_BUF_BYTES: usize = POINT_BYTES * BATCH_POINTS;
+const OUTPUT_BUF_BYTES: usize = 1 << 20;
+
+const BRUTE_FORCE_CUTOFF: usize = 32;
+
+// Adaptive strategy thresholds.
+const IN_MEMORY_POINT_LIMIT: u64 = 20_000_000;
+const EXTERNAL_POINT_LIMIT: u64 = 200_000_000;
+
+// One-pass extreme mode update cap: keeps centers responsive.
+const ONLINE_WEIGHT_CAP: u64 = 50_000;
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+struct Point {
+    x: f32,
+    y: f32,
+    z: f32,
+}
+
+#[derive(Clone, Copy, Default, Debug)]
+struct Center {
+    x: f32,
+    y: f32,
+    z: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SamplePoint {
+    p: Point,
+    index: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Strategy {
+    InMemory,
+    ExternalTemp,
+    ExtremeStreaming,
+}
+
+struct InitResult {
+    centers: Vec<Center>,
+    // (global point index, cluster id)
+    global_forced: Vec<(u64, usize)>,
+    // (sample-local index, cluster id)
+    sample_forced: Vec<(u64, usize)>,
+}
+
+#[derive(Clone, Copy)]
+struct KdNode {
+    idx: usize,
+    left: i32,
+    right: i32,
+    axis: u8,
+}
+
+struct KdTree {
+    nodes: Vec<KdNode>,
+    root: i32,
+}
+
+struct Rng {
+    state: u64,
+}
+
+struct PointReader<R: Read> {
+    inner: R,
+    buf: Vec<u8>,
+    start: usize,
+    end: usize,
+}
+
+impl From<Point> for Center {
+    fn from(p: Point) -> Self {
+        Self {
+            x: p.x,
+            y: p.y,
+            z: p.z,
+        }
+    }
+}
+
+impl Point {
+    #[inline(always)]
+    fn append_le_bytes(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.x.to_le_bytes());
+        out.extend_from_slice(&self.y.to_le_bytes());
+        out.extend_from_slice(&self.z.to_le_bytes());
+    }
+}
+
+impl Center {
+    #[inline(always)]
+    fn norm2(&self) -> f64 {
+        let x = self.x as f64;
+        let y = self.y as f64;
+        let z = self.z as f64;
+        x * x + y * y + z * z
+    }
+}
+
+impl Rng {
+    fn new(seed: u64) -> Self {
+        let seed = if seed == 0 { 0x9E3779B97F4A7C15 } else { seed };
+        Self { state: seed }
+    }
+
+    #[inline(always)]
+    fn next_u64(&mut self) -> u64 {
+        // xorshift64*
+        let mut x = self.state;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.state = x;
+        x.wrapping_mul(0x2545F4914F6CDD1D)
+    }
+
+    #[inline(always)]
+    fn gen_range(&mut self, upper: u64) -> u64 {
+        if upper == 0 {
+            0
+        } else {
+            self.next_u64() % upper
+        }
+    }
+
+    #[inline(always)]
+    fn gen_f64(&mut self) -> f64 {
+        let v = self.next_u64() >> 11;
+        (v as f64) * (1.0 / ((1u64 << 53) as f64))
+    }
+}
+
+impl<R: Read> PointReader<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            buf: vec![0u8; IO_BUF_BYTES + POINT_BYTES],
+            start: 0,
+            end: 0,
+        }
+    }
+
+    fn read_batch(&mut self, out: &mut Vec<Point>, target_points: usize) -> io::Result<usize> {
+        out.clear();
+        if target_points == 0 {
+            return Ok(0);
+        }
+
+        while out.len() < target_points {
+            let available_bytes = self.end.saturating_sub(self.start);
+            let available_points = available_bytes / POINT_BYTES;
+
+            if available_points > 0 {
+                let take = available_points.min(target_points - out.len());
+                let mut off = self.start;
+                for _ in 0..take {
+                    out.push(parse_point_at(&self.buf, off));
+                    off += POINT_BYTES;
+                }
+                self.start = off;
+                continue;
+            }
+
+            if self.start > 0 {
+                if self.start < self.end {
+                    self.buf.copy_within(self.start..self.end, 0);
+                    self.end -= self.start;
+                    self.start = 0;
+                } else {
+                    self.start = 0;
+                    self.end = 0;
+                }
+            }
+
+            let n = self.inner.read(&mut self.buf[self.end..])?;
+            if n == 0 {
+                if self.start == self.end {
+                    break;
+                } else {
+                    return Err(io::Error::new(
+                        ErrorKind::UnexpectedEof,
+                        "truncated binary point stream",
+                    ));
+                }
+            }
+            self.end += n;
+        }
+
+        Ok(out.len())
+    }
+}
+
+impl KdTree {
+    fn build(centers: &[Center]) -> Self {
+        let mut idxs: Vec<usize> = (0..centers.len()).collect();
+        let mut nodes = Vec::with_capacity(centers.len());
+        let root = Self::build_rec(&mut idxs, centers, &mut nodes);
+        Self { nodes, root }
+    }
+
+    fn build_rec(idxs: &mut [usize], centers: &[Center], nodes: &mut Vec<KdNode>) -> i32 {
+        if idxs.is_empty() {
+            return -1;
+        }
+
+        let axis = axis_of_max_spread(idxs, centers);
+        idxs.sort_unstable_by(|&a, &b| center_coord(centers[a], axis).total_cmp(&center_coord(centers[b], axis)));
+
+        let mid = idxs.len() / 2;
+        let idx = idxs[mid];
+
+        let node_pos = nodes.len() as i32;
+        nodes.push(KdNode {
+            idx,
+            left: -1,
+            right: -1,
+            axis,
+        });
+
+        let (left_slice, right_with_mid) = idxs.split_at_mut(mid);
+        let (_, right_slice) = right_with_mid.split_first_mut().unwrap();
+
+        let left = Self::build_rec(left_slice, centers, nodes);
+        let right = Self::build_rec(right_slice, centers, nodes);
+
+        let node = &mut nodes[node_pos as usize];
+        node.left = left;
+        node.right = right;
+
+        node_pos
+    }
+
+    #[inline(always)]
+    fn nearest(&self, p: Point, centers: &[Center]) -> usize {
+        let mut best_idx = 0usize;
+        let mut best_d2 = f32::INFINITY;
+        self.search(self.root, p, centers, &mut best_idx, &mut best_d2);
+        best_idx
+    }
+
+    fn search(
+        &self,
+        node_idx: i32,
+        p: Point,
+        centers: &[Center],
+        best_idx: &mut usize,
+        best_d2: &mut f32,
+    ) {
+        if node_idx < 0 {
+            return;
+        }
+
+        let node = &self.nodes[node_idx as usize];
+        let c = centers[node.idx];
+        let d2 = dist2_pc(p, c);
+        if d2 < *best_d2 {
+            *best_d2 = d2;
+            *best_idx = node.idx;
+        }
+
+        let axis = node.axis;
+        let pv = point_coord(p, axis);
+        let cv = center_coord(c, axis);
+        let (near, far) = if pv < cv {
+            (node.left, node.right)
+        } else {
+            (node.right, node.left)
+        };
+
+        if near >= 0 {
+            self.search(near, p, centers, best_idx, best_d2);
+        }
+
+        let diff = pv - cv;
+        if diff * diff < *best_d2 && far >= 0 {
+            self.search(far, p, centers, best_idx, best_d2);
+        }
+    }
+}
+
+#[inline(always)]
+fn parse_point_at(buf: &[u8], off: usize) -> Point {
+    Point {
+        x: f32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]),
+        y: f32::from_le_bytes([buf[off + 4], buf[off + 5], buf[off + 6], buf[off + 7]]),
+        z: f32::from_le_bytes([buf[off + 8], buf[off + 9], buf[off + 10], buf[off + 11]]),
+    }
+}
+
+#[inline(always)]
+fn point_coord(p: Point, axis: u8) -> f32 {
+    match axis {
+        0 => p.x,
+        1 => p.y,
+        _ => p.z,
+    }
+}
+
+#[inline(always)]
+fn center_coord(c: Center, axis: u8) -> f32 {
+    match axis {
+        0 => c.x,
+        1 => c.y,
+        _ => c.z,
+    }
+}
+
+#[inline(always)]
+fn dist2_pc(p: Point, c: Center) -> f32 {
+    let dx = p.x - c.x;
+    let dy = p.y - c.y;
+    let dz = p.z - c.z;
+    dx * dx + dy * dy + dz * dz
+}
+
+#[inline(always)]
+fn nearest_center(p: Point, centers: &[Center], tree: Option<&KdTree>) -> usize {
+    if centers.len() <= BRUTE_FORCE_CUTOFF {
+        let mut best_idx = 0usize;
+        let mut best_d2 = dist2_pc(p, centers[0]);
+        for i in 1..centers.len() {
+            let d2 = dist2_pc(p, centers[i]);
+            if d2 < best_d2 {
+                best_d2 = d2;
+                best_idx = i;
+            }
+        }
+        best_idx
+    } else {
+        tree.expect("kd-tree missing").nearest(p, centers)
+    }
+}
+
+#[inline(always)]
+fn maybe_forced_cluster(idx: u64, forced: &[(u64, usize)], ptr: &mut usize) -> Option<usize> {
+    if *ptr < forced.len() && forced[*ptr].0 == idx {
+        let c = forced[*ptr].1;
+        *ptr += 1;
+        Some(c)
+    } else {
+        None
+    }
+}
+
+fn axis_of_max_spread(idxs: &[usize], centers: &[Center]) -> u8 {
+    let mut minv = [f32::INFINITY; 3];
+    let mut maxv = [f32::NEG_INFINITY; 3];
+
+    for &i in idxs {
+        let c = centers[i];
+        minv[0] = minv[0].min(c.x);
+        minv[1] = minv[1].min(c.y);
+        minv[2] = minv[2].min(c.z);
+        maxv[0] = maxv[0].max(c.x);
+        maxv[1] = maxv[1].max(c.y);
+        maxv[2] = maxv[2].max(c.z);
+    }
+
+    let sx = maxv[0] - minv[0];
+    let sy = maxv[1] - minv[1];
+    let sz = maxv[2] - minv[2];
+
+    if sx >= sy && sx >= sz {
+        0
+    } else if sy >= sz {
+        1
+    } else {
+        2
+    }
+}
+
+fn read_header<R: BufRead>(reader: &mut R) -> io::Result<(u64, usize)> {
+    let mut header = Vec::with_capacity(64);
+    let n = reader.read_until(b'\n', &mut header)?;
+    if n == 0 {
+        return Err(io::Error::new(ErrorKind::UnexpectedEof, "missing header"));
+    }
+
+    let text = std::str::from_utf8(&header)
+        .map_err(|_| io::Error::new(ErrorKind::InvalidData, "header is not valid UTF-8"))?;
+    let mut it = text.split_whitespace();
+
+    let num_points = it
+        .next()
+        .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "missing num_points"))?
+        .parse::<u64>()
+        .map_err(|_| io::Error::new(ErrorKind::InvalidData, "invalid num_points"))?;
+
+    let num_clusters_u64 = it
+        .next()
+        .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "missing num_clusters"))?
+        .parse::<u64>()
+        .map_err(|_| io::Error::new(ErrorKind::InvalidData, "invalid num_clusters"))?;
+
+    let num_clusters = usize::try_from(num_clusters_u64)
+        .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "num_clusters too large"))?;
+
+    Ok((num_points, num_clusters))
+}
+
+fn choose_strategy(num_points: u64) -> Strategy {
+    if num_points <= IN_MEMORY_POINT_LIMIT {
+        Strategy::InMemory
+    } else if num_points <= EXTERNAL_POINT_LIMIT {
+        Strategy::ExternalTemp
+    } else {
+        Strategy::ExtremeStreaming
+    }
+}
+
+fn choose_sample_size(num_points: u64, k: usize) -> usize {
+    let num_points_usize = u64_to_usize_saturating(num_points);
+    let hard_cap = 80_000usize.max(k);
+    let mut s = k.saturating_mul(3).max(10_000).max(k);
+    s = s.min(hard_cap);
+    s.min(num_points_usize)
+}
+
+fn choose_warmup_size(num_points: u64, k: usize) -> usize {
+    let num_points_usize = u64_to_usize_saturating(num_points);
+    let hard_cap = 150_000usize.max(k);
+    let mut w = k.saturating_mul(10).max(50_000).max(k);
+    w = w.min(hard_cap);
+    w.min(num_points_usize)
+}
+
+fn choose_sample_epochs(k: usize) -> usize {
+    if k <= 128 {
+        5
+    } else if k <= 1024 {
+        4
+    } else {
+        3
+    }
+}
+
+fn choose_full_epochs(num_points: u64, k: usize, strategy: Strategy) -> usize {
+    let complexity = num_points.saturating_mul(k as u64);
+    match strategy {
+        Strategy::InMemory => {
+            if complexity <= 500_000_000 {
+                12
+            } else if complexity <= 2_000_000_000 {
+                8
+            } else if complexity <= 10_000_000_000 {
+                6
+            } else {
+                4
+            }
+        }
+        Strategy::ExternalTemp => {
+            if complexity <= 5_000_000_000 {
+                5
+            } else if complexity <= 20_000_000_000 {
+                4
+            } else if complexity <= 100_000_000_000 {
+                3
+            } else {
+                2
+            }
+        }
+        Strategy::ExtremeStreaming => 0,
+    }
+}
+
+#[inline(always)]
+fn u64_to_usize_saturating(v: u64) -> usize {
+    if v > usize::MAX as u64 {
+        usize::MAX
+    } else {
+        v as usize
+    }
+}
+
+fn has_converged(max_shift2: f64, centers: &[Center]) -> bool {
+    let mut scale2 = 0.0f64;
+    for c in centers {
+        scale2 = scale2.max(c.norm2());
+    }
+    max_shift2 <= (scale2 + 1.0) * 1e-8
+}
+
+fn reservoir_insert(
+    sample: &mut Vec<SamplePoint>,
+    cap: usize,
+    index: u64,
+    p: Point,
+    rng: &mut Rng,
+) {
+    if cap == 0 {
+        return;
+    }
+    if sample.len() < cap {
+        sample.push(SamplePoint { p, index });
+    } else {
+        let j = rng.gen_range(index + 1);
+        if j < cap as u64 {
+            sample[j as usize] = SamplePoint { p, index };
+        }
+    }
+}
+
+fn reservoir_sample_from_slice(
+    points: &[Point],
+    offset: u64,
+    sample_cap: usize,
+    rng: &mut Rng,
+) -> Vec<SamplePoint> {
+    let mut sample = Vec::with_capacity(sample_cap.min(points.len()));
+    for (i, &p) in points.iter().enumerate() {
+        reservoir_insert(&mut sample, sample_cap, offset + i as u64, p, rng);
+    }
+    sample
+}
+
+// Initializes centers from sample points and also records one "anchor" point per cluster.
+// During training/final assignment these anchors are forced into their cluster, which guarantees
+// exactly K non-empty output clusters (assuming num_points >= K).
+fn initialize_from_sample(sample: &[SamplePoint], k: usize, rng: &mut Rng) -> io::Result<InitResult> {
+    if sample.len() < k {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            "sample smaller than num_clusters",
+        ));
+    }
+
+    if sample.len() == k {
+        let mut global_forced = Vec::with_capacity(k);
+        let mut sample_forced = Vec::with_capacity(k);
+        let centers: Vec<Center> = sample.iter().map(|s| s.p.into()).collect();
+        for i in 0..k {
+            global_forced.push((sample[i].index, i));
+            sample_forced.push((i as u64, i));
+        }
+        global_forced.sort_unstable_by_key(|x| x.0);
+        sample_forced.sort_unstable_by_key(|x| x.0);
+        return Ok(InitResult {
+            centers,
+            global_forced,
+            sample_forced,
+        });
+    }
+
+    let n = sample.len();
+    let mut centers = Vec::with_capacity(k);
+    let mut global_forced = Vec::with_capacity(k);
+    let mut sample_forced = Vec::with_capacity(k);
+    let mut chosen = vec![false; n];
+    let mut min_d2 = vec![0.0f32; n];
+
+    let first = rng.gen_range(n as u64) as usize;
+    chosen[first] = true;
+    centers.push(sample[first].p.into());
+    global_forced.push((sample[first].index, 0));
+    sample_forced.push((first as u64, 0));
+
+    let first_center = centers[0];
+    for i in 0..n {
+        if i == first {
+            min_d2[i] = 0.0;
+        } else {
+            min_d2[i] = dist2_pc(sample[i].p, first_center);
+        }
+    }
+
+    for cluster_id in 1..k {
+        let mut total = 0.0f64;
+        for i in 0..n {
+            if !chosen[i] {
+                total += min_d2[i] as f64;
+            }
+        }
+
+        let next_idx = if total > 0.0 {
+            let mut target = rng.gen_f64() * total;
+            let mut selected = None;
+            for i in 0..n {
+                if chosen[i] {
+                    continue;
+                }
+                target -= min_d2[i] as f64;
+                if target <= 0.0 {
+                    selected = Some(i);
+                    break;
+                }
+            }
+            selected.unwrap_or_else(|| {
+                (0..n).rev().find(|&i| !chosen[i]).unwrap()
+            })
+        } else {
+            let unchosen: Vec<usize> = (0..n).filter(|&i| !chosen[i]).collect();
+            unchosen[rng.gen_range(unchosen.len() as u64) as usize]
+        };
+
+        chosen[next_idx] = true;
+        min_d2[next_idx] = 0.0;
+
+        let new_center: Center = sample[next_idx].p.into();
+        centers.push(new_center);
+        global_forced.push((sample[next_idx].index, cluster_id));
+        sample_forced.push((next_idx as u64, cluster_id));
+
+        for i in 0..n {
+            if !chosen[i] {
+                let d2 = dist2_pc(sample[i].p, new_center);
+                if d2 < min_d2[i] {
+                    min_d2[i] = d2;
+                }
+            }
+        }
+    }
+
+    global_forced.sort_unstable_by_key(|x| x.0);
+    sample_forced.sort_unstable_by_key(|x| x.0);
+
+    Ok(InitResult {
+        centers,
+        global_forced,
+        sample_forced,
+    })
+}
+
+fn update_centers(
+    centers: &mut [Center],
+    sx: &[f64],
+    sy: &[f64],
+    sz: &[f64],
+    counts: &[u64],
+) -> f64 {
+    let mut max_shift2 = 0.0f64;
+
+    for i in 0..centers.len() {
+        if counts[i] == 0 {
+            continue;
+        }
+        let inv = 1.0 / counts[i] as f64;
+        let nx = (sx[i] * inv) as f32;
+        let ny = (sy[i] * inv) as f32;
+        let nz = (sz[i] * inv) as f32;
+
+        let dx = centers[i].x as f64 - nx as f64;
+        let dy = centers[i].y as f64 - ny as f64;
+        let dz = centers[i].z as f64 - nz as f64;
+        let shift2 = dx * dx + dy * dy + dz * dz;
+        if shift2 > max_shift2 {
+            max_shift2 = shift2;
+        }
+
+        centers[i] = Center { x: nx, y: ny, z: nz };
+    }
+
+    max_shift2
+}
+
+fn refine_slice_with_assignments(
+    points: &[Point],
+    centers: &mut [Center],
+    forced: &[(u64, usize)],
+    epochs: usize,
+) -> (Vec<u64>, Vec<u32>) {
+    let k = centers.len();
+    let mut sx = vec![0.0f64; k];
+    let mut sy = vec![0.0f64; k];
+    let mut sz = vec![0.0f64; k];
+    let mut counts = vec![0u64; k];
+    let mut assignments = vec![0u32; points.len()];
+
+    for epoch in 0..epochs {
+        sx.fill(0.0);
+        sy.fill(0.0);
+        sz.fill(0.0);
+        counts.fill(0);
+
+        let tree = if k > BRUTE_FORCE_CUTOFF {
+            Some(KdTree::build(centers))
+        } else {
+            None
+        };
+
+        let mut forced_ptr = 0usize;
+        let mut idx = 0u64;
+
+        for (pos, &p) in points.iter().enumerate() {
+            let cluster = maybe_forced_cluster(idx, forced, &mut forced_ptr)
+                .unwrap_or_else(|| nearest_center(p, centers, tree.as_ref()));
+            assignments[pos] = cluster as u32;
+            sx[cluster] += p.x as f64;
+            sy[cluster] += p.y as f64;
+            sz[cluster] += p.z as f64;
+            counts[cluster] += 1;
+            idx += 1;
+        }
+
+        let shift = update_centers(centers, &sx, &sy, &sz, &counts);
+        if epoch + 1 >= 2 && has_converged(shift, centers) {
+            break;
+        }
+    }
+
+    (counts, assignments)
+}
+
+fn train_slice(points: &[Point], centers: &mut [Center], forced: &[(u64, usize)], epochs: usize) {
+    let k = centers.len();
+    let mut sx = vec![0.0f64; k];
+    let mut sy = vec![0.0f64; k];
+    let mut sz = vec![0.0f64; k];
+    let mut counts = vec![0u64; k];
+
+    for epoch in 0..epochs {
+        sx.fill(0.0);
+        sy.fill(0.0);
+        sz.fill(0.0);
+        counts.fill(0);
+
+        let tree = if k > BRUTE_FORCE_CUTOFF {
+            Some(KdTree::build(centers))
+        } else {
+            None
+        };
+
+        let mut forced_ptr = 0usize;
+        let mut idx = 0u64;
+
+        for &p in points {
+            let cluster = maybe_forced_cluster(idx, forced, &mut forced_ptr)
+                .unwrap_or_else(|| nearest_center(p, centers, tree.as_ref()));
+            sx[cluster] += p.x as f64;
+            sy[cluster] += p.y as f64;
+            sz[cluster] += p.z as f64;
+            counts[cluster] += 1;
+            idx += 1;
+        }
+
+        let shift = update_centers(centers, &sx, &sy, &sz, &counts);
+        if epoch + 1 >= 2 && has_converged(shift, centers) {
+            break;
+        }
+    }
+}
+
+fn train_file(
+    path: &Path,
+    num_points: u64,
+    centers: &mut [Center],
+    forced: &[(u64, usize)],
+    epochs: usize,
+) -> io::Result<()> {
+    let k = centers.len();
+    let mut sx = vec![0.0f64; k];
+    let mut sy = vec![0.0f64; k];
+    let mut sz = vec![0.0f64; k];
+    let mut counts = vec![0u64; k];
+    let mut batch = Vec::with_capacity(BATCH_POINTS);
+
+    for epoch in 0..epochs {
+        sx.fill(0.0);
+        sy.fill(0.0);
+        sz.fill(0.0);
+        counts.fill(0);
+
+        let tree = if k > BRUTE_FORCE_CUTOFF {
+            Some(KdTree::build(centers))
+        } else {
+            None
+        };
+
+        let file = File::open(path)?;
+        let mut reader = PointReader::new(file);
+
+        let mut forced_ptr = 0usize;
+        let mut idx = 0u64;
+
+        while idx < num_points {
+            let want = ((num_points - idx) as usize).min(BATCH_POINTS);
+            let got = reader.read_batch(&mut batch, want)?;
+            if got != want {
+                return Err(io::Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "point file ended early during training",
+                ));
+            }
+
+            for &p in &batch[..got] {
+                let cluster = maybe_forced_cluster(idx, forced, &mut forced_ptr)
+                    .unwrap_or_else(|| nearest_center(p, centers, tree.as_ref()));
+                sx[cluster] += p.x as f64;
+                sy[cluster] += p.y as f64;
+                sz[cluster] += p.z as f64;
+                counts[cluster] += 1;
+                idx += 1;
+            }
+        }
+
+        let shift = update_centers(centers, &sx, &sy, &sz, &counts);
+        if epoch + 1 >= 2 && has_converged(shift, centers) {
+            break;
+        }
+    }
+
+    Ok(())
+}
+
+fn read_all_points<R: Read>(
+    reader: R,
+    num_points: u64,
+    sample_cap: usize,
+    rng: &mut Rng,
+) -> io::Result<(Vec<Point>, Vec<SamplePoint>)> {
+    let point_cap = usize::try_from(num_points)
+        .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "dataset too large for in-memory mode"))?;
+    let mut points = Vec::with_capacity(point_cap);
+    let mut sample = Vec::with_capacity(sample_cap.min(point_cap));
+    let mut batch = Vec::with_capacity(BATCH_POINTS);
+    let mut point_reader = PointReader::new(reader);
+
+    let mut idx = 0u64;
+    while idx < num_points {
+        let want = ((num_points - idx) as usize).min(BATCH_POINTS);
+        let got = point_reader.read_batch(&mut batch, want)?;
+        if got != want {
+            return Err(io::Error::new(
+                ErrorKind::UnexpectedEof,
+                "input ended early while reading points",
+            ));
+        }
+
+        for &p in &batch[..got] {
+            reservoir_insert(&mut sample, sample_cap, idx, p, rng);
+            idx += 1;
+        }
+        points.extend_from_slice(&batch[..got]);
+    }
+
+    Ok((points, sample))
+}
+
+fn spool_points_to_temp<R: Read>(
+    reader: R,
+    num_points: u64,
+    sample_cap: usize,
+    rng: &mut Rng,
+    temp_file: File,
+) -> io::Result<Vec<SamplePoint>> {
+    let mut writer = BufWriter::with_capacity(IO_BUF_BYTES, temp_file);
+    let mut point_reader = PointReader::new(reader);
+    let mut batch = Vec::with_capacity(BATCH_POINTS);
+    let mut raw = Vec::with_capacity(IO_BUF_BYTES);
+    let mut sample = Vec::with_capacity(sample_cap);
+
+    let mut idx = 0u64;
+    while idx < num_points {
+        let want = ((num_points - idx) as usize).min(BATCH_POINTS);
+        let got = point_reader.read_batch(&mut batch, want)?;
+        if got != want {
+            return Err(io::Error::new(
+                ErrorKind::UnexpectedEof,
+                "input ended early while spooling points",
+            ));
+        }
+
+        raw.clear();
+        for &p in &batch[..got] {
+            reservoir_insert(&mut sample, sample_cap, idx, p, rng);
+            p.append_le_bytes(&mut raw);
+            idx += 1;
+        }
+        writer.write_all(&raw)?;
+    }
+
+    writer.flush()?;
+    Ok(sample)
+}
+
+fn write_assignments_slice<W: Write>(
+    points: &[Point],
+    centers: &[Center],
+    forced: &[(u64, usize)],
+    writer: &mut W,
+) -> io::Result<()> {
+    let tree = if centers.len() > BRUTE_FORCE_CUTOFF {
+        Some(KdTree::build(centers))
+    } else {
+        None
+    };
+
+    let mut out = Vec::with_capacity(OUTPUT_BUF_BYTES);
+    let mut forced_ptr = 0usize;
+    let mut idx = 0u64;
+
+    for &p in points {
+        let cluster = maybe_forced_cluster(idx, forced, &mut forced_ptr)
+            .unwrap_or_else(|| nearest_center(p, centers, tree.as_ref()));
+        out.extend_from_slice(&(cluster as u32).to_le_bytes());
+
+        if out.len() >= OUTPUT_BUF_BYTES {
+            writer.write_all(&out)?;
+            out.clear();
+        }
+
+        idx += 1;
+    }
+
+    if !out.is_empty() {
+        writer.write_all(&out)?;
+    }
+    Ok(())
+}
+
+fn write_assignments_file<W: Write>(
+    path: &Path,
+    num_points: u64,
+    centers: &[Center],
+    forced: &[(u64, usize)],
+    writer: &mut W,
+) -> io::Result<()> {
+    let tree = if centers.len() > BRUTE_FORCE_CUTOFF {
+        Some(KdTree::build(centers))
+    } else {
+        None
+    };
+
+    let file = File::open(path)?;
+    let mut reader = PointReader::new(file);
+    let mut batch = Vec::with_capacity(BATCH_POINTS);
+    let mut out = Vec::with_capacity(OUTPUT_BUF_BYTES);
+
+    let mut forced_ptr = 0usize;
+    let mut idx = 0u64;
+
+    while idx < num_points {
+        let want = ((num_points - idx) as usize).min(BATCH_POINTS);
+        let got = reader.read_batch(&mut batch, want)?;
+        if got != want {
+            return Err(io::Error::new(
+                ErrorKind::UnexpectedEof,
+                "point file ended early during final assignment",
+            ));
+        }
+
+        for &p in &batch[..got] {
+            let cluster = maybe_forced_cluster(idx, forced, &mut forced_ptr)
+                .unwrap_or_else(|| nearest_center(p, centers, tree.as_ref()));
+            out.extend_from_slice(&(cluster as u32).to_le_bytes());
+
+            if out.len() >= OUTPUT_BUF_BYTES {
+                writer.write_all(&out)?;
+                out.clear();
+            }
+
+            idx += 1;
+        }
+    }
+
+    if !out.is_empty() {
+        writer.write_all(&out)?;
+    }
+    Ok(())
+}
+
+fn write_u32_slice<W: Write>(writer: &mut W, values: &[u32]) -> io::Result<()> {
+    let mut out = Vec::with_capacity(OUTPUT_BUF_BYTES);
+    for &v in values {
+        out.extend_from_slice(&v.to_le_bytes());
+        if out.len() >= OUTPUT_BUF_BYTES {
+            writer.write_all(&out)?;
+            out.clear();
+        }
+    }
+    if !out.is_empty() {
+        writer.write_all(&out)?;
+    }
+    Ok(())
+}
+
+fn online_update_centers(
+    centers: &mut [Center],
+    sx: &[f64],
+    sy: &[f64],
+    sz: &[f64],
+    batch_counts: &[u64],
+    counts: &mut [u64],
+) {
+    for i in 0..centers.len() {
+        let bc = batch_counts[i];
+        if bc == 0 {
+            continue;
+        }
+
+        let prev_weight = counts[i].min(ONLINE_WEIGHT_CAP) as f64;
+        let batch_weight = bc as f64;
+        let denom = prev_weight + batch_weight;
+
+        let nx = ((centers[i].x as f64) * prev_weight + sx[i]) / denom;
+        let ny = ((centers[i].y as f64) * prev_weight + sy[i]) / denom;
+        let nz = ((centers[i].z as f64) * prev_weight + sz[i]) / denom;
+
+        centers[i] = Center {
+            x: nx as f32,
+            y: ny as f32,
+            z: nz as f32,
+        };
+        counts[i] = counts[i].saturating_add(bc);
+    }
+}
+
+fn solve_in_memory<R: Read>(
+    reader: R,
+    num_points: u64,
+    k: usize,
+    rng: &mut Rng,
+) -> io::Result<()> {
+    let sample_cap = choose_sample_size(num_points, k);
+    let (points, sample) = read_all_points(reader, num_points, sample_cap, rng)?;
+
+    let init = initialize_from_sample(&sample, k, rng)?;
+    let mut centers = init.centers;
+
+    let sample_points: Vec<Point> = sample.iter().map(|s| s.p).collect();
+    let _ = refine_slice_with_assignments(
+        &sample_points,
+        &mut centers,
+        &init.sample_forced,
+        choose_sample_epochs(k),
+    );
+
+    train_slice(
+        &points,
+        &mut centers,
+        &init.global_forced,
+        choose_full_epochs(num_points, k, Strategy::InMemory),
+    );
+
+    let stdout = io::stdout();
+    let mut writer = BufWriter::with_capacity(OUTPUT_BUF_BYTES, stdout.lock());
+    write_assignments_slice(&points, &centers, &init.global_forced, &mut writer)?;
+    writer.flush()?;
+    Ok(())
+}
+
+fn create_temp_file() -> io::Result<(File, PathBuf)> {
+    let base = env::temp_dir();
+    for attempt in 0..128u32 {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let mut path = base.clone();
+        path.push(format!(
+            "rust_kmeans3d_{}_{}_{}.bin",
+            process::id(),
+            stamp,
+            attempt
+        ));
+
+        match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(f) => return Ok((f, path)),
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+
+    Err(io::Error::new(
+        ErrorKind::AlreadyExists,
+        "failed to create temp file",
+    ))
+}
+
+fn solve_external_inner<R: Read>(
+    reader: R,
+    num_points: u64,
+    k: usize,
+    rng: &mut Rng,
+    temp_file: File,
+    temp_path: &Path,
+) -> io::Result<()> {
+    let sample_cap = choose_sample_size(num_points, k);
+    let sample = spool_points_to_temp(reader, num_points, sample_cap, rng, temp_file)?;
+
+    let init = initialize_from_sample(&sample, k, rng)?;
+    let mut centers = init.centers;
+
+    let sample_points: Vec<Point> = sample.iter().map(|s| s.p).collect();
+    let _ = refine_slice_with_assignments(
+        &sample_points,
+        &mut centers,
+        &init.sample_forced,
+        choose_sample_epochs(k),
+    );
+
+    train_file(
+        temp_path,
+        num_points,
+        &mut centers,
+        &init.global_forced,
+        choose_full_epochs(num_points, k, Strategy::ExternalTemp),
+    )?;
+
+    let stdout = io::stdout();
+    let mut writer = BufWriter::with_capacity(OUTPUT_BUF_BYTES, stdout.lock());
+    write_assignments_file(temp_path, num_points, &centers, &init.global_forced, &mut writer)?;
+    writer.flush()?;
+    Ok(())
+}
+
+fn solve_external<R: Read>(
+    reader: R,
+    num_points: u64,
+    k: usize,
+    rng: &mut Rng,
+) -> io::Result<()> {
+    let (temp_file, temp_path) = match create_temp_file() {
+        Ok(v) => v,
+        Err(_) => {
+            // If temp creation fails, fall back to the one-pass streaming solver.
+            return solve_extreme(reader, num_points, k, rng);
+        }
+    };
+
+    let result = solve_external_inner(reader, num_points, k, rng, temp_file, &temp_path);
+    let _ = remove_file(&temp_path);
+    result
+}
+
+fn solve_extreme<R: Read>(
+    reader: R,
+    num_points: u64,
+    k: usize,
+    rng: &mut Rng,
+) -> io::Result<()> {
+    let warmup = choose_warmup_size(num_points, k);
+    let mut point_reader = PointReader::new(reader);
+    let mut warm_points = Vec::with_capacity(warmup);
+    let mut batch = Vec::with_capacity(BATCH_POINTS);
+
+    while warm_points.len() < warmup {
+        let want = (warmup - warm_points.len()).min(BATCH_POINTS);
+        let got = point_reader.read_batch(&mut batch, want)?;
+        if got != want {
+            return Err(io::Error::new(
+                ErrorKind::UnexpectedEof,
+                "input ended early during warmup",
+            ));
+        }
+        warm_points.extend_from_slice(&batch[..got]);
+    }
+
+    let warm_sample = reservoir_sample_from_slice(
+        &warm_points,
+        0,
+        choose_sample_size(warmup as u64, k),
+        rng,
+    );
+
+    let init = initialize_from_sample(&warm_sample, k, rng)?;
+    let mut centers = init.centers;
+
+    let (mut counts, warm_assignments) = refine_slice_with_assignments(
+        &warm_points,
+        &mut centers,
+        &init.global_forced,
+        choose_sample_epochs(k),
+    );
+
+    let stdout = io::stdout();
+    let mut writer = BufWriter::with_capacity(OUTPUT_BUF_BYTES, stdout.lock());
+    write_u32_slice(&mut writer, &warm_assignments)?;
+
+    let mut sx = vec![0.0f64; k];
+    let mut sy = vec![0.0f64; k];
+    let mut sz = vec![0.0f64; k];
+    let mut batch_counts = vec![0u64; k];
+    let mut out = Vec::with_capacity(OUTPUT_BUF_BYTES);
+
+    let mut processed = warmup as u64;
+    while processed < num_points {
+        let want = ((num_points - processed) as usize).min(BATCH_POINTS);
+        let got = point_reader.read_batch(&mut batch, want)?;
+        if got != want {
+            return Err(io::Error::new(
+                ErrorKind::UnexpectedEof,
+                "input ended early during streaming assignment",
+            ));
+        }
+
+        sx.fill(0.0);
+        sy.fill(0.0);
+        sz.fill(0.0);
+        batch_counts.fill(0);
+        out.clear();
+
+        let tree = if k > BRUTE_FORCE_CUTOFF {
+            Some(KdTree::build(&centers))
+        } else {
+            None
+        };
+
+        for &p in &batch[..got] {
+            let cluster = nearest_center(p, &centers, tree.as_ref());
+            out.extend_from_slice(&(cluster as u32).to_le_bytes());
+
+            sx[cluster] += p.x as f64;
+            sy[cluster] += p.y as f64;
+            sz[cluster] += p.z as f64;
+            batch_counts[cluster] += 1;
+        }
+
+        writer.write_all(&out)?;
+        online_update_centers(&mut centers, &sx, &sy, &sz, &batch_counts, &mut counts);
+
+        processed += got as u64;
+    }
+
+    writer.flush()?;
+    Ok(())
+}
+
+fn output_constant_assignments(num_points: u64, cluster: u32) -> io::Result<()> {
+    let stdout = io::stdout();
+    let mut writer = BufWriter::with_capacity(OUTPUT_BUF_BYTES, stdout.lock());
+    let mut out = Vec::with_capacity(OUTPUT_BUF_BYTES);
+    let bytes = cluster.to_le_bytes();
+
+    for _ in 0..num_points {
+        out.extend_from_slice(&bytes);
+        if out.len() >= OUTPUT_BUF_BYTES {
+            writer.write_all(&out)?;
+            out.clear();
+        }
+    }
+
+    if !out.is_empty() {
+        writer.write_all(&out)?;
+    }
+    writer.flush()?;
+    Ok(())
+}
+
+fn output_identity_assignments(num_points: u64) -> io::Result<()> {
+    let stdout = io::stdout();
+    let mut writer = BufWriter::with_capacity(OUTPUT_BUF_BYTES, stdout.lock());
+    let mut out = Vec::with_capacity(OUTPUT_BUF_BYTES);
+
+    for i in 0..num_points {
+        out.extend_from_slice(&(i as u32).to_le_bytes());
+        if out.len() >= OUTPUT_BUF_BYTES {
+            writer.write_all(&out)?;
+            out.clear();
+        }
+    }
+
+    if !out.is_empty() {
+        writer.write_all(&out)?;
+    }
+    writer.flush()?;
+    Ok(())
+}
+
+fn seed_from_problem(num_points: u64, k: usize) -> u64 {
+    let t = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    let mut x = t ^ num_points.rotate_left(17) ^ ((k as u64).rotate_left(31));
+    // splitmix-style scramble
+    x = x.wrapping_add(0x9E3779B97F4A7C15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D049BB133111EB);
+    x ^ (x >> 31)
+}
+
+fn main() -> io::Result<()> {
+    let stdin = io::stdin();
+    let mut reader = BufReader::with_capacity(1 << 20, stdin.lock());
+
+    let (num_points, num_clusters) = read_header(&mut reader)?;
+
+    if num_clusters == 0 {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            "num_clusters must be > 0",
+        ));
+    }
+    if num_points == 0 {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            "num_points must be > 0",
+        ));
+    }
+    if num_points < num_clusters as u64 {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            "cannot create exactly N non-empty clusters when num_clusters > num_points",
+        ));
+    }
+    if num_clusters > u32::MAX as usize {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            "num_clusters must fit in u32",
+        ));
+    }
+
+    // Cheap exact special cases.
+    if num_clusters == 1 {
+        return output_constant_assignments(num_points, 0);
+    }
+    if num_points == num_clusters as u64 {
+        return output_identity_assignments(num_points);
+    }
+
+    let mut rng = Rng::new(seed_from_problem(num_points, num_clusters));
+    let strategy = choose_strategy(num_points);
+
+    match strategy {
+        Strategy::InMemory => solve_in_memory(reader, num_points, num_clusters, &mut rng),
+        Strategy::ExternalTemp => solve_external(reader, num_points, num_clusters, &mut rng),
+        Strategy::ExtremeStreaming => solve_extreme(reader, num_points, num_clusters, &mut rng),
+    }
+}
+```
+
+Notes:
+- It uses three adaptive modes:
+  - in-memory multipass Lloyd (`<= 20M`)
+  - temp-file streaming multipass (`<= 200M`)
+  - one-pass warmup + online updates (`> 200M`)
+- It guarantees exactly `N` used cluster IDs by forcing one sampled anchor point per cluster.
+- For extreme scale, it intentionally switches to a one-pass approximate streaming variant to stay memory-safe.

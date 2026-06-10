@@ -1,0 +1,954 @@
+use std::io::{BufReader, BufWriter, Read, Write};
+use std::sync::Arc;
+
+struct Lcg {
+    state: u64,
+}
+
+impl Lcg {
+    fn new(seed: u64) -> Self {
+        Self { state: seed }
+    }
+    fn next_u64(&mut self) -> u64 {
+        self.state = self.state.wrapping_mul(6364136223846793005).wrapping_add(1);
+        self.state
+    }
+    fn next_f32(&mut self) -> f32 {
+        (self.next_u64() >> 40) as f32 / 16777216.0
+    }
+    fn choose(&mut self, n: usize) -> usize {
+        if n == 0 {
+            return 0;
+        }
+        (self.next_u64() % (n as u64)) as usize
+    }
+}
+
+fn partial_shuffle<T>(slice: &mut [T], k: usize, rng: &mut Lcg) {
+    let n = slice.len();
+    let end = std::cmp::min(k, n);
+    for i in 0..end {
+        let j = i + rng.choose(n - i);
+        slice.swap(i, j);
+    }
+}
+
+#[inline(always)]
+fn dist_sq_3d(a: &[f32; 3], b: &[f32; 3]) -> f32 {
+    let dx = a[0] - b[0];
+    let dy = a[1] - b[1];
+    let dz = a[2] - b[2];
+    dx * dx + dy * dy + dz * dz
+}
+
+struct KdNode {
+    centroid: [f32; 3],
+    id: u32,
+    left: i32,
+    right: i32,
+    axis: u8,
+}
+
+struct KdTree {
+    nodes: Vec<KdNode>,
+    root: i32,
+}
+
+fn build_kd_tree_rec(
+    centroids: &[[f32; 3]],
+    indices: &mut [usize],
+    depth: usize,
+    nodes: &mut Vec<KdNode>,
+) -> i32 {
+    if indices.is_empty() {
+        return -1;
+    }
+
+    let axis = depth % 3;
+    let median_idx = indices.len() / 2;
+    indices.select_nth_unstable_by(median_idx, |&a, &b| {
+        centroids[a][axis]
+            .partial_cmp(&centroids[b][axis])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let centroid_idx = indices[median_idx];
+    let node_idx = nodes.len() as i32;
+
+    nodes.push(KdNode {
+        centroid: centroids[centroid_idx],
+        id: centroid_idx as u32,
+        left: -1,
+        right: -1,
+        axis: axis as u8,
+    });
+
+    let left = build_kd_tree_rec(centroids, &mut indices[..median_idx], depth + 1, nodes);
+    let right = build_kd_tree_rec(centroids, &mut indices[median_idx + 1..], depth + 1, nodes);
+
+    nodes[node_idx as usize].left = left;
+    nodes[node_idx as usize].right = right;
+
+    node_idx
+}
+
+fn build_kd_tree(centroids: &[[f32; 3]]) -> KdTree {
+    let mut indices: Vec<usize> = (0..centroids.len()).collect();
+    let mut nodes = Vec::with_capacity(centroids.len());
+    let root = build_kd_tree_rec(centroids, &mut indices, 0, &mut nodes);
+    KdTree { nodes, root }
+}
+
+fn nn_search(
+    nodes: &[KdNode],
+    node_idx: i32,
+    query: &[f32; 3],
+    best_id: &mut u32,
+    best_dist_sq: &mut f32,
+) {
+    if node_idx == -1 {
+        return;
+    }
+
+    let node = &nodes[node_idx as usize];
+    let dist_sq = dist_sq_3d(&node.centroid, query);
+    if dist_sq < *best_dist_sq {
+        *best_dist_sq = dist_sq;
+        *best_id = node.id;
+    }
+
+    let axis = node.axis as usize;
+    let diff = query[axis] - node.centroid[axis];
+
+    let (near_child, far_child) = if diff <= 0.0 {
+        (node.left, node.right)
+    } else {
+        (node.right, node.left)
+    };
+
+    nn_search(nodes, near_child, query, best_id, best_dist_sq);
+
+    if diff * diff < *best_dist_sq {
+        nn_search(nodes, far_child, query, best_id, best_dist_sq);
+    }
+}
+
+enum Searcher {
+    Linear(Arc<Vec<[f32; 3]>>),
+    Kd {
+        centroids: Arc<Vec<[f32; 3]>>,
+        kd_tree: Arc<KdTree>,
+    },
+}
+
+impl Clone for Searcher {
+    fn clone(&self) -> Self {
+        match self {
+            Searcher::Linear(c) => Searcher::Linear(Arc::clone(c)),
+            Searcher::Kd { centroids, kd_tree } => Searcher::Kd {
+                centroids: Arc::clone(centroids),
+                kd_tree: Arc::clone(kd_tree),
+            },
+        }
+    }
+}
+
+fn initialize_centroids(
+    reservoir: &[[f32; 3]],
+    k: usize,
+    rng: &mut Lcg,
+) -> Vec<[f32; 3]> {
+    let n = reservoir.len();
+    let mut centroids = Vec::with_capacity(k);
+
+    if k <= 256 && n >= k {
+        let sample_size = std::cmp::min(n, 50_000);
+        let mut sample_indices: Vec<usize> = (0..n).collect();
+        partial_shuffle(&mut sample_indices, sample_size, rng);
+        let sample_indices = &sample_indices[..sample_size];
+
+        let first_idx = sample_indices[rng.choose(sample_size)];
+        centroids.push(reservoir[first_idx]);
+
+        let mut min_dist_sq = vec![f32::MAX; sample_size];
+        for i in 0..sample_size {
+            min_dist_sq[i] = dist_sq_3d(&reservoir[sample_indices[i]], &centroids[0]);
+        }
+
+        for _ in 1..k {
+            let mut sum_dist = 0.0f64;
+            for &d in &min_dist_sq {
+                sum_dist += d as f64;
+            }
+
+            if sum_dist == 0.0 {
+                let idx = sample_indices[rng.choose(sample_size)];
+                centroids.push(reservoir[idx]);
+                continue;
+            }
+
+            let r = rng.next_f32() as f64 * sum_dist;
+            let mut accum = 0.0f64;
+            let mut chosen_idx = sample_indices[0];
+            for i in 0..sample_size {
+                accum += min_dist_sq[i] as f64;
+                if accum >= r {
+                    chosen_idx = sample_indices[i];
+                    break;
+                }
+            }
+
+            centroids.push(reservoir[chosen_idx]);
+
+            let new_c = &centroids[centroids.len() - 1];
+            for i in 0..sample_size {
+                let d = dist_sq_3d(&reservoir[sample_indices[i]], new_c);
+                if d < min_dist_sq[i] {
+                    min_dist_sq[i] = d;
+                }
+            }
+        }
+    } else {
+        let mut indices: Vec<usize> = (0..n).collect();
+        partial_shuffle(&mut indices, k, rng);
+        for i in 0..k {
+            centroids.push(reservoir[indices[i % n]]);
+        }
+    }
+
+    centroids
+}
+
+fn reinitialize_empty_clusters(
+    centroids: &mut [[f32; 3]],
+    counts: &mut [u64],
+    reservoir: &[[f32; 3]],
+    rng: &mut Lcg,
+) {
+    for i in 0..centroids.len() {
+        if counts[i] == 0 {
+            let idx = rng.choose(reservoir.len());
+            centroids[i] = reservoir[idx];
+            counts[i] = 1;
+        }
+    }
+}
+
+fn train_kmeans(
+    reservoir: &[[f32; 3]],
+    k: usize,
+    num_threads: usize,
+    rng: &mut Lcg,
+) -> Vec<[f32; 3]> {
+    let mut centroids = initialize_centroids(reservoir, k, rng);
+    let mut counts = vec![0u64; k];
+
+    let max_iters = 12;
+    let use_kdtree = k >= 32;
+
+    let reservoir_arc: Arc<[[f32; 3]]> = Arc::from(reservoir.to_vec());
+
+    for _iter in 0..max_iters {
+        let searcher = if use_kdtree {
+            let kd = build_kd_tree(&centroids);
+            Searcher::Kd {
+                centroids: Arc::new(centroids.clone()),
+                kd_tree: Arc::new(kd),
+            }
+        } else {
+            Searcher::Linear(Arc::new(centroids.clone()))
+        };
+
+        let chunk_size = (reservoir.len() + num_threads - 1) / num_threads;
+        let mut handles = Vec::with_capacity(num_threads);
+
+        for t in 0..num_threads {
+            let res_share = Arc::clone(&reservoir_arc);
+            let searcher_share = searcher.clone();
+            let start = t * chunk_size;
+            let end = std::cmp::min(start + chunk_size, reservoir.len());
+
+            if start >= end {
+                continue;
+            }
+
+            handles.push(std::thread::spawn(move || {
+                let chunk = &res_share[start..end];
+                let mut local_sums = vec![[0.0f64; 3]; k];
+                let mut local_counts = vec![0u64; k];
+
+                match &searcher_share {
+                    Searcher::Linear(centroids) => {
+                        for p in chunk {
+                            let mut best_id = 0;
+                            let mut best_dist = f32::MAX;
+                            for (i, c) in centroids.iter().enumerate() {
+                                let d = dist_sq_3d(c, p);
+                                if d < best_dist {
+                                    best_dist = d;
+                                    best_id = i as u32;
+                                }
+                            }
+                            let idx = best_id as usize;
+                            local_sums[idx][0] += p[0] as f64;
+                            local_sums[idx][1] += p[1] as f64;
+                            local_sums[idx][2] += p[2] as f64;
+                            local_counts[idx] += 1;
+                        }
+                    }
+                    Searcher::Kd { kd_tree, .. } => {
+                        let nodes = &kd_tree.nodes;
+                        let root = kd_tree.root;
+                        for p in chunk {
+                            let mut best_id = 0;
+                            let mut best_dist = f32::MAX;
+                            nn_search(nodes, root, p, &mut best_id, &mut best_dist);
+                            let idx = best_id as usize;
+                            local_sums[idx][0] += p[0] as f64;
+                            local_sums[idx][1] += p[1] as f64;
+                            local_sums[idx][2] += p[2] as f64;
+                            local_counts[idx] += 1;
+                        }
+                    }
+                }
+
+                (local_sums, local_counts)
+            }));
+        }
+
+        let mut global_sums = vec![[0.0f64; 3]; k];
+        let mut global_counts = vec![0u64; k];
+
+        for h in handles {
+            let (local_sums, local_counts) = h.join().unwrap();
+            for i in 0..k {
+                global_sums[i][0] += local_sums[i][0];
+                global_sums[i][1] += local_sums[i][1];
+                global_sums[i][2] += local_sums[i][2];
+                global_counts[i] += local_counts[i];
+            }
+        }
+
+        let old_centroids = centroids.clone();
+        for i in 0..k {
+            if global_counts[i] > 0 {
+                let c = global_counts[i] as f64;
+                centroids[i][0] = (global_sums[i][0] / c) as f32;
+                centroids[i][1] = (global_sums[i][1] / c) as f32;
+                centroids[i][2] = (global_sums[i][2] / c) as f32;
+                counts[i] = global_counts[i];
+            } else {
+                counts[i] = 0;
+            }
+        }
+
+        reinitialize_empty_clusters(&mut centroids, &mut counts, reservoir, rng);
+
+        let mut shift = 0.0f64;
+        for i in 0..k {
+            shift += dist_sq_3d(&old_centroids[i], &centroids[i]) as f64;
+        }
+        if shift / (k as f64) < 1e-7 {
+            break;
+        }
+    }
+
+    centroids
+}
+
+fn read_header<R: Read>(reader: &mut R) -> std::io::Result<(usize, usize)> {
+    let mut header = String::new();
+    let mut buf = [0u8; 1];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(1) => {
+                let c = buf[0] as char;
+                header.push(c);
+                if c == '\n' {
+                    break;
+                }
+            }
+            Ok(_) => unreachable!(),
+            Err(e) => return Err(e),
+        }
+    }
+
+    let parts: Vec<&str> = header.split_whitespace().collect();
+    if parts.len() < 2 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Invalid header format",
+        ));
+    }
+
+    let num_points = parts[0].parse::<usize>().map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid num_points")
+    })?;
+
+    let num_clusters = parts[1].parse::<usize>().map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid num_clusters")
+    })?;
+
+    Ok((num_points, num_clusters))
+}
+
+fn write_u32<W: Write>(writer: &mut W, val: u32) -> std::io::Result<()> {
+    writer.write_all(&val.to_le_bytes())
+}
+
+struct TempFileGuard {
+    path: std::path::PathBuf,
+}
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn run_in_memory<R: Read, W: Write>(
+    num_points: usize,
+    num_clusters: usize,
+    num_threads: usize,
+    reader: &mut R,
+    writer: &mut W,
+    rng: &mut Lcg,
+) -> std::io::Result<()> {
+    let mut points = Vec::with_capacity(num_points);
+    let mut buf = [0u8; 12 * 8192];
+    let mut bytes_read = 0;
+    let total_bytes = num_points * 12;
+
+    while bytes_read < total_bytes {
+        let to_read = std::cmp::min(buf.len(), total_bytes - bytes_read);
+        reader.read_exact(&mut buf[..to_read])?;
+
+        for chunk in buf[..to_read].chunks_exact(12) {
+            let x = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            let y = f32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
+            let z = f32::from_le_bytes([chunk[8], chunk[9], chunk[10], chunk[11]]);
+            points.push([x, y, z]);
+        }
+        bytes_read += to_read;
+    }
+
+    let centroids = if num_points <= 5_000_000 {
+        train_kmeans(&points, num_clusters, num_threads, rng)
+    } else {
+        let mut sample_indices: Vec<usize> = (0..num_points).collect();
+        partial_shuffle(&mut sample_indices, 5_000_000, rng);
+        let mut sample = Vec::with_capacity(5_000_000);
+        for i in 0..5_000_000 {
+            sample.push(points[sample_indices[i]]);
+        }
+        train_kmeans(&sample, num_clusters, num_threads, rng)
+    };
+
+    let use_kdtree = num_clusters >= 32;
+    let searcher = if use_kdtree {
+        let kd = build_kd_tree(&centroids);
+        Searcher::Kd {
+            centroids: Arc::new(centroids.clone()),
+            kd_tree: Arc::new(kd),
+        }
+    } else {
+        Searcher::Linear(Arc::new(centroids.clone()))
+    };
+
+    let points_arc: Arc<[[f32; 3]]> = Arc::from(points);
+    let chunk_size = (num_points + num_threads - 1) / num_threads;
+    let mut handles = Vec::with_capacity(num_threads);
+
+    for t in 0..num_threads {
+        let points_share = Arc::clone(&points_arc);
+        let searcher_share = searcher.clone();
+        let start = t * chunk_size;
+        let end = std::cmp::min(start + chunk_size, num_points);
+
+        if start >= end {
+            continue;
+        }
+
+        handles.push(std::thread::spawn(move || {
+            let chunk = &points_share[start..end];
+            let mut local_assignments = Vec::with_capacity(chunk.len());
+
+            match &searcher_share {
+                Searcher::Linear(centroids) => {
+                    for p in chunk {
+                        let mut best_id = 0;
+                        let mut best_dist = f32::MAX;
+                        for (i, c) in centroids.iter().enumerate() {
+                            let d = dist_sq_3d(c, p);
+                            if d < best_dist {
+                                best_dist = d;
+                                best_id = i as u32;
+                            }
+                        }
+                        local_assignments.push(best_id);
+                    }
+                }
+                Searcher::Kd { kd_tree, .. } => {
+                    let nodes = &kd_tree.nodes;
+                    let root = kd_tree.root;
+                    for p in chunk {
+                        let mut best_id = 0;
+                        let mut best_dist = f32::MAX;
+                        nn_search(nodes, root, p, &mut best_id, &mut best_dist);
+                        local_assignments.push(best_id);
+                    }
+                }
+            }
+            local_assignments
+        }));
+    }
+
+    for h in handles {
+        let local_assignments = h.join().unwrap();
+        for &id in &local_assignments {
+            write_u32(writer, id)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn run_disk_backed_with_file<R: Read, W: Write>(
+    num_points: usize,
+    num_clusters: usize,
+    num_threads: usize,
+    file: std::fs::File,
+    temp_path: std::path::PathBuf,
+    reader: &mut R,
+    writer: &mut W,
+    rng: &mut Lcg,
+) -> std::io::Result<()> {
+    let _guard = TempFileGuard { path: temp_path.clone() };
+    let mut temp_writer = BufWriter::new(file);
+
+    let reservoir_size = 5_000_000;
+    let mut reservoir = Vec::with_capacity(reservoir_size);
+    let mut points_seen = 0;
+
+    let mut buf = [0u8; 12 * 8192];
+    let mut bytes_read = 0;
+    let total_bytes = num_points * 12;
+
+    while bytes_read < total_bytes {
+        let to_read = std::cmp::min(buf.len(), total_bytes - bytes_read);
+        reader.read_exact(&mut buf[..to_read])?;
+
+        temp_writer.write_all(&buf[..to_read])?;
+
+        for chunk in buf[..to_read].chunks_exact(12) {
+            let x = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            let y = f32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
+            let z = f32::from_le_bytes([chunk[8], chunk[9], chunk[10], chunk[11]]);
+            let p = [x, y, z];
+
+            if points_seen < reservoir_size {
+                reservoir.push(p);
+            } else {
+                let j = rng.choose(points_seen + 1);
+                if j < reservoir_size {
+                    reservoir[j] = p;
+                }
+            }
+            points_seen += 1;
+        }
+
+        bytes_read += to_read;
+    }
+
+    temp_writer.flush()?;
+    drop(temp_writer);
+
+    let centroids = train_kmeans(&reservoir, num_clusters, num_threads, rng);
+
+    let mut temp_reader = BufReader::new(std::fs::File::open(&temp_path)?);
+
+    let use_kdtree = num_clusters >= 32;
+    let searcher = if use_kdtree {
+        let kd = build_kd_tree(&centroids);
+        Searcher::Kd {
+            centroids: Arc::new(centroids.clone()),
+            kd_tree: Arc::new(kd),
+        }
+    } else {
+        Searcher::Linear(Arc::new(centroids.clone()))
+    };
+
+    let chunk_points_count = 1_000_000;
+    let mut read_buf = vec![0u8; chunk_points_count * 12];
+    let mut points_processed = 0;
+
+    while points_processed < num_points {
+        let current_chunk_size = std::cmp::min(chunk_points_count, num_points - points_processed);
+        let bytes_to_read = current_chunk_size * 12;
+        temp_reader.read_exact(&mut read_buf[..bytes_to_read])?;
+
+        let mut chunk_points = Vec::with_capacity(current_chunk_size);
+        for chunk in read_buf[..bytes_to_read].chunks_exact(12) {
+            let x = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            let y = f32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
+            let z = f32::from_le_bytes([chunk[8], chunk[9], chunk[10], chunk[11]]);
+            chunk_points.push([x, y, z]);
+        }
+
+        let chunk_points_arc: Arc<[[f32; 3]]> = Arc::from(chunk_points);
+        let thread_chunk_size = (current_chunk_size + num_threads - 1) / num_threads;
+        let mut handles = Vec::with_capacity(num_threads);
+
+        for t in 0..num_threads {
+            let points_share = Arc::clone(&chunk_points_arc);
+            let searcher_share = searcher.clone();
+            let start = t * thread_chunk_size;
+            let end = std::cmp::min(start + thread_chunk_size, current_chunk_size);
+
+            if start >= end {
+                continue;
+            }
+
+            handles.push(std::thread::spawn(move || {
+                let chunk = &points_share[start..end];
+                let mut local_assignments = Vec::with_capacity(chunk.len());
+
+                match &searcher_share {
+                    Searcher::Linear(centroids) => {
+                        for p in chunk {
+                            let mut best_id = 0;
+                            let mut best_dist = f32::MAX;
+                            for (i, c) in centroids.iter().enumerate() {
+                                let d = dist_sq_3d(c, p);
+                                if d < best_dist {
+                                    best_dist = d;
+                                    best_id = i as u32;
+                                }
+                            }
+                            local_assignments.push(best_id);
+                        }
+                    }
+                    Searcher::Kd { kd_tree, .. } => {
+                        let nodes = &kd_tree.nodes;
+                        let root = kd_tree.root;
+                        for p in chunk {
+                            let mut best_id = 0;
+                            let mut best_dist = f32::MAX;
+                            nn_search(nodes, root, p, &mut best_id, &mut best_dist);
+                            local_assignments.push(best_id);
+                        }
+                    }
+                }
+                local_assignments
+            }));
+        }
+
+        for h in handles {
+            let local_assignments = h.join().unwrap();
+            for &id in &local_assignments {
+                write_u32(writer, id)?;
+            }
+        }
+
+        points_processed += current_chunk_size;
+    }
+
+    Ok(())
+}
+
+fn run_pure_streaming<R: Read, W: Write>(
+    num_points: usize,
+    num_clusters: usize,
+    num_threads: usize,
+    reader: &mut R,
+    writer: &mut W,
+    rng: &mut Lcg,
+) -> std::io::Result<()> {
+    let first_batch_size = std::cmp::min(num_points, 5_000_000);
+    let mut first_batch = Vec::with_capacity(first_batch_size);
+
+    let mut buf = [0u8; 12 * 8192];
+    let mut bytes_read = 0;
+    let first_batch_bytes = first_batch_size * 12;
+
+    while bytes_read < first_batch_bytes {
+        let to_read = std::cmp::min(buf.len(), first_batch_bytes - bytes_read);
+        reader.read_exact(&mut buf[..to_read])?;
+
+        for chunk in buf[..to_read].chunks_exact(12) {
+            let x = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            let y = f32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
+            let z = f32::from_le_bytes([chunk[8], chunk[9], chunk[10], chunk[11]]);
+            first_batch.push([x, y, z]);
+        }
+        bytes_read += to_read;
+    }
+
+    let mut centroids = train_kmeans(&first_batch, num_clusters, num_threads, rng);
+
+    let use_kdtree = num_clusters >= 32;
+    let mut searcher = if use_kdtree {
+        let kd = build_kd_tree(&centroids);
+        Searcher::Kd {
+            centroids: Arc::new(centroids.clone()),
+            kd_tree: Arc::new(kd),
+        }
+    } else {
+        Searcher::Linear(Arc::new(centroids.clone()))
+    };
+
+    let first_batch_arc: Arc<[[f32; 3]]> = Arc::from(first_batch);
+    let chunk_size = (first_batch_size + num_threads - 1) / num_threads;
+    let mut handles = Vec::with_capacity(num_threads);
+
+    for t in 0..num_threads {
+        let points_share = Arc::clone(&first_batch_arc);
+        let searcher_share = searcher.clone();
+        let start = t * chunk_size;
+        let end = std::cmp::min(start + chunk_size, first_batch_size);
+
+        if start >= end {
+            continue;
+        }
+
+        handles.push(std::thread::spawn(move || {
+            let chunk = &points_share[start..end];
+            let mut local_assignments = Vec::with_capacity(chunk.len());
+            let mut local_counts = vec![0u64; num_clusters];
+
+            match &searcher_share {
+                Searcher::Linear(centroids) => {
+                    for p in chunk {
+                        let mut best_id = 0;
+                        let mut best_dist = f32::MAX;
+                        for (i, c) in centroids.iter().enumerate() {
+                            let d = dist_sq_3d(c, p);
+                            if d < best_dist {
+                                best_dist = d;
+                                best_id = i as u32;
+                            }
+                        }
+                        local_assignments.push(best_id);
+                        let idx = best_id as usize;
+                        local_counts[idx] += 1;
+                    }
+                }
+                Searcher::Kd { kd_tree, .. } => {
+                    let nodes = &kd_tree.nodes;
+                    let root = kd_tree.root;
+                    for p in chunk {
+                        let mut best_id = 0;
+                        let mut best_dist = f32::MAX;
+                        nn_search(nodes, root, p, &mut best_id, &mut best_dist);
+                        local_assignments.push(best_id);
+                        let idx = best_id as usize;
+                        local_counts[idx] += 1;
+                    }
+                }
+            }
+            (local_assignments, local_counts)
+        }));
+    }
+
+    let mut counts = vec![0u64; num_clusters];
+    for h in handles {
+        let (local_assignments, local_counts) = h.join().unwrap();
+        for &id in &local_assignments {
+            write_u32(writer, id)?;
+        }
+        for i in 0..num_clusters {
+            counts[i] += local_counts[i];
+        }
+    }
+
+    let mut points_processed = first_batch_size;
+    let stream_chunk_size = 1_000_000;
+
+    let mut stream_buf = vec![0u8; stream_chunk_size * 12];
+
+    while points_processed < num_points {
+        let current_chunk_size = std::cmp::min(stream_chunk_size, num_points - points_processed);
+        let bytes_to_read = current_chunk_size * 12;
+        reader.read_exact(&mut stream_buf[..bytes_to_read])?;
+
+        let mut chunk_points = Vec::with_capacity(current_chunk_size);
+        for chunk in stream_buf[..bytes_to_read].chunks_exact(12) {
+            let x = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            let y = f32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
+            let z = f32::from_le_bytes([chunk[8], chunk[9], chunk[10], chunk[11]]);
+            chunk_points.push([x, y, z]);
+        }
+
+        let chunk_points_arc: Arc<[[f32; 3]]> = Arc::from(chunk_points);
+        let thread_chunk_size = (current_chunk_size + num_threads - 1) / num_threads;
+        let mut handles = Vec::with_capacity(num_threads);
+
+        for t in 0..num_threads {
+            let points_share = Arc::clone(&chunk_points_arc);
+            let searcher_share = searcher.clone();
+            let start = t * thread_chunk_size;
+            let end = std::cmp::min(start + thread_chunk_size, current_chunk_size);
+
+            if start >= end {
+                continue;
+            }
+
+            handles.push(std::thread::spawn(move || {
+                let chunk = &points_share[start..end];
+                let mut local_assignments = Vec::with_capacity(chunk.len());
+                let mut local_sums = vec![[0.0f64; 3]; num_clusters];
+                let mut local_counts = vec![0u64; num_clusters];
+
+                match &searcher_share {
+                    Searcher::Linear(centroids) => {
+                        for p in chunk {
+                            let mut best_id = 0;
+                            let mut best_dist = f32::MAX;
+                            for (i, c) in centroids.iter().enumerate() {
+                                let d = dist_sq_3d(c, p);
+                                if d < best_dist {
+                                    best_dist = d;
+                                    best_id = i as u32;
+                                }
+                            }
+                            local_assignments.push(best_id);
+                            let idx = best_id as usize;
+                            local_sums[idx][0] += p[0] as f64;
+                            local_sums[idx][1] += p[1] as f64;
+                            local_sums[idx][2] += p[2] as f64;
+                            local_counts[idx] += 1;
+                        }
+                    }
+                    Searcher::Kd { kd_tree, .. } => {
+                        let nodes = &kd_tree.nodes;
+                        let root = kd_tree.root;
+                        for p in chunk {
+                            let mut best_id = 0;
+                            let mut best_dist = f32::MAX;
+                            nn_search(nodes, root, p, &mut best_id, &mut best_dist);
+                            local_assignments.push(best_id);
+                            let idx = best_id as usize;
+                            local_sums[idx][0] += p[0] as f64;
+                            local_sums[idx][1] += p[1] as f64;
+                            local_sums[idx][2] += p[2] as f64;
+                            local_counts[idx] += 1;
+                        }
+                    }
+                }
+                (local_assignments, local_sums, local_counts)
+            }));
+        }
+
+        let mut batch_sums = vec![[0.0f64; 3]; num_clusters];
+        let mut batch_counts = vec![0u64; num_clusters];
+
+        for h in handles {
+            let (local_assignments, local_sums, local_counts) = h.join().unwrap();
+            for &id in &local_assignments {
+                write_u32(writer, id)?;
+            }
+            for i in 0..num_clusters {
+                batch_sums[i][0] += local_sums[i][0];
+                batch_sums[i][1] += local_sums[i][1];
+                batch_sums[i][2] += local_sums[i][2];
+                batch_counts[i] += local_counts[i];
+            }
+        }
+
+        for i in 0..num_clusters {
+            if batch_counts[i] > 0 {
+                let old_cnt = counts[i] as f64;
+                let new_cnt = (counts[i] + batch_counts[i]) as f64;
+                centroids[i][0] = ((centroids[i][0] as f64 * old_cnt + batch_sums[i][0]) / new_cnt) as f32;
+                centroids[i][1] = ((centroids[i][1] as f64 * old_cnt + batch_sums[i][1]) / new_cnt) as f32;
+                centroids[i][2] = ((centroids[i][2] as f64 * old_cnt + batch_sums[i][2]) / new_cnt) as f32;
+                counts[i] += batch_counts[i];
+            }
+        }
+
+        searcher = if use_kdtree {
+            let kd = build_kd_tree(&centroids);
+            Searcher::Kd {
+                centroids: Arc::new(centroids.clone()),
+                kd_tree: Arc::new(kd),
+            }
+        } else {
+            Searcher::Linear(Arc::new(centroids.clone()))
+        };
+
+        points_processed += current_chunk_size;
+    }
+
+    Ok(())
+}
+
+fn main() -> std::io::Result<()> {
+    let mut stdin = BufReader::new(std::io::stdin());
+    let mut stdout = BufWriter::new(std::io::stdout());
+
+    let (num_points, num_clusters) = read_header(&mut stdin)?;
+
+    if num_clusters == 1 {
+        for _ in 0..num_points {
+            write_u32(&mut stdout, 0)?;
+        }
+        stdout.flush()?;
+        return Ok(());
+    }
+
+    if num_points <= num_clusters {
+        for i in 0..num_points {
+            write_u32(&mut stdout, i as u32)?;
+        }
+        stdout.flush()?;
+        return Ok(());
+    }
+
+    let num_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+
+    let mut rng = Lcg::new(1337);
+
+    if num_points <= 30_000_000 {
+        run_in_memory(
+            num_points,
+            num_clusters,
+            num_threads,
+            &mut stdin,
+            &mut stdout,
+            &mut rng,
+        )?;
+    } else {
+        let temp_dir = std::env::current_dir()?;
+        let temp_path = temp_dir.join("temp_points.bin");
+        match std::fs::File::create(&temp_path) {
+            Ok(file) => {
+                run_disk_backed_with_file(
+                    num_points,
+                    num_clusters,
+                    num_threads,
+                    file,
+                    temp_path,
+                    &mut stdin,
+                    &mut stdout,
+                    &mut rng,
+                )?;
+            }
+            Err(_) => {
+                run_pure_streaming(
+                    num_points,
+                    num_clusters,
+                    num_threads,
+                    &mut stdin,
+                    &mut stdout,
+                    &mut rng,
+                )?;
+            }
+        }
+    }
+
+    stdout.flush()?;
+    Ok(())
+}

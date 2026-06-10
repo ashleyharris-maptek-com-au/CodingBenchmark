@@ -296,7 +296,7 @@ def get_baseline_distance(cities: list) -> float:
   # - TSP route is more efficient than random walk
   # - But less efficient than perfect grid
   # For random points, efficiency ≈ 0.6-0.8
-  efficiency = 0.25
+  efficiency = 0.8
 
   # Estimated route length
   estimated_length = n * avg_spacing * efficiency
