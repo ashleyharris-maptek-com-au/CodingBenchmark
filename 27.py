@@ -33,6 +33,8 @@ tags = [
   "constraint solving",
   "heuristic search",
 ]
+
+resultFileTypes = ("cpp", "cc", "cxx", "c++", "c", "h", "hpp", "hh", "hxx")
 TIMEOUT_SECONDS = 30
 RANDOM_SEED = 27272727
 

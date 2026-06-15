@@ -32,6 +32,7 @@ tags = [
   "collision detection",
 ]
 
+resultFileTypes = ("cpp", "cc", "cxx", "c++", "c", "h", "hpp", "hh", "hxx")
 # Seed for reproducibility
 RANDOM_SEED = 99999
 

@@ -42,6 +42,7 @@ tags = [
   "hashing",
 ]
 
+resultFileTypes = ("wgsl",)
 RANDOM_SEED = 47474747
 TIMEOUT_SECONDS = 60
 

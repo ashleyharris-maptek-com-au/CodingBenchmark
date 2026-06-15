@@ -34,6 +34,7 @@ tags = [
   "real-time decisions",
 ]
 
+resultFileTypes = ("cpp", "cc", "cxx", "c++", "c", "h", "hpp", "hh", "hxx")
 # Timeout in seconds
 TIMEOUT_SECONDS = 3600
 

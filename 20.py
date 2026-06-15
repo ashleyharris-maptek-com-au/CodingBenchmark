@@ -52,6 +52,7 @@ tags = [
   "robustness",
 ]
 
+resultFileTypes = ("rs", "rust")
 # Timeout in seconds (5 minutes)
 TIMEOUT_SECONDS = 300
 

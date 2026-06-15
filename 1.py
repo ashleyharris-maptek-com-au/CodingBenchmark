@@ -19,6 +19,7 @@ tags = [
   "large-scale input",
 ]
 
+resultFileTypes = ("cpp", "cc", "cxx", "c++", "c", "h", "hpp", "hh", "hxx")
 # Seed for reproducible city generation
 RANDOM_SEED = 42
 

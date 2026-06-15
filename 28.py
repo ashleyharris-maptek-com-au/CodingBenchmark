@@ -25,6 +25,8 @@ tags = [
   "branch and bound",
   "approximation algorithms",
 ]
+
+resultFileTypes = ("rs", "rust")
 TIMEOUT_SECONDS = 30
 RANDOM_SEED = 28282828
 _GRADE_CACHE = GradeCache("test28_minimum_vertex_cover")

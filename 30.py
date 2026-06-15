@@ -35,6 +35,8 @@ tags = [
   "boolean logic",
   "backtracking",
 ]
+
+resultFileTypes = ("py", "python")
 TIMEOUT_SECONDS = 300
 RANDOM_SEED = 30303030
 

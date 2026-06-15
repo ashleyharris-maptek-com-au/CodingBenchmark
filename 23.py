@@ -29,6 +29,7 @@ tags = [
   "real-time decisions",
 ]
 
+resultFileTypes = ("rs", "rust")
 # Timeout in seconds (60 minutes)
 TIMEOUT_SECONDS = 3600
 

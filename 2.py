@@ -18,6 +18,7 @@ tags = [
   "combinatorial optimization",
 ]
 
+resultFileTypes = ("cs", "csharp")
 # Seed for reproducible graph generation
 RANDOM_SEED = 12345
 

@@ -25,6 +25,8 @@ tags = [
   "graph partitioning",
   "local search",
 ]
+
+resultFileTypes = ("rs", "rust")
 TIMEOUT_SECONDS = 30
 RANDOM_SEED = 39393939
 

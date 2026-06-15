@@ -23,6 +23,8 @@ tags = [
   "dynamic programming",
   "integer problems",
 ]
+
+resultFileTypes = ("rs", "rust")
 TIMEOUT_SECONDS = 300
 RANDOM_SEED = 31313131
 

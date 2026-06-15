@@ -34,6 +34,8 @@ tags = [
   "branch and bound",
   "combinatorial search",
 ]
+
+resultFileTypes = ("cs", "csharp")
 TIMEOUT_SECONDS = 300
 RANDOM_SEED = 29292929
 

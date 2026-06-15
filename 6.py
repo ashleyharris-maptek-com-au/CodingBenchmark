@@ -33,6 +33,7 @@ tags = [
   "physics simulation",
 ]
 
+resultFileTypes = ("cs", "csharp")
 # Timeout in seconds (5 minutes)
 TIMEOUT_SECONDS = 30
 _BASELINE_CACHE = BaselineCache("test6_orbital_tsp")

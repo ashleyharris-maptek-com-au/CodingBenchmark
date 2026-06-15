@@ -54,6 +54,7 @@ tags = [
   "real-time control",
 ]
 
+resultFileTypes = ("py", "python")
 TIMEOUT_SECONDS = 120  # generous for 30 subpasses
 
 _HISTORY_CACHE = {}  # {(aiEngineName, subPass): history_list}

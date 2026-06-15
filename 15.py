@@ -39,6 +39,7 @@ tags = [
   "combinatorial optimization",
 ]
 
+resultFileTypes = ("rs", "rust")
 # Timeout in seconds (5 minutes)
 TIMEOUT_SECONDS = 30
 

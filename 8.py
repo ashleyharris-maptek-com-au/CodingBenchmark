@@ -18,6 +18,7 @@ tags = [
   "large-scale input",
 ]
 
+resultFileTypes = ("rs", "rust")
 # Timeout in seconds (30 seconds)
 TIMEOUT_SECONDS = 30
 

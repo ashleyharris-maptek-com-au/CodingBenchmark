@@ -32,6 +32,7 @@ tags = [
   "2d geometry",
 ]
 
+resultFileTypes = ("rs", "rust")
 # Timeout in seconds (30 seconds for testing)
 TIMEOUT_SECONDS = 30
 

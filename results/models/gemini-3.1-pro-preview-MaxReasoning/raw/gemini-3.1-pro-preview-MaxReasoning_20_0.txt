@@ -1,0 +1,372 @@
+use std::io::{self, BufRead};
+
+struct Data {
+    hole_ids: Vec<String>,
+    prop_names: Vec<String>,
+    x: Vec<f32>,
+    y: Vec<f32>,
+    z: Vec<f32>,
+    hole_idx: Vec<u32>,
+    sample_idx: Vec<u32>,
+    props: Vec<Vec<f32>>,
+}
+
+impl Data {
+    fn empty() -> Self {
+        Data {
+            hole_ids: Vec::new(),
+            prop_names: Vec::new(),
+            x: Vec::new(),
+            y: Vec::new(),
+            z: Vec::new(),
+            hole_idx: Vec::new(),
+            sample_idx: Vec::new(),
+            props: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct Anomaly {
+    hole_idx: u32,
+    sample_idx: u32,
+    prop_idx: usize,
+    confidence: f32,
+}
+
+struct ValidPoint {
+    orig_idx: usize,
+    x: f32,
+    y: f32,
+    z: f32,
+    val: f32,
+}
+
+fn median(arr: &mut [f32]) -> f32 {
+    if arr.is_empty() { return 0.0; }
+    let mid = arr.len() / 2;
+    let (_, &mut val, _) = arr.select_nth_unstable_by(mid, |a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    val
+}
+
+fn read_data<R: BufRead>(mut reader: R) -> Data {
+    let mut line = String::new();
+    let mut parts = Vec::new();
+    
+    if reader.read_line(&mut line).unwrap_or(0) == 0 { return Data::empty(); }
+    parts.extend(line.split_whitespace());
+    if parts.len() < 2 { return Data::empty(); }
+    let num_holes: usize = parts[0].parse().unwrap_or(0);
+    let num_properties: usize = parts[1].parse().unwrap_or(0);
+    
+    line.clear(); parts.clear();
+    reader.read_line(&mut line).unwrap_or(0);
+    let prop_names: Vec<String> = line.split_whitespace().map(|s| s.to_string()).collect();
+    
+    let est_samples = num_holes * 100;
+    let mut data = Data {
+        hole_ids: Vec::with_capacity(num_holes),
+        prop_names,
+        x: Vec::with_capacity(est_samples),
+        y: Vec::with_capacity(est_samples),
+        z: Vec::with_capacity(est_samples),
+        hole_idx: Vec::with_capacity(est_samples),
+        sample_idx: Vec::with_capacity(est_samples),
+        props: vec![Vec::with_capacity(est_samples); num_properties],
+    };
+    
+    for h in 0..num_holes {
+        line.clear(); parts.clear();
+        if reader.read_line(&mut line).unwrap_or(0) == 0 { break; }
+        parts.extend(line.split_whitespace());
+        if parts.is_empty() { continue; }
+        
+        data.hole_ids.push(parts[0].to_string());
+        let start_x: f64 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+        let start_y: f64 = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+        let start_z: f64 = parts.get(3).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+        let dir_x: f64 = parts.get(4).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+        let dir_y: f64 = parts.get(5).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+        let dir_z: f64 = parts.get(6).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+        let _length: f64 = parts.get(7).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+        let num_samples: usize = parts.get(8).and_then(|s| s.parse().ok()).unwrap_or(0);
+        
+        let norm = (dir_x*dir_x + dir_y*dir_y + dir_z*dir_z).sqrt();
+        let (dx, dy, dz) = if norm > 0.0 {
+            (dir_x/norm, dir_y/norm, dir_z/norm)
+        } else {
+            (0.0, 0.0, 0.0)
+        };
+
+        for s_idx in 0..num_samples {
+            line.clear(); parts.clear();
+            if reader.read_line(&mut line).unwrap_or(0) == 0 { break; }
+            parts.extend(line.split_whitespace());
+            if parts.is_empty() { continue; }
+            
+            let depth: f64 = parts.get(0).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+            let sx = start_x + dx * depth;
+            let sy = start_y + dy * depth;
+            let sz = start_z + dz * depth;
+            
+            data.x.push(sx as f32);
+            data.y.push(sy as f32);
+            data.z.push(sz as f32);
+            data.hole_idx.push(h as u32);
+            data.sample_idx.push(s_idx as u32);
+            
+            for p in 0..num_properties {
+                let val = if p + 1 < parts.len() {
+                    parts[p+1].parse::<f32>().unwrap_or(f32::NAN)
+                } else {
+                    f32::NAN
+                };
+                data.props[p].push(val);
+            }
+        }
+    }
+    data
+}
+
+fn detect_brute_force(data: &Data, prop_idx: usize, valid_points: &[ValidPoint], min_mad: f32) -> Vec<Anomaly> {
+    let mut anomalies = Vec::new();
+    let n = valid_points.len();
+    let k = 50.min(n.saturating_sub(1));
+    if k < 5 { return anomalies; }
+    
+    let num_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
+    let chunk_size = (n + num_threads - 1) / num_threads;
+    
+    std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for chunk in valid_points.chunks(chunk_size) {
+            handles.push(scope.spawn(move || {
+                let mut local_anomalies = Vec::new();
+                for p1 in chunk {
+                    let mut dists = Vec::with_capacity(n);
+                    for p2 in valid_points {
+                        if p1.orig_idx == p2.orig_idx { continue; }
+                        let dist2 = (p1.x - p2.x).powi(2) + (p1.y - p2.y).powi(2) + (p1.z - p2.z).powi(2);
+                        if dist2 < 1e-6 && data.hole_idx[p1.orig_idx] == data.hole_idx[p2.orig_idx] {
+                            continue;
+                        }
+                        dists.push((dist2, p2.val));
+                    }
+                    
+                    if dists.len() >= 5 {
+                        let actual_k = k.min(dists.len());
+                        dists.select_nth_unstable_by(actual_k - 1, |a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+                        let mut k_vals: Vec<f32> = dists.iter().take(actual_k).map(|x| x.1).collect();
+                        let local_med = median(&mut k_vals);
+                        let mut k_devs: Vec<f32> = k_vals.iter().map(|&v| (v - local_med).abs()).collect();
+                        let local_mad = median(&mut k_devs);
+                        
+                        let mad = (local_mad * 1.4826).max(min_mad);
+                        let z = (p1.val - local_med).abs() / mad;
+                        
+                        if z > 5.0 {
+                            local_anomalies.push(Anomaly {
+                                hole_idx: data.hole_idx[p1.orig_idx],
+                                sample_idx: data.sample_idx[p1.orig_idx],
+                                prop_idx,
+                                confidence: z,
+                            });
+                        }
+                    }
+                }
+                local_anomalies
+            }));
+        }
+        for handle in handles {
+            anomalies.extend(handle.join().unwrap());
+        }
+    });
+    anomalies
+}
+
+fn detect_grid(data: &Data, prop_idx: usize, valid_points: &[ValidPoint], min_mad: f32) -> Vec<Anomaly> {
+    let n = valid_points.len();
+    let mut min_x = f32::MAX; let mut max_x = f32::MIN;
+    let mut min_y = f32::MAX; let mut max_y = f32::MIN;
+    let mut min_z = f32::MAX; let mut max_z = f32::MIN;
+    
+    for p in valid_points {
+        if p.x < min_x { min_x = p.x; }
+        if p.x > max_x { max_x = p.x; }
+        if p.y < min_y { min_y = p.y; }
+        if p.y > max_y { max_y = p.y; }
+        if p.z < min_z { min_z = p.z; }
+        if p.z > max_z { max_z = p.z; }
+    }
+    
+    let vol = ((max_x - min_x).max(1e-3)) * ((max_y - min_y).max(1e-3)) * ((max_z - min_z).max(1e-3));
+    let k_target = 30.0;
+    let density = n as f32 / vol;
+    let mut s = (k_target / density).powf(1.0 / 3.0);
+    
+    let max_span = (max_x - min_x).max(max_y - min_y).max(max_z - min_z);
+    let s_min = max_span / 2_000_000.0;
+    if s < s_min { s = s_min; }
+    s *= 1.000001; 
+    
+    let mut grid: Vec<(u64, u32)> = Vec::with_capacity(n);
+    for (i, p) in valid_points.iter().enumerate() {
+        let ix = ((p.x - min_x) / s) as u64;
+        let iy = ((p.y - min_y) / s) as u64;
+        let iz = ((p.z - min_z) / s) as u64;
+        let cid = (ix << 42) | (iy << 21) | iz;
+        grid.push((cid, i as u32));
+    }
+    
+    grid.sort_unstable_by_key(|&(cid, _)| cid);
+    
+    let mut cells = Vec::new();
+    let mut i = 0;
+    while i < n {
+        let cid = grid[i].0;
+        let mut j = i + 1;
+        while j < n && grid[j].0 == cid {
+            j += 1;
+        }
+        cells.push((cid, i as u32, j as u32));
+        i = j;
+    }
+    
+    let mut anomalies = Vec::new();
+    let num_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
+    let chunk_size = (n + num_threads - 1) / num_threads;
+    
+    std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for chunk in valid_points.chunks(chunk_size) {
+            let cells_ref = &cells;
+            let grid_ref = &grid;
+            handles.push(scope.spawn(move || {
+                let mut local_anomalies = Vec::new();
+                for p in chunk {
+                    let ix = ((p.x - min_x) / s) as u64;
+                    let iy = ((p.y - min_y) / s) as u64;
+                    let iz = ((p.z - min_z) / s) as u64;
+                    
+                    let mut neighbors_dist = Vec::new();
+                    
+                    for dx in 0..=2 {
+                        let nx = if ix + dx == 0 { 0 } else { ix + dx - 1 };
+                        for dy in 0..=2 {
+                            let ny = if iy + dy == 0 { 0 } else { iy + dy - 1 };
+                            for dz in 0..=2 {
+                                let nz = if iz + dz == 0 { 0 } else { iz + dz - 1 };
+                                
+                                let ncid = (nx << 42) | (ny << 21) | nz;
+                                
+                                if let Ok(idx) = cells_ref.binary_search_by_key(&ncid, |&(cid, _, _)| cid) {
+                                    let (_, start, end) = cells_ref[idx];
+                                    for j in start..end {
+                                        let np_idx = grid_ref[j as usize].1 as usize;
+                                        let np = &valid_points[np_idx];
+                                        
+                                        if p.orig_idx != np.orig_idx {
+                                            let dist2 = (p.x - np.x).powi(2) + (p.y - np.y).powi(2) + (p.z - np.z).powi(2);
+                                            if dist2 < 1e-6 && data.hole_idx[p.orig_idx] == data.hole_idx[np.orig_idx] {
+                                                continue;
+                                            }
+                                            if dist2 <= (s * 2.0).powi(2) {
+                                                neighbors_dist.push((dist2, np.val));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    
+                    if neighbors_dist.len() > 50 {
+                        neighbors_dist.select_nth_unstable_by(49, |a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+                        neighbors_dist.truncate(50);
+                    }
+                    
+                    if neighbors_dist.len() >= 5 {
+                        let mut k_vals: Vec<f32> = neighbors_dist.iter().map(|&(_, v)| v).collect();
+                        let local_med = median(&mut k_vals);
+                        let mut devs: Vec<f32> = k_vals.iter().map(|&v| (v - local_med).abs()).collect();
+                        let local_mad = median(&mut devs);
+                        let mad = (local_mad * 1.4826).max(min_mad);
+                        let z = (p.val - local_med).abs() / mad;
+                        
+                        if z > 5.0 {
+                            local_anomalies.push(Anomaly {
+                                hole_idx: data.hole_idx[p.orig_idx],
+                                sample_idx: data.sample_idx[p.orig_idx],
+                                prop_idx,
+                                confidence: z,
+                            });
+                        }
+                    }
+                }
+                local_anomalies
+            }));
+        }
+        
+        for handle in handles {
+            anomalies.extend(handle.join().unwrap());
+        }
+    });
+    
+    anomalies
+}
+
+fn detect_for_property(data: &Data, prop_idx: usize) -> Vec<Anomaly> {
+    let mut valid_points = Vec::new();
+    let vals_ref = &data.props[prop_idx];
+    for i in 0..vals_ref.len() {
+        let v = vals_ref[i];
+        if !v.is_nan() && !data.x[i].is_nan() && !data.y[i].is_nan() && !data.z[i].is_nan() {
+            valid_points.push(ValidPoint {
+                orig_idx: i,
+                x: data.x[i],
+                y: data.y[i],
+                z: data.z[i],
+                val: v,
+            });
+        }
+    }
+    
+    let n = valid_points.len();
+    if n < 10 { return Vec::new(); }
+    
+    let mut vals: Vec<f32> = valid_points.iter().map(|p| p.val).collect();
+    let global_median = median(&mut vals);
+    let mut devs: Vec<f32> = valid_points.iter().map(|p| (p.val - global_median).abs()).collect();
+    let global_mad = median(&mut devs);
+    let min_mad = (global_mad * 0.05).max(1e-5);
+    
+    if n < 5000 {
+        detect_brute_force(data, prop_idx, &valid_points, min_mad)
+    } else {
+        detect_grid(data, prop_idx, &valid_points, min_mad)
+    }
+}
+
+fn main() {
+    let stdin = io::stdin();
+    let reader = stdin.lock();
+    let data = read_data(reader);
+    
+    if data.props.is_empty() { return; }
+    
+    let mut all_anomalies = Vec::new();
+    for p in 0..data.props.len() {
+        all_anomalies.extend(detect_for_property(&data, p));
+    }
+    
+    all_anomalies.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap_or(std::cmp::Ordering::Equal));
+    
+    if all_anomalies.len() > 100_000 {
+        all_anomalies.truncate(100_000);
+    }
+    
+    println!("{}", all_anomalies.len());
+    for a in &all_anomalies {
+        println!("{} {} {} {:.2}", data.hole_ids[a.hole_idx as usize], a.sample_idx, data.prop_names[a.prop_idx], a.confidence);
+    }
+}

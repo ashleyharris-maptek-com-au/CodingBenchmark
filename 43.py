@@ -51,6 +51,7 @@ tags = [
   "visual synthesis",
 ]
 
+resultFileTypes = ("hlsl", "fx", "hlsli")
 TIMEOUT_SECONDS = 60
 
 _renderer_instance: Optional[ShaderRenderer] = None

@@ -1,0 +1,737 @@
+// Graph Layout: Edge Crossing Minimization
+//
+// Strategy (adaptive by component size / structure):
+//   * Trees        -> radial layout (planar by construction, 0 crossings)
+//   * Simple cycle -> circle (0 crossings)
+//   * Small graphs -> Fruchterman-Reingold with multiple random restarts,
+//                     exact crossing count picks the best layout
+//   * Large graphs -> Barnes-Hut (quadtree) approximated FR forces,
+//                     multithreaded, iteration count bounded by a global
+//                     wall-clock deadline
+// Disconnected components are laid out independently and shelf-packed.
+// Self-loops and parallel edges are dropped before layout (they cannot
+// affect crossings of a straight-line drawing in a meaningful way).
+
+use std::io::{self, Read, Write, BufWriter};
+use std::time::Instant;
+
+const TIME_LIMIT: f64 = 25.0; // seconds, leave headroom under the 30s cap
+
+// ---------------------------------------------------------------- RNG
+struct Rng(u64);
+impl Rng {
+    fn new(seed: u64) -> Self { Rng(seed ^ 0x9E3779B97F4A7C15) }
+    fn next(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+        self.0 = x; x
+    }
+    fn f(&mut self) -> f64 { (self.next() >> 11) as f64 / (1u64 << 53) as f64 }
+}
+
+// ---------------------------------------------------------------- input
+fn read_input() -> (usize, Vec<(u32, u32)>) {
+    let mut buf = Vec::new();
+    io::stdin().read_to_end(&mut buf).expect("read stdin");
+    let mut nums: Vec<u64> = Vec::new();
+    let mut cur: u64 = 0;
+    let mut in_num = false;
+    for &b in &buf {
+        if b.is_ascii_digit() {
+            cur = cur * 10 + (b - b'0') as u64;
+            in_num = true;
+        } else if in_num {
+            nums.push(cur);
+            cur = 0;
+            in_num = false;
+        }
+    }
+    if in_num { nums.push(cur); }
+    if nums.is_empty() { return (0, Vec::new()); }
+    let n = nums[0] as usize;
+    let m = if nums.len() > 1 { nums[1] as usize } else { 0 };
+    let mut edges = Vec::with_capacity(m);
+    let mut i = 2;
+    while i + 1 < nums.len() && edges.len() < m {
+        let u = nums[i] as u32;
+        let v = nums[i + 1] as u32;
+        if (u as usize) < n && (v as usize) < n {
+            edges.push((u, v));
+        }
+        i += 2;
+    }
+    (n, edges)
+}
+
+// ---------------------------------------------------------------- CSR adjacency
+struct Csr {
+    off: Vec<u32>,
+    adj: Vec<u32>,
+}
+impl Csr {
+    fn build(n: usize, edges: &[(u32, u32)]) -> Csr {
+        let mut deg = vec![0u32; n];
+        for &(u, v) in edges {
+            deg[u as usize] += 1;
+            deg[v as usize] += 1;
+        }
+        let mut off = vec![0u32; n + 1];
+        for i in 0..n { off[i + 1] = off[i] + deg[i]; }
+        let mut adj = vec![0u32; off[n] as usize];
+        let mut pos: Vec<u32> = off[..n].to_vec();
+        for &(u, v) in edges {
+            adj[pos[u as usize] as usize] = v;
+            pos[u as usize] += 1;
+            adj[pos[v as usize] as usize] = u;
+            pos[v as usize] += 1;
+        }
+        Csr { off, adj }
+    }
+    fn neighbors(&self, u: usize) -> &[u32] {
+        &self.adj[self.off[u] as usize..self.off[u + 1] as usize]
+    }
+}
+
+// ---------------------------------------------------------------- quadtree (Barnes-Hut)
+struct QNode {
+    x: f64,    // center of mass
+    y: f64,
+    mass: f64,
+    size: f64, // cell width
+    child: [i32; 4],
+}
+
+struct QuadTree {
+    nodes: Vec<QNode>,
+    root: i32,
+}
+
+impl QuadTree {
+    fn build(pos: &[(f64, f64)]) -> QuadTree {
+        let n = pos.len();
+        let mut nodes: Vec<QNode> = Vec::with_capacity(2 * n + 16);
+        if n == 0 {
+            return QuadTree { nodes, root: -1 };
+        }
+        let (mut x0, mut y0, mut x1, mut y1) =
+            (f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+        for &(x, y) in pos {
+            if x < x0 { x0 = x; } if x > x1 { x1 = x; }
+            if y < y0 { y0 = y; } if y > y1 { y1 = y; }
+        }
+        let w = (x1 - x0).max(y1 - y0).max(1e-9);
+        let mut idx: Vec<u32> = (0..n as u32).collect();
+        let root = Self::build_rec(pos, &mut idx, x0, y0, w, 0, &mut nodes);
+        QuadTree { nodes, root }
+    }
+
+    fn build_rec(
+        pos: &[(f64, f64)], idx: &mut [u32],
+        x0: f64, y0: f64, w: f64, depth: u32,
+        nodes: &mut Vec<QNode>,
+    ) -> i32 {
+        if idx.is_empty() { return -1; }
+        let (mut sx, mut sy) = (0.0f64, 0.0f64);
+        for &i in idx.iter() {
+            sx += pos[i as usize].0;
+            sy += pos[i as usize].1;
+        }
+        let m = idx.len() as f64;
+        let id = nodes.len() as i32;
+        nodes.push(QNode {
+            x: sx / m, y: sy / m, mass: m, size: w,
+            child: [-1; 4],
+        });
+        if idx.len() <= 1 || depth >= 48 {
+            return id;
+        }
+        let hw = w * 0.5;
+        let mx = x0 + hw;
+        let my = y0 + hw;
+        // partition: x-split, then y-split inside each half
+        let split_x = partition(idx, |i| pos[i as usize].0 < mx);
+        let (left, right) = idx.split_at_mut(split_x);
+        let sl = partition(left, |i| pos[i as usize].1 < my);
+        let sr = partition(right, |i| pos[i as usize].1 < my);
+        let (ll, lh) = left.split_at_mut(sl);
+        let (rl, rh) = right.split_at_mut(sr);
+        let c0 = Self::build_rec(pos, ll, x0, y0, hw, depth + 1, nodes);
+        let c1 = Self::build_rec(pos, lh, x0, my, hw, depth + 1, nodes);
+        let c2 = Self::build_rec(pos, rl, mx, y0, hw, depth + 1, nodes);
+        let c3 = Self::build_rec(pos, rh, mx, my, hw, depth + 1, nodes);
+        nodes[id as usize].child = [c0, c1, c2, c3];
+        id
+    }
+
+    /// Accumulated repulsive displacement on point p (FR style: k^2 / d).
+    fn repulsion(&self, px: f64, py: f64, k2: f64, theta2: f64, rng_jit: u64) -> (f64, f64) {
+        let (mut fx, mut fy) = (0.0f64, 0.0f64);
+        if self.root < 0 { return (fx, fy); }
+        let mut stack: [i32; 96] = [0; 96];
+        let mut sp = 0usize;
+        stack[sp] = self.root; sp += 1;
+        while sp > 0 {
+            sp -= 1;
+            let node = &self.nodes[stack[sp] as usize];
+            let dx = px - node.x;
+            let dy = py - node.y;
+            let d2 = dx * dx + dy * dy;
+            let leaf = node.child == [-1; 4];
+            if leaf || node.size * node.size < theta2 * d2 {
+                if d2 > 1e-12 {
+                    let f = k2 * node.mass / d2;
+                    fx += dx * f;
+                    fy += dy * f;
+                } else if leaf && node.mass > 1.0 {
+                    // coincident points: deterministic pseudo-random nudge
+                    let a = (rng_jit % 6283) as f64 * 0.001;
+                    fx += a.cos() * k2.sqrt();
+                    fy += a.sin() * k2.sqrt();
+                }
+            } else {
+                for &c in &node.child {
+                    if c >= 0 && sp < 96 {
+                        stack[sp] = c; sp += 1;
+                    }
+                }
+            }
+        }
+        (fx, fy)
+    }
+}
+
+fn partition<F: Fn(u32) -> bool>(a: &mut [u32], pred: F) -> usize {
+    let mut i = 0usize;
+    for j in 0..a.len() {
+        if pred(a[j]) {
+            a.swap(i, j);
+            i += 1;
+        }
+    }
+    i
+}
+
+// ---------------------------------------------------------------- force-directed layout
+struct FrParams {
+    iters: usize,
+    theta2: f64,
+    threads: usize,
+}
+
+fn fr_layout(
+    n: usize,
+    csr: &Csr,
+    pos: &mut Vec<(f64, f64)>,
+    params: &FrParams,
+    start: &Instant,
+    deadline: f64,
+) {
+    if n <= 1 { return; }
+    let k = 1.0f64; // ideal edge length; everything scales off this
+    let k2 = k * k;
+    let side = (n as f64).sqrt() * k * 1.5;
+    let mut temp = side * 0.12;
+    let t_min = 0.005 * k;
+    let cool = (t_min / temp).powf(1.0 / params.iters.max(1) as f64);
+
+    let mut disp: Vec<(f64, f64)> = vec![(0.0, 0.0); n];
+
+    for it in 0..params.iters {
+        if it % 8 == 0 && start.elapsed().as_secs_f64() > deadline {
+            break;
+        }
+        let qt = QuadTree::build(pos);
+
+        let compute = |range: std::ops::Range<usize>, out: &mut [(f64, f64)]| {
+            for (oi, v) in range.clone().enumerate() {
+                let (px, py) = pos[v];
+                // repulsion via Barnes-Hut
+                let (mut fx, mut fy) =
+                    qt.repulsion(px, py, k2, params.theta2, (v as u64).wrapping_mul(0x2545F4914F6CDD1D).wrapping_add(it as u64));
+                // attraction along incident edges (node-centric: parallel safe)
+                for &u in csr.neighbors(v) {
+                    let (ux, uy) = pos[u as usize];
+                    let dx = px - ux;
+                    let dy = py - uy;
+                    let d = (dx * dx + dy * dy).sqrt().max(1e-9);
+                    let f = d / k; // FR attraction d^2/k, divided by d for direction
+                    fx -= dx * f;
+                    fy -= dy * f;
+                }
+                out[oi] = (fx, fy);
+            }
+        };
+
+        if params.threads > 1 && n >= 4096 {
+            let nt = params.threads;
+            let chunk = (n + nt - 1) / nt;
+            let mut slices: Vec<&mut [(f64, f64)]> = Vec::with_capacity(nt);
+            let mut rest: &mut [(f64, f64)] = &mut disp;
+            while !rest.is_empty() {
+                let c = chunk.min(rest.len());
+                let (a, b) = rest.split_at_mut(c);
+                slices.push(a);
+                rest = b;
+            }
+            std::thread::scope(|s| {
+                let mut lo = 0usize;
+                for sl in slices {
+                    let hi = lo + sl.len();
+                    let compute = &compute;
+                    s.spawn(move || compute(lo..hi, sl));
+                    lo = hi;
+                }
+            });
+        } else {
+            compute(0..n, &mut disp);
+        }
+
+        // apply displacements with temperature cap
+        for v in 0..n {
+            let (dx, dy) = disp[v];
+            let d = (dx * dx + dy * dy).sqrt();
+            if d > 1e-12 {
+                let step = d.min(temp);
+                pos[v].0 += dx / d * step;
+                pos[v].1 += dy / d * step;
+            }
+        }
+        temp = (temp * cool).max(t_min);
+    }
+}
+
+fn init_positions(n: usize, csr: &Csr, rng: &mut Rng) -> Vec<(f64, f64)> {
+    // BFS order from highest-degree node, placed spiraling outward
+    let mut order = Vec::with_capacity(n);
+    let mut seen = vec![false; n];
+    let mut best = 0usize;
+    for v in 0..n {
+        if csr.neighbors(v).len() > csr.neighbors(best).len() { best = v; }
+    }
+    let mut queue = std::collections::VecDeque::new();
+    for s in std::iter::once(best).chain(0..n) {
+        if seen[s] { continue; }
+        seen[s] = true;
+        queue.push_back(s);
+        while let Some(v) = queue.pop_front() {
+            order.push(v);
+            for &u in csr.neighbors(v) {
+                if !seen[u as usize] {
+                    seen[u as usize] = true;
+                    queue.push_back(u as usize);
+                }
+            }
+        }
+    }
+    let mut pos = vec![(0.0, 0.0); n];
+    for (i, &v) in order.iter().enumerate() {
+        let r = (i as f64 + 0.5).sqrt() * 0.6;
+        let a = i as f64 * 2.39996322972865332 + rng.f() * 0.3; // golden angle spiral
+        pos[v] = (r * a.cos() + rng.f() * 0.01, r * a.sin() + rng.f() * 0.01);
+    }
+    pos
+}
+
+// ---------------------------------------------------------------- tree layout (radial, planar)
+fn tree_layout(n: usize, csr: &Csr) -> Vec<(f64, f64)> {
+    let mut pos = vec![(0.0, 0.0); n];
+    if n == 1 { return pos; }
+    // find tree center: BFS twice, take middle of the longest path
+    let bfs_far = |s: usize| -> (usize, Vec<i32>) {
+        let mut dist = vec![-1i32; n];
+        let mut par = vec![-1i32; n];
+        let mut q = std::collections::VecDeque::new();
+        dist[s] = 0;
+        q.push_back(s);
+        let mut far = s;
+        while let Some(v) = q.pop_front() {
+            if dist[v] > dist[far] { far = v; }
+            for &u in csr.neighbors(v) {
+                let u = u as usize;
+                if dist[u] < 0 {
+                    dist[u] = dist[v] + 1;
+                    par[u] = v as i32;
+                    q.push_back(u);
+                }
+            }
+        }
+        (far, par)
+    };
+    let (a, _) = bfs_far(0);
+    let (b, par) = bfs_far(a);
+    let mut path = vec![b];
+    let mut cur = b;
+    while par[cur] >= 0 {
+        cur = par[cur] as usize;
+        path.push(cur);
+    }
+    let root = path[path.len() / 2];
+
+    // subtree sizes via iterative post-order
+    let mut parent = vec![usize::MAX; n];
+    let mut order = Vec::with_capacity(n);
+    let mut stack = vec![root];
+    parent[root] = root;
+    while let Some(v) = stack.pop() {
+        order.push(v);
+        for &u in csr.neighbors(v) {
+            let u = u as usize;
+            if parent[u] == usize::MAX {
+                parent[u] = v;
+                stack.push(u);
+            }
+        }
+    }
+    let mut sub = vec![1u64; n];
+    for &v in order.iter().rev() {
+        if v != root {
+            sub[parent[v]] += sub[v];
+        }
+    }
+    // assign angular wedges proportional to subtree size
+    let mut wedge = vec![(0.0f64, 0.0f64); n];
+    wedge[root] = (0.0, std::f64::consts::TAU);
+    let mut depth = vec![0u32; n];
+    for &v in order.iter() {
+        let (a0, a1) = wedge[v];
+        let mid = 0.5 * (a0 + a1);
+        let r = depth[v] as f64;
+        pos[v] = (r * mid.cos(), r * mid.sin());
+        let total: u64 = csr.neighbors(v).iter()
+            .filter(|&&u| parent[u as usize] == v && (u as usize) != root)
+            .map(|&u| sub[u as usize]).sum();
+        if total == 0 { continue; }
+        let mut acc = a0;
+        let span = a1 - a0;
+        for &u in csr.neighbors(v) {
+            let u = u as usize;
+            if parent[u] == v && u != root {
+                let w = span * sub[u] as f64 / total as f64;
+                wedge[u] = (acc, acc + w);
+                depth[u] = depth[v] + 1;
+                acc += w;
+            }
+        }
+    }
+    pos
+}
+
+// ---------------------------------------------------------------- cycle layout
+fn cycle_layout(n: usize, csr: &Csr) -> Option<Vec<(f64, f64)>> {
+    for v in 0..n {
+        if csr.neighbors(v).len() != 2 { return None; }
+    }
+    let mut pos = vec![(0.0, 0.0); n];
+    let mut prev = usize::MAX;
+    let mut cur = 0usize;
+    let r = n as f64 / std::f64::consts::TAU;
+    for i in 0..n {
+        let a = i as f64 / n as f64 * std::f64::consts::TAU;
+        pos[cur] = (r * a.cos(), r * a.sin());
+        let nb = csr.neighbors(cur);
+        let next = if nb[0] as usize != prev { nb[0] as usize } else { nb[1] as usize };
+        prev = cur;
+        cur = next;
+    }
+    if cur != 0 { return None; } // not a single cycle (shouldn't happen given checks)
+    Some(pos)
+}
+
+// ---------------------------------------------------------------- crossing count (small graphs)
+fn segments_cross(p1: (f64, f64), p2: (f64, f64), p3: (f64, f64), p4: (f64, f64)) -> bool {
+    fn orient(a: (f64, f64), b: (f64, f64), c: (f64, f64)) -> f64 {
+        (b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0)
+    }
+    let d1 = orient(p3, p4, p1);
+    let d2 = orient(p3, p4, p2);
+    let d3 = orient(p1, p2, p3);
+    let d4 = orient(p1, p2, p4);
+    ((d1 > 0.0 && d2 < 0.0) || (d1 < 0.0 && d2 > 0.0))
+        && ((d3 > 0.0 && d4 < 0.0) || (d3 < 0.0 && d4 > 0.0))
+}
+
+fn count_crossings(pos: &[(f64, f64)], edges: &[(u32, u32)]) -> usize {
+    let m = edges.len();
+    let mut c = 0usize;
+    for i in 0..m {
+        let (a, b) = edges[i];
+        for j in i + 1..m {
+            let (u, v) = edges[j];
+            if a == u || a == v || b == u || b == v { continue; }
+            if segments_cross(pos[a as usize], pos[b as usize],
+                              pos[u as usize], pos[v as usize]) {
+                c += 1;
+            }
+        }
+    }
+    c
+}
+
+/// Crossings involving edges incident to vertex v.
+fn incident_crossings(v: u32, pos: &[(f64, f64)], edges: &[(u32, u32)]) -> usize {
+    let mut c = 0usize;
+    for &(a, b) in edges {
+        if a != v && b != v { continue; }
+        let p1 = pos[a as usize];
+        let p2 = pos[b as usize];
+        for &(u, w) in edges {
+            // count each incident/other pair once; skip pairs of two incident
+            // edges (they share v) and shared-endpoint pairs
+            if u == v || w == v { continue; }
+            if u == a || u == b || w == a || w == b { continue; }
+            if segments_cross(p1, p2, pos[u as usize], pos[w as usize]) {
+                c += 1;
+            }
+        }
+    }
+    c
+}
+
+/// Hill-climbing refinement: move vertices to positions that reduce the
+/// number of crossings on their incident edges. Small graphs only.
+fn refine_crossings(
+    pos: &mut [(f64, f64)],
+    edges: &[(u32, u32)],
+    rng: &mut Rng,
+    start: &Instant,
+    deadline: f64,
+) {
+    let n = pos.len();
+    if n < 3 || edges.is_empty() { return; }
+    let (mut x0, mut y0, mut x1, mut y1) =
+        (f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+    for &(x, y) in pos.iter() {
+        if x < x0 { x0 = x; } if x > x1 { x1 = x; }
+        if y < y0 { y0 = y; } if y > y1 { y1 = y; }
+    }
+    let w = (x1 - x0).max(1e-6);
+    let h = (y1 - y0).max(1e-6);
+    for _pass in 0..60 {
+        let mut improved = false;
+        for v in 0..n as u32 {
+            if start.elapsed().as_secs_f64() > deadline { return; }
+            let base = incident_crossings(v, pos, edges);
+            if base == 0 { continue; }
+            let cur = pos[v as usize];
+            let mut best = base;
+            let mut best_p = cur;
+            for t in 0..50 {
+                let cand = if t < 35 {
+                    // global random position (slightly expanded box)
+                    (x0 - 0.15 * w + rng.f() * w * 1.3,
+                     y0 - 0.15 * h + rng.f() * h * 1.3)
+                } else {
+                    // local perturbation
+                    (cur.0 + (rng.f() - 0.5) * w * 0.25,
+                     cur.1 + (rng.f() - 0.5) * h * 0.25)
+                };
+                pos[v as usize] = cand;
+                let c = incident_crossings(v, pos, edges);
+                if c < best {
+                    best = c;
+                    best_p = cand;
+                    if best == 0 { break; }
+                }
+            }
+            pos[v as usize] = best_p;
+            if best < base { improved = true; }
+        }
+        if !improved { break; }
+    }
+}
+
+// ---------------------------------------------------------------- per-component driver
+fn layout_component(
+    cn: usize,
+    cm: usize,
+    csr: &Csr,
+    edges: &[(u32, u32)],
+    start: &Instant,
+    deadline: f64,
+    threads: usize,
+    seed: u64,
+) -> Vec<(f64, f64)> {
+    if cn == 1 {
+        return vec![(0.0, 0.0)];
+    }
+    if cm + 1 == cn {
+        return tree_layout(cn, csr);
+    }
+    if cm == cn {
+        if let Some(p) = cycle_layout(cn, csr) {
+            return p;
+        }
+    }
+    let mut rng = Rng::new(seed);
+    let iters = if cn <= 200 { 1200 }
+        else if cn <= 2000 { 700 }
+        else if cn <= 20000 { 350 }
+        else if cn <= 80000 { 200 }
+        else { 120 };
+    let theta2 = if cn <= 2000 { 0.49 } else { 0.81 };
+    let params = FrParams { iters, theta2, threads };
+
+    if cn <= 120 && cm <= 400 {
+        // multiple restarts, pick layout with fewest crossings
+        let mut best_pos: Option<Vec<(f64, f64)>> = None;
+        let mut best_x = usize::MAX;
+        for r in 0..10 {
+            if start.elapsed().as_secs_f64() > deadline { break; }
+            let mut rr = Rng::new(seed.wrapping_add(r as u64 * 7919 + 1));
+            let mut pos = init_positions(cn, csr, &mut rr);
+            fr_layout(cn, csr, &mut pos, &params, start, deadline);
+            refine_crossings(&mut pos, edges, &mut rr, start, deadline);
+            let x = count_crossings(&pos, edges);
+            if x < best_x {
+                best_x = x;
+                best_pos = Some(pos);
+            }
+            if best_x == 0 { break; }
+        }
+        return best_pos.unwrap_or_else(|| init_positions(cn, csr, &mut rng));
+    }
+
+    let mut pos = init_positions(cn, csr, &mut rng);
+    fr_layout(cn, csr, &mut pos, &params, start, deadline);
+    if cn <= 600 && cm <= 1500 {
+        refine_crossings(&mut pos, &edges, &mut rng, start, deadline);
+    }
+    pos
+}
+
+// ---------------------------------------------------------------- main
+fn main() {
+    let start = Instant::now();
+    let (n, raw_edges) = read_input();
+    let stdout = io::stdout();
+    let mut out = BufWriter::new(stdout.lock());
+
+    if n == 0 {
+        return;
+    }
+
+    // dedupe edges, drop self-loops
+    let mut edges: Vec<(u32, u32)> = raw_edges
+        .into_iter()
+        .filter(|&(u, v)| u != v)
+        .map(|(u, v)| if u < v { (u, v) } else { (v, u) })
+        .collect();
+    edges.sort_unstable();
+    edges.dedup();
+
+    let csr = Csr::build(n, &edges);
+
+    // connected components
+    let mut comp = vec![u32::MAX; n];
+    let mut comps: Vec<Vec<u32>> = Vec::new();
+    {
+        let mut q = std::collections::VecDeque::new();
+        for s in 0..n {
+            if comp[s] != u32::MAX { continue; }
+            let cid = comps.len() as u32;
+            comp[s] = cid;
+            let mut members = vec![s as u32];
+            q.push_back(s as u32);
+            while let Some(v) = q.pop_front() {
+                for &u in csr.neighbors(v as usize) {
+                    if comp[u as usize] == u32::MAX {
+                        comp[u as usize] = cid;
+                        members.push(u);
+                        q.push_back(u);
+                    }
+                }
+            }
+            comps.push(members);
+        }
+    }
+
+    // bucket edges per component
+    let mut comp_edges: Vec<Vec<(u32, u32)>> = vec![Vec::new(); comps.len()];
+    for &(u, v) in &edges {
+        comp_edges[comp[u as usize] as usize].push((u, v));
+    }
+
+    let threads = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(4)
+        .min(32);
+
+    // layout each component in local coordinates
+    let total_work: f64 = comps.iter().map(|c| c.len() as f64).sum::<f64>().max(1.0);
+    let mut global_pos: Vec<(f64, f64)> = vec![(0.0, 0.0); n];
+    let mut boxes: Vec<(usize, f64, f64)> = Vec::with_capacity(comps.len()); // (comp idx, w, h)
+    let mut local_pos: Vec<Vec<(f64, f64)>> = Vec::with_capacity(comps.len());
+
+    let mut elapsed_budget = 0.0f64;
+    let mut local_of = vec![u32::MAX; n];
+    for (ci, members) in comps.iter().enumerate() {
+        let cn = members.len();
+        // local relabel (local index == position within `members`)
+        for (li, &g) in members.iter().enumerate() {
+            local_of[g as usize] = li as u32;
+        }
+        let to_local = |g: u32| -> u32 { local_of[g as usize] };
+        let ledges: Vec<(u32, u32)> = comp_edges[ci]
+            .iter()
+            .map(|&(u, v)| (to_local(u), to_local(v)))
+            .collect();
+        let lcsr = Csr::build(cn, &ledges);
+
+        elapsed_budget += cn as f64 / total_work * (TIME_LIMIT - 2.0);
+        let deadline = elapsed_budget.min(TIME_LIMIT - 2.0);
+
+        let pos = layout_component(
+            cn, ledges.len(), &lcsr, &ledges,
+            &start, deadline, threads, 0xC0FFEE + ci as u64,
+        );
+
+        // bounding box
+        let (mut x0, mut y0, mut x1, mut y1) =
+            (f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+        for &(x, y) in &pos {
+            if x < x0 { x0 = x; } if x > x1 { x1 = x; }
+            if y < y0 { y0 = y; } if y > y1 { y1 = y; }
+        }
+        if !x0.is_finite() { x0 = 0.0; y0 = 0.0; x1 = 0.0; y1 = 0.0; }
+        let pad = 1.5;
+        let w = (x1 - x0) + pad;
+        let h = (y1 - y0) + pad;
+        // shift to origin
+        let shifted: Vec<(f64, f64)> = pos.iter().map(|&(x, y)| (x - x0, y - y0)).collect();
+        boxes.push((ci, w, h));
+        local_pos.push(shifted);
+    }
+
+    // shelf packing of component boxes (sorted by height, descending)
+    let mut order: Vec<usize> = (0..boxes.len()).collect();
+    order.sort_by(|&a, &b| boxes[b].2.partial_cmp(&boxes[a].2).unwrap_or(std::cmp::Ordering::Equal));
+    let total_area: f64 = boxes.iter().map(|b| b.1 * b.2).sum();
+    let target_w = total_area.sqrt().max(boxes.iter().map(|b| b.1).fold(0.0, f64::max));
+    let (mut cx, mut cy, mut shelf_h) = (0.0f64, 0.0f64, 0.0f64);
+    for &bi in &order {
+        let (ci, w, h) = boxes[bi];
+        if cx > 0.0 && cx + w > target_w * 1.05 {
+            cy += shelf_h;
+            cx = 0.0;
+            shelf_h = 0.0;
+        }
+        for (li, &g) in comps[ci].iter().enumerate() {
+            let (x, y) = local_pos[bi][li];
+            global_pos[g as usize] = (x + cx, y + cy);
+        }
+        cx += w;
+        if h > shelf_h { shelf_h = h; }
+    }
+
+    // output
+    let mut s = String::with_capacity(n * 24);
+    for &(x, y) in &global_pos {
+        s.push_str(&format!("{:.4} {:.4}\n", x, y));
+        if s.len() > 1 << 20 {
+            out.write_all(s.as_bytes()).unwrap();
+            s.clear();
+        }
+    }
+    out.write_all(s.as_bytes()).unwrap();
+    out.flush().unwrap();
+}

@@ -26,6 +26,7 @@ tags = [
   "constraint solving",
 ]
 
+resultFileTypes = ("rs", "rust")
 # Seed for reproducibility
 RANDOM_SEED = 77777
 

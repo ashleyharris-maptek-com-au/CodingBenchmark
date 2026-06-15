@@ -1,1 +1,768 @@
-{}
+// Chess engine: Bitboard + Alpha-Beta + Iterative Deepening + PEXT sliders
+// MSVC C++20, Windows, AMD64
+
+#include <iostream>
+#include <string>
+#include <vector>
+#include <array>
+#include <algorithm>
+#include <chrono>
+#include <thread>
+#include <atomic>
+#include <cstring>
+#include <cstdint>
+#include <sstream>
+#include <random>
+#include <intrin.h>
+
+using U64 = uint64_t;
+
+enum {
+    a1,b1,c1,d1,e1,f1,g1,h1,
+    a2,b2,c2,d2,e2,f2,g2,h2,
+    a3,b3,c3,d3,e3,f3,g3,h3,
+    a4,b4,c4,d4,e4,f4,g4,h4,
+    a5,b5,c5,d5,e5,f5,g5,h5,
+    a6,b6,c6,d6,e6,f6,g6,h6,
+    a7,b7,c7,d7,e7,f7,g7,h7,
+    a8,b8,c8,d8,e8,f8,g8,h8,
+    NO_SQ = 64
+};
+
+enum { PAWN, KNIGHT, BISHOP, ROOK, QUEEN, KING, NO_PIECE };
+enum { WHITE, BLACK };
+
+static inline int popcount(U64 b) { return (int)__popcnt64(b); }
+static inline int lsb(U64 b) { unsigned long idx; _BitScanForward64(&idx, b); return (int)idx; }
+static inline U64 pext(U64 val, U64 mask) { return _pext_u64(val, mask); }
+
+static inline int fileOf(int sq) { return sq & 7; }
+static inline int rankOf(int sq) { return sq >> 3; }
+static inline int sqOf(int r, int f) { return r * 8 + f; }
+static inline U64 bit(int sq) { return 1ULL << sq; }
+
+// Move: from(6) | to(6) | flags(2) | promo(2)
+// flags: 0=normal, 1=promo, 2=ep, 3=castle
+// promo: 0=N, 1=B, 2=R, 3=Q
+struct Move {
+    uint16_t data = 0;
+    int16_t score = 0;
+    Move() = default;
+    Move(int from, int to, int flags = 0, int promo = 0)
+        : data((uint16_t)(from | (to << 6) | (flags << 12) | (promo << 14))), score(0) {}
+    int from() const { return data & 63; }
+    int to() const { return (data >> 6) & 63; }
+    int flags() const { return (data >> 12) & 3; }
+    int promo() const { return (data >> 14) & 3; }
+    bool isPromo() const { return flags() == 1; }
+    bool isEP() const { return flags() == 2; }
+    bool isCastle() const { return flags() == 3; }
+    bool operator==(Move o) const { return data == o.data; }
+    explicit operator bool() const { return data != 0; }
+};
+
+struct Board {
+    U64 pieces[2][6]{};
+    U64 occ[2]{};
+    U64 all = 0;
+    int board[64];
+    int color[64];
+    int side = WHITE;
+    int castling = 0;
+    int epSq = NO_SQ;
+    int halfmove = 0;
+    int fullmove = 1;
+    U64 hash = 0;
+
+    struct Undo {
+        Move move;
+        int captured;
+        int castling;
+        int epSq;
+        int halfmove;
+        U64 hash;
+    };
+
+    Board() {
+        for (int i = 0; i < 64; i++) { board[i] = NO_PIECE; color[i] = WHITE; }
+    }
+};
+
+// Zobrist
+U64 zobPiece[2][6][64];
+U64 zobSide;
+U64 zobCastle[16];
+U64 zobEP[8];
+
+void initZobrist() {
+    std::mt19937_64 rng(0xBEEF);
+    for (auto& a : zobPiece) for (auto& b : a) for (auto& c : b) c = rng();
+    zobSide = rng();
+    for (auto& z : zobCastle) z = rng();
+    for (auto& z : zobEP) z = rng();
+}
+
+void computeHash(Board& b) {
+    b.hash = 0;
+    for (int sq = 0; sq < 64; sq++)
+        if (b.board[sq] != NO_PIECE) b.hash ^= zobPiece[b.color[sq]][b.board[sq]][sq];
+    if (b.side == BLACK) b.hash ^= zobSide;
+    b.hash ^= zobCastle[b.castling];
+    if (b.epSq != NO_SQ) b.hash ^= zobEP[fileOf(b.epSq)];
+}
+
+// Attack tables
+U64 pawnAttacks[2][64];
+U64 knightAttacks[64];
+U64 kingAttacks[64];
+
+struct MagicEntry { U64 mask; U64* attacks; };
+MagicEntry bishopMagic[64], rookMagic[64];
+U64 bishopTable[5248], rookTable[102400];
+
+U64 slidingAttack(int sq, U64 occ, const int deltas[4][2]) {
+    U64 att = 0;
+    for (int d = 0; d < 4; d++) {
+        int r = rankOf(sq) + deltas[d][0], f = fileOf(sq) + deltas[d][1];
+        while (r >= 0 && r < 8 && f >= 0 && f < 8) {
+            int s = sqOf(r, f);
+            att |= bit(s);
+            if (occ & bit(s)) break;
+            r += deltas[d][0]; f += deltas[d][1];
+        }
+    }
+    return att;
+}
+
+const int bishopDeltas[4][2] = {{1,1},{1,-1},{-1,1},{-1,-1}};
+const int rookDeltas[4][2] = {{1,0},{-1,0},{0,1},{0,-1}};
+
+void initMagics(MagicEntry* table, U64* storage, const int deltas[4][2]) {
+    U64* ptr = storage;
+    for (int sq = 0; sq < 64; sq++) {
+        U64 edges = 0;
+        if (rankOf(sq) != 0) edges |= 0x00000000000000FFULL;
+        if (rankOf(sq) != 7) edges |= 0xFF00000000000000ULL;
+        if (fileOf(sq) != 0) edges |= 0x0101010101010101ULL;
+        if (fileOf(sq) != 7) edges |= 0x8080808080808080ULL;
+
+        U64 mask = slidingAttack(sq, 0, deltas) & ~edges;
+        table[sq].mask = mask;
+        table[sq].attacks = ptr;
+        int bits = popcount(mask);
+        int size = 1 << bits;
+        ptr += size;
+
+        U64 occ = 0;
+        do {
+            table[sq].attacks[pext(occ, mask)] = slidingAttack(sq, occ, deltas);
+            occ = (occ - mask) & mask;
+        } while (occ);
+    }
+}
+
+inline U64 bishopAtt(int sq, U64 occ) { return bishopMagic[sq].attacks[pext(occ, bishopMagic[sq].mask)]; }
+inline U64 rookAtt(int sq, U64 occ) { return rookMagic[sq].attacks[pext(occ, rookMagic[sq].mask)]; }
+
+void initAttacks() {
+    for (int sq = 0; sq < 64; sq++) {
+        int r = rankOf(sq), f = fileOf(sq);
+        pawnAttacks[WHITE][sq] = pawnAttacks[BLACK][sq] = 0;
+        if (r < 7) { if (f > 0) pawnAttacks[WHITE][sq] |= bit(sq+7); if (f < 7) pawnAttacks[WHITE][sq] |= bit(sq+9); }
+        if (r > 0) { if (f > 0) pawnAttacks[BLACK][sq] |= bit(sq-9); if (f < 7) pawnAttacks[BLACK][sq] |= bit(sq-7); }
+        knightAttacks[sq] = 0;
+        const int kd[8][2] = {{2,1},{2,-1},{-2,1},{-2,-1},{1,2},{1,-2},{-1,2},{-1,-2}};
+        for (auto& d : kd) { int nr=r+d[0], nf=f+d[1]; if (nr>=0&&nr<8&&nf>=0&&nf<8) knightAttacks[sq]|=bit(sqOf(nr,nf)); }
+        kingAttacks[sq] = 0;
+        for (int dr=-1;dr<=1;dr++) for (int df=-1;df<=1;df++) { if (!dr&&!df) continue; int nr=r+dr,nf=f+df; if (nr>=0&&nr<8&&nf>=0&&nf<8) kingAttacks[sq]|=bit(sqOf(nr,nf)); }
+    }
+    initMagics(bishopMagic, bishopTable, bishopDeltas);
+    initMagics(rookMagic, rookTable, rookDeltas);
+}
+
+bool isAttacked(const Board& b, int sq, int bySide) {
+    if (pawnAttacks[bySide^1][sq] & b.pieces[bySide][PAWN]) return true;
+    if (knightAttacks[sq] & b.pieces[bySide][KNIGHT]) return true;
+    if (kingAttacks[sq] & b.pieces[bySide][KING]) return true;
+    if (bishopAtt(sq, b.all) & (b.pieces[bySide][BISHOP]|b.pieces[bySide][QUEEN])) return true;
+    if (rookAtt(sq, b.all) & (b.pieces[bySide][ROOK]|b.pieces[bySide][QUEEN])) return true;
+    return false;
+}
+
+bool inCheck(const Board& b, int side) {
+    U64 k = b.pieces[side][KING];
+    return k && isAttacked(b, lsb(k), side^1);
+}
+
+const U64 FileA = 0x0101010101010101ULL;
+const U64 FileH = 0x8080808080808080ULL;
+const U64 Rank1 = 0x00000000000000FFULL;
+const U64 Rank8 = 0xFF00000000000000ULL;
+
+struct MoveList {
+    Move moves[256];
+    int count = 0;
+    void add(Move m) { moves[count++] = m; }
+};
+
+void genMoves(const Board& b, MoveList& ml) {
+    int us = b.side, them = us^1;
+    U64 my = b.occ[us], their = b.occ[them], empty = ~b.all;
+    U64 promoRank = us == WHITE ? Rank8 : Rank1;
+    U64 rank3 = us == WHITE ? 0x0000000000FF0000ULL : 0x0000FF0000000000ULL;
+
+    // Pawns
+    U64 pawns = b.pieces[us][PAWN];
+    int up = us == WHITE ? 8 : -8;
+
+    // Single push (non-promo)
+    U64 push1 = (us == WHITE ? (pawns << 8) : (pawns >> 8)) & empty;
+    U64 promoPush = push1 & promoRank;
+    push1 &= ~promoRank;
+    while (push1) { int to = lsb(push1); ml.add(Move(to-up, to)); push1 &= push1-1; }
+    while (promoPush) { int to = lsb(promoPush); for (int p=0;p<4;p++) ml.add(Move(to-up,to,1,p)); promoPush &= promoPush-1; }
+
+    // Double push
+    U64 push2 = (us == WHITE ? ((((pawns << 8) & empty) & rank3) << 8) : ((((pawns >> 8) & empty) & rank3) >> 8)) & empty;
+    while (push2) { int to = lsb(push2); ml.add(Move(to-2*up, to)); push2 &= push2-1; }
+
+    // Captures
+    U64 captL, captR;
+    int dL, dR;
+    if (us == WHITE) {
+        captL = ((pawns & ~FileA) << 7) & their; dL = 7;
+        captR = ((pawns & ~FileH) << 9) & their; dR = 9;
+    } else {
+        captL = ((pawns & ~FileH) >> 7) & their; dL = -7;
+        captR = ((pawns & ~FileA) >> 9) & their; dR = -9;
+    }
+    U64 promoCL = captL & promoRank; captL &= ~promoRank;
+    U64 promoCR = captR & promoRank; captR &= ~promoRank;
+    while (captL) { int to=lsb(captL); ml.add(Move(to-dL,to)); captL&=captL-1; }
+    while (captR) { int to=lsb(captR); ml.add(Move(to-dR,to)); captR&=captR-1; }
+    while (promoCL) { int to=lsb(promoCL); for(int p=0;p<4;p++) ml.add(Move(to-dL,to,1,p)); promoCL&=promoCL-1; }
+    while (promoCR) { int to=lsb(promoCR); for(int p=0;p<4;p++) ml.add(Move(to-dR,to,1,p)); promoCR&=promoCR-1; }
+
+    // En passant
+    if (b.epSq != NO_SQ) {
+        U64 epPawns = pawnAttacks[them][b.epSq] & pawns;
+        while (epPawns) { int from=lsb(epPawns); ml.add(Move(from,b.epSq,2)); epPawns&=epPawns-1; }
+    }
+
+    // Pieces
+    auto genPiece = [&](int piece, U64 bb, auto attackFn) {
+        while (bb) { int from=lsb(bb); U64 att=attackFn(from)&~my; while(att){int to=lsb(att);ml.add(Move(from,to));att&=att-1;} bb&=bb-1; }
+    };
+    genPiece(KNIGHT, b.pieces[us][KNIGHT], [](int sq){return knightAttacks[sq];});
+    genPiece(BISHOP, b.pieces[us][BISHOP], [&](int sq){return bishopAtt(sq,b.all);});
+    genPiece(ROOK, b.pieces[us][ROOK], [&](int sq){return rookAtt(sq,b.all);});
+    genPiece(QUEEN, b.pieces[us][QUEEN], [&](int sq){return bishopAtt(sq,b.all)|rookAtt(sq,b.all);});
+    genPiece(KING, b.pieces[us][KING], [](int sq){return kingAttacks[sq];});
+
+    // Castling
+    if (us == WHITE) {
+        if ((b.castling&1) && !(b.all&(bit(f1)|bit(g1))) && !isAttacked(b,e1,BLACK) && !isAttacked(b,f1,BLACK) && !isAttacked(b,g1,BLACK))
+            ml.add(Move(e1,g1,3));
+        if ((b.castling&2) && !(b.all&(bit(b1)|bit(c1)|bit(d1))) && !isAttacked(b,e1,BLACK) && !isAttacked(b,c1,BLACK) && !isAttacked(b,d1,BLACK))
+            ml.add(Move(e1,c1,3));
+    } else {
+        if ((b.castling&4) && !(b.all&(bit(f8)|bit(g8))) && !isAttacked(b,e8,WHITE) && !isAttacked(b,f8,WHITE) && !isAttacked(b,g8,WHITE))
+            ml.add(Move(e8,g8,3));
+        if ((b.castling&8) && !(b.all&(bit(b8)|bit(c8)|bit(d8))) && !isAttacked(b,e8,WHITE) && !isAttacked(b,c8,WHITE) && !isAttacked(b,d8,WHITE))
+            ml.add(Move(e8,c8,3));
+    }
+}
+
+// Piece manipulation
+void setPiece(Board& b, int sq, int piece, int col) {
+    b.pieces[col][piece] |= bit(sq); b.occ[col] |= bit(sq); b.all |= bit(sq);
+    b.board[sq] = piece; b.color[sq] = col;
+    b.hash ^= zobPiece[col][piece][sq];
+}
+void clearPiece(Board& b, int sq) {
+    int p=b.board[sq], c=b.color[sq];
+    b.pieces[c][p] &= ~bit(sq); b.occ[c] &= ~bit(sq); b.all &= ~bit(sq);
+    b.board[sq] = NO_PIECE;
+    b.hash ^= zobPiece[c][p][sq];
+}
+
+static const int castleRights[64] = {
+    13,15,15,15,12,15,15,14, 15,15,15,15,15,15,15,15,
+    15,15,15,15,15,15,15,15, 15,15,15,15,15,15,15,15,
+    15,15,15,15,15,15,15,15, 15,15,15,15,15,15,15,15,
+    15,15,15,15,15,15,15,15,  7,15,15,15, 3,15,15,11,
+};
+
+Board::Undo makeMove(Board& b, Move m) {
+    Board::Undo u;
+    u.move=m; u.castling=b.castling; u.epSq=b.epSq; u.halfmove=b.halfmove; u.hash=b.hash;
+    int from=m.from(), to=m.to(), us=b.side, them=us^1;
+    int piece = b.board[from];
+    u.captured = b.board[to];
+
+    if (b.epSq != NO_SQ) b.hash ^= zobEP[fileOf(b.epSq)];
+    b.hash ^= zobCastle[b.castling];
+
+    if (m.isCastle()) {
+        clearPiece(b, from); setPiece(b, to, KING, us);
+        if (to > from) { int rf=us==WHITE?h1:h8, rt=us==WHITE?f1:f8; clearPiece(b,rf); setPiece(b,rt,ROOK,us); }
+        else { int rf=us==WHITE?a1:a8, rt=us==WHITE?d1:d8; clearPiece(b,rf); setPiece(b,rt,ROOK,us); }
+        b.epSq = NO_SQ;
+    } else if (m.isEP()) {
+        int capSq = to + (us==WHITE ? -8 : 8);
+        clearPiece(b, capSq); clearPiece(b, from); setPiece(b, to, PAWN, us);
+        b.epSq = NO_SQ;
+        u.captured = PAWN;
+    } else {
+        if (u.captured != NO_PIECE) clearPiece(b, to);
+        clearPiece(b, from);
+        if (m.isPromo()) {
+            static const int pp[] = {KNIGHT,BISHOP,ROOK,QUEEN};
+            setPiece(b, to, pp[m.promo()], us);
+        } else {
+            setPiece(b, to, piece, us);
+        }
+        b.epSq = (piece==PAWN && abs(to-from)==16) ? from + (us==WHITE?8:-8) : NO_SQ;
+    }
+
+    b.castling &= castleRights[from] & castleRights[to];
+    b.hash ^= zobCastle[b.castling];
+    if (b.epSq != NO_SQ) b.hash ^= zobEP[fileOf(b.epSq)];
+    b.side ^= 1; b.hash ^= zobSide;
+    if (piece==PAWN || u.captured!=NO_PIECE) b.halfmove=0; else b.halfmove++;
+    if (us==BLACK) b.fullmove++;
+    return u;
+}
+
+void unmakeMove(Board& b, const Board::Undo& u) {
+    Move m = u.move;
+    int from=m.from(), to=m.to();
+    b.side ^= 1;
+    int us=b.side, them=us^1;
+
+    if (m.isCastle()) {
+        clearPiece(b, to); setPiece(b, from, KING, us);
+        if (to > from) { int rf=us==WHITE?h1:h8, rt=us==WHITE?f1:f8; clearPiece(b,rt); setPiece(b,rf,ROOK,us); }
+        else { int rf=us==WHITE?a1:a8, rt=us==WHITE?d1:d8; clearPiece(b,rt); setPiece(b,rf,ROOK,us); }
+    } else if (m.isEP()) {
+        clearPiece(b, to); setPiece(b, from, PAWN, us);
+        setPiece(b, to+(us==WHITE?-8:8), PAWN, them);
+    } else {
+        int movedPiece = b.board[to];
+        clearPiece(b, to);
+        setPiece(b, from, m.isPromo() ? PAWN : movedPiece, us);
+        if (u.captured != NO_PIECE) setPiece(b, to, u.captured, them);
+    }
+
+    b.castling=u.castling; b.epSq=u.epSq; b.halfmove=u.halfmove; b.hash=u.hash;
+    if (us==BLACK) b.fullmove--;
+}
+
+Board parseFEN(const std::string& fen) {
+    Board b;
+    std::istringstream ss(fen);
+    std::string pos, side, castle, ep;
+    ss >> pos >> side >> castle >> ep >> b.halfmove >> b.fullmove;
+
+    int sq = 56;
+    for (char c : pos) {
+        if (c == '/') { sq -= 16; continue; }
+        if (c >= '1' && c <= '8') { sq += c - '0'; continue; }
+        int col = (c>='a'&&c<='z') ? BLACK : WHITE;
+        char lower = (c>='A'&&c<='Z') ? c+32 : c;
+        int piece = NO_PIECE;
+        switch(lower) { case 'p':piece=PAWN;break; case 'n':piece=KNIGHT;break; case 'b':piece=BISHOP;break; case 'r':piece=ROOK;break; case 'q':piece=QUEEN;break; case 'k':piece=KING;break; }
+        b.pieces[col][piece] |= bit(sq); b.occ[col] |= bit(sq); b.all |= bit(sq);
+        b.board[sq] = piece; b.color[sq] = col;
+        sq++;
+    }
+
+    b.side = (side == "b") ? BLACK : WHITE;
+    if (castle != "-") for (char c : castle) { if(c=='K')b.castling|=1; if(c=='Q')b.castling|=2; if(c=='k')b.castling|=4; if(c=='q')b.castling|=8; }
+    if (ep != "-") b.epSq = sqOf(ep[1]-'1', ep[0]-'a');
+
+    computeHash(b);
+    return b;
+}
+
+// Evaluation
+const int pieceVal[6] = {100, 320, 330, 500, 900, 20000};
+
+const int pawnPST[64] = {
+     0, 0, 0, 0, 0, 0, 0, 0,   50,50,50,50,50,50,50,50,
+    10,10,20,30,30,20,10,10,     5, 5,10,25,25,10, 5, 5,
+     0, 0, 0,20,20, 0, 0, 0,    5,-5,-10,0, 0,-10,-5, 5,
+     5,10,10,-20,-20,10,10, 5,   0, 0, 0, 0, 0, 0, 0, 0
+};
+const int knightPST[64] = {
+    -50,-40,-30,-30,-30,-30,-40,-50, -40,-20, 0, 0, 0, 0,-20,-40,
+    -30, 0,10,15,15,10, 0,-30,      -30, 5,15,20,20,15, 5,-30,
+    -30, 0,15,20,20,15, 0,-30,      -30, 5,10,15,15,10, 5,-30,
+    -40,-20, 0, 5, 5, 0,-20,-40,    -50,-40,-30,-30,-30,-30,-40,-50
+};
+const int bishopPST[64] = {
+    -20,-10,-10,-10,-10,-10,-10,-20, -10, 0, 0, 0, 0, 0, 0,-10,
+    -10, 0, 5,10,10, 5, 0,-10,      -10, 5, 5,10,10, 5, 5,-10,
+    -10, 0,10,10,10,10, 0,-10,      -10,10,10,10,10,10,10,-10,
+    -10, 5, 0, 0, 0, 0, 5,-10,      -20,-10,-10,-10,-10,-10,-10,-20
+};
+const int rookPST[64] = {
+     0, 0, 0, 0, 0, 0, 0, 0,    5,10,10,10,10,10,10, 5,
+    -5, 0, 0, 0, 0, 0, 0,-5,   -5, 0, 0, 0, 0, 0, 0,-5,
+    -5, 0, 0, 0, 0, 0, 0,-5,   -5, 0, 0, 0, 0, 0, 0,-5,
+    -5, 0, 0, 0, 0, 0, 0,-5,    0, 0, 0, 5, 5, 0, 0, 0
+};
+const int kingMidPST[64] = {
+    -30,-40,-40,-50,-50,-40,-40,-30, -30,-40,-40,-50,-50,-40,-40,-30,
+    -30,-40,-40,-50,-50,-40,-40,-30, -30,-40,-40,-50,-50,-40,-40,-30,
+    -20,-30,-30,-40,-40,-30,-30,-20, -10,-20,-20,-20,-20,-20,-20,-10,
+     20, 20, 0, 0, 0, 0, 20, 20,     20, 30,10, 0, 0,10, 30, 20
+};
+const int kingEndPST[64] = {
+    -50,-40,-30,-20,-20,-30,-40,-50, -30,-20,-10, 0, 0,-10,-20,-30,
+    -30,-10,20,30,30,20,-10,-30,     -30,-10,30,40,40,30,-10,-30,
+    -30,-10,30,40,40,30,-10,-30,     -30,-10,20,30,30,20,-10,-30,
+    -30,-30, 0, 0, 0, 0,-30,-30,    -50,-30,-30,-30,-30,-30,-30,-50
+};
+const int queenPST[64] = {
+    -20,-10,-10,-5,-5,-10,-10,-20, -10, 0, 0, 0, 0, 0, 0,-10,
+    -10, 0, 5, 5, 5, 5, 0,-10,     -5, 0, 5, 5, 5, 5, 0,-5,
+      0, 0, 5, 5, 5, 5, 0,-5,     -10, 5, 5, 5, 5, 5, 0,-10,
+    -10, 0, 5, 0, 0, 0, 0,-10,    -20,-10,-10,-5,-5,-10,-10,-20
+};
+
+const int* pstTable[6] = {pawnPST, knightPST, bishopPST, rookPST, queenPST, kingMidPST};
+
+int evaluate(const Board& b) {
+    int mg = 0, eg = 0, phase = 0;
+    for (int col = 0; col < 2; col++) {
+        int sign = col == WHITE ? 1 : -1;
+        for (int p = 0; p < 6; p++) {
+            U64 bb = b.pieces[col][p];
+            while (bb) {
+                int sq = lsb(bb);
+                int pstSq = col == WHITE ? sq : (sq ^ 56);
+                mg += sign * (pieceVal[p] + pstTable[p][pstSq]);
+                eg += sign * (pieceVal[p] + (p == KING ? kingEndPST[pstSq] : pstTable[p][pstSq]));
+                if (p==KNIGHT||p==BISHOP) phase+=1; else if (p==ROOK) phase+=2; else if (p==QUEEN) phase+=4;
+                bb &= bb-1;
+            }
+        }
+    }
+    phase = std::min(phase, 24);
+    int score = (mg * phase + eg * (24 - phase)) / 24;
+    return b.side == WHITE ? score : -score;
+}
+
+// Transposition table
+enum TTFlag { TT_EXACT, TT_ALPHA, TT_BETA };
+struct TTEntry { U64 key = 0; int16_t score = 0; Move bestMove; uint8_t depth = 0; uint8_t flag = 0; };
+
+const int TT_SIZE = 1 << 22;
+TTEntry ttable[TT_SIZE];
+
+TTEntry* ttProbe(U64 key) { TTEntry* e = &ttable[key & (TT_SIZE-1)]; return e->key == key ? e : nullptr; }
+void ttStore(U64 key, int score, int depth, int flag, Move bestMove) {
+    TTEntry* e = &ttable[key & (TT_SIZE-1)];
+    if (e->key != key || depth >= (int)e->depth - 2) {
+        e->key = key; e->score = (int16_t)score; e->depth = (uint8_t)depth; e->flag = (uint8_t)flag; e->bestMove = bestMove;
+    }
+}
+
+// Search
+std::atomic<bool> stopSearch{false};
+std::chrono::steady_clock::time_point searchStart;
+int64_t timeLimit;
+
+bool timeUp() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - searchStart).count() >= timeLimit;
+}
+
+const int INF = 30000, MATE = 29000;
+
+struct SearchData {
+    Move killers[128][2];
+    int history[2][64][64];
+    int ply = 0;
+    U64 nodeCount = 0;
+    SearchData() { memset(killers,0,sizeof(killers)); memset(history,0,sizeof(history)); }
+};
+
+void scoreMoves(MoveList& ml, const Board& b, Move ttMove, const SearchData& sd) {
+    for (int i = 0; i < ml.count; i++) {
+        Move& m = ml.moves[i];
+        if (m == ttMove) { m.score = 10000; continue; }
+        int to = m.to();
+        bool cap = b.board[to] != NO_PIECE || m.isEP();
+        if (cap) { int v = m.isEP() ? PAWN : b.board[to]; m.score = (int16_t)(5000 + pieceVal[v] - pieceVal[b.board[m.from()]]/10); }
+        else if (m.isPromo()) m.score = 6000 + m.promo()*100;
+        else if (sd.ply < 128 && m == sd.killers[sd.ply][0]) m.score = 4000;
+        else if (sd.ply < 128 && m == sd.killers[sd.ply][1]) m.score = 3999;
+        else m.score = (int16_t)std::min(3998, sd.history[b.side][m.from()][m.to()]);
+    }
+}
+
+Move pickMove(MoveList& ml, int start) {
+    int best = start;
+    for (int i = start+1; i < ml.count; i++) if (ml.moves[i].score > ml.moves[best].score) best = i;
+    std::swap(ml.moves[start], ml.moves[best]);
+    return ml.moves[start];
+}
+
+int quiesce(Board& b, int alpha, int beta, SearchData& sd) {
+    sd.nodeCount++;
+    if ((sd.nodeCount & 4095) == 0 && timeUp()) { stopSearch = true; return 0; }
+    int stand = evaluate(b);
+    if (stand >= beta) return beta;
+    if (stand > alpha) alpha = stand;
+
+    MoveList ml; genMoves(b, ml);
+    for (int i = 0; i < ml.count; i++) {
+        Move& m = ml.moves[i];
+        bool cap = b.board[m.to()] != NO_PIECE || m.isEP();
+        if (!cap && !m.isPromo()) { m.score = -10000; continue; }
+        int v = m.isEP() ? PAWN : b.board[m.to()];
+        m.score = (int16_t)(pieceVal[v]);
+    }
+    for (int i = 0; i < ml.count; i++) {
+        pickMove(ml, i);
+        if (ml.moves[i].score <= -10000) break;
+        Move m = ml.moves[i];
+        Board::Undo u = makeMove(b, m);
+        if (inCheck(b, b.side^1)) { unmakeMove(b, u); continue; }
+        int score = -quiesce(b, -beta, -alpha, sd);
+        unmakeMove(b, u);
+        if (stopSearch) return 0;
+        if (score >= beta) return beta;
+        if (score > alpha) alpha = score;
+    }
+    return alpha;
+}
+
+int alphaBeta(Board& b, int depth, int alpha, int beta, SearchData& sd, bool doNull = true) {
+    if (stopSearch) return 0;
+    sd.nodeCount++;
+    if ((sd.nodeCount & 4095) == 0 && timeUp()) { stopSearch = true; return 0; }
+
+    bool pvNode = beta - alpha > 1;
+    bool inChk = inCheck(b, b.side);
+    if (inChk) depth++;
+    if (depth <= 0) return quiesce(b, alpha, beta, sd);
+
+    // Draw by 50 move rule
+    if (b.halfmove >= 100) return 0;
+
+    Move ttMove;
+    TTEntry* tte = ttProbe(b.hash);
+    if (tte) {
+        ttMove = tte->bestMove;
+        if (!pvNode && tte->depth >= depth) {
+            if (tte->flag == TT_EXACT) return tte->score;
+            if (tte->flag == TT_ALPHA && tte->score <= alpha) return alpha;
+            if (tte->flag == TT_BETA && tte->score >= beta) return beta;
+        }
+    }
+
+    int staticEval = inChk ? -INF : evaluate(b);
+
+    // Null move pruning
+    if (doNull && !inChk && !pvNode && depth >= 3 && staticEval >= beta
+        && (b.pieces[b.side][KNIGHT]|b.pieces[b.side][BISHOP]|b.pieces[b.side][ROOK]|b.pieces[b.side][QUEEN])) {
+        Board bc = b;
+        bc.side ^= 1; bc.hash ^= zobSide;
+        if (bc.epSq != NO_SQ) { bc.hash ^= zobEP[fileOf(bc.epSq)]; bc.epSq = NO_SQ; }
+        int R = 3 + depth/6;
+        sd.ply++;
+        int score = -alphaBeta(bc, depth-1-R, -beta, -beta+1, sd, false);
+        sd.ply--;
+        if (score >= beta) return beta;
+    }
+
+    // Reverse futility
+    if (!inChk && !pvNode && depth <= 6 && staticEval - 80*depth >= beta) return staticEval;
+
+    MoveList ml; genMoves(b, ml);
+    scoreMoves(ml, b, ttMove, sd);
+
+    Move bestMove;
+    int bestScore = -INF, movesSearched = 0, ttFlag = TT_ALPHA;
+
+    for (int i = 0; i < ml.count; i++) {
+        pickMove(ml, i);
+        Move m = ml.moves[i];
+        Board::Undo u = makeMove(b, m);
+        if (inCheck(b, b.side^1)) { unmakeMove(b, u); continue; }
+
+        sd.ply++;
+        int score;
+        if (movesSearched >= 4 && depth >= 3 && !inChk && !m.isPromo()
+            && b.board[m.to()] == NO_PIECE && !m.isEP() && !inCheck(b, b.side)) {
+            int R = 1 + movesSearched/8;
+            score = -alphaBeta(b, depth-1-R, -alpha-1, -alpha, sd);
+            if (score > alpha) score = -alphaBeta(b, depth-1, -beta, -alpha, sd);
+        } else if (!pvNode || movesSearched > 0) {
+            score = -alphaBeta(b, depth-1, -alpha-1, -alpha, sd);
+            if (pvNode && score > alpha) score = -alphaBeta(b, depth-1, -beta, -alpha, sd);
+        } else {
+            score = -alphaBeta(b, depth-1, -beta, -alpha, sd);
+        }
+        sd.ply--;
+        unmakeMove(b, u);
+        movesSearched++;
+
+        if (stopSearch) return bestScore > -INF ? bestScore : 0;
+
+        if (score > bestScore) {
+            bestScore = score; bestMove = m;
+            if (score > alpha) {
+                alpha = score; ttFlag = TT_EXACT;
+                if (score >= beta) {
+                    if (b.board[m.to()] == NO_PIECE && !m.isEP() && sd.ply < 128) {
+                        sd.killers[sd.ply][1] = sd.killers[sd.ply][0];
+                        sd.killers[sd.ply][0] = m;
+                        sd.history[b.side][m.from()][m.to()] += depth*depth;
+                        if (sd.history[b.side][m.from()][m.to()] > 8000)
+                            for (auto& a:sd.history) for (auto& bb:a) for (auto& c:bb) c/=2;
+                    }
+                    ttStore(b.hash, score, depth, TT_BETA, bestMove);
+                    return score;
+                }
+            }
+        }
+    }
+
+    if (movesSearched == 0) return inChk ? (-MATE + sd.ply) : 0;
+    ttStore(b.hash, bestScore, depth, ttFlag, bestMove);
+    return bestScore;
+}
+
+struct RootResult { Move bestMove; int score = 0; int depth = 0; };
+
+RootResult rootSearch(Board b) {
+    SearchData sd;
+    RootResult result;
+
+    for (int depth = 1; depth <= 100; depth++) {
+        int alpha = -INF, beta = INF;
+        if (depth >= 5) { alpha = result.score - 50; beta = result.score + 50; }
+
+        MoveList ml; genMoves(b, ml);
+        Move ttMove;
+        TTEntry* tte = ttProbe(b.hash);
+        if (tte) ttMove = tte->bestMove;
+        scoreMoves(ml, b, ttMove, sd);
+
+        int bestScore = -INF;
+        Move bestMove;
+        int movesSearched = 0;
+        bool failedAsp = false;
+
+        for (int i = 0; i < ml.count; i++) {
+            pickMove(ml, i);
+            Move m = ml.moves[i];
+            Board::Undo u = makeMove(b, m);
+            if (inCheck(b, b.side^1)) { unmakeMove(b, u); continue; }
+
+            sd.ply = 1;
+            int score;
+            if (movesSearched == 0) score = -alphaBeta(b, depth-1, -beta, -alpha, sd);
+            else {
+                score = -alphaBeta(b, depth-1, -alpha-1, -alpha, sd);
+                if (score > alpha && score < beta) score = -alphaBeta(b, depth-1, -beta, -alpha, sd);
+            }
+            sd.ply = 0;
+            unmakeMove(b, u);
+            movesSearched++;
+
+            if (stopSearch) goto done;
+            if (score > bestScore) {
+                bestScore = score; bestMove = m;
+                if (score > alpha) { alpha = score; if (score >= beta) break; }
+            }
+        }
+
+        if (movesSearched == 0) break;
+
+        // On aspiration fail, just use full window next iteration
+        if (bestScore <= result.score - 50 || bestScore >= result.score + 50) {
+            // Re-search with full window
+            alpha = -INF; beta = INF;
+            bestScore = -INF; movesSearched = 0;
+            scoreMoves(ml, b, ttMove, sd);
+            for (int i = 0; i < ml.count; i++) {
+                pickMove(ml, i);
+                Move m = ml.moves[i];
+                Board::Undo u = makeMove(b, m);
+                if (inCheck(b, b.side^1)) { unmakeMove(b, u); continue; }
+                sd.ply = 1;
+                int score;
+                if (movesSearched == 0) score = -alphaBeta(b, depth-1, -beta, -alpha, sd);
+                else {
+                    score = -alphaBeta(b, depth-1, -alpha-1, -alpha, sd);
+                    if (score > alpha) score = -alphaBeta(b, depth-1, -beta, -alpha, sd);
+                }
+                sd.ply = 0;
+                unmakeMove(b, u);
+                movesSearched++;
+                if (stopSearch) goto done;
+                if (score > bestScore) { bestScore = score; bestMove = m; if (score > alpha) alpha = score; }
+            }
+        }
+
+        result.bestMove = bestMove; result.score = bestScore; result.depth = depth;
+    done:
+        if (stopSearch) break;
+    }
+    return result;
+}
+
+std::string formatMove(const Board& b, Move m) {
+    if (m.isCastle()) return m.to() > m.from() ? "O-O" : "O-O-O";
+
+    std::string res;
+    int from=m.from(), to=m.to(), piece=b.board[from];
+    bool capture = b.board[to] != NO_PIECE || m.isEP();
+    const char pc[] = "pNBRQK";
+    res += pc[piece];
+    res += (char)('a'+fileOf(from)); res += (char)('1'+rankOf(from));
+    if (capture) res += 'x';
+    res += (char)('a'+fileOf(to)); res += (char)('1'+rankOf(to));
+    if (m.isEP()) res += "ep";
+    if (m.isPromo()) { res += '/'; const char pp[] = "NBRQ"; res += pp[m.promo()]; }
+
+    // Check/checkmate detection
+    Board bc = b;
+    Board::Undo u = makeMove(bc, m);
+    if (inCheck(bc, bc.side)) {
+        MoveList ml2; genMoves(bc, ml2);
+        bool hasLegal = false;
+        for (int i = 0; i < ml2.count && !hasLegal; i++) {
+            Board::Undo u2 = makeMove(bc, ml2.moves[i]);
+            if (!inCheck(bc, bc.side^1)) hasLegal = true;
+            unmakeMove(bc, u2);
+        }
+        res += hasLegal ? "+" : "#";
+    }
+    return res;
+}
+
+int main() {
+    initZobrist();
+    initAttacks();
+
+    double timeout;
+    std::string fen;
+    std::cin >> timeout;
+    std::getline(std::cin, fen);
+    std::getline(std::cin, fen);
+
+    Board b = parseFEN(fen);
+    timeLimit = (int64_t)((timeout - 0.5) * 1000);
+    if (timeLimit < 500) timeLimit = 500;
+    searchStart = std::chrono::steady_clock::now();
+    stopSearch = false;
+
+    RootResult r = rootSearch(b);
+    std::cout << formatMove(b, r.bestMove) << std::endl;
+    return 0;
+}

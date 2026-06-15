@@ -32,6 +32,7 @@ tags = [
   "probabilistic reasoning",
 ]
 
+resultFileTypes = ("cs", "csharp")
 # Timeout in seconds (5 minutes)
 TIMEOUT_SECONDS = 30
 

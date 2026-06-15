@@ -49,6 +49,7 @@ tags = [
   "numerical methods",
 ]
 
+resultFileTypes = ("glsl", "frag", "comp", "vert")
 RANDOM_SEED = 46464646
 TIMEOUT_SECONDS = 60
 

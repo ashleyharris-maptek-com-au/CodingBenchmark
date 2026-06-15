@@ -1,0 +1,529 @@
+import math
+
+# Persistent state across calls
+_pid_state = {}
+_prev = {}
+_initialized = False
+_trim_accumulator = 0.0
+_last_valid_alt = None
+_last_valid_ias = None
+_last_valid_hdg = None
+_last_valid_vs = None
+_last_valid_pitch = None
+_last_valid_roll = None
+_last_valid_aoa = None
+_last_valid_mach = None
+_stall_recovery_active = False
+_overspeed_active = False
+_engine_failure_detected = [False, False]
+_last_time = None
+
+
+def _clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+
+def _normalize_angle(a):
+    while a > 180:
+        a -= 360
+    while a < -180:
+        a += 360
+    return a
+
+
+def _median_of_valid(values, valids=None, fallback=None):
+    if valids is not None:
+        filtered = [v for v, ok in zip(values, valids) if ok and v is not None and math.isfinite(v)]
+    else:
+        filtered = [v for v in values if v is not None and math.isfinite(v)]
+    if not filtered:
+        return fallback
+    if len(filtered) == 1:
+        return filtered[0]
+    if len(filtered) == 2:
+        if abs(filtered[0] - filtered[1]) > _outlier_threshold(filtered):
+            return filtered[0]
+        return (filtered[0] + filtered[1]) / 2.0
+    filtered.sort()
+    return filtered[1]
+
+
+def _outlier_threshold(vals):
+    if not vals:
+        return 1e9
+    avg = sum(vals) / len(vals)
+    return max(abs(avg) * 0.15, 50)
+
+
+def _vote_sensor(s, key_prefix, key_suffix, valid_suffix='_valid', count=3, fallback=None):
+    values = []
+    valids = []
+    for i in range(1, count + 1):
+        val = s.get(f'{key_prefix}_{i}_{key_suffix}')
+        valid = s.get(f'{key_prefix}_{i}{valid_suffix}', True)
+        values.append(val)
+        valids.append(valid)
+    return _median_of_valid(values, valids, fallback)
+
+
+def _vote_sensor_simple(s, keys, valid_keys=None, fallback=None):
+    values = [s.get(k) for k in keys]
+    if valid_keys:
+        valids = [s.get(k, True) for k in valid_keys]
+    else:
+        valids = None
+    return _median_of_valid(values, valids, fallback)
+
+
+def _pid(name, error, dt, kp, ki, kd, i_limit=None, d_limit=None, output_limit=None):
+    global _pid_state
+    if name not in _pid_state:
+        _pid_state[name] = {'integral': 0.0, 'prev_error': error, 'prev_output': 0.0}
+    st = _pid_state[name]
+    st['integral'] += error * dt
+    if i_limit is not None:
+        st['integral'] = _clamp(st['integral'], -i_limit, i_limit)
+    derivative = (error - st['prev_error']) / dt if dt > 0 else 0.0
+    if d_limit is not None:
+        derivative = _clamp(derivative, -d_limit, d_limit)
+    st['prev_error'] = error
+    output = kp * error + ki * st['integral'] + kd * derivative
+    if output_limit is not None:
+        output = _clamp(output, -output_limit, output_limit)
+    st['prev_output'] = output
+    return output
+
+
+def _reset_pid(name):
+    global _pid_state
+    if name in _pid_state:
+        _pid_state[name] = {'integral': 0.0, 'prev_error': 0.0, 'prev_output': 0.0}
+
+
+def _fuse_altitude(s):
+    global _last_valid_alt
+    baro = _vote_sensor_simple(s,
+        ['baro_alt_1_ft', 'baro_alt_2_ft', 'baro_alt_3_ft'],
+        ['baro_alt_1_valid', 'baro_alt_2_valid', 'baro_alt_3_valid'])
+    gps_alt = _vote_sensor_simple(s,
+        ['gps_1_alt_ft', 'gps_2_alt_ft', 'gps_3_alt_ft'],
+        ['gps_1_valid', 'gps_2_valid', 'gps_3_valid'])
+    radar = _vote_sensor_simple(s,
+        ['radar_alt_1_ft', 'radar_alt_2_ft', 'radar_alt_3_ft'],
+        ['radar_alt_1_valid', 'radar_alt_2_valid', 'radar_alt_3_valid'])
+    pressure_alt = _vote_sensor_simple(s,
+        ['adc_1_pressure_alt_ft', 'adc_2_pressure_alt_ft', 'adc_3_pressure_alt_ft'],
+        ['adc_1_valid', 'adc_2_valid', 'adc_3_valid'])
+
+    candidates = []
+    if baro is not None:
+        candidates.append(baro)
+    if gps_alt is not None:
+        candidates.append(gps_alt)
+    if pressure_alt is not None:
+        candidates.append(pressure_alt)
+
+    if len(candidates) >= 2:
+        candidates.sort()
+        result = candidates[len(candidates) // 2]
+    elif len(candidates) == 1:
+        result = candidates[0]
+    elif radar is not None:
+        result = radar
+    elif _last_valid_alt is not None:
+        result = _last_valid_alt
+    else:
+        result = s.get('target_alt_ft', 10000)
+
+    _last_valid_alt = result
+    return result, radar
+
+
+def _fuse_airspeed(s):
+    global _last_valid_ias, _last_valid_mach
+    ias = _vote_sensor_simple(s,
+        ['ias_1_kt', 'ias_2_kt', 'ias_3_kt'],
+        ['ias_1_valid', 'ias_2_valid', 'ias_3_valid'])
+
+    if ias is not None and ias > 10:
+        _last_valid_ias = ias
+    elif _last_valid_ias is not None:
+        ias = _last_valid_ias
+    else:
+        gs = s.get('ground_speed_kt')
+        if gs is not None and gs > 10:
+            ias = gs
+        else:
+            ias = s.get('target_ias_kt', 250)
+
+    mach = _vote_sensor_simple(s, ['mach_1', 'mach_2', 'mach_3'])
+    if mach is not None:
+        _last_valid_mach = mach
+    else:
+        mach = _last_valid_mach if _last_valid_mach is not None else 0.0
+
+    tas = _vote_sensor_simple(s, ['tas_1_kt', 'tas_2_kt', 'tas_3_kt'])
+    return ias, mach, tas
+
+
+def _fuse_heading(s):
+    global _last_valid_hdg
+    irs_hdg = _vote_sensor_simple(s,
+        ['irs_1_heading_deg', 'irs_2_heading_deg', 'irs_3_heading_deg'],
+        ['irs_1_valid', 'irs_2_valid', 'irs_3_valid'])
+    mag_hdg = s.get('magnetic_heading_deg')
+    true_hdg = s.get('true_heading_deg')
+    gps_track = _vote_sensor_simple(s,
+        ['gps_1_track_deg', 'gps_2_track_deg', 'gps_3_track_deg'],
+        ['gps_1_valid', 'gps_2_valid', 'gps_3_valid'])
+
+    if irs_hdg is not None:
+        hdg = irs_hdg
+    elif mag_hdg is not None:
+        hdg = mag_hdg
+    elif true_hdg is not None:
+        hdg = true_hdg
+    elif gps_track is not None:
+        hdg = gps_track
+    elif _last_valid_hdg is not None:
+        hdg = _last_valid_hdg
+    else:
+        hdg = s.get('target_hdg_deg', 0)
+
+    _last_valid_hdg = hdg
+    return hdg
+
+
+def _fuse_vs(s):
+    global _last_valid_vs
+    irs_vs = _vote_sensor_simple(s,
+        ['irs_1_vs_fpm', 'irs_2_vs_fpm', 'irs_3_vs_fpm'],
+        ['irs_1_valid', 'irs_2_valid', 'irs_3_valid'])
+    nav_vs = s.get('vertical_speed_fpm')
+    if irs_vs is not None:
+        vs = irs_vs
+    elif nav_vs is not None:
+        vs = nav_vs
+    elif _last_valid_vs is not None:
+        vs = _last_valid_vs
+    else:
+        vs = 0.0
+    _last_valid_vs = vs
+    return vs
+
+
+def _fuse_pitch_roll(s):
+    global _last_valid_pitch, _last_valid_roll
+    pitch = _vote_sensor_simple(s,
+        ['irs_1_pitch_deg', 'irs_2_pitch_deg', 'irs_3_pitch_deg'],
+        ['irs_1_valid', 'irs_2_valid', 'irs_3_valid'])
+    roll = _vote_sensor_simple(s,
+        ['irs_1_roll_deg', 'irs_2_roll_deg', 'irs_3_roll_deg'],
+        ['irs_1_valid', 'irs_2_valid', 'irs_3_valid'])
+    if pitch is not None:
+        _last_valid_pitch = pitch
+    else:
+        pitch = _last_valid_pitch if _last_valid_pitch is not None else 0.0
+    if roll is not None:
+        _last_valid_roll = roll
+    else:
+        roll = _last_valid_roll if _last_valid_roll is not None else 0.0
+    return pitch, roll
+
+
+def _fuse_aoa(s):
+    global _last_valid_aoa
+    aoa = _vote_sensor_simple(s,
+        ['aoa_1_deg', 'aoa_2_deg', 'aoa_3_deg'],
+        ['aoa_1_valid', 'aoa_2_valid', 'aoa_3_valid'])
+    if aoa is not None:
+        _last_valid_aoa = aoa
+    else:
+        aoa = _last_valid_aoa if _last_valid_aoa is not None else 2.0
+    return aoa
+
+
+def _fuse_gyro_rates(s):
+    pitch_rate = _vote_sensor_simple(s,
+        ['gyro_1_pitch_rate_dps', 'gyro_2_pitch_rate_dps', 'gyro_3_pitch_rate_dps'],
+        ['gyro_1_valid', 'gyro_2_valid', 'gyro_3_valid'],
+        fallback=0.0)
+    roll_rate = _vote_sensor_simple(s,
+        ['gyro_1_roll_rate_dps', 'gyro_2_roll_rate_dps', 'gyro_3_roll_rate_dps'],
+        ['gyro_1_valid', 'gyro_2_valid', 'gyro_3_valid'],
+        fallback=0.0)
+    yaw_rate = _vote_sensor_simple(s,
+        ['gyro_1_yaw_rate_dps', 'gyro_2_yaw_rate_dps', 'gyro_3_yaw_rate_dps'],
+        ['gyro_1_valid', 'gyro_2_valid', 'gyro_3_valid'],
+        fallback=0.0)
+    return pitch_rate, roll_rate, yaw_rate
+
+
+def autopilot_step(state: dict, dt: float) -> dict:
+    global _initialized, _trim_accumulator, _stall_recovery_active, _overspeed_active
+    global _engine_failure_detected, _last_time, _pid_state, _prev
+    global _last_valid_alt, _last_valid_ias, _last_valid_hdg, _last_valid_vs
+    global _last_valid_pitch, _last_valid_roll, _last_valid_aoa, _last_valid_mach
+
+    s = state
+    if dt <= 0:
+        dt = 0.05
+
+    sim_time = s.get('sim_time_s', 0)
+    if _last_time is not None and sim_time < _last_time - 1.0:
+        _pid_state = {}
+        _prev = {}
+        _initialized = False
+        _trim_accumulator = 0.0
+        _last_valid_alt = None
+        _last_valid_ias = None
+        _last_valid_hdg = None
+        _last_valid_vs = None
+        _last_valid_pitch = None
+        _last_valid_roll = None
+        _last_valid_aoa = None
+        _last_valid_mach = None
+        _stall_recovery_active = False
+        _overspeed_active = False
+        _engine_failure_detected = [False, False]
+    _last_time = sim_time
+
+    # Sensor fusion
+    alt, radar_alt = _fuse_altitude(s)
+    ias, mach, tas = _fuse_airspeed(s)
+    hdg = _fuse_heading(s)
+    vs = _fuse_vs(s)
+    pitch, roll = _fuse_pitch_roll(s)
+    aoa = _fuse_aoa(s)
+    pitch_rate, roll_rate, yaw_rate = _fuse_gyro_rates(s)
+
+    # Targets
+    target_alt = s.get('target_alt_ft', alt)
+    target_hdg = s.get('target_hdg_deg', hdg)
+    target_ias = s.get('target_ias_kt', 250)
+    target_vs = s.get('target_vs_fpm', 0)
+
+    # Engine status
+    e1_running = s.get('engine_1_running', True)
+    e2_running = s.get('engine_2_running', True)
+    e1_fire = s.get('engine_1_fire', False)
+    e2_fire = s.get('engine_2_fire', False)
+    e1_n1 = s.get('engine_1_n1_pct', 0)
+    e2_n1 = s.get('engine_2_n1_pct', 0)
+
+    e1_failed = (not e1_running) or e1_fire or (e1_n1 is not None and e1_n1 < 5)
+    e2_failed = (not e2_running) or e2_fire or (e2_n1 is not None and e2_n1 < 5)
+    single_engine = e1_failed != e2_failed
+    dual_engine_fail = e1_failed and e2_failed
+
+    if e1_failed:
+        _engine_failure_detected[0] = True
+    if e2_failed:
+        _engine_failure_detected[1] = True
+
+    on_ground = (s.get('weight_on_wheels_left', False) or
+                 s.get('weight_on_wheels_right', False) or
+                 s.get('weight_on_wheels_nose', False))
+
+    # Flap schedule
+    flap_current = max(s.get('flap_pos_left_deg', 0) or 0, s.get('flap_pos_right_deg', 0) or 0)
+    if on_ground:
+        flaps_cmd = flap_current
+    elif radar_alt is not None and radar_alt < 1500:
+        if ias < 180:
+            flaps_cmd = 20
+        elif ias < 210:
+            flaps_cmd = 10
+        else:
+            flaps_cmd = 0
+    elif ias < 160 and alt < 5000:
+        flaps_cmd = 15
+    else:
+        flaps_cmd = 0
+
+    # Gear
+    if on_ground:
+        gear_cmd = 1
+    elif radar_alt is not None and radar_alt < 500:
+        gear_cmd = 1
+    elif alt < target_alt - 500 and vs > 200:
+        gear_cmd = 0
+    elif radar_alt is not None and radar_alt > 1000:
+        gear_cmd = 0
+    else:
+        gear_cmd = 1 if (s.get('gear_handle_down', False)) else 0
+
+    # ---- STALL PROTECTION ----
+    stall_aoa_limit = 14.0 if flaps_cmd < 10 else 18.0
+    stall_speed = 130 if flaps_cmd < 10 else 110
+
+    approaching_stall = (aoa > stall_aoa_limit - 3) or (ias < stall_speed + 10)
+    in_stall = (aoa > stall_aoa_limit) or (ias < stall_speed - 5)
+
+    if in_stall and not on_ground:
+        _stall_recovery_active = True
+    if _stall_recovery_active and aoa < stall_aoa_limit - 5 and ias > stall_speed + 20:
+        _stall_recovery_active = False
+
+    # ---- OVERSPEED PROTECTION ----
+    vne_ias = 365
+    vne_mach = 0.82
+    overspeed = (ias > vne_ias - 5) or (mach > vne_mach - 0.01)
+    if overspeed:
+        _overspeed_active = True
+    if _overspeed_active and ias < vne_ias - 20 and mach < vne_mach - 0.03:
+        _overspeed_active = False
+
+    # ---- ALTITUDE CONTROL ----
+    alt_error = target_alt - alt
+    alt_error = _clamp(alt_error, -5000, 5000)
+
+    if abs(alt_error) < 100:
+        desired_vs = alt_error * 3.0
+    elif abs(alt_error) < 1000:
+        desired_vs = _clamp(alt_error * 2.0, -1500, 1500)
+    else:
+        desired_vs = _clamp(alt_error * 1.0, -2500, 2500)
+
+    if target_vs != 0 and abs(alt_error) > 50:
+        desired_vs = target_vs
+
+    if abs(alt_error) < 30:
+        desired_vs = _clamp(alt_error * 1.5, -200, 200)
+
+    # ---- PITCH CONTROL ----
+    if _stall_recovery_active:
+        desired_pitch = -5.0
+        _reset_pid('vs')
+        _reset_pid('pitch')
+        vs_error = 0
+        pitch_cmd = _pid('pitch_stall', desired_pitch - pitch, dt, 0.06, 0.01, 0.03,
+                         i_limit=5, output_limit=1.0)
+    elif _overspeed_active:
+        desired_pitch = 5.0
+        _reset_pid('vs')
+        pitch_cmd = _pid('pitch_ovspd', desired_pitch - pitch, dt, 0.05, 0.01, 0.03,
+                         i_limit=5, output_limit=1.0)
+    elif on_ground:
+        pitch_cmd = 0.0
+        desired_pitch = pitch
+    else:
+        vs_error = desired_vs - vs
+        desired_pitch_delta = _pid('vs', vs_error, dt, 0.004, 0.001, 0.002,
+                                    i_limit=10, output_limit=15)
+        desired_pitch = _clamp(desired_pitch_delta, -15, 20)
+        pitch_error = desired_pitch - pitch
+        pitch_cmd = _pid('pitch', pitch_error, dt, 0.05, 0.008, 0.035,
+                         i_limit=8, output_limit=1.0)
+
+    pitch_rate_damp = -pitch_rate * 0.015
+    elevator_cmd = _clamp(pitch_cmd + pitch_rate_damp, -1.0, 1.0)
+
+    # ---- TRIM ----
+    if not on_ground:
+        trim_rate = 0.0
+        if abs(elevator_cmd) > 0.1:
+            trim_rate = elevator_cmd * 0.3 * dt
+        _trim_accumulator = _clamp(_trim_accumulator + trim_rate, -1.0, 1.0)
+    trim_cmd = _trim_accumulator
+
+    # ---- HEADING / ROLL CONTROL ----
+    hdg_error = _normalize_angle(target_hdg - hdg)
+
+    if on_ground:
+        desired_roll = 0.0
+    else:
+        bank_limit = 30.0
+        if single_engine:
+            bank_limit = 15.0
+        if approaching_stall:
+            bank_limit = 10.0
+        desired_roll = _clamp(hdg_error * 1.2, -bank_limit, bank_limit)
+        if abs(hdg_error) < 3:
+            desired_roll = hdg_error * 0.8
+
+    roll_error = desired_roll - roll
+    aileron_cmd = _pid('roll', roll_error, dt, 0.03, 0.003, 0.02,
+                       i_limit=5, output_limit=1.0)
+    roll_rate_damp = -roll_rate * 0.01
+    aileron_cmd = _clamp(aileron_cmd + roll_rate_damp, -1.0, 1.0)
+
+    # ---- RUDDER / YAW DAMPER ----
+    rudder_cmd = -yaw_rate * 0.02
+
+    if single_engine and not on_ground:
+        if e1_failed:
+            rudder_cmd += 0.3
+        elif e2_failed:
+            rudder_cmd -= 0.3
+
+        accel_y = _vote_sensor_simple(s,
+            ['accel_1_y_g', 'accel_2_y_g', 'accel_3_y_g'],
+            ['accel_1_valid', 'accel_2_valid', 'accel_3_valid'],
+            fallback=0.0)
+        if accel_y is not None:
+            rudder_cmd -= accel_y * 1.5
+
+    rudder_cmd = _clamp(rudder_cmd, -1.0, 1.0)
+
+    # ---- SPEED CONTROL (AUTOTHROTTLE) ----
+    if _stall_recovery_active:
+        throttle_1_cmd = 0.0 if e1_failed else 1.0
+        throttle_2_cmd = 0.0 if e2_failed else 1.0
+    elif _overspeed_active:
+        throttle_1_cmd = 0.0 if e1_failed else 0.0
+        throttle_2_cmd = 0.0 if e2_failed else 0.0
+    elif dual_engine_fail:
+        throttle_1_cmd = 0.0
+        throttle_2_cmd = 0.0
+    elif on_ground:
+        throttle_1_cmd = s.get('throttle_1_pos', 0)
+        throttle_2_cmd = s.get('throttle_2_pos', 0)
+    else:
+        effective_target = target_ias
+        if effective_target > vne_ias - 15:
+            effective_target = vne_ias - 15
+        if approaching_stall:
+            effective_target = max(effective_target, stall_speed + 20)
+
+        spd_error = effective_target - ias
+        throttle_base = _pid('speed', spd_error, dt, 0.015, 0.004, 0.008,
+                             i_limit=15, output_limit=1.0)
+
+        cruise_throttle = 0.55 if not single_engine else 0.80
+        throttle_val = _clamp(cruise_throttle + throttle_base, 0.05, 1.0)
+
+        if e1_failed:
+            throttle_1_cmd = 0.0
+            throttle_2_cmd = _clamp(throttle_val * 1.1, 0.05, 1.0)
+        elif e2_failed:
+            throttle_1_cmd = _clamp(throttle_val * 1.1, 0.05, 1.0)
+            throttle_2_cmd = 0.0
+        else:
+            throttle_1_cmd = throttle_val
+            throttle_2_cmd = throttle_val
+
+    # ---- SPEEDBRAKE ----
+    speedbrake_cmd = 0.0
+    if _overspeed_active and not on_ground:
+        speedbrake_cmd = 1.0
+    elif not on_ground and ias > target_ias + 30 and not approaching_stall:
+        speedbrake_cmd = _clamp((ias - target_ias - 20) / 30.0, 0, 0.7)
+    elif on_ground and s.get('weight_on_wheels_left') and s.get('weight_on_wheels_right'):
+        if ias > 60:
+            speedbrake_cmd = 1.0
+
+    # ---- BUILD OUTPUT ----
+    out = {
+        'elevator': _clamp(elevator_cmd, -1.0, 1.0),
+        'aileron': _clamp(aileron_cmd, -1.0, 1.0),
+        'rudder': _clamp(rudder_cmd, -1.0, 1.0),
+        'throttle_1': _clamp(throttle_1_cmd, 0.0, 1.0),
+        'throttle_2': _clamp(throttle_2_cmd, 0.0, 1.0),
+        'elevator_trim': _clamp(trim_cmd, -1.0, 1.0),
+        'flaps': _clamp(flaps_cmd, 0, 40),
+        'speedbrake': _clamp(speedbrake_cmd, 0.0, 1.0),
+        'gear': gear_cmd,
+    }
+
+    return out

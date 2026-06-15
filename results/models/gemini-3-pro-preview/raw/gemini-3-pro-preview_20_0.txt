@@ -1,0 +1,818 @@
+/*
+================================================================================
+Robust Spatial Outlier Detection for Drillhole Assay Data
+================================================================================
+
+Design & Optimizations:
+1. Two-Stage Candidate Filtering:
+   - Evaluates each sample against its immediate neighbors in the same hole (above/below).
+   - Only samples that significantly deviate from their intra-hole neighbors (or belong
+     to single-sample holes) are selected as candidate outliers for the 3D spatial search.
+   - This filters out >99% of samples, bypassing expensive 3D queries for typical points.
+
+2. Flat Grid / Voxel Hashing (Cell Link List):
+   - Divides 3D space into voxels of size R x R x R.
+   - Computes grid coordinates in parallel across all cores.
+   - Sorts the cell keys unstably to group samples in the same cell contiguously.
+   - Finds cell boundaries using O(log N) binary search (.partition_point()), avoiding
+     the heap and speed overhead of HashMap structures.
+
+3. Adaptive Radius Estimation:
+   - Estimates sample density and computes the median inter-hole nearest-neighbor distance
+     dynamically by querying a subset of the dataset.
+   - Automatically adapts the search radius to different project scales and layouts.
+
+4. Log-Transform for Skewed Properties:
+   - Automatically detects log-normally distributed properties (like Gold grade)
+     by checking skewness metrics (max-to-median ratio).
+   - Performs validation in log-space, making Z-score and Median Absolute Deviation (MAD)
+     highly robust to grade spikes and preventing false positives.
+
+5. Allocation-Free Inner Loop & Multi-Core Parallelism:
+   - Divides drillholes evenly across all available CPU cores using std::thread::scope.
+   - Reuses pre-allocated vectors for neighbor collections and statistics, achieving
+     zero heap allocations in the validation loop.
+   - Handles NaN/infinite values in coordinates, depths, and properties gracefully.
+*/
+
+use std::io::{self, Read, Write};
+
+// Fast token-based parser for performance and zero-allocation parsing
+struct FastParser<R: Read> {
+    reader: R,
+    buf: Vec<u8>,
+    pos: usize,
+    cap: usize,
+    token_buf: Vec<u8>,
+}
+
+impl<R: Read> FastParser<R> {
+    fn new(reader: R) -> Self {
+        Self {
+            reader,
+            buf: vec![0; 262144], // 256 KB buffer
+            pos: 0,
+            cap: 0,
+            token_buf: Vec::with_capacity(128),
+        }
+    }
+
+    #[inline]
+    fn fill_buf(&mut self) -> bool {
+        if self.pos >= self.cap {
+            match self.reader.read(&mut self.buf) {
+                Ok(n) => {
+                    self.cap = n;
+                    self.pos = 0;
+                    n > 0
+                }
+                Err(_) => false,
+            }
+        } else {
+            true
+        }
+    }
+
+    fn next_token(&mut self) -> Option<&[u8]> {
+        // Skip leading whitespace
+        loop {
+            if self.pos >= self.cap && !self.fill_buf() {
+                return None;
+            }
+            let b = self.buf[self.pos];
+            if !b.is_ascii_whitespace() {
+                break;
+            }
+            self.pos += 1;
+        }
+
+        let start = self.pos;
+        let mut end = start;
+        while end < self.cap {
+            if self.buf[end].is_ascii_whitespace() {
+                self.pos = end;
+                return Some(&self.buf[start..end]);
+            }
+            end += 1;
+        }
+
+        // If token spans across buffer boundary
+        self.token_buf.clear();
+        self.token_buf.extend_from_slice(&self.buf[start..self.cap]);
+        self.pos = self.cap;
+
+        loop {
+            if !self.fill_buf() {
+                break;
+            }
+            let mut end = 0;
+            while end < self.cap {
+                if self.buf[end].is_ascii_whitespace() {
+                    self.token_buf.extend_from_slice(&self.buf[0..end]);
+                    self.pos = end;
+                    return Some(&self.token_buf);
+                }
+                end += 1;
+            }
+            self.token_buf.extend_from_slice(&self.buf[0..self.cap]);
+            self.pos = self.cap;
+        }
+
+        if !self.token_buf.is_empty() {
+            Some(&self.token_buf)
+        } else {
+            None
+        }
+    }
+
+    fn next_f64(&mut self) -> Option<f64> {
+        let tok = self.next_token()?;
+        let s = std::str::from_utf8(tok).ok()?;
+        s.parse::<f64>().ok().or(Some(f64::NAN))
+    }
+
+    fn next_usize(&mut self) -> Option<usize> {
+        let tok = self.next_token()?;
+        let s = std::str::from_utf8(tok).ok()?;
+        s.parse::<usize>().ok()
+    }
+
+    fn next_string(&mut self) -> Option<String> {
+        let tok = self.next_token()?;
+        std::str::from_utf8(tok).ok().map(|s| s.to_string())
+    }
+}
+
+// Flat representation of the drillhole dataset
+struct Dataset {
+    num_properties: usize,
+    property_names: Vec<String>,
+    hole_ids: Vec<String>,
+    
+    // Flat parallel vectors for samples:
+    sample_coords: Vec<[f64; 3]>,
+    sample_properties: Vec<f64>, // size: total_samples * num_properties
+    sample_orig_indices: Vec<usize>,
+    sample_hole_indices: Vec<usize>,
+    
+    // For each hole, the range of samples in the above flat vectors
+    hole_sample_ranges: Vec<std::ops::Range<usize>>,
+}
+
+struct TempSample {
+    orig_idx: usize,
+    depth: f64,
+    coords: [f64; 3],
+    properties: Vec<f64>,
+}
+
+#[derive(Debug)]
+struct GlobalStats {
+    std_dev: f64,
+    median: f64,
+    use_log: bool,
+    log_epsilon: f64,
+}
+
+#[inline]
+fn get_transformed_value(val: f64, stats: &GlobalStats) -> f64 {
+    if val.is_nan() {
+        f64::NAN
+    } else if stats.use_log {
+        (val + stats.log_epsilon).ln()
+    } else {
+        val
+    }
+}
+
+struct Outlier {
+    hole_id: String,
+    sample_idx: usize,
+    property_name: String,
+    confidence: f64,
+}
+
+fn estimate_search_radius(
+    dataset: &Dataset,
+    total_samples: usize,
+) -> f64 {
+    let mut min_x = f64::INFINITY;
+    let mut max_x = f64::NEG_INFINITY;
+    let mut min_y = f64::INFINITY;
+    let mut max_y = f64::NEG_INFINITY;
+    let mut min_z = f64::INFINITY;
+    let mut max_z = f64::NEG_INFINITY;
+
+    for &[x, y, z] in &dataset.sample_coords {
+        if x.is_finite() && y.is_finite() && z.is_finite() {
+            if x < min_x { min_x = x; }
+            if x > max_x { max_x = x; }
+            if y < min_y { min_y = y; }
+            if y > max_y { max_y = y; }
+            if z < min_z { min_z = z; }
+            if z > max_z { max_z = z; }
+        }
+    }
+
+    if min_x.is_infinite() || max_x.is_infinite() || min_y.is_infinite() || max_y.is_infinite() || min_z.is_infinite() || max_z.is_infinite() {
+        return 1.0;
+    }
+
+    let dx = max_x - min_x;
+    let dy = max_y - min_y;
+    let dz = max_z - min_z;
+    let diag = (dx*dx + dy*dy + dz*dz).sqrt();
+
+    if diag < 1e-6 {
+        return 1.0;
+    }
+
+    let vol = dx * dy * dz;
+    let mut d_est = if vol > 0.0 && total_samples > 0 {
+        (vol / total_samples as f64).powf(1.0 / 3.0)
+    } else {
+        diag / (total_samples as f64).sqrt().max(1.0)
+    };
+    if d_est < 1e-5 {
+        d_est = 1e-5;
+    }
+
+    let mut cell_size = d_est;
+    let mut distances = Vec::new();
+
+    for _attempt in 0..3 {
+        let mut sample_cells = Vec::with_capacity(total_samples);
+        for idx in 0..total_samples {
+            let [x, y, z] = dataset.sample_coords[idx];
+            let mut cx = (x / cell_size).floor();
+            let mut cy = (y / cell_size).floor();
+            let mut cz = (z / cell_size).floor();
+            if !cx.is_finite() { cx = 0.0; }
+            if !cy.is_finite() { cy = 0.0; }
+            if !cz.is_finite() { cz = 0.0; }
+            sample_cells.push(((cx as i32, cy as i32, cz as i32), idx));
+        }
+        sample_cells.sort_unstable_by_key(|&((cx, cy, cz), _)| (cx, cy, cz));
+
+        distances.clear();
+        let stride = (total_samples / 500).max(1);
+        
+        for i in (0..total_samples).step_by(stride) {
+            let [sx, sy, sz] = dataset.sample_coords[i];
+            let sh_idx = dataset.sample_hole_indices[i];
+            let mut cx = (sx / cell_size).floor();
+            let mut cy = (sy / cell_size).floor();
+            let mut cz = (sz / cell_size).floor();
+            if !cx.is_finite() { cx = 0.0; }
+            if !cy.is_finite() { cy = 0.0; }
+            if !cz.is_finite() { cz = 0.0; }
+            let cx = cx as i32;
+            let cy = cy as i32;
+            let cz = cz as i32;
+
+            let mut min_dist = f64::INFINITY;
+
+            for dcx in -1..=1 {
+                for dcy in -1..=1 {
+                    for dcz in -1..=1 {
+                        let cell = (cx + dcx, cy + dcy, cz + dcz);
+                        let start = sample_cells.partition_point(|&(c, _)| c < cell);
+                        let end = sample_cells.partition_point(|&(c, _)| c <= cell);
+                        for &(_, other_idx) in &sample_cells[start..end] {
+                            if dataset.sample_hole_indices[other_idx] != sh_idx {
+                                let [ox, oy, oz] = dataset.sample_coords[other_idx];
+                                let dist = ((sx - ox).powi(2) + (sy - oy).powi(2) + (sz - oz).powi(2)).sqrt();
+                                if dist < min_dist {
+                                    min_dist = dist;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if min_dist.is_finite() && min_dist > 1e-7 {
+                distances.push(min_dist);
+            }
+        }
+
+        if distances.len() >= 20 {
+            break;
+        }
+        cell_size *= 3.0;
+    }
+
+    if distances.len() >= 5 {
+        distances.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let median_dist = distances[distances.len() / 2];
+        let radius = 2.5 * median_dist;
+        radius.min(0.2 * diag).max(1e-4)
+    } else {
+        (0.02 * diag).max(1e-4)
+    }
+}
+
+fn compute_intra_z(
+    dataset: &Dataset,
+    sample_idx: usize,
+    prop_idx: usize,
+    stats: &GlobalStats,
+    neighbors: &mut Vec<f64>,
+    diffs: &mut Vec<f64>,
+) -> Option<f64> {
+    let val = get_transformed_value(dataset.sample_properties[sample_idx * dataset.num_properties + prop_idx], stats);
+    if val.is_nan() {
+        return None;
+    }
+
+    let h_idx = dataset.sample_hole_indices[sample_idx];
+    let range = &dataset.hole_sample_ranges[h_idx];
+    
+    if range.len() <= 1 {
+        return None;
+    }
+
+    neighbors.clear();
+    for offset in &[-2, -1, 1, 2] {
+        let n_idx_i = sample_idx as isize + offset;
+        if n_idx_i >= range.start as isize && n_idx_i < range.end as isize {
+            let n_idx = n_idx_i as usize;
+            let n_val = get_transformed_value(dataset.sample_properties[n_idx * dataset.num_properties + prop_idx], stats);
+            if !n_val.is_nan() {
+                neighbors.push(n_val);
+            }
+        }
+    }
+
+    if neighbors.is_empty() {
+        return None;
+    }
+
+    neighbors.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let median_n = neighbors[neighbors.len() / 2];
+
+    diffs.clear();
+    for &x in neighbors.iter() {
+        diffs.push((x - median_n).abs());
+    }
+    diffs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let mad_n = diffs[diffs.len() / 2];
+
+    let epsilon = 0.1;
+    let min_abs = 1e-5 * (stats.median.abs() + 1.0);
+    let denom = mad_n.max(epsilon * stats.std_dev).max(min_abs);
+
+    let z = (val - median_n).abs() / denom;
+    Some(z)
+}
+
+fn compute_spatial_z(
+    dataset: &Dataset,
+    sample_idx: usize,
+    prop_idx: usize,
+    stats: &GlobalStats,
+    sample_cells: &[((i32, i32, i32), usize)],
+    cell_size: f64,
+    radius: f64,
+    spatial_vals: &mut Vec<f64>,
+    diffs: &mut Vec<f64>,
+) -> Option<f64> {
+    let val = get_transformed_value(dataset.sample_properties[sample_idx * dataset.num_properties + prop_idx], stats);
+    if val.is_nan() {
+        return None;
+    }
+
+    let [sx, sy, sz] = dataset.sample_coords[sample_idx];
+    let sh_idx = dataset.sample_hole_indices[sample_idx];
+    
+    let mut cx = (sx / cell_size).floor();
+    let mut cy = (sy / cell_size).floor();
+    let mut cz = (sz / cell_size).floor();
+    if !cx.is_finite() { cx = 0.0; }
+    if !cy.is_finite() { cy = 0.0; }
+    if !cz.is_finite() { cz = 0.0; }
+    let cx = cx as i32;
+    let cy = cy as i32;
+    let cz = cz as i32;
+
+    spatial_vals.clear();
+
+    for dcx in -1..=1 {
+        for dcy in -1..=1 {
+            for dcz in -1..=1 {
+                let cell = (cx + dcx, cy + dcy, cz + dcz);
+                let start = sample_cells.partition_point(|&(c, _)| c < cell);
+                let end = sample_cells.partition_point(|&(c, _)| c <= cell);
+                for &(_, other_idx) in &sample_cells[start..end] {
+                    if dataset.sample_hole_indices[other_idx] != sh_idx {
+                        let [ox, oy, oz] = dataset.sample_coords[other_idx];
+                        let dist_sq = (sx - ox).powi(2) + (sy - oy).powi(2) + (sz - oz).powi(2);
+                        if dist_sq <= radius * radius {
+                            let oval = get_transformed_value(dataset.sample_properties[other_idx * dataset.num_properties + prop_idx], stats);
+                            if !oval.is_nan() {
+                                spatial_vals.push(oval);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if spatial_vals.len() < 3 {
+        return None;
+    }
+
+    spatial_vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let median_s = spatial_vals[spatial_vals.len() / 2];
+
+    diffs.clear();
+    for &x in spatial_vals.iter() {
+        diffs.push((x - median_s).abs());
+    }
+    diffs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let mad_s = diffs[diffs.len() / 2];
+
+    let epsilon = 0.1;
+    let min_abs = 1e-5 * (stats.median.abs() + 1.0);
+    let denom = mad_s.max(epsilon * stats.std_dev).max(min_abs);
+
+    let z = (val - median_s).abs() / denom;
+    Some(z)
+}
+
+fn main() -> io::Result<()> {
+    let stdin = io::stdin();
+    let mut parser = FastParser::new(stdin.lock());
+
+    let num_holes = match parser.next_usize() {
+        Some(n) => n,
+        None => return Ok(()),
+    };
+    let num_properties = match parser.next_usize() {
+        Some(n) => n,
+        None => return Ok(()),
+    };
+
+    let mut property_names = Vec::with_capacity(num_properties);
+    for _ in 0..num_properties {
+        property_names.push(parser.next_string().unwrap_or_else(|| "unknown".to_string()));
+    }
+
+    let mut hole_ids = Vec::with_capacity(num_holes);
+    let mut sample_coords = Vec::new();
+    let mut sample_properties = Vec::new();
+    let mut sample_orig_indices = Vec::new();
+    let mut sample_hole_indices = Vec::new();
+    let mut hole_sample_ranges = Vec::with_capacity(num_holes);
+
+    for _ in 0..num_holes {
+        let hole_id = match parser.next_string() {
+            Some(id) => id,
+            None => break,
+        };
+        let start_x = parser.next_f64().unwrap_or(0.0);
+        let start_y = parser.next_f64().unwrap_or(0.0);
+        let start_z = parser.next_f64().unwrap_or(0.0);
+        let dir_x = parser.next_f64().unwrap_or(0.0);
+        let dir_y = parser.next_f64().unwrap_or(0.0);
+        let dir_z = parser.next_f64().unwrap_or(0.0);
+        let _length = parser.next_f64().unwrap_or(0.0);
+        let num_samples = parser.next_usize().unwrap_or(0);
+
+        let dir_len = (dir_x*dir_x + dir_y*dir_y + dir_z*dir_z).sqrt();
+        let norm_dir = if dir_len > 1e-6 {
+            [dir_x / dir_len, dir_y / dir_len, dir_z / dir_len]
+        } else {
+            [0.0, 0.0, 0.0]
+        };
+
+        let hole_idx = hole_ids.len();
+        hole_ids.push(hole_id);
+
+        let mut temp_samples = Vec::with_capacity(num_samples);
+        for orig_idx in 0..num_samples {
+            let depth = match parser.next_f64() {
+                Some(d) => d,
+                None => break,
+            };
+            let mut props = Vec::with_capacity(num_properties);
+            for _ in 0..num_properties {
+                props.push(parser.next_f64().unwrap_or(f64::NAN));
+            }
+
+            let coords = if dir_len > 1e-6 && start_x.is_finite() && start_y.is_finite() && start_z.is_finite() && norm_dir[0].is_finite() && norm_dir[1].is_finite() && norm_dir[2].is_finite() && depth.is_finite() {
+                [
+                    start_x + depth * norm_dir[0],
+                    start_y + depth * norm_dir[1],
+                    start_z + depth * norm_dir[2],
+                ]
+            } else {
+                [start_x, start_y, start_z]
+            };
+
+            temp_samples.push(TempSample {
+                orig_idx,
+                depth,
+                coords,
+                properties: props,
+            });
+        }
+
+        // Sort by depth then by orig_idx
+        temp_samples.sort_by(|a, b| {
+            a.depth.partial_cmp(&b.depth)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.orig_idx.cmp(&b.orig_idx))
+        });
+
+        // Deduplicate identical depth/props samples
+        temp_samples.dedup_by(|a, b| {
+            if (a.depth - b.depth).abs() < 1e-7 {
+                a.properties.iter().zip(b.properties.iter()).all(|(&x, &y)| {
+                    (x.is_nan() && y.is_nan()) || (x - y).abs() < 1e-7
+                })
+            } else {
+                false
+            }
+        });
+
+        let start_range = sample_coords.len();
+        for ts in temp_samples {
+            sample_coords.push(ts.coords);
+            sample_properties.extend(ts.properties);
+            sample_orig_indices.push(ts.orig_idx);
+            sample_hole_indices.push(hole_idx);
+        }
+        let end_range = sample_coords.len();
+        hole_sample_ranges.push(start_range..end_range);
+    }
+
+    let total_samples = sample_coords.len();
+    if total_samples == 0 {
+        println!("0");
+        return Ok(());
+    }
+
+    let dataset = Dataset {
+        num_properties,
+        property_names,
+        hole_ids,
+        sample_coords,
+        sample_properties,
+        sample_orig_indices,
+        sample_hole_indices,
+        hole_sample_ranges,
+    };
+
+    // Calculate global stats for each property
+    let mut property_stats = Vec::with_capacity(num_properties);
+    for prop_idx in 0..num_properties {
+        let mut sum = 0.0;
+        let mut sum_sq = 0.0;
+        let mut count = 0;
+        let mut min_val = f64::INFINITY;
+        let mut max_val = f64::NEG_INFINITY;
+
+        for sample_idx in 0..total_samples {
+            let val = dataset.sample_properties[sample_idx * num_properties + prop_idx];
+            if !val.is_nan() {
+                sum += val;
+                sum_sq += val * val;
+                count += 1;
+                if val < min_val { min_val = val; }
+                if val > max_val { max_val = val; }
+            }
+        }
+
+        if count == 0 {
+            property_stats.push(GlobalStats {
+                std_dev: 1.0,
+                median: 0.0,
+                use_log: false,
+                log_epsilon: 0.0,
+            });
+            continue;
+        }
+
+        let mean = sum / count as f64;
+        let var = (sum_sq / count as f64 - mean * mean).max(0.0);
+        let std_dev = var.sqrt();
+
+        let mut sample_values = Vec::new();
+        if count <= 100000 {
+            sample_values.reserve(count);
+            for sample_idx in 0..total_samples {
+                let val = dataset.sample_properties[sample_idx * num_properties + prop_idx];
+                if !val.is_nan() {
+                    sample_values.push(val);
+                }
+            }
+        } else {
+            sample_values.reserve(100000);
+            let stride = count / 100000;
+            let mut c = 0;
+            for sample_idx in 0..total_samples {
+                let val = dataset.sample_properties[sample_idx * num_properties + prop_idx];
+                if !val.is_nan() {
+                    if c % stride == 0 && sample_values.len() < 100000 {
+                        sample_values.push(val);
+                    }
+                    c += 1;
+                }
+            }
+        }
+
+        sample_values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let median = if sample_values.is_empty() {
+            0.0
+        } else {
+            sample_values[sample_values.len() / 2]
+        };
+
+        let mut use_log = false;
+        let mut log_epsilon = 0.0;
+        if min_val >= 0.0 && median > 1e-4 && (max_val / median) > 50.0 {
+            use_log = true;
+            log_epsilon = 1e-5 * median;
+        }
+
+        if use_log {
+            let mut sum_log = 0.0;
+            let mut sum_sq_log = 0.0;
+            let mut log_samples = Vec::with_capacity(sample_values.len());
+            for &v in &sample_values {
+                let lv = (v + log_epsilon).ln();
+                log_samples.push(lv);
+            }
+            log_samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let median_log = log_samples[log_samples.len() / 2];
+
+            for sample_idx in 0..total_samples {
+                let val = dataset.sample_properties[sample_idx * num_properties + prop_idx];
+                if !val.is_nan() {
+                    let lv = (val + log_epsilon).ln();
+                    sum_log += lv;
+                    sum_sq_log += lv * lv;
+                }
+            }
+            let mean_log = sum_log / count as f64;
+            let var_log = (sum_sq_log / count as f64 - mean_log * mean_log).max(0.0);
+            let std_dev_log = var_log.sqrt();
+
+            property_stats.push(GlobalStats {
+                std_dev: std_dev_log,
+                median: median_log,
+                use_log: true,
+                log_epsilon,
+            });
+        } else {
+            property_stats.push(GlobalStats {
+                std_dev,
+                median,
+                use_log: false,
+                log_epsilon: 0.0,
+            });
+        }
+    }
+
+    // Estimate spatial search radius
+    let cell_size = estimate_search_radius(&dataset, total_samples);
+    let radius = cell_size;
+
+    // Build the final spatial grid keys
+    let num_cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    let mut sample_cells = vec![((0, 0, 0), 0); total_samples];
+
+    std::thread::scope(|s| {
+        let chunk_size = (total_samples + num_cores - 1) / num_cores;
+        let mut chunks = sample_cells.chunks_mut(chunk_size);
+        for thread_idx in 0..num_cores {
+            if let Some(chunk) = chunks.next() {
+                let start_sample_idx = thread_idx * chunk_size;
+                let dataset_ref = &dataset;
+                s.spawn(move || {
+                    for (offset, item) in chunk.iter_mut().enumerate() {
+                        let idx = start_sample_idx + offset;
+                        let [x, y, z] = dataset_ref.sample_coords[idx];
+                        let mut cx = (x / cell_size).floor();
+                        let mut cy = (y / cell_size).floor();
+                        let mut cz = (z / cell_size).floor();
+                        if !cx.is_finite() { cx = 0.0; }
+                        if !cy.is_finite() { cy = 0.0; }
+                        if !cz.is_finite() { cz = 0.0; }
+                        *item = ((cx as i32, cy as i32, cz as i32), idx);
+                    }
+                });
+            }
+        }
+    });
+
+    sample_cells.sort_unstable_by_key(|&((cx, cy, cz), _)| (cx, cy, cz));
+
+    // Outlier validation in parallel
+    let mut thread_results = Vec::new();
+    std::thread::scope(|s| {
+        let chunk_size = (dataset.hole_ids.len() + num_cores - 1) / num_cores;
+        let mut threads = Vec::new();
+
+        for thread_idx in 0..num_cores {
+            let start_hole = thread_idx * chunk_size;
+            let end_hole = (start_hole + chunk_size).min(dataset.hole_ids.len());
+            if start_hole >= end_hole {
+                continue;
+            }
+
+            let dataset_ref = &dataset;
+            let stats_ref = &property_stats;
+            let sample_cells_ref = &sample_cells;
+
+            let handle = s.spawn(move || {
+                let mut spatial_vals = Vec::with_capacity(128);
+                let mut neighbors = Vec::with_capacity(8);
+                let mut diffs = Vec::with_capacity(128);
+                let mut local_outliers = Vec::new();
+
+                for h_idx in start_hole..end_hole {
+                    let range = &dataset_ref.hole_sample_ranges[h_idx];
+                    for sample_idx in range.clone() {
+                        let orig_idx = dataset_ref.sample_orig_indices[sample_idx];
+                        for prop_idx in 0..num_properties {
+                            // 1. Calculate intra Z-score
+                            let z_intra = compute_intra_z(
+                                dataset_ref,
+                                sample_idx,
+                                prop_idx,
+                                &stats_ref[prop_idx],
+                                &mut neighbors,
+                                &mut diffs,
+                            );
+
+                            // Candidate check
+                            let is_candidate = match z_intra {
+                                None => true, // Single sample hole or no valid neighbors
+                                Some(z) => z > 4.5,
+                            };
+
+                            if is_candidate {
+                                // 2. Calculate spatial Z-score
+                                let z_spatial = compute_spatial_z(
+                                    dataset_ref,
+                                    sample_idx,
+                                    prop_idx,
+                                    &stats_ref[prop_idx],
+                                    sample_cells_ref,
+                                    cell_size,
+                                    radius,
+                                    &mut spatial_vals,
+                                    &mut diffs,
+                                );
+
+                                let confidence = match (z_intra, z_spatial) {
+                                    (Some(zi), Some(zs)) => zi.min(zs),
+                                    (Some(zi), None) => zi, // no spatial context, rely on intra
+                                    (None, Some(zs)) => zs, // single sample hole, rely on spatial
+                                    (None, None) => 0.0,    // no context at all
+                                };
+
+                                if confidence > 4.5 {
+                                    local_outliers.push(Outlier {
+                                        hole_id: dataset_ref.hole_ids[h_idx].clone(),
+                                        sample_idx: orig_idx,
+                                        property_name: dataset_ref.property_names[prop_idx].clone(),
+                                        confidence,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+                local_outliers
+            });
+            threads.push(handle);
+        }
+
+        for handle in threads {
+            if let Ok(res) = handle.join() {
+                thread_results.extend(res);
+            }
+        }
+    });
+
+    // Sort suspects by confidence desc
+    thread_results.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Output to stdout
+    let stdout = io::stdout();
+    let mut out = io::BufWriter::new(stdout.lock());
+    writeln!(out, "{}", thread_results.len())?;
+    for outlier in thread_results {
+        writeln!(
+            out,
+            "{} {} {} {:.2}",
+            outlier.hole_id, outlier.sample_idx, outlier.property_name, outlier.confidence
+        )?;
+    }
+
+    Ok(())
+}

@@ -22,6 +22,7 @@ tags = [
   "real-time decisions",
 ]
 
+resultFileTypes = ("cs", "csharp")
 # Timeout in seconds (5 minutes)
 TIMEOUT_SECONDS = 300
 

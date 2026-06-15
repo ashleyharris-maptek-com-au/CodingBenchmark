@@ -42,6 +42,7 @@ tags = [
   "combinatorial optimization",
 ]
 
+resultFileTypes = ("cs", "csharp")
 TIMEOUT_SECONDS = 300
 RANDOM_SEED = 19191919
 

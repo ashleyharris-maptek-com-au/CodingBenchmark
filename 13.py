@@ -27,6 +27,7 @@ tags = [
   "large-scale input",
 ]
 
+resultFileTypes = ("cpp", "cc", "cxx", "c++", "c", "h", "hpp", "hh", "hxx")
 # Timeout in seconds (0.5 minutes)
 TIMEOUT_SECONDS = 300
 

@@ -1,0 +1,301 @@
+```rust
+use std::io::{self, BufRead, BufReader, Write};
+use std::collections::{VecDeque, HashSet};
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
+
+const UPDATE_INTERVAL: Duration = Duration::from_millis(100);
+const MIN_OUTPUT_HZ: f64 = 20.0;
+const MIN_OUTPUT_INTERVAL: Duration = Duration::from_secs_f64(1.0 / MIN_OUTPUT_HZ);
+const LANDER_SIZE: f64 = 1.0;
+const SAFE_VELOCITY: f64 = 2.0;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Vec2 {
+    x: f64,
+    y: f64,
+}
+
+impl Vec2 {
+    fn new(x: f64, y: f64) -> Self { Self { x, y } }
+    fn magnitude(self) -> f64 { self.x.hypot(self.y) }
+    fn dot(self, other: Self) -> f64 { self.x * other.x + self.y * other.y }
+    fn normalize(self) -> Self {
+        let m = self.magnitude();
+        if m < 1e-6 { Self::new(0.0, 0.0) } else { Self::new(self.x / m, self.y / m) }
+    }
+    fn rotate(self, angle: f64) -> Self {
+        let cos = angle.cos();
+        let sin = angle.sin();
+        Self::new(
+            self.x * cos - self.y * sin,
+            self.x * sin + self.y * cos,
+        )
+    }
+}
+
+struct Map {
+    width: usize,
+    height: usize,
+    gravity: f64,
+    max_thrust: f64,
+    fuel: f64,
+    start: Vec2,
+    target: Vec2,
+    obstacles: HashSet<(usize, usize)>,
+    landing_zone: HashSet<(usize, usize)>,
+}
+
+impl Map {
+    fn is_obstacle(&self, x: f64, y: f64) -> bool {
+        let ix = x.floor() as isize;
+        let iy = y.floor() as isize;
+        if ix < 0 || iy < 0 || ix >= self.width as isize || iy >= self.height as isize {
+            return true;
+        }
+        self.obstacles.contains(&(ix as usize, iy as usize))
+    }
+
+    fn is_in_landing_zone(&self, x: f64, y: f64) -> bool {
+        let ix = x.floor() as isize;
+        let iy = y.floor() as isize;
+        if ix < 0 || iy < 0 || ix >= self.width as isize || iy >= self.height as isize {
+            return false;
+        }
+        self.landing_zone.contains(&(ix as usize, iy as usize))
+    }
+}
+
+struct State {
+    pos: Vec2,
+    vel: Vec2,
+    angle: f64,
+    angular_vel: f64,
+    fuel: f64,
+}
+
+struct Controller {
+    map: Map,
+    state: Option<State>,
+    last_output: std::time::Instant,
+    command_tx: mpsc::Sender<(f64, f64)>,
+    shutdown_tx: Option<mpsc::Sender<()>>,
+    worker_handle: Option<thread::JoinHandle<()>>,
+}
+
+impl Controller {
+    fn new(map: Map) -> Self {
+        let (command_tx, command_rx) = mpsc::channel();
+        let (shutdown_tx, shutdown_rx) = mpsc::channel();
+
+        let worker_handle = thread::spawn(move || {
+            let mut last_command = (0.0, 0.0);
+            loop {
+                // Non-blocking receive with timeout to check for shutdown
+                match command_rx.recv_timeout(UPDATE_INTERVAL) {
+                    Ok((thrust, turn)) => {
+                        last_command = (thrust, turn);
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        // Use last command
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+
+                // Output at minimum 20Hz
+                println!("{} {}", last_command.0, last_command.1);
+                io::stdout().flush().unwrap();
+
+                // Sleep until next output interval
+                thread::sleep(MIN_OUTPUT_INTERVAL);
+            }
+        });
+
+        Self {
+            map,
+            state: None,
+            last_output: std::time::Instant::now(),
+            command_tx,
+            shutdown_tx: Some(shutdown_tx),
+            worker_handle: Some(worker_handle),
+        }
+    }
+
+    fn update_state(&mut self, x: f64, y: f64, vx: f64, vy: f64, angle: f64, angular_vel: f64, fuel: f64) {
+        self.state = Some(State {
+            pos: Vec2::new(x, y),
+            vel: Vec2::new(vx, vy),
+            angle,
+            angular_vel,
+            fuel,
+        });
+    }
+
+    fn compute_control(&self, state: &State) -> (f64, f64) {
+        // Simple PD controller for position and velocity
+        let target_pos = self.map.target;
+        let pos_error = Vec2::new(target_pos.x - state.pos.x, target_pos.y - state.pos.y);
+        let vel_error = Vec2::new(0.0 - state.vel.x, 0.0 - state.vel.y); // Target zero velocity
+
+        // Proportional gains
+        let kp_pos = 0.5;
+        let kd_vel = 0.8;
+
+        // Desired acceleration in world frame
+        let desired_acc = Vec2::new(
+            kp_pos * pos_error.x + kd_vel * vel_error.x,
+            kp_pos * pos_error.y + kd_vel * vel_error.y,
+        );
+
+        // Compensate for gravity
+        let gravity_acc = Vec2::new(0.0, self.map.gravity);
+        let required_acc = Vec2::new(
+            desired_acc.x - gravity_acc.x,
+            desired_acc.y - gravity_acc.y,
+        );
+
+        // Convert required acceleration to thrust direction
+        let thrust_dir = Vec2::new(state.angle.cos(), state.angle.sin()); // Facing direction
+        let thrust_mag = required_acc.dot(thrust_dir);
+
+        // Clamp thrust
+        let thrust = thrust_mag.max(0.0).min(1.0);
+
+        // Turning control: align to face target
+        let to_target = Vec2::new(target_pos.x - state.pos.x, target_pos.y - state.pos.y);
+        let target_angle = to_target.y.atan2(to_target.x); // atan2(y, x) for standard math
+        // Note: In our coordinate system, y increases downward, angle 0 is up.
+        // So we need to adjust: standard math angle 0 is right (east), up is -pi/2.
+        // But input says: angle 0 is facing up. So:
+        //   Our state.angle: 0 = up, + = clockwise.
+        //   Standard math: 0 = right (east), + = counterclockwise.
+        // Conversion: standard_angle = -state.angle + pi/2
+        // But we want to compute error in standard math.
+        let standard_state_angle = -state.angle + std::f64::consts::PI / 2.0;
+        let standard_target_angle = target_angle; // atan2(dy, dx) in standard math (y up)
+        let mut angle_error = standard_target_angle - standard_state_angle;
+        // Normalize to [-pi, pi]
+        while angle_error > std::f64::consts::PI { angle_error -= 2.0 * std::f64::consts::PI; }
+        while angle_error < -std::f64::consts::PI { angle_error += 2.0 * std::f64::consts::PI; }
+
+        // Proportional turning
+        let kp_turn = 2.0;
+        let turn = (kp_turn * angle_error).clamp(-1.0, 1.0);
+
+        (thrust, turn)
+    }
+
+    fn run(&mut self) {
+        let stdin = io::stdin();
+        let mut handle = io::BufReader::new(stdin).lines();
+
+        // Read header
+        if let Some(Ok(line)) = handle.next() {
+            let parts: Vec<f64> = line.split_whitespace().filter_map(|s| s.parse().ok()).collect();
+            if parts.len() < 5 {
+                eprintln!("Invalid header");
+                return;
+            }
+            let width = parts[0] as usize;
+            let height = parts[1] as usize;
+            let gravity = parts[2];
+            let max_thrust = parts[3];
+            let fuel = parts[4];
+
+            // Read second line
+            if let Some(Ok(line)) = handle.next() {
+                let parts: Vec<f64> = line.split_whitespace().filter_map(|s| s.parse().ok()).collect();
+                if parts.len() < 4 {
+                    eprintln!("Invalid start/target line");
+                    return;
+                }
+                let start_x = parts[0];
+                let start_y = parts[1];
+                let target_x = parts[2];
+                let target_y = parts[3];
+
+                // Read map
+                let mut obstacles = HashSet::new();
+                let mut landing_zone = HashSet::new();
+                let mut y = 0;
+                for line in handle.flatten() {
+                    if y >= height { break; }
+                    for (x, c) in line.chars().enumerate() {
+                        if x >= width { break; }
+                        match c {
+                            '#' => { obstacles.insert((x, y)); }
+                            'S' => {} // Start already read
+                            'T' => {} // Target already read
+                            'L' => { landing_zone.insert((x, y)); }
+                            _ => {} // '.' or others
+                        }
+                    }
+                    y += 1;
+                }
+
+                self.map = Map {
+                    width,
+                    height,
+                    gravity,
+                    max_thrust,
+                    fuel,
+                    start: Vec2::new(start_x, start_y),
+                    target: Vec2::new(target_x, target_y),
+                    obstacles,
+                    landing_zone,
+                };
+            }
+        }
+
+        // Main loop: read state updates and send to worker
+        for line in handle.flatten() {
+            let parts: Vec<f64> = line.split_whitespace().filter_map(|s| s.parse().ok()).collect();
+            if parts.len() < 7 {
+                continue; // Skip invalid lines
+            }
+            let x = parts[0];
+            let y = parts[1];
+            let vx = parts[2];
+            let vy = parts[3];
+            let angle = parts[4];
+            let angular_vel = parts[5];
+            let fuel = parts[6];
+
+            self.update_state(x, y, vx, vy, angle, angular_vel, fuel);
+
+            if let Some(state) = &self.state {
+                let (thrust, turn) = self.compute_control(state);
+                // Non-blocking send to worker; if channel is full, we drop the frame
+                let _ = self.command_tx.try_send((thrust, turn));
+            }
+        }
+
+        // Shutdown worker
+        if let Some(shutdown_tx) = self.shutdown_tx.take() {
+            let _ = shutdown_tx.send(());
+        }
+        if let Some(handle) = self.worker_handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn main() {
+    // Start with a dummy map; will be overwritten by input
+    let dummy_map = Map {
+        width: 100,
+        height: 50,
+        gravity: 1.62, // Lunar gravity
+        max_thrust: 5.0,
+        fuel: 100.0,
+        start: Vec2::new(0.0, 0.0),
+        target: Vec2::new(50.0, 25.0),
+        obstacles: HashSet::new(),
+        landing_zone: HashSet::new(),
+    };
+
+    let mut controller = Controller::new(dummy_map);
+    controller.run();
+}
+```

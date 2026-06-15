@@ -28,6 +28,8 @@ tags = [
   "branch and bound",
   "combinatorial search",
 ]
+
+resultFileTypes = ("cpp", "cc", "cxx", "c++", "c", "h", "hpp", "hh", "hxx")
 TIMEOUT_SECONDS = 30
 RANDOM_SEED = 36363636
 

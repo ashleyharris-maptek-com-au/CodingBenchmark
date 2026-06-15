@@ -31,6 +31,8 @@ tags = [
   "set cover",
   "approximation algorithms",
 ]
+
+resultFileTypes = ("rs", "rust")
 TIMEOUT_SECONDS = 30
 RANDOM_SEED = 35353535
 

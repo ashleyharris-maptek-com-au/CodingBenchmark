@@ -50,6 +50,7 @@ tags = [
   "visual synthesis",
 ]
 
+resultFileTypes = ("hex", "spvhex", "spirvhex", "spirv", "spv")
 TIMEOUT_SECONDS = 60
 
 # ---------------------------------------------------------------------------
