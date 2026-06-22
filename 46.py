@@ -431,7 +431,7 @@ def _load_cpu_reference(n, timesteps, dt, softening):
   if cache_path.exists():
     try:
       data = np.load(cache_path)
-      ref_bodies = data["bodies"]
+      ref_bodies = [tuple(x) for x in data["bodies"]]
       _ref_cache[key] = ref_bodies
       if _CACHE_DEBUG:
         print(f"[cache46] cpu_ref hit (disk) {cache_path}")
@@ -623,6 +623,21 @@ def gradeAnswer(result, subPass, aiEngineName):
       return 0.0, f"Failed to read subprocess result: {e}"
 
 
+def _sanitize_json(obj):
+  if isinstance(obj, dict):
+    return {k: _sanitize_json(v) for k, v in obj.items()}
+  elif isinstance(obj, list):
+    return [_sanitize_json(x) for x in obj]
+  elif isinstance(obj, tuple):
+    return tuple(_sanitize_json(x) for x in obj)
+  elif np is not None and isinstance(obj, np.ndarray):
+    return _sanitize_json(obj.tolist())
+  elif np is not None and isinstance(obj, (np.void, np.number)):
+    return obj.item()
+  else:
+    return obj
+
+
 def _run_grade_subprocess(in_path: str, out_path: str) -> int:
   try:
     with open(in_path, "r", encoding="utf-8") as f:
@@ -631,10 +646,13 @@ def _run_grade_subprocess(in_path: str, out_path: str) -> int:
     subPass = int(payload.get("subPass", 0))
     aiEngineName = payload.get("aiEngineName", "")
     score, explanation, details = _grade_answer_inner(result, subPass, aiEngineName)
+    sanitized_details = _sanitize_json(details)
     with open(out_path, "w", encoding="utf-8") as f:
-      json.dump({"score": score, "explanation": explanation, "details": details}, f)
+      json.dump({"score": score, "explanation": explanation, "details": sanitized_details}, f)
     return 0
   except Exception as e:
+    import traceback
+    traceback.print_exc()
     try:
       with open(out_path, "w", encoding="utf-8") as f:
         json.dump({"score": 0.0, "explanation": f"Subprocess error: {e}",
