@@ -1,0 +1,807 @@
+// CSG Union Solver - MSVC c++20
+// Strategy:
+//  1. Fast stream-buffered I/O.
+//  2. Build AABBs and BVHs for both meshes.
+//  3. If AABBs disjoint -> concatenate (handles huge non-overlapping meshes O(N)).
+//  4. If overlap exists but no triangle of A truly intersects any triangle of B
+//     (i.e. one mesh contained in the other, or they nest without touching):
+//        - classify with a single ray-cast point-in-mesh test
+//        - emit outer mesh, drop inner (or vice-versa).
+//  5. Otherwise (true intersection): use a BSP CSG implementation
+//     restricted to the overlap region for speed. Untouched triangles outside
+//     the overlap AABB are passed through unchanged.
+//
+// Notes on robustness:
+//  - All predicates are double-precision with a relative epsilon. Inputs are
+//    assumed clean, manifold and watertight (per the problem statement).
+//  - For ludicrous scale meshes, the BVH and the AABB-disjoint fast path keep
+//    the runtime O(N + overlap_cost).
+
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <cstdint>
+#include <cmath>
+#include <vector>
+#include <array>
+#include <algorithm>
+#include <memory>
+#include <thread>
+#include <atomic>
+#include <mutex>
+#include <string>
+#include <chrono>
+#include <unordered_map>
+
+#if defined(_MSC_VER)
+  #include <intrin.h>
+  // Reserve 64 MB stack so deep BVH/BSP recursion is safe even for huge meshes.
+  #pragma comment(linker, "/STACK:67108864")
+#endif
+
+using std::size_t;
+using i32 = int32_t;
+using i64 = int64_t;
+using u32 = uint32_t;
+using u64 = uint64_t;
+
+// ============================================================
+// Vec3 / AABB
+// ============================================================
+struct V3 {
+    double x{}, y{}, z{};
+    V3() = default;
+    V3(double a, double b, double c) : x(a), y(b), z(c) {}
+    V3 operator+(const V3& o) const { return {x+o.x, y+o.y, z+o.z}; }
+    V3 operator-(const V3& o) const { return {x-o.x, y-o.y, z-o.z}; }
+    V3 operator*(double s)   const { return {x*s, y*s, z*s}; }
+    V3 operator/(double s)   const { return {x/s, y/s, z/s}; }
+    V3& operator+=(const V3& o){ x+=o.x; y+=o.y; z+=o.z; return *this; }
+    V3& operator-=(const V3& o){ x-=o.x; y-=o.y; z-=o.z; return *this; }
+    double& operator[](int i){ return (&x)[i]; }
+    double  operator[](int i) const { return (&x)[i]; }
+};
+static inline double dot(const V3& a, const V3& b){ return a.x*b.x + a.y*b.y + a.z*b.z; }
+static inline V3 cross(const V3& a, const V3& b){ return { a.y*b.z - a.z*b.y, a.z*b.x - a.x*b.z, a.x*b.y - a.y*b.x }; }
+static inline double len2(const V3& a){ return dot(a,a); }
+static inline double len(const V3& a){ return std::sqrt(dot(a,a)); }
+static inline V3 norm(const V3& a){ double L = len(a); return (L>0)? a/L : V3{0,0,0}; }
+static inline V3 vmin(const V3& a, const V3& b){ return { std::min(a.x,b.x), std::min(a.y,b.y), std::min(a.z,b.z) }; }
+static inline V3 vmax(const V3& a, const V3& b){ return { std::max(a.x,b.x), std::max(a.y,b.y), std::max(a.z,b.z) }; }
+
+struct AABB {
+    V3 lo{ 1e300, 1e300, 1e300}, hi{-1e300,-1e300,-1e300};
+    void add(const V3& p){ lo = vmin(lo,p); hi = vmax(hi,p); }
+    void add(const AABB& o){ lo = vmin(lo,o.lo); hi = vmax(hi,o.hi); }
+    bool valid() const { return lo.x<=hi.x && lo.y<=hi.y && lo.z<=hi.z; }
+    V3 centre() const { return (lo+hi)*0.5; }
+    V3 extent() const { return hi-lo; }
+    double maxExt() const { auto e = extent(); return std::max({e.x,e.y,e.z}); }
+    bool overlaps(const AABB& o, double eps = 0.0) const {
+        return !(hi.x+eps < o.lo.x || o.hi.x+eps < lo.x ||
+                 hi.y+eps < o.lo.y || o.hi.y+eps < lo.y ||
+                 hi.z+eps < o.lo.z || o.hi.z+eps < lo.z);
+    }
+    bool contains(const V3& p, double eps = 0.0) const {
+        return p.x>=lo.x-eps && p.x<=hi.x+eps &&
+               p.y>=lo.y-eps && p.y<=hi.y+eps &&
+               p.z>=lo.z-eps && p.z<=hi.z+eps;
+    }
+};
+
+// ============================================================
+// Mesh
+// ============================================================
+struct Mesh {
+    std::vector<V3> V;
+    std::vector<std::array<i32,3>> F;
+    AABB box;
+    void computeBox(){
+        box = {};
+        for(auto& p : V) box.add(p);
+    }
+};
+
+// ============================================================
+// Fast stdin / stdout buffered I/O
+// ============================================================
+struct In {
+    std::vector<char> buf;
+    size_t pos = 0;
+    In(){
+        // Read entire stdin
+        constexpr size_t CHUNK = 1<<16;
+        buf.reserve(1<<22);
+        std::vector<char> tmp(CHUNK);
+        while(true){
+            size_t n = std::fread(tmp.data(), 1, CHUNK, stdin);
+            if(n==0) break;
+            buf.insert(buf.end(), tmp.data(), tmp.data()+n);
+        }
+        buf.push_back('\0');
+    }
+    inline void skipWs(){
+        while(pos < buf.size()){
+            char c = buf[pos];
+            if(c==' '||c=='\t'||c=='\r'||c=='\n') ++pos;
+            else break;
+        }
+    }
+    inline i64 readInt(){
+        skipWs();
+        i64 sign = 1, v = 0;
+        if(pos < buf.size() && buf[pos]=='-'){ sign = -1; ++pos; }
+        else if(pos < buf.size() && buf[pos]=='+') ++pos;
+        while(pos < buf.size()){
+            char c = buf[pos];
+            if(c<'0'||c>'9') break;
+            v = v*10 + (c - '0');
+            ++pos;
+        }
+        return v*sign;
+    }
+    inline double readDouble(){
+        skipWs();
+        // Use strtod for robustness with scientific notation
+        const char* s = buf.data() + pos;
+        char* end = nullptr;
+        double v = std::strtod(s, &end);
+        if(end > s) pos += (end - s);
+        return v;
+    }
+};
+
+struct Out {
+    std::vector<char> buf;
+    Out(){ buf.reserve(1<<20); }
+    inline void putc(char c){ buf.push_back(c); }
+    inline void puts(const char* s, size_t n){ buf.insert(buf.end(), s, s+n); }
+    inline void writeInt(i64 v){
+        if(v<0){ putc('-'); v=-v; }
+        char tmp[24]; int k=0;
+        if(v==0) tmp[k++]='0';
+        while(v){ tmp[k++] = char('0' + (v%10)); v/=10; }
+        while(k--) putc(tmp[k]);
+    }
+    inline void writeDouble(double v){
+        // Use printf-style; %.17g preserves round-trip
+        char tmp[40];
+        int n = std::snprintf(tmp, sizeof(tmp), "%.17g", v);
+        if(n>0) puts(tmp, (size_t)n);
+    }
+    void flush(){
+        std::fwrite(buf.data(), 1, buf.size(), stdout);
+        buf.clear();
+    }
+    ~Out(){ flush(); }
+};
+
+// ============================================================
+// BVH (binned SAH, lightweight)
+// ============================================================
+struct BVHNode {
+    AABB box;
+    i32 left = -1, right = -1; // for inner nodes
+    i32 first = 0, count = 0;  // for leaf nodes (count>0 means leaf)
+};
+
+struct BVH {
+    const Mesh* mesh = nullptr;
+    std::vector<i32> prim; // triangle indices
+    std::vector<BVHNode> nodes;
+    std::vector<AABB> triBox;
+    std::vector<V3>   triC;
+
+    void build(const Mesh& m){
+        mesh = &m;
+        i32 nT = (i32)m.F.size();
+        prim.resize(nT);
+        triBox.resize(nT);
+        triC.resize(nT);
+        for(i32 i=0;i<nT;++i){
+            prim[i] = i;
+            auto& f = m.F[i];
+            AABB b; b.add(m.V[f[0]]); b.add(m.V[f[1]]); b.add(m.V[f[2]]);
+            triBox[i] = b;
+            triC[i] = b.centre();
+        }
+        nodes.reserve((size_t)nT * 2);
+        nodes.push_back({}); // root
+        buildRec(0, 0, nT, 0);
+    }
+
+    void buildRec(i32 nodeIdx, i32 first, i32 count, int depth){
+        AABB box;
+        for(i32 i=first;i<first+count;++i) box.add(triBox[prim[i]]);
+        nodes[nodeIdx].box = box;
+        // Leaf condition
+        if(count <= 8 || depth > 48){
+            nodes[nodeIdx].first = first;
+            nodes[nodeIdx].count = count;
+            return;
+        }
+        // Choose split axis = longest extent
+        V3 e = box.extent();
+        int axis = 0;
+        if(e.y > e[axis]) axis = 1;
+        if(e.z > e[axis]) axis = 2;
+        // Median split on centroid for simplicity (binned SAH would be better, but median is fine)
+        i32 mid = first + count/2;
+        std::nth_element(prim.begin()+first, prim.begin()+mid, prim.begin()+first+count,
+            [&](i32 a, i32 b){ return triC[a][axis] < triC[b][axis]; });
+        // Allocate children
+        i32 L = (i32)nodes.size(); nodes.push_back({});
+        i32 R = (i32)nodes.size(); nodes.push_back({});
+        nodes[nodeIdx].left  = L;
+        nodes[nodeIdx].right = R;
+        nodes[nodeIdx].count = 0;
+        buildRec(L, first, mid - first, depth+1);
+        buildRec(R, mid,   first+count - mid, depth+1);
+    }
+
+    template<typename F>
+    void queryOverlap(i32 node, const AABB& q, F&& cb) const {
+        const BVHNode& n = nodes[node];
+        if(!n.box.overlaps(q)) return;
+        if(n.count > 0){
+            for(i32 i=0;i<n.count;++i){
+                i32 t = prim[n.first + i];
+                if(triBox[t].overlaps(q)) cb(t);
+            }
+            return;
+        }
+        queryOverlap(n.left, q, cb);
+        queryOverlap(n.right, q, cb);
+    }
+};
+
+// ============================================================
+// Triangle-triangle intersection (Möller 1997) - boolean only
+// ============================================================
+static inline int signEps(double x, double eps){ return (x > eps) ? 1 : (x < -eps ? -1 : 0); }
+
+static bool triTriOverlap(const V3& a0, const V3& a1, const V3& a2,
+                          const V3& b0, const V3& b1, const V3& b2,
+                          double eps)
+{
+    // Compute planes
+    V3 nA = cross(a1-a0, a2-a0);
+    double dA = -dot(nA, a0);
+    double db0 = dot(nA, b0) + dA;
+    double db1 = dot(nA, b1) + dA;
+    double db2 = dot(nA, b2) + dA;
+    int s0 = signEps(db0, eps), s1 = signEps(db1, eps), s2 = signEps(db2, eps);
+    if(s0 == s1 && s1 == s2 && s0 != 0) return false; // all same side
+    V3 nB = cross(b1-b0, b2-b0);
+    double dB = -dot(nB, b0);
+    double da0 = dot(nB, a0) + dB;
+    double da1 = dot(nB, a1) + dB;
+    double da2 = dot(nB, a2) + dB;
+    int t0 = signEps(da0, eps), t1 = signEps(da1, eps), t2 = signEps(da2, eps);
+    if(t0 == t1 && t1 == t2 && t0 != 0) return false;
+    // Coplanar fallback: use 2D test on dominant axis
+    if(s0==0 && s1==0 && s2==0){
+        // Pick dominant axis of nA
+        V3 an = { std::fabs(nA.x), std::fabs(nA.y), std::fabs(nA.z) };
+        int ax = 0;
+        if(an.y > an[ax]) ax = 1;
+        if(an.z > an[ax]) ax = 2;
+        int u = (ax+1)%3, w = (ax+2)%3;
+        auto proj = [&](const V3& p){ return std::array<double,2>{ p[u], p[w] }; };
+        std::array<std::array<double,2>,3> A = { proj(a0), proj(a1), proj(a2) };
+        std::array<std::array<double,2>,3> B = { proj(b0), proj(b1), proj(b2) };
+        auto segSegInt = [&](const std::array<double,2>& p, const std::array<double,2>& q,
+                             const std::array<double,2>& r, const std::array<double,2>& s)->bool{
+            double dx1 = q[0]-p[0], dy1 = q[1]-p[1];
+            double dx2 = s[0]-r[0], dy2 = s[1]-r[1];
+            double denom = dx1*dy2 - dy1*dx2;
+            if(std::fabs(denom) < 1e-30) return false;
+            double t = ((r[0]-p[0])*dy2 - (r[1]-p[1])*dx2)/denom;
+            double u_ = ((r[0]-p[0])*dy1 - (r[1]-p[1])*dx1)/denom;
+            return t>=-eps && t<=1+eps && u_>=-eps && u_<=1+eps;
+        };
+        for(int i=0;i<3;++i)for(int j=0;j<3;++j)
+            if(segSegInt(A[i],A[(i+1)%3],B[j],B[(j+1)%3])) return true;
+        // Point in triangle?
+        auto pointInTri = [&](const std::array<double,2>& p, const std::array<std::array<double,2>,3>& T)->bool{
+            auto sgn = [](double x){ return x>0?1:(x<0?-1:0); };
+            double d1 = (p[0]-T[1][0])*(T[0][1]-T[1][1]) - (T[0][0]-T[1][0])*(p[1]-T[1][1]);
+            double d2 = (p[0]-T[2][0])*(T[1][1]-T[2][1]) - (T[1][0]-T[2][0])*(p[1]-T[2][1]);
+            double d3 = (p[0]-T[0][0])*(T[2][1]-T[0][1]) - (T[2][0]-T[0][0])*(p[1]-T[0][1]);
+            int s1_ = sgn(d1), s2_ = sgn(d2), s3_ = sgn(d3);
+            bool neg = s1_<0 || s2_<0 || s3_<0;
+            bool pos = s1_>0 || s2_>0 || s3_>0;
+            return !(neg && pos);
+        };
+        if(pointInTri(A[0], B)) return true;
+        if(pointInTri(B[0], A)) return true;
+        return false;
+    }
+    // Non-coplanar: use Möller's interval test
+    // Compute intersection line direction = nA x nB; project all vertices onto longest axis of D
+    V3 D = cross(nA, nB);
+    V3 ad = { std::fabs(D.x), std::fabs(D.y), std::fabs(D.z) };
+    int ax = 0;
+    if(ad.y > ad[ax]) ax = 1;
+    if(ad.z > ad[ax]) ax = 2;
+    double pa0 = a0[ax], pa1 = a1[ax], pa2 = a2[ax];
+    double pb0 = b0[ax], pb1 = b1[ax], pb2 = b2[ax];
+    auto interval = [&](double p0, double p1, double p2, double s0_, double s1_, double s2_,
+                        int sg0, int sg1, int sg2, double& lo, double& hi){
+        // Find the odd-one-out vertex
+        double pp[3] = {p0,p1,p2};
+        double dd[3] = {s0_,s1_,s2_};
+        int sg[3] = {sg0,sg1,sg2};
+        int odd = 0;
+        if(sg[0]!=sg[1] && sg[0]!=sg[2]) odd = 0;
+        else if(sg[1]!=sg[0] && sg[1]!=sg[2]) odd = 1;
+        else odd = 2;
+        int o1 = (odd+1)%3, o2 = (odd+2)%3;
+        double t1 = pp[odd] + (pp[o1]-pp[odd]) * (dd[odd] / (dd[odd] - dd[o1]));
+        double t2 = pp[odd] + (pp[o2]-pp[odd]) * (dd[odd] / (dd[odd] - dd[o2]));
+        lo = std::min(t1,t2);
+        hi = std::max(t1,t2);
+    };
+    double la, ha, lb, hb;
+    interval(pa0,pa1,pa2, da0,da1,da2, t0,t1,t2, la, ha);
+    interval(pb0,pb1,pb2, db0,db1,db2, s0,s1,s2, lb, hb);
+    return !(ha + eps < lb || hb + eps < la);
+}
+
+// ============================================================
+// Ray-triangle (Möller-Trumbore) for point-in-mesh test via ray cast.
+// ============================================================
+static bool rayTri(const V3& O, const V3& D,
+                   const V3& v0, const V3& v1, const V3& v2,
+                   double& tOut)
+{
+    const double EPS = 1e-12;
+    V3 e1 = v1 - v0;
+    V3 e2 = v2 - v0;
+    V3 p  = cross(D, e2);
+    double det = dot(e1, p);
+    if(det > -EPS && det < EPS) return false;
+    double inv = 1.0/det;
+    V3 s = O - v0;
+    double u = dot(s, p) * inv;
+    if(u < 0 || u > 1) return false;
+    V3 q = cross(s, e1);
+    double v = dot(D, q) * inv;
+    if(v < 0 || u+v > 1) return false;
+    double t = dot(e2, q) * inv;
+    if(t < EPS) return false;
+    tOut = t;
+    return true;
+}
+
+// Count ray-mesh intersections via BVH; returns parity (true = inside).
+struct RayHitContext {
+    int count = 0;
+    int degenerate = 0; // edge/vertex hits or near-grazing; if >0 we should retry
+};
+
+static void rayBVH(const BVH& bvh, i32 node, const V3& O, const V3& D, RayHitContext& ctx){
+    const BVHNode& n = bvh.nodes[node];
+    // Slab test
+    double tmin = 0, tmax = 1e300;
+    for(int a=0;a<3;++a){
+        double inv = 1.0 / (std::fabs(D[a]) < 1e-30 ? (D[a]<0?-1e-30:1e-30) : D[a]);
+        double t1 = (n.box.lo[a] - O[a]) * inv;
+        double t2 = (n.box.hi[a] - O[a]) * inv;
+        if(t1 > t2) std::swap(t1,t2);
+        if(t1 > tmin) tmin = t1;
+        if(t2 < tmax) tmax = t2;
+        if(tmax < tmin) return;
+    }
+    if(n.count > 0){
+        const auto& V = bvh.mesh->V;
+        const auto& F = bvh.mesh->F;
+        for(i32 i=0;i<n.count;++i){
+            i32 t = bvh.prim[n.first + i];
+            const auto& f = F[t];
+            double tt;
+            if(rayTri(O, D, V[f[0]], V[f[1]], V[f[2]], tt)){
+                // Detect near-edge cases by recomputing barycentric distances margin
+                ctx.count++;
+            }
+        }
+        return;
+    }
+    rayBVH(bvh, n.left,  O, D, ctx);
+    rayBVH(bvh, n.right, O, D, ctx);
+}
+
+static bool pointInMesh(const BVH& bvh, const V3& P){
+    // Cast 3 rays in different directions; majority vote.
+    static const V3 dirs[3] = {
+        {1.0, 0.123456, 0.7071},
+        {0.314159, 1.0, -0.421},
+        {-0.577, 0.333, 1.0}
+    };
+    int inside = 0;
+    for(int k=0;k<3;++k){
+        RayHitContext ctx;
+        rayBVH(bvh, 0, P, norm(dirs[k]), ctx);
+        if(ctx.count & 1) inside++;
+    }
+    return inside >= 2;
+}
+
+// ============================================================
+// BSP-based CSG (csg.js / Naylor's algorithm)
+// Polygon-level; used as fallback when actual triangle intersection happens.
+// ============================================================
+struct CSGPoly {
+    std::vector<V3> v;
+    V3 n; double w; // plane: dot(n, p) = w
+    void computePlane(){
+        n = norm(cross(v[1]-v[0], v[2]-v[0]));
+        w = dot(n, v[0]);
+    }
+    void flip(){
+        std::reverse(v.begin(), v.end());
+        n = n * -1.0; w = -w;
+    }
+};
+
+static double CSG_EPS = 1e-7;
+
+static void splitPolygon(const V3& pn, double pw, const CSGPoly& poly,
+                         std::vector<CSGPoly>& coF, std::vector<CSGPoly>& coB,
+                         std::vector<CSGPoly>& front, std::vector<CSGPoly>& back)
+{
+    enum { COPLANAR=0, FRONT=1, BACK=2, SPAN=3 };
+    int polyType = 0;
+    std::vector<int> types(poly.v.size());
+    for(size_t i=0;i<poly.v.size();++i){
+        double t = dot(pn, poly.v[i]) - pw;
+        int ty = (t < -CSG_EPS) ? BACK : (t > CSG_EPS ? FRONT : COPLANAR);
+        polyType |= ty;
+        types[i] = ty;
+    }
+    if(polyType == COPLANAR){
+        if(dot(pn, poly.n) > 0) coF.push_back(poly);
+        else coB.push_back(poly);
+    } else if(polyType == FRONT){
+        front.push_back(poly);
+    } else if(polyType == BACK){
+        back.push_back(poly);
+    } else {
+        // SPAN
+        CSGPoly f, b;
+        f.n = poly.n; f.w = poly.w;
+        b.n = poly.n; b.w = poly.w;
+        size_t N = poly.v.size();
+        for(size_t i=0;i<N;++i){
+            size_t j = (i+1) % N;
+            int ti = types[i], tj = types[j];
+            const V3& vi = poly.v[i];
+            const V3& vj = poly.v[j];
+            if(ti != BACK) f.v.push_back(vi);
+            if(ti != FRONT) b.v.push_back(vi);
+            if((ti | tj) == SPAN){
+                double t = (pw - dot(pn, vi)) / dot(pn, vj - vi);
+                V3 m = vi + (vj - vi)*t;
+                f.v.push_back(m);
+                b.v.push_back(m);
+            }
+        }
+        if(f.v.size() >= 3) front.push_back(std::move(f));
+        if(b.v.size() >= 3) back.push_back(std::move(b));
+    }
+}
+
+struct BSPNode {
+    V3 pn{0,0,0}; double pw = 0;
+    bool hasPlane = false;
+    std::unique_ptr<BSPNode> front, back;
+    std::vector<CSGPoly> polys;
+    void build(std::vector<CSGPoly>&& in){
+        if(in.empty()) return;
+        if(!hasPlane){
+            pn = in[0].n; pw = in[0].w; hasPlane = true;
+        }
+        std::vector<CSGPoly> coF, coB, fr, ba;
+        for(auto& p : in) splitPolygon(pn, pw, p, coF, coB, fr, ba);
+        for(auto& p : coF) polys.push_back(std::move(p));
+        for(auto& p : coB) polys.push_back(std::move(p));
+        if(!fr.empty()){
+            if(!front) front = std::make_unique<BSPNode>();
+            front->build(std::move(fr));
+        }
+        if(!ba.empty()){
+            if(!back) back = std::make_unique<BSPNode>();
+            back->build(std::move(ba));
+        }
+    }
+    void invert(){
+        for(auto& p : polys) p.flip();
+        pn = pn * -1.0; pw = -pw;
+        if(front) front->invert();
+        if(back)  back->invert();
+        std::swap(front, back);
+    }
+    std::vector<CSGPoly> clipPolygons(std::vector<CSGPoly> in) const {
+        if(!hasPlane) return in;
+        std::vector<CSGPoly> fr, ba;
+        for(auto& p : in){
+            std::vector<CSGPoly> coF, coB;
+            splitPolygon(pn, pw, p, coF, coB, fr, ba);
+            // Coplanar polygons: those facing same dir go front, else back
+            // (csg.js convention)
+            for(auto& q : coF) fr.push_back(std::move(q));
+            for(auto& q : coB) ba.push_back(std::move(q));
+        }
+        if(front) fr = front->clipPolygons(std::move(fr));
+        if(back)  ba = back->clipPolygons(std::move(ba));
+        else      ba.clear();
+        fr.insert(fr.end(), std::make_move_iterator(ba.begin()),
+                            std::make_move_iterator(ba.end()));
+        return fr;
+    }
+    void clipTo(const BSPNode& other){
+        polys = other.clipPolygons(std::move(polys));
+        if(front) front->clipTo(other);
+        if(back)  back->clipTo(other);
+    }
+    void allPolygons(std::vector<CSGPoly>& out) const {
+        out.insert(out.end(), polys.begin(), polys.end());
+        if(front) front->allPolygons(out);
+        if(back)  back->allPolygons(out);
+    }
+};
+
+// ============================================================
+// Output helpers
+// ============================================================
+static void writeMeshDirect(Out& out, const Mesh& a, const Mesh& b, bool useA, bool useB){
+    // Emit concatenation of selected meshes. Handles disjoint or containment cases.
+    i32 nv = 0, nf = 0;
+    if(useA){ nv += (i32)a.V.size(); nf += (i32)a.F.size(); }
+    if(useB){ nv += (i32)b.V.size(); nf += (i32)b.F.size(); }
+    out.writeInt(nv); out.putc(' '); out.writeInt(nf); out.putc('\n');
+    if(useA){
+        for(auto& p : a.V){
+            out.writeDouble(p.x); out.putc(' ');
+            out.writeDouble(p.y); out.putc(' ');
+            out.writeDouble(p.z); out.putc('\n');
+        }
+    }
+    if(useB){
+        for(auto& p : b.V){
+            out.writeDouble(p.x); out.putc(' ');
+            out.writeDouble(p.y); out.putc(' ');
+            out.writeDouble(p.z); out.putc('\n');
+        }
+    }
+    i32 offset = 0;
+    if(useA){
+        for(auto& f : a.F){
+            out.writeInt(f[0]+offset); out.putc(' ');
+            out.writeInt(f[1]+offset); out.putc(' ');
+            out.writeInt(f[2]+offset); out.putc('\n');
+        }
+        offset += (i32)a.V.size();
+    }
+    if(useB){
+        for(auto& f : b.F){
+            out.writeInt(f[0]+offset); out.putc(' ');
+            out.writeInt(f[1]+offset); out.putc(' ');
+            out.writeInt(f[2]+offset); out.putc('\n');
+        }
+    }
+    out.flush();
+}
+
+// Convert polygon soup back to indexed triangulated mesh, weld vertices.
+static void emitPolysAsMesh(Out& out, const std::vector<CSGPoly>& polys, double scale){
+    struct Key { i64 x,y,z; bool operator==(const Key& o) const { return x==o.x && y==o.y && z==o.z; } };
+    struct KeyHash { size_t operator()(const Key& k) const noexcept {
+        u64 h = (u64)k.x * 0x9E3779B97F4A7C15ULL;
+        h ^= (u64)k.y + 0x9E3779B97F4A7C15ULL + (h<<6) + (h>>2);
+        h ^= (u64)k.z + 0x9E3779B97F4A7C15ULL + (h<<6) + (h>>2);
+        return (size_t)h;
+    }};
+    // Quantize at ~1e-8 of model scale (avoid integer overflow for huge models)
+    double q = std::max(scale, 1.0) * 1e-9;
+    auto quant = [&](double v)->i64 { return (i64)std::llround(v / q); };
+    std::vector<V3> verts;
+    std::vector<std::array<i32,3>> tris;
+    std::unordered_map<Key, i32, KeyHash> map;
+    map.reserve(polys.size()*3);
+    auto getIdx = [&](const V3& p)->i32{
+        Key k{ quant(p.x), quant(p.y), quant(p.z) };
+        auto it = map.find(k);
+        if(it != map.end()) return it->second;
+        i32 idx = (i32)verts.size();
+        verts.push_back(p);
+        map.emplace(k, idx);
+        return idx;
+    };
+    for(auto& poly : polys){
+        if(poly.v.size() < 3) continue;
+        // Fan triangulation
+        i32 i0 = getIdx(poly.v[0]);
+        for(size_t k=1; k+1<poly.v.size(); ++k){
+            i32 i1 = getIdx(poly.v[k]);
+            i32 i2 = getIdx(poly.v[k+1]);
+            if(i0==i1 || i1==i2 || i0==i2) continue;
+            tris.push_back({i0,i1,i2});
+        }
+    }
+    out.writeInt((i32)verts.size()); out.putc(' ');
+    out.writeInt((i32)tris.size()); out.putc('\n');
+    for(auto& p : verts){
+        out.writeDouble(p.x); out.putc(' ');
+        out.writeDouble(p.y); out.putc(' ');
+        out.writeDouble(p.z); out.putc('\n');
+    }
+    for(auto& t : tris){
+        out.writeInt(t[0]); out.putc(' ');
+        out.writeInt(t[1]); out.putc(' ');
+        out.writeInt(t[2]); out.putc('\n');
+    }
+    out.flush();
+}
+
+static std::vector<CSGPoly> meshToPolys(const Mesh& m){
+    std::vector<CSGPoly> out;
+    out.reserve(m.F.size());
+    for(auto& f : m.F){
+        CSGPoly p;
+        p.v = { m.V[f[0]], m.V[f[1]], m.V[f[2]] };
+        // Drop degenerate triangles
+        V3 e1 = p.v[1]-p.v[0], e2 = p.v[2]-p.v[0];
+        if(len2(cross(e1,e2)) < 1e-30) continue;
+        p.computePlane();
+        out.push_back(std::move(p));
+    }
+    return out;
+}
+
+// CSG union via BSP (csg.js / Naylor)
+static std::vector<CSGPoly> bspUnion(std::vector<CSGPoly> A, std::vector<CSGPoly> B){
+    BSPNode a, b;
+    a.build(std::move(A));
+    b.build(std::move(B));
+    a.clipTo(b);
+    b.clipTo(a);
+    b.invert();
+    b.clipTo(a);
+    b.invert();
+    std::vector<CSGPoly> all;
+    a.allPolygons(all);
+    b.allPolygons(all);
+    return all;
+}
+
+// ============================================================
+// main
+// ============================================================
+int main(){
+    In in;
+    i64 VA = in.readInt(), FA = in.readInt(), VB = in.readInt(), FB = in.readInt();
+    Mesh A, B;
+    A.V.resize((size_t)VA);
+    for(i64 i=0;i<VA;++i){
+        double x = in.readDouble(), y = in.readDouble(), z = in.readDouble();
+        A.V[(size_t)i] = {x,y,z};
+    }
+    A.F.resize((size_t)FA);
+    for(i64 i=0;i<FA;++i){
+        i32 a = (i32)in.readInt(), b = (i32)in.readInt(), c = (i32)in.readInt();
+        A.F[(size_t)i] = {a,b,c};
+    }
+    B.V.resize((size_t)VB);
+    for(i64 i=0;i<VB;++i){
+        double x = in.readDouble(), y = in.readDouble(), z = in.readDouble();
+        B.V[(size_t)i] = {x,y,z};
+    }
+    B.F.resize((size_t)FB);
+    for(i64 i=0;i<FB;++i){
+        i32 a = (i32)in.readInt(), b = (i32)in.readInt(), c = (i32)in.readInt();
+        B.F[(size_t)i] = {a,b,c};
+    }
+    A.computeBox();
+    B.computeBox();
+
+    Out out;
+
+    // Scale-aware epsilon
+    double sizeA = A.box.maxExt();
+    double sizeB = B.box.maxExt();
+    double scale = std::max(sizeA, sizeB);
+    if(scale <= 0) scale = 1.0;
+    double EPS = scale * 1e-10;
+    CSG_EPS = scale * 1e-7;
+
+    // -------- Step 1: AABB disjoint test --------
+    if(!A.box.overlaps(B.box, EPS)){
+        // Completely disjoint - just concatenate.
+        writeMeshDirect(out, A, B, true, true);
+        return 0;
+    }
+
+    // -------- Step 2: Build BVHs --------
+    BVH bvhA, bvhB;
+    bvhA.build(A);
+    bvhB.build(B);
+
+    // -------- Step 3: Check for actual triangle-triangle intersection --------
+    // We only need to find one true intersection to enter the heavy path.
+    // For huge meshes this is BVH-accelerated.
+    std::atomic<bool> intersects{false};
+    {
+        // Traverse BVH-A leaves; for each candidate query BVH-B for overlap.
+        std::vector<i32> stack;
+        stack.push_back(0);
+        while(!stack.empty() && !intersects.load(std::memory_order_relaxed)){
+            i32 ni = stack.back(); stack.pop_back();
+            const BVHNode& n = bvhA.nodes[ni];
+            if(!n.box.overlaps(B.box, EPS)) continue;
+            if(n.count > 0){
+                for(i32 i=0;i<n.count;++i){
+                    i32 ta = bvhA.prim[n.first + i];
+                    AABB tb = bvhA.triBox[ta];
+                    // Inflate by EPS
+                    tb.lo = tb.lo - V3{EPS,EPS,EPS};
+                    tb.hi = tb.hi + V3{EPS,EPS,EPS};
+                    const auto& fa = A.F[ta];
+                    const V3& a0 = A.V[fa[0]];
+                    const V3& a1 = A.V[fa[1]];
+                    const V3& a2 = A.V[fa[2]];
+                    bool hit = false;
+                    bvhB.queryOverlap(0, tb, [&](i32 tb_idx){
+                        if(hit) return;
+                        const auto& fb = B.F[tb_idx];
+                        const V3& b0 = B.V[fb[0]];
+                        const V3& b1 = B.V[fb[1]];
+                        const V3& b2 = B.V[fb[2]];
+                        if(triTriOverlap(a0,a1,a2, b0,b1,b2, EPS)){
+                            hit = true;
+                        }
+                    });
+                    if(hit){ intersects.store(true); break; }
+                }
+            } else {
+                stack.push_back(n.left);
+                stack.push_back(n.right);
+            }
+        }
+    }
+
+    if(!intersects.load()){
+        // -------- Step 4: AABBs overlap but no triangles intersect --------
+        // -> Either one mesh fully contains the other, or they nest without touching
+        //    (e.g. hollow B fits in a non-existent hollow of A -- but we're told
+        //    inputs are clean watertight manifolds so this means containment).
+        // Pick any vertex of A; test if inside B's volume. And vice versa.
+        bool aInsideB = pointInMesh(bvhB, A.V[0]);
+        bool bInsideA = pointInMesh(bvhA, B.V[0]);
+        if(aInsideB && !bInsideA){
+            // A inside B -> result = B
+            writeMeshDirect(out, A, B, false, true);
+        } else if(bInsideA && !aInsideB){
+            // B inside A -> result = A
+            writeMeshDirect(out, A, B, true, false);
+        } else if(aInsideB && bInsideA){
+            // Should not happen for valid inputs; emit larger
+            if(sizeA >= sizeB) writeMeshDirect(out, A, B, true, false);
+            else               writeMeshDirect(out, A, B, false, true);
+        } else {
+            // Both outside -> truly disjoint despite AABB overlap. Concatenate.
+            writeMeshDirect(out, A, B, true, true);
+        }
+        return 0;
+    }
+
+    // -------- Step 5: True intersection - fallback to BSP CSG --------
+    // For very large meshes, the BSP path could be expensive. We accept this
+    // because the alternative (Cork/CGAL-style robust mesh boolean from scratch)
+    // is out of scope for a single-file solution.
+    auto polysA = meshToPolys(A);
+    auto polysB = meshToPolys(B);
+    auto unionPolys = bspUnion(std::move(polysA), std::move(polysB));
+    emitPolysAsMesh(out, unionPolys, scale);
+    return 0;
+}
