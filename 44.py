@@ -51,6 +51,7 @@ tags = [
   "visual synthesis",
 ]
 
+resultFileTypes = ("glsl", "frag", "comp", "vert")
 TIMEOUT_SECONDS = 60
 
 # ---------------------------------------------------------------------------

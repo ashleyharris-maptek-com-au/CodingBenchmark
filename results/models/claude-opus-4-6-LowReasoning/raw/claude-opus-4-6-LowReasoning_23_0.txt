@@ -1,0 +1,278 @@
+use std::io::{self, BufRead, Write, BufWriter};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
+
+#[derive(Clone, Debug)]
+struct State {
+    x: f64,
+    y: f64,
+    vx: f64,
+    vy: f64,
+    angle: f64,
+    angular_vel: f64,
+    fuel: f64,
+    timestamp: Instant,
+}
+
+struct MapInfo {
+    _width: f64,
+    _height: f64,
+    gravity: f64,
+    max_thrust: f64,
+    _fuel: f64,
+    _start_x: f64,
+    _start_y: f64,
+    target_x: f64,
+    target_y: f64,
+}
+
+fn main() {
+    let stdin = io::stdin();
+    let mut lines = stdin.lock().lines();
+
+    // Parse header
+    let line1 = lines.next().unwrap().unwrap();
+    let v1: Vec<f64> = line1.split_whitespace().map(|s| s.parse().unwrap()).collect();
+    let width = v1[0];
+    let height = v1[1];
+    let gravity = v1[2];
+    let max_thrust = v1[3];
+    let fuel = v1[4];
+
+    let line2 = lines.next().unwrap().unwrap();
+    let v2: Vec<f64> = line2.split_whitespace().map(|s| s.parse().unwrap()).collect();
+    let start_x = v2[0];
+    let start_y = v2[1];
+    let target_x = v2[2];
+    let target_y = v2[3];
+
+    // Read map rows - need to read `height` rows but be memory efficient
+    // For large maps, we don't store the full map, just scan for obstacles near path
+    let h = height as usize;
+    // We'll store a compressed representation: for each row, store obstacle column ranges
+    // For very large maps, just skip and rely on state-based control
+    let mut obstacle_cols: Vec<Vec<(usize, usize)>> = Vec::new();
+    let store_map = (width * height) < 50_000_000.0; // Only store if < 50M cells
+
+    for _row in 0..h {
+        let line = lines.next().unwrap().unwrap();
+        if store_map {
+            let mut ranges = Vec::new();
+            let bytes = line.as_bytes();
+            let mut in_obstacle = false;
+            let mut start = 0usize;
+            for (col, &b) in bytes.iter().enumerate() {
+                if b == b'#' {
+                    if !in_obstacle {
+                        start = col;
+                        in_obstacle = true;
+                    }
+                } else {
+                    if in_obstacle {
+                        ranges.push((start, col - 1));
+                        in_obstacle = false;
+                    }
+                }
+            }
+            if in_obstacle {
+                ranges.push((start, bytes.len() - 1));
+            }
+            obstacle_cols.push(ranges);
+        }
+    }
+
+    let map_info = Arc::new(MapInfo {
+        _width: width,
+        _height: height,
+        gravity,
+        max_thrust,
+        _fuel: fuel,
+        _start_x: start_x,
+        _start_y: start_y,
+        target_x,
+        target_y,
+    });
+
+    let state = Arc::new(Mutex::new(State {
+        x: start_x,
+        y: start_y,
+        vx: 0.0,
+        vy: 0.0,
+        angle: 0.0,
+        angular_vel: 0.0,
+        fuel,
+        timestamp: Instant::now(),
+    }));
+
+    // Reader thread
+    let state_clone = Arc::clone(&state);
+    thread::spawn(move || {
+        for line in lines {
+            let line = match line {
+                Ok(l) => l,
+                Err(_) => break,
+            };
+            let vals: Vec<f64> = line.split_whitespace()
+                .filter_map(|s| s.parse().ok())
+                .collect();
+            if vals.len() >= 7 {
+                let mut s = state_clone.lock().unwrap();
+                s.x = vals[0];
+                s.y = vals[1];
+                s.vx = vals[2];
+                s.vy = vals[3];
+                s.angle = vals[4];
+                s.angular_vel = vals[5];
+                s.fuel = vals[6];
+                s.timestamp = Instant::now();
+            }
+        }
+    });
+
+    // Control loop at ~50hz
+    let stdout = io::stdout();
+    let mut out = BufWriter::new(stdout.lock());
+    let map = Arc::clone(&map_info);
+
+    loop {
+        let s = {
+            let guard = state.lock().unwrap();
+            guard.clone()
+        };
+
+        let (thrust, turn) = compute_control(&s, &map, &obstacle_cols, store_map);
+
+        let t = thrust.clamp(0.0, 1.0);
+        let r = turn.clamp(-1.0, 1.0);
+        let _ = writeln!(out, "{:.4} {:.4}", t, r);
+        let _ = out.flush();
+
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn compute_control(s: &State, map: &MapInfo, obstacles: &[Vec<(usize, usize)>], has_map: bool) -> (f64, f64) {
+    let gravity = map.gravity;
+    let max_thrust = map.max_thrust;
+    let tx = map.target_x;
+    let ty = map.target_y;
+
+    let dx = tx - s.x;
+    let dy = ty - s.y; // positive means target is below us
+
+    let dist = (dx * dx + dy * dy).sqrt();
+    let speed = (s.vx * s.vx + s.vy * s.vy).sqrt();
+
+    // Desired angle: we want to point thrust opposite to where we need to decelerate
+    // and toward where we need to go
+
+    // Phase-based control
+    let horizontal_dist = dx.abs();
+    let vertical_dist = dy; // positive = target below
+
+    // Check if we're close to landing
+    let near_target = horizontal_dist < 3.0 && vertical_dist.abs() < 5.0;
+    let very_close = horizontal_dist < 1.5 && vertical_dist.abs() < 2.0;
+
+    // Check for obstacles below using simple raycast
+    let obstacle_below = if has_map {
+        check_obstacle_below(s.x, s.y, ty, obstacles)
+    } else {
+        false
+    };
+
+    let (desired_angle, thrust);
+
+    if very_close {
+        // Final landing phase - point straight up, control descent
+        let desired_vy = if dy > 0.5 { 1.0_f64.min(dy * 0.5) } else { -0.5 };
+        let vy_error = s.vy - desired_vy;
+
+        // Thrust to counteract gravity and control vertical speed
+        let needed_accel = gravity + vy_error * 2.0;
+        thrust = if max_thrust > 0.0 { (needed_accel / max_thrust).clamp(0.0, 1.0) } else { 0.0 };
+
+        // Point toward target horizontally with gentle correction
+        let desired_vx = dx * 0.5;
+        let vx_error = s.vx - desired_vx;
+        desired_angle = (vx_error * 0.3).clamp(-0.3, 0.3);
+    } else if near_target {
+        // Approach phase - slow down and align
+        let desired_vx = dx * 0.3;
+        let vx_error = s.vx - desired_vx;
+
+        let desired_vy = if dy > 0.0 { 1.5_f64.min(dy * 0.3) } else { -1.0 };
+        let vy_error = s.vy - desired_vy;
+
+        let needed_vert_accel = gravity + vy_error * 2.5;
+        let needed_horiz_accel = -vx_error * 2.0;
+
+        desired_angle = needed_horiz_accel.atan2(needed_vert_accel).clamp(-0.8, 0.8);
+        let total_accel = (needed_vert_accel * needed_vert_accel + needed_horiz_accel * needed_horiz_accel).sqrt();
+        thrust = if max_thrust > 0.0 { (total_accel / max_thrust).clamp(0.0, 1.0) } else { 0.0 };
+    } else {
+        // Navigation phase - fly toward target
+        // Desired velocity toward target
+        let max_approach_speed = 20.0_f64.min(dist * 0.5);
+
+        let desired_vx = if horizontal_dist > 1.0 {
+            dx.signum() * max_approach_speed.min(horizontal_dist * 0.5)
+        } else {
+            dx * 0.5
+        };
+
+        let desired_vy = if dy > 10.0 {
+            // Target is well below - allow falling but not too fast
+            let safe_fall_speed = (2.0 * gravity * dy.abs()).sqrt() * 0.5;
+            safe_fall_speed.min(15.0)
+        } else if dy > 0.0 {
+            dy * 0.3
+        } else {
+            // Target is above - need to go up
+            -5.0_f64.max(dy * 0.3)
+        };
+
+        let vx_error = s.vx - desired_vx;
+        let vy_error = s.vy - desired_vy;
+
+        let needed_vert_accel = gravity + vy_error * 1.5;
+        let needed_horiz_accel = -vx_error * 1.5;
+
+        // If obstacle below, add upward thrust
+        let vert_boost = if obstacle_below { 5.0 } else { 0.0 };
+
+        desired_angle = needed_horiz_accel.atan2(needed_vert_accel + vert_boost).clamp(-1.2, 1.2);
+        let total_accel = ((needed_vert_accel + vert_boost).powi(2) + needed_horiz_accel.powi(2)).sqrt();
+        thrust = if max_thrust > 0.0 { (total_accel / max_thrust).clamp(0.0, 1.0) } else { 0.0 };
+    }
+
+    // Angle control - PD controller
+    let angle_error = desired_angle - s.angle;
+    let turn = (angle_error * 3.0 - s.angular_vel * 1.5).clamp(-1.0, 1.0);
+
+    // Don't thrust if pointing wrong way significantly
+    let final_thrust = if angle_error.abs() > 1.0 { thrust * 0.1 } else { thrust };
+
+    // Fuel conservation - if no fuel, no thrust
+    let final_thrust = if s.fuel <= 0.0 { 0.0 } else { final_thrust };
+
+    (final_thrust, turn)
+}
+
+fn check_obstacle_below(x: f64, y: f64, target_y: f64, obstacles: &[Vec<(usize, usize)>]) -> bool {
+    let col = x as usize;
+    let start_row = y as usize;
+    let end_row = (target_y as usize).min(obstacles.len());
+
+    for row in start_row..end_row {
+        if row < obstacles.len() {
+            for &(c_start, c_end) in &obstacles[row] {
+                if col >= c_start.saturating_sub(2) && col <= c_end + 2 {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}

@@ -26,6 +26,8 @@ tags = [
   "directed graphs",
   "constraint solving",
 ]
+
+resultFileTypes = ("cs", "csharp")
 TIMEOUT_SECONDS = 30
 RANDOM_SEED = 37373737
 

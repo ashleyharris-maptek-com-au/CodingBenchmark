@@ -1,0 +1,542 @@
+use std::cmp::Ordering;
+use std::collections::BinaryHeap;
+use std::io::{self, BufRead, Write};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
+
+#[derive(Debug, Clone, Copy)]
+struct State {
+    x: f64,
+    y: f64,
+    vx: f64,
+    vy: f64,
+    angle: f64,
+    angular_vel: f64,
+    fuel: f64,
+    timestamp: Instant,
+}
+
+struct SharedState {
+    state: Option<State>,
+    ended: bool,
+}
+
+#[derive(Copy, Clone, PartialEq)]
+struct StateNode {
+    f_score: f64,
+    x: i32,
+    y: i32,
+}
+
+impl Eq for StateNode {}
+
+impl Ord for StateNode {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other.f_score.partial_cmp(&self.f_score).unwrap_or(Ordering::Equal)
+    }
+}
+
+impl PartialOrd for StateNode {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+fn heuristic(p1: (i32, i32), p2: (i32, i32)) -> f64 {
+    let dx = (p1.0 - p2.0) as f64;
+    let dy = (p1.1 - p2.1) as f64;
+    (dx * dx + dy * dy).sqrt()
+}
+
+#[allow(dead_code)]
+struct LanderController {
+    width: usize,
+    height: usize,
+    gravity: f64,
+    max_thrust: f64,
+    fuel: f64,
+    start_x: f64,
+    start_y: f64,
+    target_x: f64,
+    target_y: f64,
+    obstacles: Vec<Vec<(u32, u32)>>,
+    path: Vec<(f64, f64)>,
+}
+
+impl LanderController {
+    fn is_cell_obstacle(&self, ix: i32, iy: i32) -> bool {
+        if ix < 0 || ix >= self.width as i32 || iy < 0 || iy >= self.height as i32 {
+            return true;
+        }
+        let intervals = &self.obstacles[iy as usize];
+        let idx = intervals.partition_point(|&(_, c_end)| c_end < ix as u32);
+        if idx < intervals.len() {
+            let (c_start, _) = intervals[idx];
+            if c_start <= ix as u32 {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn find_path(&self) -> Option<Vec<(f64, f64)>> {
+        let start_grid = (self.start_x.round() as i32, self.start_y.round() as i32);
+        let target_grid = (self.target_x.round() as i32, self.target_y.round() as i32);
+
+        // Try to find a path using a hierarchical margin
+        for margin in [100, 300, 1000, 5000, 100000] {
+            if let Some(path) = self.find_path_with_margin(start_grid, target_grid, margin) {
+                return Some(path);
+            }
+        }
+        None
+    }
+
+    fn find_path_with_margin(&self, start_grid: (i32, i32), target_grid: (i32, i32), margin: i32) -> Option<Vec<(f64, f64)>> {
+        let bbox_x_min = (start_grid.0.min(target_grid.0) - margin).max(0);
+        let bbox_x_max = (start_grid.0.max(target_grid.0) + margin).min(self.width as i32 - 1);
+        let bbox_y_min = (start_grid.1.min(target_grid.1) - margin).max(0);
+        let bbox_y_max = (start_grid.1.max(target_grid.1) + margin).min(self.height as i32 - 1);
+
+        let bbox_w = bbox_x_max - bbox_x_min + 1;
+        let bbox_h = bbox_y_max - bbox_y_min + 1;
+
+        if bbox_w <= 0 || bbox_h <= 0 {
+            return None;
+        }
+
+        let to_index = |x: i32, y: i32| -> usize {
+            ((y - bbox_y_min) * bbox_w + (x - bbox_x_min)) as usize
+        };
+
+        // Precompute safety penalties
+        let mut safety_penalties = vec![0.0f64; (bbox_w * bbox_h) as usize];
+        for y in bbox_y_min..=bbox_y_max {
+            for x in bbox_x_min..=bbox_x_max {
+                let idx = to_index(x, y);
+                if self.is_cell_obstacle(x, y) {
+                    safety_penalties[idx] = f64::INFINITY;
+                } else {
+                    // Check radius 1
+                    let mut has_r1 = false;
+                    for dy in -1..=1 {
+                        for dx in -1..=1 {
+                            if dx == 0 && dy == 0 { continue; }
+                            if self.is_cell_obstacle(x + dx, y + dy) {
+                                has_r1 = true;
+                                break;
+                            }
+                        }
+                        if has_r1 { break; }
+                    }
+                    if has_r1 {
+                        safety_penalties[idx] = 10.0;
+                    } else {
+                        // Check radius 2
+                        let mut has_r2 = false;
+                        for dy in -2..=2 {
+                            for dx in -2..=2 {
+                                if dy >= -1 && dy <= 1 && dx >= -1 && dx <= 1 { continue; }
+                                if self.is_cell_obstacle(x + dx, y + dy) {
+                                    has_r2 = true;
+                                    break;
+                                }
+                            }
+                            if has_r2 { break; }
+                        }
+                        if has_r2 {
+                            safety_penalties[idx] = 4.0;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Force start and target to be free from infinite cost
+        let start_idx = to_index(start_grid.0, start_grid.1);
+        let target_idx = to_index(target_grid.0, target_grid.1);
+        safety_penalties[start_idx] = 0.0;
+        safety_penalties[target_idx] = 0.0;
+
+        let mut open_set = BinaryHeap::new();
+        let mut g_score = vec![f64::INFINITY; (bbox_w * bbox_h) as usize];
+        let mut came_from = vec![None; (bbox_w * bbox_h) as usize];
+
+        g_score[start_idx] = 0.0;
+
+        open_set.push(StateNode {
+            f_score: heuristic(start_grid, target_grid),
+            x: start_grid.0,
+            y: start_grid.1,
+        });
+
+        while let Some(current) = open_set.pop() {
+            let curr_x = current.x;
+            let curr_y = current.y;
+
+            if (curr_x, curr_y) == target_grid {
+                let mut path = Vec::new();
+                let mut curr = (curr_x, curr_y);
+                while curr != start_grid {
+                    path.push((curr.0 as f64 + 0.5, curr.1 as f64 + 0.5));
+                    let idx = to_index(curr.0, curr.1);
+                    curr = came_from[idx].unwrap();
+                }
+                path.push((start_grid.0 as f64 + 0.5, start_grid.1 as f64 + 0.5));
+                path.reverse();
+                return Some(path);
+            }
+
+            let curr_idx = to_index(curr_x, curr_y);
+            if current.f_score > g_score[curr_idx] + heuristic((curr_x, curr_y), target_grid) + 1e-6 {
+                continue;
+            }
+
+            for dy in -1..=1 {
+                for dx in -1..=1 {
+                    if dx == 0 && dy == 0 {
+                        continue;
+                    }
+                    let nx = curr_x + dx;
+                    let ny = curr_y + dy;
+
+                    if nx < bbox_x_min || nx > bbox_x_max || ny < bbox_y_min || ny > bbox_y_max {
+                        continue;
+                    }
+
+                    let n_idx = to_index(nx, ny);
+                    let penalty = safety_penalties[n_idx];
+                    if penalty.is_infinite() {
+                        continue;
+                    }
+
+                    let step_dist = if dx != 0 && dy != 0 {
+                        1.4142135623730951
+                    } else {
+                        1.0
+                    };
+
+                    let tentative_g = g_score[curr_idx] + step_dist + penalty;
+                    if tentative_g < g_score[n_idx] {
+                        came_from[n_idx] = Some((curr_x, curr_y));
+                        g_score[n_idx] = tentative_g;
+                        open_set.push(StateNode {
+                            f_score: tentative_g + heuristic((nx, ny), target_grid),
+                            x: nx,
+                            y: ny,
+                        });
+                    }
+                }
+            }
+        }
+        None
+    }
+}
+
+fn parse_initial_map<R: BufRead>(reader: &mut R) -> io::Result<LanderController> {
+    let mut line = String::new();
+
+    // Read first line
+    reader.read_line(&mut line)?;
+    let mut parts = line.split_whitespace();
+    let width = parts.next().unwrap().parse::<usize>().unwrap();
+    let height = parts.next().unwrap().parse::<usize>().unwrap();
+    let gravity = parts.next().unwrap().parse::<f64>().unwrap();
+    let max_thrust = parts.next().unwrap().parse::<f64>().unwrap();
+    let fuel = parts.next().unwrap().parse::<f64>().unwrap();
+
+    // Read second line
+    line.clear();
+    reader.read_line(&mut line)?;
+    let mut parts = line.split_whitespace();
+    let start_x = parts.next().unwrap().parse::<f64>().unwrap();
+    let start_y = parts.next().unwrap().parse::<f64>().unwrap();
+    let target_x = parts.next().unwrap().parse::<f64>().unwrap();
+    let target_y = parts.next().unwrap().parse::<f64>().unwrap();
+
+    // Read map rows
+    let mut obstacles = vec![Vec::new(); height];
+    for y in 0..height {
+        line.clear();
+        reader.read_line(&mut line)?;
+        let bytes = line.trim_end().as_bytes();
+
+        let mut in_obstacle = false;
+        let mut obs_start = 0;
+
+        for (x, &b) in bytes.iter().enumerate() {
+            let x = x as u32;
+            if b == b'#' {
+                if !in_obstacle {
+                    in_obstacle = true;
+                    obs_start = x;
+                }
+            } else {
+                if in_obstacle {
+                    obstacles[y].push((obs_start, x - 1));
+                    in_obstacle = false;
+                }
+            }
+        }
+        if in_obstacle {
+            obstacles[y].push((obs_start, bytes.len() as u32 - 1));
+        }
+    }
+
+    Ok(LanderController {
+        width,
+        height,
+        gravity,
+        max_thrust,
+        fuel,
+        start_x,
+        start_y,
+        target_x,
+        target_y,
+        obstacles,
+        path: Vec::new(),
+    })
+}
+
+fn read_state<R: BufRead>(reader: &mut R, line_buf: &mut String) -> Option<State> {
+    line_buf.clear();
+    if reader.read_line(line_buf).ok()? == 0 {
+        return None;
+    }
+    let mut parts = line_buf.split_whitespace();
+    let x = parts.next()?.parse::<f64>().ok()?;
+    let y = parts.next()?.parse::<f64>().ok()?;
+    let vx = parts.next()?.parse::<f64>().ok()?;
+    let vy = parts.next()?.parse::<f64>().ok()?;
+    let angle = parts.next()?.parse::<f64>().ok()?;
+    let angular_vel = parts.next()?.parse::<f64>().ok()?;
+    let fuel = parts.next()?.parse::<f64>().ok()?;
+    Some(State {
+        x,
+        y,
+        vx,
+        vy,
+        angle,
+        angular_vel,
+        fuel,
+        timestamp: Instant::now(),
+    })
+}
+
+fn predict_state(state: &State, last_thrust: f64, _last_turn: f64, max_thrust: f64, gravity: f64) -> State {
+    let dt = state.timestamp.elapsed().as_secs_f64();
+    let dt = dt.min(0.2);
+
+    let thruster_acc = last_thrust * max_thrust;
+    let ax = thruster_acc * state.angle.sin();
+    let ay = gravity - thruster_acc * state.angle.cos();
+
+    let vx = state.vx + ax * dt;
+    let vy = state.vy + ay * dt;
+    let x = state.x + state.vx * dt + 0.5 * ax * dt * dt;
+    let y = state.y + state.vy * dt + 0.5 * ay * dt * dt;
+
+    let angular_vel = state.angular_vel;
+    let angle = state.angle + angular_vel * dt;
+
+    State {
+        x,
+        y,
+        vx,
+        vy,
+        angle,
+        angular_vel,
+        fuel: state.fuel - last_thrust * dt,
+        timestamp: Instant::now(),
+    }
+}
+
+fn angle_difference(a: f64, b: f64) -> f64 {
+    let mut diff = a - b;
+    while diff > std::f64::consts::PI {
+        diff -= 2.0 * std::f64::consts::PI;
+    }
+    while diff < -std::f64::consts::PI {
+        diff += 2.0 * std::f64::consts::PI;
+    }
+    diff
+}
+
+fn main() {
+    let stdin = io::stdin();
+    let mut reader = stdin.lock();
+
+    let mut controller = match parse_initial_map(&mut reader) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+
+    if let Some(path) = controller.find_path() {
+        controller.path = path;
+    } else {
+        // Fallback: direct path from start to target
+        controller.path = vec![
+            (controller.start_x, controller.start_y),
+            (controller.target_x, controller.target_y),
+        ];
+    }
+
+    let shared_state = Arc::new(Mutex::new(SharedState {
+        state: None,
+        ended: false,
+    }));
+
+    let reader_shared = Arc::clone(&shared_state);
+    thread::spawn(move || {
+        let stdin = io::stdin();
+        let mut reader = stdin.lock();
+        let mut line_buf = String::new();
+        while let Some(state) = read_state(&mut reader, &mut line_buf) {
+            let mut lock = reader_shared.lock().unwrap();
+            lock.state = Some(state);
+        }
+        let mut lock = reader_shared.lock().unwrap();
+        lock.ended = true;
+    });
+
+    let mut last_thrust = 0.0;
+    let mut last_turn = 0.0;
+
+    let interval = Duration::from_millis(40);
+    let mut next_tick = Instant::now();
+
+    loop {
+        let state = {
+            let lock = shared_state.lock().unwrap();
+            if lock.ended {
+                break;
+            }
+            lock.state
+        };
+
+        let Some(state) = state else {
+            thread::sleep(Duration::from_millis(10));
+            continue;
+        };
+
+        // Predict current state using dead reckoning
+        let est = predict_state(
+            &state,
+            last_thrust,
+            last_turn,
+            controller.max_thrust,
+            controller.gravity,
+        );
+
+        // Path tracking logic
+        let mut min_dist = f64::INFINITY;
+        let mut closest_idx = 0;
+        for (i, w) in controller.path.iter().enumerate() {
+            let dx = w.0 - est.x;
+            let dy = w.1 - est.y;
+            let dist = (dx * dx + dy * dy).sqrt();
+            if dist < min_dist {
+                min_dist = dist;
+                closest_idx = i;
+            }
+        }
+
+        // Dynamic lookahead
+        let speed = (est.vx * est.vx + est.vy * est.vy).sqrt();
+        let lookahead_dist = (speed * 1.0).clamp(4.0, 15.0);
+
+        let mut target_idx = closest_idx;
+        while target_idx < controller.path.len() - 1 {
+            let dx = controller.path[target_idx].0 - est.x;
+            let dy = controller.path[target_idx].1 - est.y;
+            let dist = (dx * dx + dy * dy).sqrt();
+            if dist >= lookahead_dist {
+                break;
+            }
+            target_idx += 1;
+        }
+        let target_wp = controller.path[target_idx];
+
+        // Target velocity computation
+        let dx = target_wp.0 - est.x;
+        let dy = target_wp.1 - est.y;
+        let dist = (dx * dx + dy * dy).sqrt().max(1e-5);
+
+        let max_speed = 8.0;
+        let p_speed = (dist * 0.8).min(max_speed);
+
+        let mut vx_des = (dx / dist) * p_speed;
+        let mut vy_des = (dy / dist) * p_speed;
+
+        // If approaching the final destination
+        if target_idx == controller.path.len() - 1 {
+            let y_dist = controller.target_y - est.y;
+            if y_dist > 0.0 && y_dist < 15.0 {
+                let x_err = controller.target_x - est.x;
+                vx_des = (x_err * 0.5).clamp(-2.0, 2.0);
+                if x_err.abs() < 1.0 {
+                    if y_dist > 3.0 {
+                        vy_des = 1.5;
+                    } else {
+                        vy_des = 0.8;
+                    }
+                } else {
+                    vy_des = (y_dist - 2.0).clamp(0.0, 0.5);
+                }
+            }
+        }
+
+        // Add cross-track error correction if off-path
+        let closest_wp = controller.path[closest_idx];
+        let dx_ct = closest_wp.0 - est.x;
+        let dy_ct = closest_wp.1 - est.y;
+        let dist_ct = (dx_ct * dx_ct + dy_ct * dy_ct).sqrt();
+        if dist_ct > 1.0 {
+            vx_des += dx_ct * 0.8;
+            vy_des += dy_ct * 0.8;
+        }
+
+        // Compute desired acceleration
+        let ax_des = (vx_des - est.vx) * 1.5;
+        let ay_des = (vy_des - est.vy) * 1.5;
+
+        // Gravity-compensated thrust force
+        let fx = ax_des;
+        let fy = ay_des - controller.gravity;
+
+        // Desired orientation and magnitude
+        let theta_max = 1.0;
+        let theta_des = fx.atan2(-fy).clamp(-theta_max, theta_max);
+        let f_des = (fx * fx + fy * fy).sqrt();
+
+        // Thrust scaling based on angle error
+        let angle_err = angle_difference(theta_des, est.angle).abs();
+        let thrust_scale = if angle_err < 0.5 {
+            1.0 - (angle_err / 0.5) * 0.5
+        } else if angle_err < 1.0 {
+            0.5 - ((angle_err - 0.5) / 0.5) * 0.5
+        } else {
+            0.0
+        };
+
+        let thrust = (f_des / controller.max_thrust * thrust_scale).clamp(0.0, 1.0);
+
+        // Turn rate PD controller
+        let turn = (4.0 * angle_difference(theta_des, est.angle) - 0.5 * est.angular_vel).clamp(-1.0, 1.0);
+
+        println!("{:.4} {:.4}", thrust, turn);
+        io::stdout().flush().unwrap();
+
+        last_thrust = thrust;
+        last_turn = turn;
+
+        next_tick += interval;
+        let now = Instant::now();
+        if next_tick > now {
+            thread::sleep(next_tick - now);
+        } else {
+            next_tick = now;
+        }
+    }
+}

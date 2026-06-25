@@ -29,6 +29,7 @@ tags = [
   "2d geometry",
 ]
 
+resultFileTypes = ("cpp", "cc", "cxx", "c++", "c", "h", "hpp", "hh", "hxx")
 # Timeout in seconds (30 seconds)
 TIMEOUT_SECONDS = 30
 _BASELINE_CACHE = BaselineCache("test10_rectangle_cutting")

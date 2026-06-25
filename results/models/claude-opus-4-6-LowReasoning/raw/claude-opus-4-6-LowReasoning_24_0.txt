@@ -1,0 +1,320 @@
+#include <iostream>
+#include <fstream>
+#include <vector>
+#include <cmath>
+#include <string>
+#include <thread>
+#include <mutex>
+#include <atomic>
+#include <algorithm>
+#include <cstdint>
+#include <sstream>
+
+static const double PI = 3.14159265358979323846;
+
+struct State {
+    double x, y, z, vx, vy, vz;
+    double pitch, yaw, roll;
+    double pitch_rate, yaw_rate, roll_rate;
+    double fuel;
+};
+
+struct Params {
+    int width, depth, height;
+    double gravity, max_thrust, fuel;
+    double start_x, start_y, start_z;
+    double target_x, target_y, target_z;
+    std::string terrain_path;
+};
+
+// Downsampled terrain for collision avoidance
+struct TerrainInfo {
+    std::vector<uint16_t> ground_top; // a values
+    int tw, td; // terrain dimensions (possibly downsampled)
+    int scale; // downsampling factor
+    std::atomic<bool> ready{false};
+    int orig_w, orig_d;
+};
+
+static TerrainInfo g_terrain;
+
+static double clamp(double v, double lo, double hi) {
+    return v < lo ? lo : (v > hi ? hi : v);
+}
+
+static double angle_diff(double target, double current) {
+    double d = target - current;
+    while (d > PI) d -= 2 * PI;
+    while (d < -PI) d += 2 * PI;
+    return d;
+}
+
+// Get terrain height at position (interpolated from possibly downsampled data)
+static double get_terrain_height(double px, double py) {
+    if (!g_terrain.ready.load(std::memory_order_acquire)) return 0.0;
+    int s = g_terrain.scale;
+    int gx = (int)(px / s);
+    int gy = (int)(py / s);
+    gx = std::max(0, std::min(gx, g_terrain.tw - 1));
+    gy = std::max(0, std::min(gy, g_terrain.td - 1));
+    return (double)g_terrain.ground_top[(size_t)gx * g_terrain.td + gy];
+}
+
+// Check terrain clearance along a path segment
+static double get_max_terrain_in_region(double cx, double cy, double radius) {
+    if (!g_terrain.ready.load(std::memory_order_acquire)) return 0.0;
+    int s = g_terrain.scale;
+    int gx0 = std::max(0, (int)((cx - radius) / s));
+    int gy0 = std::max(0, (int)((cy - radius) / s));
+    int gx1 = std::min(g_terrain.tw - 1, (int)((cx + radius) / s));
+    int gy1 = std::min(g_terrain.td - 1, (int)((cy + radius) / s));
+    double maxh = 0;
+    for (int gx = gx0; gx <= gx1; gx++)
+        for (int gy = gy0; gy <= gy1; gy++)
+            maxh = std::max(maxh, (double)g_terrain.ground_top[(size_t)gx * g_terrain.td + gy]);
+    return maxh;
+}
+
+void load_terrain(const std::string& path, int w, int d) {
+    g_terrain.orig_w = w;
+    g_terrain.orig_d = d;
+
+    // Determine downsampling to keep memory reasonable (max ~64M entries)
+    int scale = 1;
+    while ((int64_t)(w / scale) * (d / scale) > 64000000) scale *= 2;
+
+    g_terrain.scale = scale;
+    g_terrain.tw = (w + scale - 1) / scale;
+    g_terrain.td = (d + scale - 1) / scale;
+
+    g_terrain.ground_top.resize((size_t)g_terrain.tw * g_terrain.td, 0);
+
+    std::ifstream fin(path, std::ios::binary);
+    if (!fin.is_open()) {
+        g_terrain.ready.store(true, std::memory_order_release);
+        return;
+    }
+
+    // Read terrain - for downsampled, we take max of ground_top in each block
+    const size_t row_bytes = (size_t)d * 6;
+    std::vector<uint8_t> row_buf(row_bytes);
+
+    for (int x = 0; x < w; x++) {
+        fin.read((char*)row_buf.data(), row_bytes);
+        if (!fin) break;
+        int gx = x / scale;
+        if (gx >= g_terrain.tw) continue;
+        for (int y = 0; y < d; y++) {
+            int gy = y / scale;
+            if (gy >= g_terrain.td) continue;
+            uint16_t a = (uint16_t)row_buf[y * 6] | ((uint16_t)row_buf[y * 6 + 1] << 8);
+            size_t idx = (size_t)gx * g_terrain.td + gy;
+            if (a > g_terrain.ground_top[idx])
+                g_terrain.ground_top[idx] = a;
+        }
+    }
+
+    g_terrain.ready.store(true, std::memory_order_release);
+}
+
+int main() {
+    std::ios_base::sync_with_stdio(false);
+    std::cin.tie(nullptr);
+
+    Params p;
+    std::cin >> p.width >> p.depth >> p.height >> p.gravity >> p.max_thrust >> p.fuel;
+    std::cin >> p.start_x >> p.start_y >> p.start_z >> p.target_x >> p.target_y >> p.target_z;
+    std::cin.ignore(1024, '\n');
+    std::getline(std::cin, p.terrain_path);
+
+    // Read "STATE" marker
+    std::string marker;
+    std::cin >> marker;
+
+    // Load terrain in background
+    std::thread terrain_thread(load_terrain, p.terrain_path, p.width, p.depth);
+    terrain_thread.detach();
+
+    double tx = p.target_x, ty = p.target_y, tz = p.target_z;
+    double g = p.gravity;
+
+    // Main control loop
+    State s;
+    char line_buf[1024];
+
+    while (std::cin >> s.x >> s.y >> s.z >> s.vx >> s.vy >> s.vz
+                    >> s.pitch >> s.yaw >> s.roll
+                    >> s.pitch_rate >> s.yaw_rate >> s.roll_rate >> s.fuel) {
+
+        double dx = tx - s.x;
+        double dy = ty - s.y;
+        double dz = tz - s.z;
+        double dist_h = std::sqrt(dx * dx + dy * dy);
+        double dist_3d = std::sqrt(dx * dx + dy * dy + dz * dz);
+        double speed_h = std::sqrt(s.vx * s.vx + s.vy * s.vy);
+        double speed_3d = std::sqrt(s.vx * s.vx + s.vy * s.vy + s.vz * s.vz);
+
+        // Desired yaw to face target horizontally
+        double desired_yaw = std::atan2(-dx, -dy);
+        // Note: thrust direction with pitch: at yaw=0, +pitch tilts forward redirecting thrust into -X
+        // More precisely: thrust_x = -sin(pitch)*cos(yaw), thrust_y = -sin(pitch)*sin(yaw) ... wait
+        // Actually from the spec: pitch=0,yaw=0 -> thrust +Z. +pitch redirects into -X.
+        // So thrust direction = (-sin(pitch)*cos(yaw), -sin(pitch)*sin(yaw), cos(pitch))
+        // We want to move toward target. If we set yaw = atan2(dy, dx) and apply +pitch,
+        // thrust goes toward -cos(yaw)*X - sin(yaw)*Y direction.
+        // We want horizontal force toward (dx, dy). So we need:
+        // -cos(yaw) proportional to dx, -sin(yaw) proportional to dy
+        // => cos(yaw) = -dx/dist_h, sin(yaw) = -dy/dist_h
+        // => yaw = atan2(-dy, -dx)
+        // Wait let me reconsider. Thrust horizontal component = -sin(pitch) * (cos(yaw), sin(yaw))
+        // We want this proportional to (dx, dy), so:
+        // cos(yaw) ~ -dx, sin(yaw) ~ -dy (since sin(pitch) will be negative for positive pitch... no, positive pitch means sin(pitch) > 0, so horizontal thrust = -sin(pitch)*(cos(yaw),sin(yaw)))
+        // For horizontal thrust toward target (dx, dy direction), we need:
+        // -sin(pitch)*cos(yaw) = k*dx, -sin(pitch)*sin(yaw) = k*dy where k>0, pitch>0
+        // => cos(yaw) = -dx/dist_h * sign, sin(yaw) = -dy/dist_h * sign
+        // Since we want pitch > 0 (positive tilt): k = -sin(pitch)/dist_h, but sin(pitch)>0 so k<0...
+        // That means thrust goes AWAY from target with positive pitch at this yaw.
+        // Let me fix: we want thrust TOWARD target, so horizontal thrust component should be in direction (dx,dy).
+        // Horizontal thrust = -sin(pitch)*(cos(yaw), sin(yaw)) * max_thrust * thrust_frac
+        // For this to point toward (dx,dy): we need -sin(pitch)*(cos(yaw),sin(yaw)) || (dx,dy)
+        // Option 1: pitch < 0 (which is clamped to -pi/2..pi/2 so fine), then -sin(pitch) > 0
+        //   and (cos(yaw),sin(yaw)) should point toward (dx,dy)
+        //   => yaw = atan2(dy, dx)
+        // Option 2: pitch > 0, -sin(pitch) < 0, so (cos(yaw),sin(yaw)) should point AWAY from target
+        //   => yaw = atan2(-dy, -dx)
+        // Let's use negative pitch to move toward target. yaw = atan2(dy, dx), pitch < 0.
+
+        desired_yaw = std::atan2(dy, dx);
+
+        // --- Phase-based control ---
+        // Phase 1: Move horizontally toward target while maintaining altitude
+        // Phase 2: Descend vertically onto target
+
+        double landing_radius = std::max(5.0, std::min((double)p.width, (double)p.depth) * 0.02);
+
+        // Terrain clearance
+        double terrain_h = get_terrain_height(s.x, s.y);
+        double target_terrain_h = get_terrain_height(tx, ty);
+        double path_max_terrain = get_max_terrain_in_region(
+            (s.x + tx) / 2, (s.y + ty) / 2,
+            dist_h / 2 + 50);
+        double safe_alt = path_max_terrain + std::max(20.0, dist_h * 0.1);
+        safe_alt = std::max(safe_alt, terrain_h + 10.0);
+
+        // Vertical control
+        double desired_vz = 0.0;
+        double desired_pitch = 0.0;
+
+        bool over_target = dist_h < landing_radius * 2;
+        bool close_to_target = dist_h < landing_radius * 0.5;
+
+        if (over_target) {
+            // Descend phase
+            double alt_above_target = s.z - tz;
+
+            // Desired descent rate: proportional to altitude, but capped
+            // Use sqrt profile for smooth landing
+            // v_desired = -sqrt(2 * decel * alt) but capped
+            double max_decel = p.max_thrust / 1.0 - g; // approximate max upward accel (mass=1 assumption... thrust is in m/s²? Let's check)
+            // Actually max_thrust is total thrust force. With unit mass assumption or since the sim
+            // presumably uses F=ma with m folded in, max_thrust is max accel.
+            // Net upward accel = max_thrust - gravity
+            if (max_decel < 0.5) max_decel = 0.5;
+
+            if (alt_above_target > 2.0) {
+                // Descend with braking profile
+                double safe_speed = std::sqrt(2.0 * max_decel * 0.5 * std::max(0.1, alt_above_target - 1.0));
+                safe_speed = std::min(safe_speed, 10.0); // cap descent rate
+                desired_vz = -safe_speed;
+            } else if (alt_above_target > 0.2) {
+                desired_vz = -std::min(2.0, alt_above_target * 1.0);
+            } else {
+                desired_vz = -0.5;
+            }
+
+            // Kill horizontal velocity when over target
+            // Use pitch/yaw to counteract horizontal motion
+            // We want horizontal thrust to oppose velocity
+            if (speed_h > 0.3) {
+                double brake_yaw = std::atan2(-s.vy, -s.vx);
+                desired_yaw = brake_yaw;
+                // Pitch magnitude proportional to horizontal speed
+                desired_pitch = -clamp(speed_h * 0.3, 0.0, 0.5);
+            } else {
+                desired_pitch = 0.0;
+            }
+        } else {
+            // Cruise phase: move toward target
+            // Maintain safe altitude
+            if (s.z < safe_alt) {
+                desired_vz = clamp((safe_alt - s.z) * 0.5, 0.0, 15.0);
+            } else {
+                // Start descending if we're well above and getting close
+                double alt_excess = s.z - safe_alt;
+                desired_vz = -clamp(alt_excess * 0.2, 0.0, 5.0);
+            }
+
+            // Horizontal: tilt toward target
+            // Desired horizontal speed proportional to distance, capped
+            double desired_speed_h = clamp(dist_h * 0.15, 0.0, std::min(50.0, dist_h * 0.5));
+            // Reduce speed as we approach
+            if (dist_h < 100) desired_speed_h = clamp(dist_h * 0.1, 0.0, 10.0);
+
+            // Current speed toward target
+            double v_toward = (dx * s.vx + dy * s.vy) / std::max(dist_h, 0.01);
+            double speed_error = desired_speed_h - v_toward;
+
+            // Lateral speed (perpendicular to target direction)
+            double lat_vx = s.vx - (dx / std::max(dist_h, 0.01)) * v_toward;
+            double lat_vy = s.vy - (dy / std::max(dist_h, 0.01)) * v_toward;
+            double lat_speed = std::sqrt(lat_vx * lat_vx + lat_vy * lat_vy);
+
+            // Combined desired horizontal thrust direction
+            double accel_toward = clamp(speed_error * 0.5, -5.0, 5.0);
+            double desired_ax = (dx / std::max(dist_h, 0.01)) * accel_toward - lat_vx * 0.5;
+            double desired_ay = (dy / std::max(dist_h, 0.01)) * accel_toward - lat_vy * 0.5;
+            double desired_ah = std::sqrt(desired_ax * desired_ax + desired_ay * desired_ay);
+
+            if (desired_ah > 0.01) {
+                desired_yaw = std::atan2(desired_ay, desired_ax);
+                desired_pitch = -clamp(desired_ah * 0.15, 0.0, 0.6);
+            } else {
+                desired_pitch = 0.0;
+            }
+        }
+
+        // Vertical thrust to achieve desired_vz
+        double vz_error = desired_vz - s.vz;
+        double thrust_z = g + clamp(vz_error * 2.0, -g, p.max_thrust * 0.8);
+        // thrust_z is desired vertical acceleration. Actual vertical thrust = thrust * cos(pitch) * max_thrust
+        // So thrust = thrust_z / (cos(pitch) * max_thrust)
+        double cos_pitch = std::cos(s.pitch);
+        double thrust_frac;
+        if (std::abs(cos_pitch) > 0.1)
+            thrust_frac = thrust_z / (cos_pitch * p.max_thrust);
+        else
+            thrust_frac = 1.0; // emergency
+        thrust_frac = clamp(thrust_frac, 0.0, 1.0);
+
+        // Attitude control: PD controller for pitch and yaw
+        double yaw_err = angle_diff(desired_yaw, s.yaw);
+        double pitch_err = desired_pitch - s.pitch;
+
+        // Yaw command: P + D
+        double yaw_cmd = clamp(yaw_err * 2.0 - s.yaw_rate * 1.5, -1.0, 1.0);
+        double pitch_cmd = clamp(pitch_err * 2.0 - s.pitch_rate * 1.5, -1.0, 1.0);
+        double roll_cmd = clamp(-s.roll * 1.0 - s.roll_rate * 1.0, -1.0, 1.0);
+
+        // Safety: if very close to ground and moving fast, full brake
+        double alt_above_ground = s.z - terrain_h;
+        if (alt_above_ground < 5.0 && s.vz < -3.0) {
+            thrust_frac = 1.0;
+            pitch_cmd = clamp(-s.pitch * 3.0 - s.pitch_rate * 2.0, -1.0, 1.0);
+        }
+
+        printf("%.4f %.4f %.4f %.4f\n", thrust_frac, pitch_cmd, yaw_cmd, roll_cmd);
+        fflush(stdout);
+    }
+
+    return 0;
+}

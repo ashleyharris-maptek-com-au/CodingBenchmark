@@ -1,0 +1,327 @@
+import math
+
+# Persistent state across calls
+_prev_lane_offset = 0.0
+_prev_steering = 0.0
+_lane_offset_integral = 0.0
+_speed_integral = 0.0
+_prev_speed_error = 0.0
+_prev_obstacle_dist = None
+_prev_fused_speed = 0.0
+_lane_change_timer = 0.0
+_prev_yaw_rate = 0.0
+_filtered_lane_offset = 0.0
+_filtered_curvature = 0.0
+_obstacle_detected_count = 0
+_obstacle_clear_count = 0
+_filtered_obstacle_dist = 200.0
+_filtered_obstacle_rel_speed = 0.0
+_step_count = 0
+
+
+def _median(values):
+    if not values:
+        return None
+    s = sorted(values)
+    n = len(s)
+    if n % 2 == 1:
+        return s[n // 2]
+    return (s[n // 2 - 1] + s[n // 2]) / 2.0
+
+
+def _fuse_speed(state):
+    speeds = []
+    for prefix in ['fl', 'fr', 'rl', 'rr']:
+        if state.get(f'wheel_speed_{prefix}_valid', False):
+            speeds.append(state[f'wheel_speed_{prefix}_kmh'])
+    for i in [1, 2]:
+        v = state.get(f'vehicle_speed_{i}_kmh', None)
+        if v is not None and v >= 0:
+            speeds.append(v)
+    for i in [1, 2]:
+        if state.get(f'gps_{i}_valid', False):
+            speeds.append(state[f'gps_{i}_speed_kmh'])
+    if not speeds:
+        return 0.0
+    med = _median(speeds)
+    filtered = [s for s in speeds if abs(s - med) < 30]
+    return _median(filtered) if filtered else med
+
+
+def _fuse_yaw_rate(state):
+    vals = []
+    for i in [1, 2, 3]:
+        if state.get(f'gyro_{i}_valid', False):
+            vals.append(state[f'gyro_{i}_yaw_rate_dps'])
+    if not vals:
+        return 0.0
+    return _median(vals)
+
+
+def _fuse_lane_offset(state):
+    offsets = []
+    for i in [1, 2, 3]:
+        prefix = f'vision_{i}_'
+        left_valid = state.get(f'{prefix}left_line_valid', False)
+        right_valid = state.get(f'{prefix}right_line_valid', False)
+        if left_valid and right_valid:
+            left_d = state.get(f'{prefix}left_line_dist_m', 0)
+            right_d = state.get(f'{prefix}right_line_dist_m', 0)
+            offset = (right_d - left_d) / 2.0
+            offsets.append(offset)
+        elif left_valid or right_valid:
+            vo = state.get(f'{prefix}lane_offset_m', None)
+            if vo is not None:
+                offsets.append(vo)
+    if offsets:
+        return _median(offsets)
+    for i in [1, 2, 3]:
+        vo = state.get(f'vision_{i}_lane_offset_m', None)
+        if vo is not None:
+            offsets.append(vo)
+    if offsets:
+        return _median(offsets)
+    return None
+
+
+def _fuse_curvature(state):
+    vals = []
+    for i in [1, 2, 3]:
+        if state.get(f'vision_{i}_left_line_valid', False) or state.get(f'vision_{i}_right_line_valid', False):
+            c = state.get(f'vision_{i}_road_curvature_1pm', 0.0)
+            if c is not None:
+                vals.append(c)
+    return _median(vals) if vals else 0.0
+
+
+def _fuse_obstacle(state):
+    detections = []
+    for i in [1, 2, 3]:
+        prefix = f'vision_{i}_'
+        if state.get(f'{prefix}obstacle_valid', False) and state.get(f'{prefix}obstacle_detected', False):
+            dist = state.get(f'{prefix}obstacle_dist_m', 200)
+            rel_spd = state.get(f'{prefix}obstacle_rel_speed_kmh', 0)
+            detections.append((dist, rel_spd))
+
+    angles_front = ['+005', '-005', '+015', '-015']
+    for a in angles_front:
+        key_v = f'lidar_{a}_deg_valid'
+        key_r = f'lidar_{a}_deg_range_m'
+        if state.get(key_v, False):
+            r = state.get(key_r, 200)
+            if r is not None and r < 150:
+                detections.append((r, 0))
+
+    if not detections:
+        return False, 200.0, 0.0
+
+    dists = [d[0] for d in detections]
+    rel_spds = [d[1] for d in detections]
+    return True, _median(dists), _median(rel_spds)
+
+
+def _get_speed_limit(state):
+    vals = []
+    for i in [1, 2, 3]:
+        if state.get(f'vision_{i}_speed_limit_valid', False):
+            v = state.get(f'vision_{i}_speed_limit_kmh', None)
+            if v is not None and v > 0:
+                vals.append(v)
+    return _median(vals) if vals else None
+
+
+def _lidar_side_clearance(state, side):
+    if side == 'left':
+        angles = ['+030', '+045', '+060', '+090']
+    else:
+        angles = ['-030', '-045', '-060', '-090']
+    ranges = []
+    for a in angles:
+        if state.get(f'lidar_{a}_deg_valid', False):
+            r = state.get(f'lidar_{a}_deg_range_m', 0)
+            if r is not None:
+                ranges.append(r)
+    return min(ranges) if ranges else 50.0
+
+
+def autopilot_step(state: dict, dt: float) -> dict:
+    global _prev_lane_offset, _prev_steering, _lane_offset_integral
+    global _speed_integral, _prev_speed_error, _prev_obstacle_dist
+    global _prev_fused_speed, _lane_change_timer, _prev_yaw_rate
+    global _filtered_lane_offset, _filtered_curvature
+    global _obstacle_detected_count, _obstacle_clear_count
+    global _filtered_obstacle_dist, _filtered_obstacle_rel_speed
+    global _step_count
+
+    _step_count += 1
+    if dt <= 0:
+        dt = 0.02
+
+    mu = state.get('estimated_mu', 1.0)
+    if mu is None or mu <= 0:
+        mu = 0.3
+    mu = max(0.1, min(1.0, mu))
+
+    current_lane = state.get('current_lane', 1)
+    target_lane = state.get('target_lane', 1)
+    target_speed = state.get('target_speed_kmh', 100)
+
+    speed_kmh = _fuse_speed(state)
+    alpha_spd = 0.3
+    fused_speed = alpha_spd * speed_kmh + (1 - alpha_spd) * _prev_fused_speed
+    _prev_fused_speed = fused_speed
+    speed_ms = fused_speed / 3.6
+
+    yaw_rate = _fuse_yaw_rate(state)
+    alpha_yaw = 0.5
+    fused_yaw = alpha_yaw * yaw_rate + (1 - alpha_yaw) * _prev_yaw_rate
+    _prev_yaw_rate = fused_yaw
+
+    lane_offset = _fuse_lane_offset(state)
+    if lane_offset is None:
+        lane_offset = _filtered_lane_offset
+    alpha_lo = 0.4
+    _filtered_lane_offset = alpha_lo * lane_offset + (1 - alpha_lo) * _filtered_lane_offset
+
+    curvature = _fuse_curvature(state)
+    alpha_c = 0.3
+    _filtered_curvature = alpha_c * curvature + (1 - alpha_c) * _filtered_curvature
+
+    obs_detected, obs_dist, obs_rel_speed = _fuse_obstacle(state)
+
+    if obs_detected:
+        _obstacle_detected_count = min(_obstacle_detected_count + 1, 10)
+        _obstacle_clear_count = 0
+    else:
+        _obstacle_clear_count = min(_obstacle_clear_count + 1, 10)
+        if _obstacle_clear_count >= 3:
+            _obstacle_detected_count = max(_obstacle_detected_count - 1, 0)
+
+    confirmed_obstacle = _obstacle_detected_count >= 2
+
+    if confirmed_obstacle:
+        alpha_od = 0.5
+        _filtered_obstacle_dist = alpha_od * obs_dist + (1 - alpha_od) * _filtered_obstacle_dist
+        _filtered_obstacle_rel_speed = alpha_od * obs_rel_speed + (1 - alpha_od) * _filtered_obstacle_rel_speed
+    else:
+        _filtered_obstacle_dist = min(_filtered_obstacle_dist + 5 * dt, 200.0)
+        _filtered_obstacle_rel_speed *= 0.9
+
+    speed_limit = _get_speed_limit(state)
+    effective_target = target_speed
+    if speed_limit is not None:
+        effective_target = min(effective_target, speed_limit)
+
+    mu_factor = min(1.0, mu / 0.8)
+    effective_target *= mu_factor
+
+    # === STEERING ===
+    lane_error = _filtered_lane_offset
+    if current_lane != target_lane:
+        _lane_change_timer += dt
+        lane_diff = target_lane - current_lane
+        lane_change_offset = lane_diff * 1.5
+        blend = min(_lane_change_timer / 3.0, 1.0)
+        lane_error = _filtered_lane_offset - lane_change_offset * blend
+    else:
+        _lane_change_timer = 0.0
+
+    _lane_offset_integral += lane_error * dt
+    _lane_offset_integral = max(-2.0, min(2.0, _lane_offset_integral))
+
+    lane_d = (lane_error - _prev_lane_offset) / dt if dt > 0 else 0
+    _prev_lane_offset = lane_error
+
+    kp = 0.15
+    ki = 0.01
+    kd = 0.08
+
+    steer = -(kp * lane_error + ki * _lane_offset_integral + kd * lane_d)
+
+    curvature_ff = _filtered_curvature * speed_ms * 0.15
+    steer += curvature_ff
+
+    yaw_damping = -fused_yaw * 0.005
+    steer += yaw_damping
+
+    steer *= mu_factor
+    max_steer_rate = 2.0 * dt
+    steer_delta = steer - _prev_steering
+    steer_delta = max(-max_steer_rate, min(max_steer_rate, steer_delta))
+    steer = _prev_steering + steer_delta
+    steer = max(-1.0, min(1.0, steer))
+    _prev_steering = steer
+
+    # === SPEED CONTROL ===
+    speed_error = effective_target - fused_speed
+
+    # Obstacle handling
+    throttle = 0.0
+    brake = 0.0
+
+    if confirmed_obstacle:
+        safe_dist = max(10.0, speed_ms * 2.0)
+        od = _filtered_obstacle_dist
+
+        if od < 5.0:
+            brake = 1.0
+            throttle = 0.0
+        elif od < safe_dist:
+            brake_intensity = (safe_dist - od) / safe_dist
+            brake = min(1.0, brake_intensity * 1.5)
+            throttle = 0.0
+
+            if od < safe_dist * 0.5 and current_lane == target_lane:
+                if target_lane > 0 and _lidar_side_clearance(state, 'left') > 4:
+                    pass
+                elif target_lane < 2 and _lidar_side_clearance(state, 'right') > 4:
+                    pass
+        elif od < safe_dist * 2:
+            approach_speed = -_filtered_obstacle_rel_speed / 3.6
+            if approach_speed > 0:
+                brake = min(0.3, approach_speed / (speed_ms + 0.1) * 0.5)
+            else:
+                speed_error_adj = min(speed_error, (_filtered_obstacle_rel_speed + 5))
+                throttle = max(0.0, min(0.5, speed_error_adj * 0.02))
+        else:
+            if speed_error > 0:
+                throttle = min(1.0, speed_error * 0.03)
+            else:
+                brake = min(1.0, -speed_error * 0.02)
+    else:
+        if speed_error > 2:
+            _speed_integral += speed_error * dt
+            _speed_integral = max(-10, min(10, _speed_integral))
+            d_err = (speed_error - _prev_speed_error) / dt if dt > 0 else 0
+            throttle = min(1.0, max(0.0, 0.03 * speed_error + 0.005 * _speed_integral + 0.01 * d_err))
+            throttle *= mu_factor
+        elif speed_error < -2:
+            _speed_integral = 0
+            brake = min(1.0, max(0.0, -speed_error * 0.02))
+            brake *= mu_factor
+        else:
+            _speed_integral *= 0.95
+            throttle = max(0.0, min(0.3, speed_error * 0.01))
+
+    _prev_speed_error = speed_error
+
+    # Brake failure: try engine braking
+    brake_1_valid = state.get('brake_pressure_1_valid', True)
+    brake_2_valid = state.get('brake_pressure_2_valid', True)
+    if not brake_1_valid and not brake_2_valid:
+        if brake > 0:
+            throttle = 0.0
+            brake = 0.0
+
+    # Traction: limit inputs on low mu
+    if mu < 0.5:
+        throttle = min(throttle, 0.3 * mu_factor)
+        brake = min(brake, 0.5 * mu_factor)
+        steer = max(-0.3, min(0.3, steer))
+        _prev_steering = steer
+
+    return {
+        'steering': round(steer, 4),
+        'throttle': round(max(0.0, min(1.0, throttle)), 4),
+        'brake': round(max(0.0, min(1.0, brake)), 4),
+    }

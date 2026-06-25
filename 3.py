@@ -17,6 +17,7 @@ tags = [
   "visualization",
 ]
 
+resultFileTypes = ("rs", "rust")
 # Seed for reproducible graph generation
 RANDOM_SEED = 54321
 

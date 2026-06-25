@@ -40,6 +40,8 @@ tags = [
   "orbital mechanics",
   "real-time control",
 ]
+
+resultFileTypes = ("py", "python")
 TIMEOUT_SECONDS = 120
 
 _HISTORY_CACHE = {}  # {(aiEngineName, subPass): history_list}

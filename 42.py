@@ -62,6 +62,7 @@ tags = [
   "visual synthesis",
 ]
 
+resultFileTypes = ("spvasm", "asm", "spirv", "spv")
 TIMEOUT_SECONDS = 60
 
 # ---------------------------------------------------------------------------

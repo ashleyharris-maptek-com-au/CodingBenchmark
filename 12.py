@@ -30,6 +30,7 @@ tags = [
   "collision detection",
 ]
 
+resultFileTypes = ("cs", "csharp")
 # Timeout in seconds (5 minutes)
 TIMEOUT_SECONDS = 30
 
@@ -372,6 +373,7 @@ def validate_solution(solution: Dict, poly: Dict, container: Tuple) -> Tuple[boo
   else:
     placementsToCheck = placements
 
+  overlaps = False
   for p in placementsToCheck:
     if not isinstance(p, dict):
       continue
@@ -390,7 +392,6 @@ def validate_solution(solution: Dict, poly: Dict, container: Tuple) -> Tuple[boo
       continue
 
     # Check overlap with previously placed (using AABB approximation)
-    overlaps = False
     for prev_mesh in placed_meshes:
       if meshes_intersect_simple(transformed, prev_mesh):
         overlaps = True

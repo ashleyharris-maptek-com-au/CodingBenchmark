@@ -33,6 +33,7 @@ LANGUAGES = {
     "name": "javascript",
     "label": "JavaScript",
     "code_key": "javascript_code",
+    "result_file_types": ("js", "mjs", "cjs", "javascript"),
     "tags": ["javascript", "nodejs"],
     "execute": execute_javascript,
     "describe": describe_javascript_runtime,
@@ -45,6 +46,8 @@ LANGUAGES = {
     "TypeScript",
     "code_key":
     "typescript_code",
+    "result_file_types":
+    ("ts", "tsx", "typescript"),
     "tags": ["typescript", "nodejs"],
     "execute":
     execute_typescript,
@@ -88,6 +91,7 @@ def configure_problem(problem_key: str,
   return {
     "title": f"{problem['title']} ({language['label']})",
     "tags": _merge_tags(language["tags"], problem["tags"], extra_tags or []),
+    "resultFileTypes": language["result_file_types"],
     "TIMEOUT_SECONDS": TIMEOUT_SECONDS,
     "structure": None,
     "prepareSubpassPrompt": prepareSubpassPrompt,

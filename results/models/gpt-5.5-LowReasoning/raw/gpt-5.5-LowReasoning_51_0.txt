@@ -1,0 +1,308 @@
+import math
+
+_ap_mem = {
+    "last_t": None,
+    "alt": None,
+    "ias": None,
+    "hdg": None,
+    "vs": 0.0,
+    "ias_i": 0.0,
+    "alt_i": 0.0,
+    "hdg_i": 0.0,
+    "trim": 0.0,
+}
+
+
+def _clamp(x, lo, hi):
+    try:
+        if x != x:
+            return (lo + hi) * 0.5
+    except Exception:
+        return (lo + hi) * 0.5
+    return max(lo, min(hi, x))
+
+
+def _num(x, default=0.0):
+    try:
+        x = float(x)
+        return x if math.isfinite(x) else default
+    except Exception:
+        return default
+
+
+def _angle_diff(target, actual):
+    return (target - actual + 180.0) % 360.0 - 180.0
+
+
+def _median(xs):
+    xs = sorted(xs)
+    n = len(xs)
+    if n == 0:
+        return None
+    if n & 1:
+        return xs[n // 2]
+    return 0.5 * (xs[n // 2 - 1] + xs[n // 2])
+
+
+def _vote(values, nominal_min=-1e9, nominal_max=1e9, spread_gate=None, key=None):
+    """Robust selector for three redundant channels.
+
+    Valid flags are treated only as a hint.  Implausible values are discarded,
+    then the closest pair is preferred.  If all channels disagree, keep the
+    channel that is most consistent with the previous accepted value.
+    """
+    candidates = []
+    for val, valid in values:
+        v = _num(val, None)
+        if v is None or v < nominal_min or v > nominal_max:
+            continue
+        score = 0 if valid is False else 1
+        candidates.append((v, score))
+    if not candidates:
+        return None, 0.0
+    if len(candidates) == 1:
+        return candidates[0][0], 0.35
+
+    vals = [v for v, _ in candidates]
+    if spread_gate is None:
+        return _median(vals), min(1.0, len(vals) / 3.0)
+
+    best = None
+    for i in range(len(vals)):
+        for j in range(i + 1, len(vals)):
+            d = abs(vals[i] - vals[j])
+            if best is None or d < best[0]:
+                best = (d, vals[i], vals[j])
+    if best and best[0] <= spread_gate:
+        return 0.5 * (best[1] + best[2]), 0.95 if len(vals) >= 3 else 0.75
+
+    prev = _ap_mem.get(key) if key else None
+    if prev is not None:
+        return min(vals, key=lambda v: abs(v - prev)), 0.45
+    return _median(vals), 0.4
+
+
+def _fused_vertical_state(state, dt):
+    baro, bc = _vote(
+        [(state.get(f"baro_alt_{i}_ft"), state.get(f"baro_alt_{i}_valid")) for i in (1, 2, 3)],
+        -1500, 50000, 350, "alt")
+    gps, gc = _vote(
+        [(state.get(f"gps_{i}_alt_ft"), state.get(f"gps_{i}_valid")) for i in (1, 2, 3)],
+        -1500, 60000, 550, "alt")
+    rad, rc = _vote(
+        [(state.get(f"radar_alt_{i}_ft"), state.get(f"radar_alt_{i}_valid")) for i in (1, 2, 3)],
+        -20, 6000, 120, None)
+    irs_vs, vc = _vote(
+        [(state.get(f"irs_{i}_vs_fpm"), state.get(f"irs_{i}_valid")) for i in (1, 2, 3)],
+        -10000, 10000, 600, None)
+
+    nav_vs = _num(state.get("vertical_speed_fpm"), None)
+    prev_alt = _ap_mem.get("alt")
+    derived = None
+    if prev_alt is not None and baro is not None and dt > 0:
+        raw = (baro - prev_alt) * 60.0 / dt
+        if abs(raw) < 12000:
+            derived = raw
+
+    # Above radio-altimeter range, baro is primary.  Below it, use radar only
+    # to protect terrain clearance and flare decisions; it is height AGL, not MSL.
+    alt = baro if baro is not None else gps
+    conf = max(bc, gc)
+    if alt is None:
+        alt = _num(state.get("target_alt_ft"), 0.0)
+        conf = 0.1
+
+    vs_samples = [v for v in (irs_vs, nav_vs, derived) if v is not None and abs(v) < 12000]
+    vs = _median(vs_samples)
+    if vs is None:
+        vs = _ap_mem.get("vs", 0.0)
+    vs = 0.65 * _ap_mem.get("vs", 0.0) + 0.35 * vs
+    return alt, vs, rad, conf
+
+
+def _fused_speed(state):
+    ias, ic = _vote(
+        [(state.get(f"ias_{i}_kt"), state.get(f"ias_{i}_valid")) for i in (1, 2, 3)],
+        30, 450, 25, "ias")
+    mach, mc = _vote([(state.get(f"mach_{i}"), True) for i in (1, 2, 3)], 0.05, 0.95, 0.035, None)
+    tas, tc = _vote([(state.get(f"tas_{i}_kt"), True) for i in (1, 2, 3)], 40, 600, 45, None)
+    gs, _ = _vote(
+        [(state.get(f"gps_{i}_gs_kt"), state.get(f"gps_{i}_valid")) for i in (1, 2, 3)] +
+        [(state.get(f"irs_{i}_gs_kt"), state.get(f"irs_{i}_valid")) for i in (1, 2, 3)] +
+        [(state.get("ground_speed_kt"), True)],
+        0, 650, 45, None)
+    if ias is None and tas is not None:
+        ias = tas
+        ic = tc * 0.5
+    if ias is None and gs is not None:
+        ias = gs
+        ic = 0.25
+    if ias is None:
+        ias = _ap_mem.get("ias") or _num(state.get("target_ias_kt"), 250)
+        ic = 0.1
+    return ias, mach if mach is not None else 0.0, gs if gs is not None else ias, ic
+
+
+def _fused_attitude(state):
+    pitch, _ = _vote([(state.get(f"irs_{i}_pitch_deg"), state.get(f"irs_{i}_valid")) for i in (1, 2, 3)],
+                     -35, 35, 4, None)
+    roll, _ = _vote([(state.get(f"irs_{i}_roll_deg"), state.get(f"irs_{i}_valid")) for i in (1, 2, 3)],
+                    -80, 80, 5, None)
+    hdg, _ = _vote([(state.get(f"irs_{i}_heading_deg"), state.get(f"irs_{i}_valid")) for i in (1, 2, 3)] +
+                   [(state.get("magnetic_heading_deg"), True), (state.get("true_heading_deg"), True)],
+                   0, 360, None, "hdg")
+    trk, _ = _vote([(state.get(f"gps_{i}_track_deg"), state.get(f"gps_{i}_valid")) for i in (1, 2, 3)] +
+                   [(state.get(f"irs_{i}_track_deg"), state.get(f"irs_{i}_valid")) for i in (1, 2, 3)] +
+                   [(state.get("track_deg"), True)],
+                   0, 360, None, None)
+    pr, _ = _vote([(state.get(f"gyro_{i}_pitch_rate_dps"), state.get(f"gyro_{i}_valid")) for i in (1, 2, 3)],
+                  -80, 80, 8, None)
+    rr, _ = _vote([(state.get(f"gyro_{i}_roll_rate_dps"), state.get(f"gyro_{i}_valid")) for i in (1, 2, 3)],
+                  -120, 120, 10, None)
+    yr, _ = _vote([(state.get(f"gyro_{i}_yaw_rate_dps"), state.get(f"gyro_{i}_valid")) for i in (1, 2, 3)],
+                  -60, 60, 8, None)
+    aoa, _ = _vote([(state.get(f"aoa_{i}_deg"), state.get(f"aoa_{i}_valid")) for i in (1, 2, 3)],
+                   -10, 35, 3.5, None)
+    fused_hdg = hdg if hdg is not None else (_ap_mem.get("hdg") if _ap_mem.get("hdg") is not None else 0.0)
+    fused_trk = trk if trk is not None else fused_hdg
+    return (pitch or 0.0), (roll or 0.0), fused_hdg, fused_trk, (pr or 0.0), (rr or 0.0), (yr or 0.0), aoa
+
+
+def autopilot_step(state: dict, dt: float) -> dict:
+    dt = _clamp(_num(dt if dt else state.get("dt"), 0.05), 0.01, 0.25)
+
+    alt, vs, radar_alt, alt_conf = _fused_vertical_state(state, dt)
+    ias, mach, gs, spd_conf = _fused_speed(state)
+    pitch, roll, hdg, trk, pitch_rate, roll_rate, yaw_rate, aoa = _fused_attitude(state)
+
+    target_alt = _num(state.get("target_alt_ft"), alt)
+    target_hdg = _num(state.get("target_hdg_deg"), hdg) % 360.0
+    target_ias = _clamp(_num(state.get("target_ias_kt"), 250.0), 135.0, 340.0)
+    target_vs = _clamp(_num(state.get("target_vs_fpm"), 0.0), -2500.0, 2500.0)
+
+    wow = bool(state.get("weight_on_wheels_left") or state.get("weight_on_wheels_right") or state.get("weight_on_wheels_nose"))
+    gear_down = bool(state.get("gear_handle_down") or state.get("gear_left_locked") or state.get("gear_right_locked"))
+    flaps_now = max(_num(state.get("flap_pos_left_deg"), 0.0), _num(state.get("flap_pos_right_deg"), 0.0))
+    icing = _num(state.get("icing_rate"), 0.0) > 0.15
+    turbulence = _clamp(_num(state.get("turbulence_intensity"), 0.0), 0.0, 1.0)
+
+    stall_floor = 145.0 + (15.0 if flaps_now < 5 else 0.0) + (10.0 if gear_down else 0.0) + (12.0 if icing else 0.0)
+    overspeed = ias > 365.0 or mach > 0.82
+    stall = ias < stall_floor or (aoa is not None and aoa > 12.0)
+
+    alt_err = _clamp(target_alt - alt, -8000.0, 8000.0)
+    if abs(alt_err) > 150.0:
+        cmd_vs = _clamp(alt_err * 2.2, -2200.0, 2200.0)
+        if target_vs:
+            cmd_vs = _clamp(0.65 * cmd_vs + 0.35 * target_vs, -2500.0, 2500.0)
+    else:
+        cmd_vs = _clamp(target_vs, -1200.0, 1200.0)
+
+    # Terrain and landing protection.  Do not chase a low selected altitude into
+    # the ground; radio altitude wins for the last few hundred feet.
+    if radar_alt is not None and not wow:
+        if radar_alt < 70:
+            cmd_vs = max(cmd_vs, 350.0)
+        elif radar_alt < 250 and alt_err < -100:
+            cmd_vs = max(cmd_vs, -350.0)
+
+    # Energy management: pitch protects angle-of-attack and Vne before altitude.
+    if stall:
+        cmd_vs = min(cmd_vs, -800.0)
+    elif overspeed:
+        cmd_vs = min(cmd_vs, -300.0)
+
+    _ap_mem["alt_i"] = _clamp(_ap_mem.get("alt_i", 0.0) + alt_err * dt * 0.00002, -0.18, 0.18)
+    vs_err = _clamp(cmd_vs - vs, -3500.0, 3500.0)
+    pitch_cmd = _clamp(vs_err / 850.0 + _ap_mem["alt_i"], -0.65, 0.65)
+    elevator = pitch_cmd - 0.055 * pitch - 0.035 * pitch_rate
+    if stall:
+        elevator = min(elevator, -0.45)
+    if overspeed:
+        elevator = min(elevator, -0.15)
+    elevator = _clamp(elevator, -1.0, 1.0)
+
+    # Slow trim toward the steady elevator demand so the relative elevator can
+    # return near neutral without producing a sudden stabilizer movement.
+    _ap_mem["trim"] = _clamp(0.995 * _ap_mem.get("trim", 0.0) + 0.005 * elevator, -0.5, 0.5)
+    elevator_trim = _clamp(_ap_mem["trim"], -1.0, 1.0)
+
+    hdg_err = _angle_diff(target_hdg, hdg)
+    bank_cmd = _clamp(hdg_err * 0.45, -28.0, 28.0)
+    if ias < stall_floor + 15.0 or radar_alt is not None and radar_alt < 300:
+        bank_cmd = _clamp(bank_cmd, -12.0, 12.0)
+    if turbulence > 0.4:
+        bank_cmd *= 0.75
+    roll_err = bank_cmd - roll
+    aileron = _clamp(roll_err / 22.0 - 0.045 * roll_rate, -1.0, 1.0)
+
+    e1_ok = bool(state.get("engine_1_running", True)) and not bool(state.get("engine_1_fire", False))
+    e2_ok = bool(state.get("engine_2_running", True)) and not bool(state.get("engine_2_fire", False))
+    n1_1 = _num(state.get("engine_1_n1_pct"), 0.0)
+    n1_2 = _num(state.get("engine_2_n1_pct"), 0.0)
+    asym = (n1_1 - n1_2) / 100.0
+    rudder = _clamp(-0.18 * yaw_rate - 0.55 * asym - 0.01 * _angle_diff(trk, hdg), -1.0, 1.0)
+
+    spd_err = _clamp(target_ias - ias, -120.0, 120.0)
+    _ap_mem["ias_i"] = _clamp(_ap_mem.get("ias_i", 0.0) + spd_err * dt * 0.002, -0.18, 0.18)
+    base_thr = 0.50 + 0.0042 * spd_err + _ap_mem["ias_i"] + 0.00006 * max(cmd_vs, -500.0)
+    if stall:
+        base_thr = 1.0
+    elif overspeed:
+        base_thr = 0.05
+    elif gear_down or flaps_now > 5:
+        base_thr += 0.08
+    if spd_conf < 0.3:
+        base_thr = max(base_thr, 0.55)
+    base_thr = _clamp(base_thr, 0.0, 1.0)
+
+    throttle_1 = base_thr if e1_ok else 0.0
+    throttle_2 = base_thr if e2_ok else 0.0
+    if e1_ok and not e2_ok:
+        throttle_1 = min(1.0, base_thr + 0.12)
+    if e2_ok and not e1_ok:
+        throttle_2 = min(1.0, base_thr + 0.12)
+
+    if wow:
+        gear = 1
+    elif radar_alt is not None and radar_alt < 800 and (target_alt - alt) < 1500:
+        gear = 1
+    else:
+        gear = 0
+
+    if wow or (radar_alt is not None and radar_alt < 1800 and target_ias < 210):
+        flaps = 30 if target_ias < 165 else 20
+    elif target_ias < 200 or (radar_alt is not None and radar_alt < 3000):
+        flaps = 10
+    else:
+        flaps = 0
+
+    speedbrake = 0.0
+    if overspeed:
+        speedbrake = 0.65
+    elif ias > target_ias + 25 and alt_err < -250 and not stall:
+        speedbrake = 0.35
+    if radar_alt is not None and radar_alt < 500:
+        speedbrake = 0.0
+
+    _ap_mem["alt"] = alt
+    _ap_mem["ias"] = ias
+    _ap_mem["hdg"] = hdg
+    _ap_mem["vs"] = vs
+
+    if not state.get("ap_engaged", True):
+        # With AP off, still return autothrottle if requested and keep surfaces neutral.
+        elevator = aileron = rudder = elevator_trim = 0.0
+    out = {
+        "elevator": _clamp(elevator, -1.0, 1.0),
+        "aileron": _clamp(aileron, -1.0, 1.0),
+        "rudder": _clamp(rudder, -1.0, 1.0),
+        "elevator_trim": _clamp(elevator_trim, -1.0, 1.0),
+        "flaps": int(_clamp(flaps, 0, 40)),
+        "speedbrake": _clamp(speedbrake, 0.0, 1.0),
+        "gear": int(gear),
+    }
+    if state.get("at_engaged", True):
+        out["throttle_1"] = _clamp(throttle_1, 0.0, 1.0)
+        out["throttle_2"] = _clamp(throttle_2, 0.0, 1.0)
+    return out

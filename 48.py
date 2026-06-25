@@ -50,6 +50,7 @@ tags = [
   "numerical methods",
 ]
 
+resultFileTypes = ("spvasm", "asm", "spirv", "spv")
 RANDOM_SEED = 48484848
 TIMEOUT_SECONDS = 60
 

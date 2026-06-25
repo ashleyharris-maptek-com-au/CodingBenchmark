@@ -1,0 +1,1208 @@
+Below is a complete C++20 controller. It is multi-threaded, uses a dedicated control/output loop, a planner thread, and memory-maps the terrain file on Windows for fast random access.
+
+```cpp
+#define NOMINMAX
+#include <windows.h>
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <iomanip>
+#include <iostream>
+#include <limits>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+
+namespace {
+
+constexpr double PI = 3.1415926535897932384626433832795;
+using Clock = std::chrono::steady_clock;
+
+template <typename T>
+T clampv(T v, T lo, T hi) {
+    return (v < lo) ? lo : ((v > hi) ? hi : v);
+}
+
+double wrap_pi(double a) {
+    while (a > PI) a -= 2.0 * PI;
+    while (a < -PI) a += 2.0 * PI;
+    return a;
+}
+
+struct Vec2 {
+    double x = 0.0;
+    double y = 0.0;
+};
+
+struct Vec3 {
+    double x = 0.0;
+    double y = 0.0;
+    double z = 0.0;
+};
+
+Vec2 operator+(const Vec2& a, const Vec2& b) { return {a.x + b.x, a.y + b.y}; }
+Vec2 operator-(const Vec2& a, const Vec2& b) { return {a.x - b.x, a.y - b.y}; }
+Vec2 operator*(const Vec2& a, double s) { return {a.x * s, a.y * s}; }
+Vec2 operator/(const Vec2& a, double s) { return {a.x / s, a.y / s}; }
+
+Vec3 operator+(const Vec3& a, const Vec3& b) { return {a.x + b.x, a.y + b.y, a.z + b.z}; }
+Vec3 operator-(const Vec3& a, const Vec3& b) { return {a.x - b.x, a.y - b.y, a.z - b.z}; }
+Vec3 operator*(const Vec3& a, double s) { return {a.x * s, a.y * s, a.z * s}; }
+Vec3 operator/(const Vec3& a, double s) { return {a.x / s, a.y / s, a.z / s}; }
+
+double norm(const Vec2& v) { return std::hypot(v.x, v.y); }
+double norm(const Vec3& v) { return std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z); }
+
+Vec2 normalize_or_zero(const Vec2& v) {
+    const double n = norm(v);
+    if (n < 1e-12) return {0.0, 0.0};
+    return v / n;
+}
+
+Vec2 clamp_mag(const Vec2& v, double max_mag) {
+    const double n = norm(v);
+    if (n <= max_mag || n < 1e-12) return v;
+    return v * (max_mag / n);
+}
+
+Vec2 lerp(const Vec2& a, const Vec2& b, double t) {
+    return {a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t};
+}
+
+#pragma pack(push, 1)
+struct Column {
+    std::uint16_t a;
+    std::uint16_t b;
+    std::uint16_t c;
+};
+#pragma pack(pop)
+
+static_assert(sizeof(Column) == 6, "Column must be exactly 6 bytes.");
+
+inline std::uint16_t read_u16_le(const unsigned char* p) {
+    return static_cast<std::uint16_t>(p[0] | (static_cast<std::uint16_t>(p[1]) << 8));
+}
+
+class Terrain {
+public:
+    Terrain() = default;
+    ~Terrain() { close(); }
+
+    bool open(const std::string& path, int w, int d, int h) {
+        close();
+        width_ = w;
+        depth_ = d;
+        height_ = h;
+
+        file_ = ::CreateFileA(
+            path.c_str(),
+            GENERIC_READ,
+            FILE_SHARE_READ,
+            nullptr,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_RANDOM_ACCESS,
+            nullptr);
+
+        if (file_ == INVALID_HANDLE_VALUE) {
+            return false;
+        }
+
+        LARGE_INTEGER file_size{};
+        if (!::GetFileSizeEx(file_, &file_size)) {
+            close();
+            return false;
+        }
+
+        const std::uint64_t expected_size =
+            static_cast<std::uint64_t>(width_) * static_cast<std::uint64_t>(depth_) * 6ull;
+        if (static_cast<std::uint64_t>(file_size.QuadPart) != expected_size) {
+            close();
+            return false;
+        }
+
+        mapping_ = ::CreateFileMappingA(file_, nullptr, PAGE_READONLY, 0, 0, nullptr);
+        if (mapping_ != nullptr) {
+            view_ = static_cast<const unsigned char*>(::MapViewOfFile(mapping_, FILE_MAP_READ, 0, 0, 0));
+            if (view_ == nullptr) {
+                ::CloseHandle(mapping_);
+                mapping_ = nullptr;
+            }
+        }
+
+        return true;
+    }
+
+    void close() {
+        if (view_ != nullptr) {
+            ::UnmapViewOfFile(view_);
+            view_ = nullptr;
+        }
+        if (mapping_ != nullptr) {
+            ::CloseHandle(mapping_);
+            mapping_ = nullptr;
+        }
+        if (file_ != INVALID_HANDLE_VALUE) {
+            ::CloseHandle(file_);
+            file_ = INVALID_HANDLE_VALUE;
+        }
+        width_ = depth_ = height_ = 0;
+    }
+
+    bool ready() const {
+        return file_ != INVALID_HANDLE_VALUE;
+    }
+
+    bool getColumn(int x, int y, Column& out) const {
+        if (!ready()) return false;
+        if (x < 0 || x >= width_ || y < 0 || y >= depth_) return false;
+
+        const std::uint64_t idx =
+            static_cast<std::uint64_t>(x) * static_cast<std::uint64_t>(depth_) +
+            static_cast<std::uint64_t>(y);
+        const std::uint64_t off = idx * 6ull;
+
+        if (view_ != nullptr) {
+            const unsigned char* p = view_ + off;
+            out.a = read_u16_le(p + 0);
+            out.b = read_u16_le(p + 2);
+            out.c = read_u16_le(p + 4);
+            return true;
+        }
+
+        std::lock_guard<std::mutex> lock(file_mutex_);
+        LARGE_INTEGER li{};
+        li.QuadPart = static_cast<LONGLONG>(off);
+        if (!::SetFilePointerEx(file_, li, nullptr, FILE_BEGIN)) return false;
+
+        unsigned char buf[6];
+        DWORD bytes_read = 0;
+        if (!::ReadFile(file_, buf, 6, &bytes_read, nullptr) || bytes_read != 6) {
+            return false;
+        }
+
+        out.a = read_u16_le(buf + 0);
+        out.b = read_u16_le(buf + 2);
+        out.c = read_u16_le(buf + 4);
+        return true;
+    }
+
+private:
+    int width_ = 0;
+    int depth_ = 0;
+    int height_ = 0;
+
+    HANDLE file_ = INVALID_HANDLE_VALUE;
+    HANDLE mapping_ = nullptr;
+    const unsigned char* view_ = nullptr;
+    mutable std::mutex file_mutex_;
+};
+
+struct Config {
+    int width = 0;
+    int depth = 0;
+    int height = 0;
+    double gravity = 1.62;
+    double max_thrust = 0.0;
+    double initial_fuel = 0.0;
+    Vec3 start{};
+    Vec3 target{};
+    double landing_radius = 5.0;
+    double diag_xy = 0.0;
+};
+
+struct State {
+    Vec3 pos{};
+    Vec3 vel{};
+    double pitch = 0.0;
+    double yaw = 0.0;
+    double roll = 0.0;
+    double pitch_rate = 0.0;
+    double yaw_rate = 0.0;
+    double roll_rate = 0.0;
+    double fuel = 0.0;
+    std::uint64_t seq = 0;
+    Clock::time_point stamp = Clock::now();
+};
+
+enum class WaypointMode {
+    FAST,
+    SLOW,
+    LAND
+};
+
+struct Waypoint {
+    Vec3 pos{};
+    WaypointMode mode = WaypointMode::FAST;
+    double xy_tol = 2.0;
+    double z_tol = 1.0;
+};
+
+struct Plan {
+    bool valid = false;
+    std::uint64_t based_on_seq = 0;
+    Clock::time_point made = Clock::now();
+    std::vector<Waypoint> waypoints;
+};
+
+struct Route2D {
+    bool ok = false;
+    std::vector<Vec3> points;
+};
+
+struct PortalCandidate {
+    bool ok = false;
+    int ix = -1;
+    int iy = -1;
+    Vec2 portal_xy{};
+    Route2D route;
+    double cost = 0.0;
+};
+
+struct Shared {
+    Config cfg;
+    Terrain terrain;
+
+    std::mutex state_mutex;
+    State latest_state{};
+    std::atomic<bool> have_state{false};
+    std::atomic<std::uint64_t> state_seq{0};
+
+    std::mutex plan_mutex;
+    Plan latest_plan{};
+
+    std::atomic<bool> running{true};
+};
+
+bool in_bounds_xy(const Config& cfg, const Vec2& p, double margin = 0.0) {
+    return p.x >= margin &&
+           p.y >= margin &&
+           p.x < static_cast<double>(cfg.width) - margin &&
+           p.y < static_cast<double>(cfg.depth) - margin;
+}
+
+bool point_to_cell(const Config& cfg, const Vec2& p, int& ix, int& iy) {
+    if (!in_bounds_xy(cfg, p, 0.0)) return false;
+    ix = static_cast<int>(std::floor(p.x));
+    iy = static_cast<int>(std::floor(p.y));
+    if (ix < 0 || ix >= cfg.width || iy < 0 || iy >= cfg.depth) return false;
+    return true;
+}
+
+Vec2 cell_center(int ix, int iy) {
+    return {static_cast<double>(ix) + 0.5, static_cast<double>(iy) + 0.5};
+}
+
+double path_length_points(const std::vector<Vec3>& pts) {
+    double total = 0.0;
+    for (std::size_t i = 1; i < pts.size(); ++i) {
+        total += norm(pts[i] - pts[i - 1]);
+    }
+    return total;
+}
+
+double path_length_waypoints(const std::vector<Waypoint>& pts) {
+    double total = 0.0;
+    for (std::size_t i = 1; i < pts.size(); ++i) {
+        total += norm(pts[i].pos - pts[i - 1].pos);
+    }
+    return total;
+}
+
+Waypoint make_waypoint(const Config& cfg, const Vec3& pos, WaypointMode mode) {
+    Waypoint w;
+    w.pos = pos;
+    w.mode = mode;
+    if (mode == WaypointMode::FAST) {
+        w.xy_tol = clampv(0.20 * cfg.landing_radius, 2.0, 10.0);
+        w.z_tol = 2.0;
+    } else if (mode == WaypointMode::SLOW) {
+        w.xy_tol = clampv(0.10 * cfg.landing_radius, 1.0, 4.0);
+        w.z_tol = 1.0;
+    } else {
+        w.xy_tol = clampv(0.05 * cfg.landing_radius, 0.5, 2.0);
+        w.z_tol = 0.5;
+    }
+    return w;
+}
+
+void append_route(const Config& cfg, std::vector<Waypoint>& out, const Route2D& route, WaypointMode mode) {
+    if (!route.ok) return;
+    for (const Vec3& p : route.points) {
+        Waypoint w = make_waypoint(cfg, p, mode);
+        if (!out.empty()) {
+            const Waypoint& last = out.back();
+            const double d = norm(last.pos - w.pos);
+            if (d < 0.25 && last.mode == w.mode) {
+                continue;
+            }
+        }
+        out.push_back(w);
+    }
+}
+
+template <typename F>
+bool sample_line_cells(const Config& cfg, const Terrain& terr, const Vec2& a, const Vec2& b, F&& fn) {
+    const double dx = b.x - a.x;
+    const double dy = b.y - a.y;
+    const int steps = std::max(1, static_cast<int>(std::ceil(2.0 * std::max(std::abs(dx), std::abs(dy)))));
+
+    int prev_x = std::numeric_limits<int>::min();
+    int prev_y = std::numeric_limits<int>::min();
+
+    for (int i = 0; i <= steps; ++i) {
+        const double t = static_cast<double>(i) / static_cast<double>(steps);
+        const Vec2 p{a.x + dx * t, a.y + dy * t};
+
+        int ix = 0, iy = 0;
+        if (!point_to_cell(cfg, p, ix, iy)) return false;
+        if (ix == prev_x && iy == prev_y) continue;
+
+        Column c{};
+        if (!terr.getColumn(ix, iy, c)) return false;
+        if (!fn(ix, iy, c)) return false;
+
+        prev_x = ix;
+        prev_y = iy;
+    }
+    return true;
+}
+
+bool has_floating_rock(const Column& c) {
+    return c.b < c.c;
+}
+
+double upper_solid_top_with_margin(const Config& cfg, const Column& c) {
+    const double rock_clear = 0.75;
+    const double ground_clear = std::max(6.0, 0.05 * cfg.landing_radius);
+    if (has_floating_rock(c)) {
+        return static_cast<double>(c.c) + rock_clear;
+    }
+    return static_cast<double>(c.a) + ground_clear;
+}
+
+bool compute_upper_altitude_for_line(
+    const Config& cfg,
+    const Terrain& terr,
+    const Vec2& a,
+    const Vec2& b,
+    double& z_required)
+{
+    const double top_margin = 0.15;
+    z_required = 0.0;
+
+    bool ok = sample_line_cells(cfg, terr, a, b, [&](int, int, const Column& c) {
+        z_required = std::max(z_required, upper_solid_top_with_margin(cfg, c));
+        return z_required < static_cast<double>(cfg.height) - top_margin;
+    });
+
+    return ok && z_required < static_cast<double>(cfg.height) - top_margin;
+}
+
+bool compute_lower_corridor_for_line(
+    const Config& cfg,
+    const Terrain& terr,
+    const Vec2& a,
+    const Vec2& b,
+    double& z_min,
+    double& z_max)
+{
+    const double floor_clear = 0.75;
+    const double ceil_clear = 0.75;
+    const double top_margin = 0.15;
+
+    z_min = -std::numeric_limits<double>::infinity();
+    z_max = std::numeric_limits<double>::infinity();
+
+    bool ok = sample_line_cells(cfg, terr, a, b, [&](int, int, const Column& c) {
+        const double floor_z = static_cast<double>(c.a) + floor_clear;
+        const double ceiling_z = has_floating_rock(c)
+            ? (static_cast<double>(c.b) - ceil_clear)
+            : (static_cast<double>(cfg.height) - top_margin);
+
+        z_min = std::max(z_min, floor_z);
+        z_max = std::min(z_max, ceiling_z);
+        return z_min < z_max;
+    });
+
+    return ok && z_min < z_max;
+}
+
+double choose_lower_transit_z(double z_min, double z_max, double hint) {
+    if (!(z_min < z_max)) return 0.0;
+    const double span = z_max - z_min;
+    double lo = z_min + 0.15 * span;
+    double hi = z_max - 0.15 * span;
+    if (lo > hi) {
+        lo = z_min;
+        hi = z_max;
+    }
+    return clampv(hint, lo, hi);
+}
+
+std::vector<double> candidate_radii(double base, double dist, double max_r) {
+    std::vector<double> r;
+    auto add = [&](double v) {
+        if (v > 0.0 && v <= max_r) r.push_back(v);
+    };
+
+    add(base);
+    add(base * 2.0);
+    add(base * 4.0);
+    add(base * 8.0);
+    add(dist * 0.15);
+    add(dist * 0.30);
+    add(dist * 0.50);
+
+    if (r.empty() && max_r > 0.0) r.push_back(max_r);
+
+    std::sort(r.begin(), r.end());
+    r.erase(std::unique(r.begin(), r.end(), [](double a, double b) {
+        return std::abs(a - b) < 1e-6;
+    }), r.end());
+    return r;
+}
+
+Route2D compute_lower_route(
+    const Config& cfg,
+    const Terrain& terr,
+    const Vec2& a,
+    const Vec2& b,
+    double hint_z)
+{
+    Route2D route;
+
+    double zmin = 0.0, zmax = 0.0;
+    if (compute_lower_corridor_for_line(cfg, terr, a, b, zmin, zmax)) {
+        const double z = choose_lower_transit_z(zmin, zmax, hint_z);
+        route.ok = true;
+        route.points.push_back({a.x, a.y, z});
+        route.points.push_back({b.x, b.y, z});
+        return route;
+    }
+
+    const double dist = norm(b - a);
+    if (dist < 1.0) return route;
+
+    const Vec2 centers[] = {lerp(a, b, 0.25), lerp(a, b, 0.5), lerp(a, b, 0.75)};
+    const double base = std::max(6.0, cfg.landing_radius);
+    const double max_r = std::min(
+        std::min(2000.0, 0.25 * static_cast<double>(std::min(cfg.width, cfg.depth))),
+        std::max(30.0, dist * 0.7 + 20.0));
+
+    const std::vector<double> radii = candidate_radii(base, dist, max_r);
+
+    double best_cost = std::numeric_limits<double>::infinity();
+    Route2D best;
+
+    for (const Vec2& center : centers) {
+        for (double r : radii) {
+            const int n = clampv(static_cast<int>(std::ceil(2.0 * PI * r / std::max(8.0, cfg.landing_radius))), 8, 48);
+            for (int i = 0; i < n; ++i) {
+                const double ang = 2.0 * PI * static_cast<double>(i) / static_cast<double>(n);
+                Vec2 w{
+                    center.x + r * std::cos(ang),
+                    center.y + r * std::sin(ang)
+                };
+                if (!in_bounds_xy(cfg, w, 0.5)) continue;
+
+                int wix = 0, wiy = 0;
+                if (!point_to_cell(cfg, w, wix, wiy)) continue;
+                w = cell_center(wix, wiy);
+
+                double z1min = 0.0, z1max = 0.0, z2min = 0.0, z2max = 0.0;
+                if (!compute_lower_corridor_for_line(cfg, terr, a, w, z1min, z1max)) continue;
+                if (!compute_lower_corridor_for_line(cfg, terr, w, b, z2min, z2max)) continue;
+
+                const double z1 = choose_lower_transit_z(z1min, z1max, hint_z);
+                const double z2 = choose_lower_transit_z(z2min, z2max, hint_z);
+
+                Route2D cand;
+                cand.ok = true;
+                cand.points.push_back({a.x, a.y, z1});
+                cand.points.push_back({w.x, w.y, z1});
+                cand.points.push_back({w.x, w.y, z2});
+                cand.points.push_back({b.x, b.y, z2});
+
+                const double cost = path_length_points(cand.points);
+                if (cost < best_cost) {
+                    best_cost = cost;
+                    best = cand;
+                }
+            }
+        }
+    }
+
+    return best;
+}
+
+Route2D compute_upper_route(
+    const Config& cfg,
+    const Terrain& terr,
+    const Vec2& a,
+    const Vec2& b,
+    double min_z)
+{
+    Route2D route;
+    double z_req = 0.0;
+
+    if (compute_upper_altitude_for_line(cfg, terr, a, b, z_req)) {
+        const double z = std::max(z_req, min_z);
+        route.ok = true;
+        route.points.push_back({a.x, a.y, z});
+        route.points.push_back({b.x, b.y, z});
+        return route;
+    }
+
+    const double dist = norm(b - a);
+    if (dist < 1.0) return route;
+
+    const Vec2 centers[] = {lerp(a, b, 0.25), lerp(a, b, 0.5), lerp(a, b, 0.75)};
+    const double base = std::max(10.0, cfg.landing_radius * 1.5);
+    const double max_r = std::min(
+        std::min(5000.0, 0.50 * static_cast<double>(std::min(cfg.width, cfg.depth))),
+        std::max(50.0, dist * 0.8 + 40.0));
+
+    const std::vector<double> radii = candidate_radii(base, dist, max_r);
+
+    double best_cost = std::numeric_limits<double>::infinity();
+    Route2D best;
+
+    for (const Vec2& center : centers) {
+        for (double r : radii) {
+            const int n = clampv(static_cast<int>(std::ceil(2.0 * PI * r / std::max(12.0, cfg.landing_radius))), 10, 64);
+            for (int i = 0; i < n; ++i) {
+                const double ang = 2.0 * PI * static_cast<double>(i) / static_cast<double>(n);
+                Vec2 w{
+                    center.x + r * std::cos(ang),
+                    center.y + r * std::sin(ang)
+                };
+                if (!in_bounds_xy(cfg, w, 0.5)) continue;
+
+                int wix = 0, wiy = 0;
+                if (!point_to_cell(cfg, w, wix, wiy)) continue;
+                w = cell_center(wix, wiy);
+
+                double z1 = 0.0, z2 = 0.0;
+                if (!compute_upper_altitude_for_line(cfg, terr, a, w, z1)) continue;
+                if (!compute_upper_altitude_for_line(cfg, terr, w, b, z2)) continue;
+
+                const double z = std::max(std::max(z1, z2), min_z);
+
+                Route2D cand;
+                cand.ok = true;
+                cand.points.push_back({a.x, a.y, z});
+                cand.points.push_back({w.x, w.y, z});
+                cand.points.push_back({b.x, b.y, z});
+
+                const double cost = path_length_points(cand.points);
+                if (cost < best_cost) {
+                    best_cost = cost;
+                    best = cand;
+                }
+            }
+        }
+    }
+
+    return best;
+}
+
+bool sky_blocked_at(const Config& cfg, const Terrain& terr, const Vec3& p) {
+    int ix = 0, iy = 0;
+    if (!point_to_cell(cfg, {p.x, p.y}, ix, iy)) return true;
+    Column c{};
+    if (!terr.getColumn(ix, iy, c)) return true;
+    return has_floating_rock(c) && (p.z < static_cast<double>(c.b) - 0.1);
+}
+
+bool can_access_lower_at(const Config& cfg, const Terrain& terr, const Vec3& p) {
+    int ix = 0, iy = 0;
+    if (!point_to_cell(cfg, {p.x, p.y}, ix, iy)) return false;
+    Column c{};
+    if (!terr.getColumn(ix, iy, c)) return false;
+    return (!has_floating_rock(c)) || (p.z < static_cast<double>(c.b) - 0.1);
+}
+
+bool column_has_no_ceiling(const Terrain& terr, int ix, int iy) {
+    Column c{};
+    if (!terr.getColumn(ix, iy, c)) return false;
+    return !has_floating_rock(c);
+}
+
+void insert_portal_candidate(std::vector<PortalCandidate>& out, PortalCandidate cand, int max_keep) {
+    for (const auto& e : out) {
+        if (e.ix == cand.ix && e.iy == cand.iy) return;
+    }
+    out.push_back(std::move(cand));
+    std::sort(out.begin(), out.end(), [](const PortalCandidate& a, const PortalCandidate& b) {
+        return a.cost < b.cost;
+    });
+    if (static_cast<int>(out.size()) > max_keep) {
+        out.resize(static_cast<std::size_t>(max_keep));
+    }
+}
+
+std::vector<PortalCandidate> search_portals(
+    const Config& cfg,
+    const Terrain& terr,
+    const Vec2& anchor_xy,
+    double hint_z,
+    bool route_from_anchor,
+    int max_candidates)
+{
+    std::vector<PortalCandidate> result;
+
+    auto test_candidate_cell = [&](int ix, int iy) {
+        if (ix < 0 || ix >= cfg.width || iy < 0 || iy >= cfg.depth) return;
+        if (!column_has_no_ceiling(terr, ix, iy)) return;
+
+        const Vec2 portal = cell_center(ix, iy);
+        Route2D route = route_from_anchor
+            ? compute_lower_route(cfg, terr, anchor_xy, portal, hint_z)
+            : compute_lower_route(cfg, terr, portal, anchor_xy, hint_z);
+
+        if (!route.ok) return;
+
+        PortalCandidate cand;
+        cand.ok = true;
+        cand.ix = ix;
+        cand.iy = iy;
+        cand.portal_xy = portal;
+        cand.route = std::move(route);
+        cand.cost = path_length_points(cand.route.points);
+        insert_portal_candidate(result, std::move(cand), max_candidates);
+    };
+
+    int cx = 0, cy = 0;
+    if (!point_to_cell(cfg, anchor_xy, cx, cy)) return result;
+
+    const int dense_r = 40;
+    for (int r = 0; r <= dense_r; ++r) {
+        for (int x = cx - r; x <= cx + r; ++x) {
+            test_candidate_cell(x, cy - r);
+            if (r != 0) test_candidate_cell(x, cy + r);
+        }
+        for (int y = cy - r + 1; y <= cy + r - 1; ++y) {
+            test_candidate_cell(cx - r, y);
+            if (r != 0) test_candidate_cell(cx + r, y);
+        }
+    }
+
+    const double max_r = std::min(
+        5000.0,
+        std::max(150.0, 0.45 * static_cast<double>(std::min(cfg.width, cfg.depth))));
+
+    for (double r = 60.0; r <= max_r; r *= 1.45) {
+        const int n = clampv(static_cast<int>(std::ceil(2.0 * PI * r / 20.0)), 16, 96);
+        for (int i = 0; i < n; ++i) {
+            const double ang = 2.0 * PI * static_cast<double>(i) / static_cast<double>(n);
+            Vec2 p{
+                anchor_xy.x + r * std::cos(ang),
+                anchor_xy.y + r * std::sin(ang)
+            };
+            if (!in_bounds_xy(cfg, p, 0.5)) continue;
+            int ix = 0, iy = 0;
+            if (!point_to_cell(cfg, p, ix, iy)) continue;
+            test_candidate_cell(ix, iy);
+        }
+    }
+
+    return result;
+}
+
+State snapshot_state(Shared& shared) {
+    std::lock_guard<std::mutex> lock(shared.state_mutex);
+    return shared.latest_state;
+}
+
+Plan snapshot_plan(Shared& shared) {
+    std::lock_guard<std::mutex> lock(shared.plan_mutex);
+    return shared.latest_plan;
+}
+
+Plan build_plan(const Config& cfg, const Terrain& terr, const State& st) {
+    Plan best_plan;
+    best_plan.valid = false;
+    best_plan.based_on_seq = st.seq;
+    best_plan.made = Clock::now();
+
+    if (!terr.ready()) return best_plan;
+    if (!in_bounds_xy(cfg, {st.pos.x, st.pos.y}, 0.0)) return best_plan;
+    if (!in_bounds_xy(cfg, {cfg.target.x, cfg.target.y}, 0.0)) return best_plan;
+
+    const Vec3 target = cfg.target;
+
+    const bool current_sky_blocked = sky_blocked_at(cfg, terr, st.pos);
+    const bool target_sky_blocked = sky_blocked_at(cfg, terr, target);
+
+    const bool current_lower_access = can_access_lower_at(cfg, terr, st.pos);
+    const bool target_lower_access = can_access_lower_at(cfg, terr, target);
+
+    auto consider_candidate = [&](Plan cand) {
+        cand.valid = !cand.waypoints.empty();
+        cand.based_on_seq = st.seq;
+        cand.made = Clock::now();
+        if (!cand.valid) return;
+
+        const double score = path_length_waypoints(cand.waypoints) + 5.0 * static_cast<double>(cand.waypoints.size());
+        if (!best_plan.valid) {
+            best_plan = std::move(cand);
+            return;
+        }
+        const double best_score = path_length_waypoints(best_plan.waypoints) + 5.0 * static_cast<double>(best_plan.waypoints.size());
+        if (score < best_score) {
+            best_plan = std::move(cand);
+        }
+    };
+
+    // If at least one endpoint is under a ceiling, try a direct lower-layer plan first.
+    if ((current_sky_blocked || target_sky_blocked) && current_lower_access && target_lower_access) {
+        const double hint_z = std::max(st.pos.z, target.z + std::max(3.0, 0.30 * cfg.landing_radius));
+        Route2D lower_direct = compute_lower_route(cfg, terr, {st.pos.x, st.pos.y}, {target.x, target.y}, hint_z);
+        if (lower_direct.ok) {
+            Plan cand;
+            append_route(cfg, cand.waypoints, lower_direct, WaypointMode::SLOW);
+            cand.waypoints.push_back(make_waypoint(cfg, target, WaypointMode::LAND));
+            consider_candidate(std::move(cand));
+        }
+    }
+
+    std::vector<PortalCandidate> start_portals;
+    std::vector<PortalCandidate> target_portals;
+
+    if (current_sky_blocked) {
+        start_portals = search_portals(cfg, terr, {st.pos.x, st.pos.y}, st.pos.z, true, 4);
+        if (start_portals.empty()) {
+            return best_plan;
+        }
+    } else {
+        PortalCandidate p;
+        p.ok = true;
+        p.portal_xy = {st.pos.x, st.pos.y};
+        p.cost = 0.0;
+        start_portals.push_back(p);
+    }
+
+    if (target_sky_blocked) {
+        const double hint_z = target.z + std::max(3.0, 0.30 * cfg.landing_radius);
+        target_portals = search_portals(cfg, terr, {target.x, target.y}, hint_z, false, 4);
+        if (target_portals.empty()) {
+            return best_plan;
+        }
+    } else {
+        PortalCandidate p;
+        p.ok = true;
+        p.portal_xy = {target.x, target.y};
+        p.cost = 0.0;
+        target_portals.push_back(p);
+    }
+
+    for (const auto& sp : start_portals) {
+        for (const auto& tp : target_portals) {
+            const Vec2 upper_start = current_sky_blocked ? sp.portal_xy : Vec2{st.pos.x, st.pos.y};
+            const Vec2 upper_end   = target_sky_blocked ? tp.portal_xy : Vec2{target.x, target.y};
+
+            const double min_upper_z = current_sky_blocked ? 0.0 : st.pos.z;
+            Route2D upper = compute_upper_route(cfg, terr, upper_start, upper_end, min_upper_z);
+            if (!upper.ok) continue;
+
+            Plan cand;
+            if (current_sky_blocked) {
+                append_route(cfg, cand.waypoints, sp.route, WaypointMode::SLOW);
+            }
+            append_route(cfg, cand.waypoints, upper, WaypointMode::FAST);
+            if (target_sky_blocked) {
+                append_route(cfg, cand.waypoints, tp.route, WaypointMode::SLOW);
+            }
+            cand.waypoints.push_back(make_waypoint(cfg, target, WaypointMode::LAND));
+            consider_candidate(std::move(cand));
+        }
+    }
+
+    // Last-resort lower route, only if no valid plan yet.
+    if (!best_plan.valid && current_lower_access && target_lower_access) {
+        const double hint_z = std::max(st.pos.z, target.z + std::max(3.0, 0.30 * cfg.landing_radius));
+        Route2D lower_direct = compute_lower_route(cfg, terr, {st.pos.x, st.pos.y}, {target.x, target.y}, hint_z);
+        if (lower_direct.ok) {
+            Plan cand;
+            append_route(cfg, cand.waypoints, lower_direct, WaypointMode::SLOW);
+            cand.waypoints.push_back(make_waypoint(cfg, target, WaypointMode::LAND));
+            consider_candidate(std::move(cand));
+        }
+    }
+
+    return best_plan;
+}
+
+bool reached_waypoint(const State& st, const Waypoint& wp) {
+    if (wp.mode == WaypointMode::LAND) return false;
+    const double dxy = std::hypot(wp.pos.x - st.pos.x, wp.pos.y - st.pos.y);
+    const double dz = std::abs(wp.pos.z - st.pos.z);
+    return dxy <= wp.xy_tol && dz <= wp.z_tol;
+}
+
+Waypoint fallback_waypoint(const Config& cfg, const State& st) {
+    const double climb_margin = std::max(30.0, 0.02 * static_cast<double>(cfg.height));
+    const double cruise_z = clampv(
+        std::max({st.pos.z, cfg.target.z + 20.0, st.pos.z + climb_margin}),
+        5.0,
+        static_cast<double>(cfg.height) - 1.0);
+
+    const double dxy = std::hypot(cfg.target.x - st.pos.x, cfg.target.y - st.pos.y);
+    if (st.pos.z < cruise_z - 2.0) {
+        return make_waypoint(cfg, {st.pos.x, st.pos.y, cruise_z}, WaypointMode::SLOW);
+    }
+    if (dxy > cfg.landing_radius) {
+        return make_waypoint(cfg, {cfg.target.x, cfg.target.y, cruise_z}, WaypointMode::FAST);
+    }
+    return make_waypoint(cfg, cfg.target, WaypointMode::LAND);
+}
+
+Waypoint select_active_waypoint(const Config& cfg, const State& st, const Plan& plan) {
+    if (!plan.valid || plan.waypoints.empty()) {
+        return fallback_waypoint(cfg, st);
+    }
+
+    for (const Waypoint& wp : plan.waypoints) {
+        if (!reached_waypoint(st, wp)) {
+            return wp;
+        }
+    }
+
+    return plan.waypoints.back();
+}
+
+struct Command {
+    double thrust = 0.0;
+    double pitch_cmd = 0.0;
+    double yaw_cmd = 0.0;
+    double roll_cmd = 0.0;
+};
+
+Command compute_command(const Config& cfg, const State& st, const Waypoint& wp) {
+    Command cmd{};
+
+    if (cfg.max_thrust <= 1e-9) {
+        return cmd;
+    }
+
+    const double up_acc_nom = std::max(0.2, cfg.max_thrust - cfg.gravity);
+    const double horiz_nom = std::max(0.2, std::sqrt(std::max(0.0, cfg.max_thrust * cfg.max_thrust - cfg.gravity * cfg.gravity)));
+
+    struct Params {
+        double xy_brake_a = 1.0;
+        double xy_speed_cap = 10.0;
+        double z_up_cap = 10.0;
+        double z_down_cap = 10.0;
+        double kv_xy = 1.0;
+        double kv_z = 1.0;
+    } p;
+
+    if (wp.mode == WaypointMode::FAST) {
+        p.xy_brake_a = std::max(0.3, 0.80 * horiz_nom);
+        p.xy_speed_cap = clampv(0.8 * std::sqrt(std::max(1.0, 2.0 * horiz_nom * std::max(cfg.width, cfg.depth))), 30.0, 900.0);
+        p.z_up_cap = 30.0;
+        p.z_down_cap = 20.0;
+        p.kv_xy = 1.0;
+        p.kv_z = 1.0;
+    } else if (wp.mode == WaypointMode::SLOW) {
+        p.xy_brake_a = std::max(0.2, 0.55 * horiz_nom);
+        p.xy_speed_cap = 35.0;
+        p.z_up_cap = 12.0;
+        p.z_down_cap = 8.0;
+        p.kv_xy = 1.3;
+        p.kv_z = 1.4;
+    } else {
+        p.xy_brake_a = std::max(0.15, 0.45 * horiz_nom);
+        p.xy_speed_cap = 6.0;
+        p.z_up_cap = 6.0;
+        p.z_down_cap = 4.0;
+        p.kv_xy = 1.8;
+        p.kv_z = 1.8;
+    }
+
+    const Vec2 pos_xy{st.pos.x, st.pos.y};
+    const Vec2 vel_xy{st.vel.x, st.vel.y};
+    const Vec2 goal_xy{wp.pos.x, wp.pos.y};
+
+    const Vec2 err_xy = goal_xy - pos_xy;
+    const double dist_xy = norm(err_xy);
+    const Vec2 dir_xy = normalize_or_zero(err_xy);
+
+    double v_allow_xy = std::sqrt(std::max(0.0, 2.0 * p.xy_brake_a * dist_xy));
+    v_allow_xy = std::min(v_allow_xy, p.xy_speed_cap);
+
+    if (wp.mode == WaypointMode::LAND) {
+        if (dist_xy > 2.0 * cfg.landing_radius) {
+            v_allow_xy = std::min(v_allow_xy, 4.0);
+        } else if (dist_xy > cfg.landing_radius) {
+            v_allow_xy = std::min(v_allow_xy, 2.0);
+        } else {
+            v_allow_xy = std::min(v_allow_xy, 1.0);
+        }
+    }
+
+    const Vec2 v_des_xy = dir_xy * v_allow_xy;
+    Vec2 a_des_xy = (v_des_xy - vel_xy) * p.kv_xy;
+
+    if (dist_xy < 5.0 * wp.xy_tol) {
+        a_des_xy = a_des_xy + err_xy * 0.25;
+    }
+
+    const double dz = wp.pos.z - st.pos.z;
+    double v_des_z = 0.0;
+
+    if (wp.mode == WaypointMode::LAND) {
+        if (dz >= 0.0) {
+            v_des_z = std::min(3.0, std::sqrt(std::max(0.0, 2.0 * up_acc_nom * dz)));
+        } else {
+            const double above = -dz;
+            double sink_cap = 0.7;
+            if (dist_xy > 2.0 * cfg.landing_radius) sink_cap = 0.5;
+            else if (dist_xy > cfg.landing_radius) sink_cap = 1.0;
+            else if (above > 40.0) sink_cap = 8.0;
+            else if (above > 15.0) sink_cap = 4.0;
+            else if (above > 5.0) sink_cap = 1.8;
+            else sink_cap = 0.7;
+
+            v_des_z = -std::min(sink_cap, std::sqrt(std::max(0.0, 2.0 * up_acc_nom * above)));
+        }
+    } else {
+        if (dz >= 0.0) {
+            v_des_z = std::min(p.z_up_cap, std::sqrt(std::max(0.0, 2.0 * up_acc_nom * dz)));
+        } else {
+            v_des_z = -std::min(p.z_down_cap, std::sqrt(std::max(0.0, 2.0 * up_acc_nom * (-dz))));
+        }
+    }
+
+    double a_des_z = (v_des_z - st.vel.z) * p.kv_z;
+    if (std::abs(dz) < 3.0) {
+        a_des_z += dz * 0.35;
+    }
+
+    double thrust_z = cfg.gravity + a_des_z;
+    if (wp.mode != WaypointMode::LAND) {
+        const double reserve = (wp.mode == WaypointMode::FAST)
+            ? 0.10 * up_acc_nom
+            : 0.20 * up_acc_nom;
+        thrust_z = std::max(thrust_z, cfg.gravity + reserve);
+    }
+    thrust_z = clampv(thrust_z, 0.2, cfg.max_thrust);
+
+    if (wp.mode == WaypointMode::LAND && st.vel.z < 0.0) {
+        const double above = std::max(0.0, st.pos.z - wp.pos.z);
+        const double stop_dist = (st.vel.z * st.vel.z) / (2.0 * std::max(0.2, up_acc_nom));
+        if (stop_dist + 0.6 > above) {
+            thrust_z = cfg.max_thrust;
+        }
+    }
+
+    const double h_cap = std::sqrt(std::max(0.0, cfg.max_thrust * cfg.max_thrust - thrust_z * thrust_z));
+    const Vec2 thrust_xy = clamp_mag(a_des_xy, h_cap * 0.98);
+
+    Vec3 thrust_vec{thrust_xy.x, thrust_xy.y, thrust_z};
+    double thrust_mag = norm(thrust_vec);
+    if (thrust_mag > cfg.max_thrust) {
+        thrust_vec = thrust_vec * (cfg.max_thrust / thrust_mag);
+        thrust_mag = cfg.max_thrust;
+    }
+
+    cmd.thrust = clampv(thrust_mag / cfg.max_thrust, 0.0, 1.0);
+
+    double desired_pitch = 0.0;
+    double desired_yaw = st.yaw;
+
+    if (thrust_mag > 1e-8) {
+        const double ux = thrust_vec.x / thrust_mag;
+        const double uy = thrust_vec.y / thrust_mag;
+        const double uz = clampv(thrust_vec.z / thrust_mag, -1.0, 1.0);
+
+        const double hxy = std::hypot(ux, uy);
+
+        if (hxy > 1e-6) {
+            const double pitch_abs = std::atan2(hxy, std::max(1e-9, uz));
+            const double yaw_base = std::atan2(-uy, -ux);
+
+            const double p1 = pitch_abs;
+            const double y1 = yaw_base;
+
+            const double p2 = -pitch_abs;
+            const double y2 = wrap_pi(yaw_base + PI);
+
+            const double cost1 = std::abs(p1 - st.pitch) + 0.5 * std::abs(wrap_pi(y1 - st.yaw));
+            const double cost2 = std::abs(p2 - st.pitch) + 0.5 * std::abs(wrap_pi(y2 - st.yaw));
+
+            if (cost1 <= cost2) {
+                desired_pitch = p1;
+                desired_yaw = y1;
+            } else {
+                desired_pitch = p2;
+                desired_yaw = y2;
+            }
+        }
+    }
+
+    const double pitch_err = clampv(desired_pitch - st.pitch, -PI, PI);
+    const double yaw_err = wrap_pi(desired_yaw - st.yaw);
+    const double roll_err = wrap_pi(-st.roll);
+
+    cmd.pitch_cmd = clampv(2.5 * pitch_err - 0.8 * st.pitch_rate, -1.0, 1.0);
+    cmd.yaw_cmd = clampv(1.8 * yaw_err - 0.6 * st.yaw_rate, -1.0, 1.0);
+    cmd.roll_cmd = clampv(1.2 * roll_err - 0.5 * st.roll_rate, -1.0, 1.0);
+
+    return cmd;
+}
+
+void planner_thread_main(Shared* shared) {
+    while (shared->running.load(std::memory_order_relaxed)) {
+        if (!shared->have_state.load(std::memory_order_acquire)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            continue;
+        }
+
+        State st = snapshot_state(*shared);
+        Plan plan = build_plan(shared->cfg, shared->terrain, st);
+
+        {
+            std::lock_guard<std::mutex> lock(shared->plan_mutex);
+            if (plan.valid || !shared->latest_plan.valid) {
+                shared->latest_plan = std::move(plan);
+            }
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    }
+}
+
+void control_thread_main(Shared* shared) {
+    std::cout.setf(std::ios::fixed);
+    std::cout << std::setprecision(6);
+
+    auto next_tick = Clock::now();
+
+    while (shared->running.load(std::memory_order_relaxed)) {
+        State st = snapshot_state(*shared);
+        Plan plan = snapshot_plan(*shared);
+
+        Waypoint wp = select_active_waypoint(shared->cfg, st, plan);
+        Command cmd = compute_command(shared->cfg, st, wp);
+
+        std::cout
+            << cmd.thrust << ' '
+            << cmd.pitch_cmd << ' '
+            << cmd.yaw_cmd << ' '
+            << cmd.roll_cmd << '\n';
+        std::cout.flush();
+
+        next_tick += std::chrono::milliseconds(50);
+        std::this_thread::sleep_until(next_tick);
+    }
+}
+
+} // namespace
+
+int main() {
+    std::ios::sync_with_stdio(false);
+    std::cin.tie(nullptr);
+
+    double width_d = 0.0, depth_d = 0.0, height_d = 0.0;
+    double gravity = 0.0, max_thrust = 0.0, fuel0 = 0.0;
+    double sx = 0.0, sy = 0.0, sz = 0.0;
+    double tx = 0.0, ty = 0.0, tz = 0.0;
+
+    if (!(std::cin >> width_d >> depth_d >> height_d >> gravity >> max_thrust >> fuel0)) {
+        return 0;
+    }
+    if (!(std::cin >> sx >> sy >> sz >> tx >> ty >> tz)) {
+        return 0;
+    }
+
+    std::string dummy;
+    std::getline(std::cin, dummy);
+
+    std::string terrain_path;
+    std::getline(std::cin, terrain_path);
+
+    std::string state_marker;
+    if (!(std::cin >> state_marker)) {
+        return 0;
+    }
+
+    Shared shared;
+    shared.cfg.width = std::max(1, static_cast<int>(std::llround(width_d)));
+    shared.cfg.depth = std::max(1, static_cast<int>(std::llround(depth_d)));
+    shared.cfg.height = std::max(1, static_cast<int>(std::llround(height_d)));
+    shared.cfg.gravity = gravity;
+    shared.cfg.max_thrust = max_thrust;
+    shared.cfg.initial_fuel = fuel0;
+    shared.cfg.start = {sx, sy, sz};
+    shared.cfg.target = {tx, ty, tz};
+    shared.cfg.landing_radius = std::max(
+        5.0,
+        0.02 * static_cast<double>(std::min(shared.cfg.width, shared.cfg.depth)));
+    shared.cfg.diag_xy = std::hypot(
+        static_cast<double>(shared.cfg.width),
+        static_cast<double>(shared.cfg.depth));
+
+    shared.terrain.open(
+        terrain_path,
+        shared.cfg.width,
+        shared.cfg.depth,
+        shared.cfg.height);
+
+    {
+        std::lock_guard<std::mutex> lock(shared.state_mutex);
+        shared.latest_state.pos = shared.cfg.start;
+        shared.latest_state.vel = {0.0, 0.0, 0.0};
+        shared.latest_state.pitch = 0.0;
+        shared.latest_state.yaw = 0.0;
+        shared.latest_state.roll = 0.0;
+        shared.latest_state.pitch_rate = 0.0;
+        shared.latest_state.yaw_rate = 0.0;
+        shared.latest_state.roll_rate = 0.0;
+        shared.latest_state.fuel = fuel0;
+        shared.latest_state.seq = 0;
+        shared.latest_state.stamp = Clock::now();
+    }
+    shared.have_state.store(true, std::memory_order_release);
+
+    std::thread planner(planner_thread_main, &shared);
+    std::thread controller(control_thread_main, &shared);
+
+    while (shared.running.load(std::memory_order_relaxed)) {
+        State st;
+        if (!(std::cin
+              >> st.pos.x >> st.pos.y >> st.pos.z
+              >> st.vel.x >> st.vel.y >> st.vel.z
+              >> st.pitch >> st.yaw >> st.roll
+              >> st.pitch_rate >> st.yaw_rate >> st.roll_rate
+              >> st.fuel)) {
+            break;
+        }
+
+        st.seq = shared.state_seq.fetch_add(1, std::memory_order_acq_rel) + 1;
+        st.stamp = Clock::now();
+
+        {
+            std::lock_guard<std::mutex> lock(shared.state_mutex);
+            shared.latest_state = st;
+        }
+        shared.have_state.store(true, std::memory_order_release);
+    }
+
+    shared.running.store(false, std::memory_order_release);
+
+    if (planner.joinable()) planner.join();
+    if (controller.joinable()) controller.join();
+
+    return 0;
+}
+```
+
+If you want, I can also provide a second version with:
+1. more aggressive guidance for speed/time,
+2. more conservative landing tuning,
+3. or a purely standard-library terrain reader without Windows memory mapping.

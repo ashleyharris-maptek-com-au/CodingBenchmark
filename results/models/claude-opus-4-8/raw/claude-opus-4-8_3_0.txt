@@ -1,0 +1,419 @@
+// Graph Layout — Edge Crossing Minimization
+//
+// Strategy: a scalable force-directed (Fruchterman-Reingold style) layout.
+//   * Repulsion is approximated with a uniform spatial grid so that each node
+//     only interacts with neighbours in adjacent cells -> ~O(N) per iteration.
+//   * Attraction runs along the edge list -> O(M) per iteration.
+//   * Repulsion work is split across threads (std::thread::scope) for large
+//     graphs.
+//   * Iteration count and effort adapt to graph size so we stay well within
+//     the 30s budget from 6 nodes up to 200,000 nodes.
+//
+// Robustness: self-loops and out-of-range endpoints are ignored, parallel
+// edges are harmless (they add a little extra attraction), and disconnected
+// components are kept together by a weak gravity pull toward the centre.
+//
+// No external crates: compiles with a bare `rustc -O solution.rs`.
+
+use std::io::{self, Read, Write};
+use std::thread;
+
+// ----------------------------------------------------------------------------
+// Fast deterministic RNG (xorshift) — reproducible layouts, no dependencies.
+// ----------------------------------------------------------------------------
+struct Rng(u64);
+impl Rng {
+    fn new(seed: u64) -> Self {
+        Rng(seed | 1)
+    }
+    #[inline]
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        x
+    }
+    #[inline]
+    fn next_f32(&mut self) -> f32 {
+        (self.next_u64() >> 40) as f32 / (1u64 << 24) as f32
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Fast integer parsing from a byte buffer.
+// ----------------------------------------------------------------------------
+struct Parser<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+impl<'a> Parser<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Parser { data, pos: 0 }
+    }
+    #[inline]
+    fn next_usize(&mut self) -> Option<usize> {
+        let d = self.data;
+        let n = d.len();
+        while self.pos < n && !d[self.pos].is_ascii_digit() {
+            self.pos += 1;
+        }
+        if self.pos >= n {
+            return None;
+        }
+        let mut val: usize = 0;
+        while self.pos < n && d[self.pos].is_ascii_digit() {
+            val = val * 10 + (d[self.pos] - b'0') as usize;
+            self.pos += 1;
+        }
+        Some(val)
+    }
+}
+
+// Read-only grid description shared across threads during repulsion.
+struct Grid<'a> {
+    gw: usize,
+    gh: usize,
+    min_x: f32,
+    min_y: f32,
+    cell_size: f32,
+    cell_start: &'a [u32],
+    cell_nodes: &'a [u32],
+}
+
+fn main() {
+    // ---- Read all of stdin ----
+    let mut input = Vec::new();
+    io::stdin().read_to_end(&mut input).expect("read stdin");
+    let mut p = Parser::new(&input);
+
+    let n = p.next_usize().unwrap_or(0);
+    let m = p.next_usize().unwrap_or(0);
+
+    if n == 0 {
+        let mut out = io::stdout().lock();
+        let _ = writeln!(out, "0");
+        return;
+    }
+
+    // ---- Read edges, build CSR adjacency (skip self-loops / bad indices) ----
+    let mut edges: Vec<(u32, u32)> = Vec::with_capacity(m);
+    let mut degree: Vec<u32> = vec![0; n];
+    for _ in 0..m {
+        let u = match p.next_usize() {
+            Some(v) => v,
+            None => break,
+        };
+        let v = match p.next_usize() {
+            Some(v) => v,
+            None => break,
+        };
+        if u >= n || v >= n || u == v {
+            continue;
+        }
+        edges.push((u as u32, v as u32));
+        degree[u] += 1;
+        degree[v] += 1;
+    }
+
+    // ---- Layout parameters ----
+    let nf = n as f32;
+    let k = 1.0f32; // ideal edge length
+    let area_side = nf.sqrt() * k * 2.0; // bounding region side
+    let center = area_side * 0.5;
+
+    // Adaptive iteration count.
+    let iters: usize = if n <= 100 {
+        600
+    } else if n <= 1_000 {
+        400
+    } else if n <= 10_000 {
+        250
+    } else if n <= 50_000 {
+        150
+    } else {
+        90
+    };
+
+    // ---- Initial positions ----
+    let mut pos_x: Vec<f32> = vec![0.0; n];
+    let mut pos_y: Vec<f32> = vec![0.0; n];
+    let mut rng = Rng::new(0x9E3779B97F4A7C15);
+    for i in 0..n {
+        pos_x[i] = rng.next_f32() * area_side;
+        pos_y[i] = rng.next_f32() * area_side;
+    }
+
+    if n == 1 {
+        let mut out = io::stdout().lock();
+        let _ = writeln!(out, "1");
+        let _ = writeln!(out, "0.0 0.0");
+        return;
+    }
+
+    let nthreads = if n >= 2_000 {
+        thread::available_parallelism()
+            .map(|x| x.get())
+            .unwrap_or(1)
+            .min(64)
+            .max(1)
+    } else {
+        1
+    };
+
+    let mut disp_x: Vec<f32> = vec![0.0; n];
+    let mut disp_y: Vec<f32> = vec![0.0; n];
+
+    let cell_size = 2.0 * k; // grid cell ~ interaction radius
+
+    let mut temp = area_side * 0.1;
+    let temp_min = 0.01 * k;
+    let cooling = (temp_min / temp).powf(1.0 / iters as f32);
+
+    // Reusable grid buffers.
+    let mut cell_of: Vec<u32> = vec![0; n];
+    let mut cell_nodes: Vec<u32> = vec![0; n];
+
+    for _it in 0..iters {
+        // ---- Bounding box ----
+        let mut min_x = f32::MAX;
+        let mut min_y = f32::MAX;
+        let mut max_x = f32::MIN;
+        let mut max_y = f32::MIN;
+        for i in 0..n {
+            let x = pos_x[i];
+            let y = pos_y[i];
+            if x < min_x {
+                min_x = x;
+            }
+            if y < min_y {
+                min_y = y;
+            }
+            if x > max_x {
+                max_x = x;
+            }
+            if y > max_y {
+                max_y = y;
+            }
+        }
+        if !min_x.is_finite() {
+            min_x = 0.0;
+            min_y = 0.0;
+            max_x = area_side;
+            max_y = area_side;
+        }
+
+        let gw = (((max_x - min_x) / cell_size).ceil() as usize + 1).max(1);
+        let gh = (((max_y - min_y) / cell_size).ceil() as usize + 1).max(1);
+        let ncells = gw * gh;
+
+        // ---- Bin nodes into cells (counting sort) ----
+        let mut cell_start: Vec<u32> = vec![0; ncells + 1];
+        for i in 0..n {
+            let cx = (((pos_x[i] - min_x) / cell_size) as usize).min(gw - 1);
+            let cy = (((pos_y[i] - min_y) / cell_size) as usize).min(gh - 1);
+            let c = (cy * gw + cx) as u32;
+            cell_of[i] = c;
+            cell_start[c as usize + 1] += 1;
+        }
+        for c in 0..ncells {
+            cell_start[c + 1] += cell_start[c];
+        }
+        {
+            let mut cur = cell_start.clone();
+            for i in 0..n {
+                let c = cell_of[i] as usize;
+                let idx = cur[c] as usize;
+                cell_nodes[idx] = i as u32;
+                cur[c] += 1;
+            }
+        }
+
+        let grid = Grid {
+            gw,
+            gh,
+            min_x,
+            min_y,
+            cell_size,
+            cell_start: &cell_start,
+            cell_nodes: &cell_nodes,
+        };
+
+        // ---- Repulsion (grid-approximated), parallel over node ranges ----
+        let k2 = k * k;
+        repulsion_parallel(n, nthreads, &grid, &pos_x, &pos_y, k2, &mut disp_x, &mut disp_y);
+
+        // ---- Attraction along edges ----
+        for &(u, v) in &edges {
+            let u = u as usize;
+            let v = v as usize;
+            let dx = pos_x[u] - pos_x[v];
+            let dy = pos_y[u] - pos_y[v];
+            let mut dist = (dx * dx + dy * dy).sqrt();
+            if dist < 1e-6 {
+                dist = 1e-6;
+            }
+            let f = dist / k; // attractive magnitude = dist^2 / k, scaled by dir/dist
+            let fx = dx / dist * f;
+            let fy = dy / dist * f;
+            disp_x[u] -= fx;
+            disp_y[u] -= fy;
+            disp_x[v] += fx;
+            disp_y[v] += fy;
+        }
+
+        // ---- Weak gravity toward centre (keeps components together) ----
+        let grav = 0.01 * k;
+        for i in 0..n {
+            let dx = center - pos_x[i];
+            let dy = center - pos_y[i];
+            let w = grav * (1.0 + degree[i] as f32).sqrt() * 0.1;
+            disp_x[i] += dx * w;
+            disp_y[i] += dy * w;
+        }
+
+        // ---- Apply displacements, capped by temperature ----
+        for i in 0..n {
+            let dx = disp_x[i];
+            let dy = disp_y[i];
+            let len = (dx * dx + dy * dy).sqrt();
+            if len > 1e-9 {
+                let cap = if len > temp { temp / len } else { 1.0 };
+                pos_x[i] += dx * cap;
+                pos_y[i] += dy * cap;
+            }
+            disp_x[i] = 0.0;
+            disp_y[i] = 0.0;
+        }
+
+        temp *= cooling;
+    }
+
+    // ---- Output ----
+    let mut out = Vec::with_capacity(n * 16);
+    out.extend_from_slice(n.to_string().as_bytes());
+    out.push(b'\n');
+    let mut buf = String::with_capacity(32);
+    for i in 0..n {
+        fmt_f32(pos_x[i], &mut out, &mut buf);
+        out.push(b' ');
+        fmt_f32(pos_y[i], &mut out, &mut buf);
+        out.push(b'\n');
+    }
+    let stdout = io::stdout();
+    let mut lock = stdout.lock();
+    let _ = lock.write_all(&out);
+    let _ = lock.flush();
+}
+
+fn fmt_f32(v: f32, out: &mut Vec<u8>, buf: &mut String) {
+    use std::fmt::Write as _;
+    buf.clear();
+    let v = if v.is_finite() { v } else { 0.0 };
+    let _ = write!(buf, "{:.4}", v);
+    out.extend_from_slice(buf.as_bytes());
+}
+
+// ----------------------------------------------------------------------------
+// Parallel repulsion. Each thread handles a contiguous range of nodes; it
+// reads shared positions/grid (immutable) and writes only its own disjoint
+// slice of the displacement buffers, so this is data-race free.
+// ----------------------------------------------------------------------------
+fn repulsion_parallel(
+    n: usize,
+    nthreads: usize,
+    grid: &Grid,
+    px: &[f32],
+    py: &[f32],
+    k2: f32,
+    disp_x: &mut [f32],
+    disp_y: &mut [f32],
+) {
+    if nthreads <= 1 {
+        for i in 0..n {
+            let (fx, fy) = repulsion_for_node(i, grid, px, py, k2);
+            disp_x[i] += fx;
+            disp_y[i] += fy;
+        }
+        return;
+    }
+
+    let chunk = (n + nthreads - 1) / nthreads;
+    let mut dx_chunks: Vec<&mut [f32]> = Vec::new();
+    let mut dy_chunks: Vec<&mut [f32]> = Vec::new();
+    {
+        let mut dx_rem: &mut [f32] = disp_x;
+        let mut dy_rem: &mut [f32] = disp_y;
+        while !dx_rem.is_empty() {
+            let take = chunk.min(dx_rem.len());
+            let (a, b) = dx_rem.split_at_mut(take);
+            dx_rem = b;
+            dx_chunks.push(a);
+            let (c, d) = dy_rem.split_at_mut(take);
+            dy_rem = d;
+            dy_chunks.push(c);
+        }
+    }
+
+    thread::scope(|s| {
+        let mut start = 0usize;
+        for (dxc, dyc) in dx_chunks.into_iter().zip(dy_chunks.into_iter()) {
+            let len = dxc.len();
+            let lo = start;
+            start += len;
+            s.spawn(move || {
+                for off in 0..len {
+                    let i = lo + off;
+                    let (fx, fy) = repulsion_for_node(i, grid, px, py, k2);
+                    dxc[off] += fx;
+                    dyc[off] += fy;
+                }
+            });
+        }
+    });
+}
+
+#[inline]
+fn repulsion_for_node(i: usize, grid: &Grid, px: &[f32], py: &[f32], k2: f32) -> (f32, f32) {
+    let xi = px[i];
+    let yi = py[i];
+    let gw = grid.gw as i64;
+    let gh = grid.gh as i64;
+    let cx = (((xi - grid.min_x) / grid.cell_size) as i64).clamp(0, gw - 1);
+    let cy = (((yi - grid.min_y) / grid.cell_size) as i64).clamp(0, gh - 1);
+
+    let mut fx = 0.0f32;
+    let mut fy = 0.0f32;
+    for ddy in -1..=1i64 {
+        let ny = cy + ddy;
+        if ny < 0 || ny >= gh {
+            continue;
+        }
+        for ddx in -1..=1i64 {
+            let nx = cx + ddx;
+            if nx < 0 || nx >= gw {
+                continue;
+            }
+            let c = (ny * gw + nx) as usize;
+            let s = grid.cell_start[c] as usize;
+            let e = grid.cell_start[c + 1] as usize;
+            for idx in s..e {
+                let j = grid.cell_nodes[idx] as usize;
+                if j == i {
+                    continue;
+                }
+                let dx = xi - px[j];
+                let dy = yi - py[j];
+                let mut d2 = dx * dx + dy * dy;
+                if d2 < 1e-6 {
+                    d2 = 1e-6;
+                }
+                let f = k2 / d2; // |force| = k^2/d, applied as (dx,dy)*k^2/d^2
+                fx += dx * f;
+                fy += dy * f;
+            }
+        }
+    }
+    (fx, fy)
+}

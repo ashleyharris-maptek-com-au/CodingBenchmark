@@ -1,0 +1,291 @@
+use std::io::{self, BufRead, Write};
+use std::sync::{Arc, atomic::{AtomicU64, AtomicBool, Ordering}};
+use std::thread;
+use std::time::{Duration, Instant};
+
+struct MapInfo {
+    width: usize,
+    height: usize,
+    gravity: f64,
+    max_thrust: f64,
+    initial_fuel: f64,
+    start_x: f64,
+    start_y: f64,
+    target_x: f64,
+    target_y: f64,
+}
+
+#[derive(Clone, Default)]
+struct StateUpdate {
+    x: f64,
+    y: f64,
+    vx: f64,
+    vy: f64,
+    angle: f64,
+    angular_vel: f64,
+    fuel_remaining: f64,
+}
+
+struct SharedState {
+    x: AtomicU64,
+    y: AtomicU64,
+    vx: AtomicU64,
+    vy: AtomicU64,
+    angle: AtomicU64,
+    angular_vel: AtomicU64,
+    fuel_remaining: AtomicU64,
+    updated: AtomicBool,
+}
+
+impl SharedState {
+    fn new() -> Self {
+        Self {
+            x: AtomicU64::new(0),
+            y: AtomicU64::new(0),
+            vx: AtomicU64::new(0),
+            vy: AtomicU64::new(0),
+            angle: AtomicU64::new(0),
+            angular_vel: AtomicU64::new(0),
+            fuel_remaining: AtomicU64::new(0),
+            updated: AtomicBool::new(false),
+        }
+    }
+    fn update(&self, st: StateUpdate) {
+        self.x.store(st.x.to_bits(), Ordering::Relaxed);
+        self.y.store(st.y.to_bits(), Ordering::Relaxed);
+        self.vx.store(st.vx.to_bits(), Ordering::Relaxed);
+        self.vy.store(st.vy.to_bits(), Ordering::Relaxed);
+        self.angle.store(st.angle.to_bits(), Ordering::Relaxed);
+        self.angular_vel.store(st.angular_vel.to_bits(), Ordering::Relaxed);
+        self.fuel_remaining.store(st.fuel_remaining.to_bits(), Ordering::Relaxed);
+        self.updated.store(true, Ordering::Release);
+    }
+    fn get(&self) -> StateUpdate {
+        StateUpdate {
+            x: f64::from_bits(self.x.load(Ordering::Relaxed)),
+            y: f64::from_bits(self.y.load(Ordering::Relaxed)),
+            vx: f64::from_bits(self.vx.load(Ordering::Relaxed)),
+            vy: f64::from_bits(self.vy.load(Ordering::Relaxed)),
+            angle: f64::from_bits(self.angle.load(Ordering::Relaxed)),
+            angular_vel: f64::from_bits(self.angular_vel.load(Ordering::Relaxed)),
+            fuel_remaining: f64::from_bits(self.fuel_remaining.load(Ordering::Relaxed)),
+        }
+    }
+    fn is_updated(&self) -> bool {
+        self.updated.load(Ordering::Acquire)
+    }
+}
+
+#[derive(PartialEq, Clone, Copy, Debug)]
+enum Phase {
+    Ascend,
+    Traverse,
+    Descend,
+}
+
+fn compute_control(state: &StateUpdate, map: &MapInfo, safe_y: f64, phase: Phase) -> (f64, f64) {
+    let ref_x;
+    let ref_y;
+
+    match phase {
+        Phase::Ascend => {
+            ref_x = state.x;
+            ref_y = safe_y;
+        }
+        Phase::Traverse => {
+            ref_x = map.target_x;
+            ref_y = safe_y;
+        }
+        Phase::Descend => {
+            ref_x = map.target_x;
+            ref_y = map.target_y;
+        }
+    }
+
+    let mut target_vx = (ref_x - state.x) * 0.5;
+    let mut target_vy = (ref_y - state.y) * 0.5;
+
+    let max_vx = 20.0;
+    let max_vy = 15.0;
+
+    target_vx = target_vx.clamp(-max_vx, max_vx);
+    target_vy = target_vy.clamp(-max_vy, max_vy);
+
+    // Terminal descent guidance
+    if phase == Phase::Descend {
+        let dist_y = map.target_y - state.y;
+        if dist_y < 15.0 {
+            target_vy = 1.5; // Final constant slow descent (< 2m/s)
+            target_vx = (map.target_x - state.x) * 1.5;
+            target_vx = target_vx.clamp(-1.5, 1.5);
+        } else if dist_y < 35.0 {
+            target_vy = target_vy.clamp(-4.0, 4.0);
+            target_vx = target_vx.clamp(-3.0, 3.0);
+        } else if dist_y < 60.0 {
+            target_vy = target_vy.clamp(-8.0, 8.0);
+        }
+    }
+
+    let ax = 1.5 * (target_vx - state.vx);
+    let ay = 1.5 * (target_vy - state.vy);
+
+    let tx = ax;
+    let mut ty = ay - map.gravity;
+    if ty > 0.0 { ty = 0.0; } // Never thrust downwards
+
+    let t_req = (tx*tx + ty*ty).sqrt();
+    let mut thrust = t_req / map.max_thrust;
+    thrust = thrust.clamp(0.0, 1.0);
+
+    let mut theta_req = tx.atan2(-ty);
+    
+    // Prevent over-tilting which would lose vertical lift
+    let mut max_angle = (map.gravity / map.max_thrust).acos() * 0.85;
+    if max_angle.is_nan() { max_angle = 0.0; }
+    max_angle = max_angle.clamp(0.0, std::f64::consts::PI / 2.5);
+
+    theta_req = theta_req.clamp(-max_angle, max_angle);
+
+    // Compute shortest turn
+    let mut e_theta = (theta_req - state.angle) % (2.0 * std::f64::consts::PI);
+    if e_theta > std::f64::consts::PI { e_theta -= 2.0 * std::f64::consts::PI; }
+    if e_theta < -std::f64::consts::PI { e_theta += 2.0 * std::f64::consts::PI; }
+
+    let turn_cmd = e_theta * 4.0 - state.angular_vel * 2.0;
+    let turn = turn_cmd.clamp(-1.0, 1.0);
+
+    // Avoid accelerating towards the ground if pointing the wrong way
+    if state.angle.abs() > std::f64::consts::PI / 2.0 + 0.2 {
+        thrust = 0.0;
+    }
+
+    (thrust, turn)
+}
+
+fn main() {
+    let mut reader = io::BufReader::with_capacity(1024 * 1024 * 4, io::stdin());
+
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    let parts: Vec<&str> = line.split_whitespace().collect();
+    if parts.len() < 5 { return; }
+    let width: usize = parts[0].parse().unwrap_or(0);
+    let height: usize = parts[1].parse().unwrap_or(0);
+    let gravity: f64 = parts[2].parse().unwrap_or(0.0);
+    let max_thrust: f64 = parts[3].parse().unwrap_or(1.0);
+    let initial_fuel: f64 = parts[4].parse().unwrap_or(0.0);
+
+    line.clear();
+    reader.read_line(&mut line).unwrap();
+    let parts: Vec<&str> = line.split_whitespace().collect();
+    if parts.len() < 4 { return; }
+    let start_x: f64 = parts[0].parse().unwrap_or(0.0);
+    let start_y: f64 = parts[1].parse().unwrap_or(0.0);
+    let target_x: f64 = parts[2].parse().unwrap_or(0.0);
+    let target_y: f64 = parts[3].parse().unwrap_or(0.0);
+
+    let map_info = Arc::new(MapInfo {
+        width, height, gravity, max_thrust, initial_fuel,
+        start_x, start_y, target_x, target_y
+    });
+
+    let min_x = (start_x.min(target_x) as usize).saturating_sub(15);
+    let max_x = (start_x.max(target_x) as usize + 15).min(width);
+
+    let mut highest_obstacle_y = height as f64;
+    let mut found_obstacle = false;
+
+    let mut buf = Vec::new();
+    // Fast path to read map and extract highest obstacle within the path corridor
+    for y in 0..height {
+        buf.clear();
+        let bytes_read = reader.read_until(b'\n', &mut buf).unwrap();
+        if bytes_read == 0 { break; }
+        
+        if !found_obstacle {
+            let mut x_m = 0;
+            for &b in &buf {
+                if b == b'.' || b == b'#' || b == b'S' || b == b'T' || b == b'L' {
+                    if b == b'#' {
+                        if x_m >= min_x && x_m <= max_x {
+                            highest_obstacle_y = y as f64;
+                            found_obstacle = true;
+                        }
+                    }
+                    x_m += 1;
+                }
+            }
+        }
+    }
+
+    let shared_state = Arc::new(SharedState::new());
+    let state_clone = shared_state.clone();
+    
+    // Spawn background thread to continuously parse state updates from stdin
+    thread::spawn(move || {
+        let mut buf = Vec::new();
+        loop {
+            buf.clear();
+            match reader.read_until(b'\n', &mut buf) {
+                Ok(0) => break, // EOF
+                Ok(_) => {
+                    let s = String::from_utf8_lossy(&buf);
+                    let parts: Vec<&str> = s.split_whitespace().collect();
+                    if parts.len() >= 7 {
+                        let state = StateUpdate {
+                            x: parts[0].parse().unwrap_or(0.0),
+                            y: parts[1].parse().unwrap_or(0.0),
+                            vx: parts[2].parse().unwrap_or(0.0),
+                            vy: parts[3].parse().unwrap_or(0.0),
+                            angle: parts[4].parse().unwrap_or(0.0),
+                            angular_vel: parts[5].parse().unwrap_or(0.0),
+                            fuel_remaining: parts[6].parse().unwrap_or(0.0),
+                        };
+                        state_clone.update(state);
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let safe_y = (highest_obstacle_y - 15.0).min(start_y - 15.0).min(target_y - 15.0);
+
+    let mut phase = if map_info.start_x.abs_diff(map_info.target_x) <= 2.0 {
+        Phase::Descend
+    } else if map_info.start_y <= safe_y + 5.0 {
+        Phase::Traverse
+    } else {
+        Phase::Ascend
+    };
+
+    let control_interval = Duration::from_secs_f64(1.0 / 30.0); // 30Hz loop
+
+    loop {
+        let loop_start = Instant::now();
+
+        if !shared_state.is_updated() {
+            thread::sleep(Duration::from_millis(5));
+            continue;
+        }
+
+        let state = shared_state.get();
+
+        // Evaluate state phase transitions
+        if state.x.abs_diff(map_info.target_x) <= 2.0 {
+            phase = Phase::Descend;
+        } else if phase == Phase::Ascend && state.y <= safe_y + 5.0 {
+            phase = Phase::Traverse;
+        }
+
+        let (thrust, turn) = compute_control(&state, &map_info, safe_y, phase);
+
+        println!("{:.4} {:.4}", thrust, turn);
+        io::stdout().flush().unwrap();
+
+        let elapsed = loop_start.elapsed();
+        if elapsed < control_interval {
+            thread::sleep(control_interval - elapsed);
+        }
+    }
+}

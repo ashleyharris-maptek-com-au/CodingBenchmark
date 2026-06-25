@@ -42,6 +42,7 @@ tags = [
   "binary encoding",
 ]
 
+resultFileTypes = ("hex", "spvhex", "spirvhex", "spirv", "spv")
 RANDOM_SEED = 49494949
 TIMEOUT_SECONDS = 60
 

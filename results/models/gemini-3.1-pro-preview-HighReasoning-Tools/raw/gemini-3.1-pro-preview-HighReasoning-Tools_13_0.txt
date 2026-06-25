@@ -1,0 +1,332 @@
+#include <iostream>
+#include <vector>
+#include <string>
+#include <string_view>
+#include <algorithm>
+#include <execution>
+#include <thread>
+#include <atomic>
+#include <random>
+
+// Structure to hold the 128-bit double hash
+struct DoubleHash {
+    uint64_t h1;
+    uint64_t h2;
+    bool operator==(const DoubleHash& o) const {
+        return h1 == o.h1 && h2 == o.h2;
+    }
+    bool operator<(const DoubleHash& o) const {
+        if (h1 != o.h1) return h1 < o.h1;
+        return h2 < o.h2;
+    }
+};
+
+// Entry storing the hash and its corresponding start index in the shortest string (S0)
+struct HashEntry {
+    DoubleHash hash;
+    int index;
+};
+
+// Thread-safe wrapper around std::atomic<char> to allow vector resizing and safe concurrent writes
+struct AtomicChar {
+    std::atomic<char> val;
+    AtomicChar() : val(0) {}
+    AtomicChar(const AtomicChar& o) : val(o.val.load()) {}
+    AtomicChar& operator=(const AtomicChar& o) {
+        val.store(o.val.load());
+        return *this;
+    }
+};
+
+// Binary exponentiation for precomputing B^len modulo 2^64
+uint64_t power(uint64_t base, uint64_t exp) {
+    uint64_t res = 1;
+    while (exp > 0) {
+        if (exp % 2 == 1) res = res * base;
+        base = base * base;
+        exp /= 2;
+    }
+    return res;
+}
+
+// Checks if a common substring of length 'len' exists in all strings.
+// Returns true and sets 'out_index' to the start index in S0 if found.
+bool check_length(int len, int& out_index, const std::vector<std::string>& S, uint64_t B1, uint64_t B2) {
+    const std::string& S0 = S[0];
+    int L0 = S0.length();
+    if (L0 < len) return false;
+
+    uint64_t B1_len = power(B1, len);
+    uint64_t B2_len = power(B2, len);
+
+    // 1. Generate double hashes for all substrings of S0 of length 'len'
+    std::vector<HashEntry> entries(L0 - len + 1);
+    
+    int num_threads = std::thread::hardware_concurrency();
+    if (num_threads == 0) num_threads = 1;
+    if (L0 - len + 1 < 100000) num_threads = 1;
+
+    std::vector<std::thread> threads;
+    int chunk_size = (L0 - len + 1 + num_threads - 1) / num_threads;
+
+    for (int t = 0; t < num_threads; ++t) {
+        int start = t * chunk_size;
+        int end = std::min<int>(start + chunk_size, L0 - len + 1);
+        if (start >= end) break;
+        threads.emplace_back([&, start, end]() {
+            DoubleHash h = {0, 0};
+            for (int i = 0; i < len; ++i) {
+                h.h1 = h.h1 * B1 + (unsigned char)S0[start + i];
+                h.h2 = h.h2 * B2 + (unsigned char)S0[start + i];
+            }
+            entries[start] = {h, start};
+            for (int i = start + 1; i < end; ++i) {
+                h.h1 = h.h1 * B1 + (unsigned char)S0[i + len - 1] - (unsigned char)S0[i - 1] * B1_len;
+                h.h2 = h.h2 * B2 + (unsigned char)S0[i + len - 1] - (unsigned char)S0[i - 1] * B2_len;
+                entries[i] = {h, i};
+            }
+        });
+    }
+    for (auto& th : threads) th.join();
+
+    // 2. Sort and remove duplicate hashes
+    if (entries.size() > 10000) {
+        std::sort(std::execution::par, entries.begin(), entries.end(), [](const HashEntry& a, const HashEntry& b) {
+            return a.hash < b.hash;
+        });
+    } else {
+        std::sort(entries.begin(), entries.end(), [](const HashEntry& a, const HashEntry& b) {
+            return a.hash < b.hash;
+        });
+    }
+    
+    auto new_end = std::unique(entries.begin(), entries.end(), [](const HashEntry& a, const HashEntry& b) {
+        return a.hash == b.hash;
+    });
+    entries.erase(new_end, entries.end());
+
+    // 3. Incrementally intersect candidate hashes with the remaining strings S1 ... S_{N-1}
+    for (size_t i = 1; i < S.size(); ++i) {
+        if (entries.empty()) return false;
+        
+        const std::string& Si = S[i];
+        int Li = Si.length();
+        
+        if (entries.size() < 1000) {
+            // Strategy A: Candidate Search
+            // If the number of candidates is small, search them directly in Si using fast std::string::find.
+            std::vector<AtomicChar> matched(entries.size());
+            int num_t = std::thread::hardware_concurrency();
+            if (num_t == 0) num_t = 1;
+            if (entries.size() < 100) num_t = 1;
+            
+            std::vector<std::thread> c_threads;
+            int c_chunk = (entries.size() + num_t - 1) / num_t;
+            
+            for (int t = 0; t < num_t; ++t) {
+                int start = t * c_chunk;
+                int end = std::min<int>(start + c_chunk, (int)entries.size());
+                if (start >= end) break;
+                c_threads.emplace_back([&, start, end]() {
+                    for (int j = start; j < end; ++j) {
+                        std::string_view candidate(S0.data() + entries[j].index, len);
+                        if (Si.find(candidate) != std::string::npos) {
+                            matched[j].val.store(1, std::memory_order_relaxed);
+                        }
+                    }
+                });
+            }
+            for (auto& th : c_threads) th.join();
+            
+            std::vector<HashEntry> next_entries;
+            next_entries.reserve(entries.size());
+            for (size_t j = 0; j < entries.size(); ++j) {
+                if (matched[j].val.load(std::memory_order_relaxed)) {
+                    next_entries.push_back(entries[j]);
+                }
+            }
+            entries = std::move(next_entries);
+        } else {
+            // Strategy B: Scan and Hash
+            // If the candidate pool is large, build a flat bucket index for fast cache-friendly lookups.
+            std::vector<int> bucket_start(65536 + 1, 0);
+            int current_bucket = 0;
+            bucket_start[0] = 0;
+            for (size_t j = 0; j < entries.size(); ++j) {
+                int b = entries[j].hash.h1 >> 48;
+                while (current_bucket < b) {
+                    bucket_start[++current_bucket] = j;
+                }
+            }
+            while (current_bucket < 65536) {
+                bucket_start[++current_bucket] = entries.size();
+            }
+            
+            std::vector<AtomicChar> matched(entries.size());
+            int total_starts = Li - len + 1;
+            if (total_starts <= 0) {
+                entries.clear();
+                return false;
+            }
+            
+            int num_t = std::thread::hardware_concurrency();
+            if (num_t == 0) num_t = 1;
+            if (total_starts < 100000) num_t = 1;
+            
+            std::vector<std::thread> s_threads;
+            int s_chunk = (total_starts + num_t - 1) / num_t;
+            
+            for (int t = 0; t < num_t; ++t) {
+                int start = t * s_chunk;
+                int end = std::min<int>(start + s_chunk, total_starts);
+                if (start >= end) break;
+                
+                s_threads.emplace_back([&, start, end]() {
+                    DoubleHash h = {0, 0};
+                    for (int j = 0; j < len; ++j) {
+                        h.h1 = h.h1 * B1 + (unsigned char)Si[start + j];
+                        h.h2 = h.h2 * B2 + (unsigned char)Si[start + j];
+                    }
+                    
+                    auto check_and_mark = [&](DoubleHash hash_val) {
+                        int b = hash_val.h1 >> 48;
+                        int bs = bucket_start[b];
+                        int be = bucket_start[b + 1];
+                        auto it = std::lower_bound(entries.begin() + bs, entries.begin() + be, hash_val, 
+                            [](const HashEntry& entry, const DoubleHash& val) {
+                                return entry.hash < val;
+                            });
+                        if (it != entries.begin() + be && it->hash == hash_val) {
+                            matched[it - entries.begin()].val.store(1, std::memory_order_relaxed);
+                        }
+                    };
+                    
+                    check_and_mark(h);
+                    
+                    for (int j = start + 1; j < end; ++j) {
+                        h.h1 = h.h1 * B1 + (unsigned char)Si[j + len - 1] - (unsigned char)Si[j - 1] * B1_len;
+                        h.h2 = h.h2 * B2 + (unsigned char)Si[j + len - 1] - (unsigned char)Si[j - 1] * B2_len;
+                        check_and_mark(h);
+                    }
+                });
+            }
+            for (auto& th : s_threads) th.join();
+            
+            std::vector<HashEntry> next_entries;
+            next_entries.reserve(entries.size());
+            for (size_t j = 0; j < entries.size(); ++j) {
+                if (matched[j].val.load(std::memory_order_relaxed)) {
+                    next_entries.push_back(entries[j]);
+                }
+            }
+            entries = std::move(next_entries);
+        }
+    }
+    
+    if (!entries.empty()) {
+        out_index = entries[0].index;
+        return true;
+    }
+    return false;
+}
+
+int main() {
+    // Enable fast standard I/O operations
+    std::ios_base::sync_with_stdio(false);
+    std::cin.tie(NULL);
+
+    int N;
+    if (!(std::cin >> N)) return 0;
+    std::string line;
+    std::getline(std::cin, line); // Consume remainder of the first line
+
+    std::vector<std::string> S(N);
+    for (int i = 0; i < N; ++i) {
+        if (!std::getline(std::cin, S[i])) {
+            S.resize(i);
+            break;
+        }
+        // Remove trailing carriage returns to handle Windows CRLF inputs correctly
+        if (!S[i].empty() && S[i].back() == '\r') {
+            S[i].pop_back();
+        }
+    }
+
+    if (S.empty()) {
+        std::cout << "\n";
+        return 0;
+    }
+    if (S.size() == 1) {
+        std::cout << S[0] << "\n";
+        return 0;
+    }
+
+    // Sort strings by length (shortest first) and lexicographically to group and remove duplicates
+    std::sort(S.begin(), S.end(), [](const std::string& a, const std::string& b) {
+        if (a.length() != b.length()) {
+            return a.length() < b.length();
+        }
+        return a < b;
+    });
+
+    auto unique_end = std::unique(S.begin(), S.end());
+    S.erase(unique_end, S.end());
+
+    int L_min = S[0].length();
+    if (L_min == 0) {
+        std::cout << "\n";
+        return 0;
+    }
+
+    // Dynamically choose randomized bases (must be odd to be coprime with 2^64)
+    std::random_device rd;
+    std::mt19937_64 gen(rd());
+    std::uniform_int_distribution<uint64_t> dis(1000000, 1000000000);
+    uint64_t B1 = dis(gen) | 1;
+    uint64_t B2 = dis(gen) | 1;
+    while (B2 == B1) {
+        B2 = dis(gen) | 1;
+    }
+
+    int low = 1;
+    int high = L_min;
+    int best_len = 0;
+    int best_index = -1;
+
+    // Exponential Probing: Quick bounds-narrowing strategy before full binary search
+    std::vector<int> probes = {1, 10, 100, 1000};
+    for (int p : probes) {
+        if (p > high) break;
+        int idx = -1;
+        if (check_length(p, idx, S, B1, B2)) {
+            best_len = p;
+            best_index = idx;
+            low = p + 1;
+        } else {
+            high = p - 1;
+            break;
+        }
+    }
+
+    // Binary search over the remaining length range
+    while (low <= high) {
+        int mid = low + (high - low) / 2;
+        int idx = -1;
+        if (check_length(mid, idx, S, B1, B2)) {
+            best_len = mid;
+            best_index = idx;
+            low = mid + 1;
+        } else {
+            high = mid - 1;
+        }
+    }
+
+    // Output the longest common substring found
+    if (best_len > 0 && best_index != -1) {
+        std::cout << S[0].substr(best_index, best_len) << "\n";
+    } else {
+        std::cout << "\n";
+    }
+
+    return 0;
+}

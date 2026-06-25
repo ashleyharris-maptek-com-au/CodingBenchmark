@@ -27,6 +27,8 @@ tags = [
   "local search",
   "heuristics",
 ]
+
+resultFileTypes = ("cs", "csharp")
 TIMEOUT_SECONDS = 30
 RANDOM_SEED = 33333333
 

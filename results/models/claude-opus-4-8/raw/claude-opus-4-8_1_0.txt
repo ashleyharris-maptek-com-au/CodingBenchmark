@@ -1,0 +1,551 @@
+// Adaptive Travelling Salesman Problem solver.
+//
+// Strategy is chosen by N (number of cities):
+//   N <= 3            : trivial identity order.
+//   N <= 12           : Held-Karp exact dynamic programming (optimal).
+//   N <= 11000000     : Hilbert-curve initial tour, then neighbour-list 2-opt
+//                       (plus Or-opt for N <= 100000) with don't-look bits,
+//                       refining under a wall-clock budget. Candidate lists
+//                       come from a uniform grid built in parallel.
+//   N >  11000000      : Hilbert-curve space-filling tour only (O(N log N)),
+//                       a good, cheap approximation at any scale.
+//
+// Builds with MSVC /std:c++20.  Only the standard library is used.
+
+#include <cstdio>
+#include <cstdint>
+#include <cmath>
+#include <vector>
+#include <algorithm>
+#include <chrono>
+#include <thread>
+#include <string>
+
+using namespace std;
+using Clock = chrono::steady_clock;
+
+static Clock::time_point g_start;
+static double elapsed() {
+    return chrono::duration<double>(Clock::now() - g_start).count();
+}
+// Wall-clock budget for the local-search phase. The hard limit is 300s; we
+// stop refining well before that to leave room for output writing (the largest
+// instances emit tens of MB) and for slower grading hardware.
+static const double TIME_LIMIT = 240.0;
+
+// ---------------------------------------------------------------------------
+// Fast input
+// ---------------------------------------------------------------------------
+struct Reader {
+    vector<char> buf;
+    size_t pos = 0;
+    Reader() {
+        // Slurp all of stdin.
+        const size_t CHUNK = 1 << 20;
+        size_t total = 0;
+        buf.resize(CHUNK);
+        for (;;) {
+            if (total + CHUNK > buf.size()) buf.resize(buf.size() * 2);
+            size_t got = fread(buf.data() + total, 1, CHUNK, stdin);
+            total += got;
+            if (got < CHUNK) break;
+        }
+        buf.resize(total + 1);
+        buf[total] = '\0';
+    }
+    // Parse next signed floating point number. Returns false at EOF.
+    bool next(double& out) {
+        const char* p = buf.data();
+        size_t n = buf.size();
+        // skip non-numeric
+        while (pos < n) {
+            char c = p[pos];
+            if ((c >= '0' && c <= '9') || c == '-' || c == '+' || c == '.') break;
+            ++pos;
+        }
+        if (pos >= n) return false;
+        bool neg = false;
+        if (p[pos] == '-') { neg = true; ++pos; }
+        else if (p[pos] == '+') { ++pos; }
+        double val = 0.0;
+        bool any = false;
+        while (pos < n && p[pos] >= '0' && p[pos] <= '9') {
+            val = val * 10.0 + (p[pos] - '0');
+            ++pos; any = true;
+        }
+        if (pos < n && p[pos] == '.') {
+            ++pos;
+            double frac = 0.0, scale = 1.0;
+            while (pos < n && p[pos] >= '0' && p[pos] <= '9') {
+                frac = frac * 10.0 + (p[pos] - '0');
+                scale *= 10.0;
+                ++pos; any = true;
+            }
+            val += frac / scale;
+        }
+        if (pos < n && (p[pos] == 'e' || p[pos] == 'E')) {
+            ++pos;
+            bool eneg = false;
+            if (pos < n && (p[pos] == '-' || p[pos] == '+')) { eneg = (p[pos] == '-'); ++pos; }
+            int e = 0;
+            while (pos < n && p[pos] >= '0' && p[pos] <= '9') { e = e * 10 + (p[pos] - '0'); ++pos; }
+            val *= pow(10.0, eneg ? -e : e);
+        }
+        if (!any) return false;
+        out = neg ? -val : val;
+        return true;
+    }
+    bool nextInt(long long& out) {
+        double d;
+        if (!next(d)) return false;
+        out = (long long)llround(d);
+        return true;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Globals for geometry
+// ---------------------------------------------------------------------------
+static int N;
+static vector<float> X, Y;
+
+static inline double dist(int a, int b) {
+    double dx = (double)X[a] - X[b];
+    double dy = (double)Y[a] - Y[b];
+    return sqrt(dx * dx + dy * dy);
+}
+
+// ---------------------------------------------------------------------------
+// Hilbert curve ordering
+// ---------------------------------------------------------------------------
+static inline uint64_t hilbert_d(uint32_t n, uint32_t x, uint32_t y) {
+    uint64_t d = 0;
+    for (uint32_t s = n >> 1; s > 0; s >>= 1) {
+        uint32_t rx = (x & s) ? 1u : 0u;
+        uint32_t ry = (y & s) ? 1u : 0u;
+        d += (uint64_t)s * (uint64_t)s * ((3u * rx) ^ ry);
+        // rotate quadrant
+        if (ry == 0) {
+            if (rx == 1) {
+                x = s - 1 - x;
+                y = s - 1 - y;
+            }
+            uint32_t t = x; x = y; y = t;
+        }
+    }
+    return d;
+}
+
+static vector<int> hilbert_order() {
+    vector<int> order(N);
+    for (int i = 0; i < N; ++i) order[i] = i;
+    if (N <= 1) return order;
+
+    float minx = X[0], maxx = X[0], miny = Y[0], maxy = Y[0];
+    for (int i = 1; i < N; ++i) {
+        minx = min(minx, X[i]); maxx = max(maxx, X[i]);
+        miny = min(miny, Y[i]); maxy = max(maxy, Y[i]);
+    }
+    double sx = (maxx > minx) ? (double)(maxx - minx) : 1.0;
+    double sy = (maxy > miny) ? (double)(maxy - miny) : 1.0;
+    const uint32_t BITS = 16;
+    const uint32_t SIDE = 1u << BITS; // 65536
+    const double scale = (double)(SIDE - 1);
+
+    vector<uint64_t> key(N);
+    for (int i = 0; i < N; ++i) {
+        uint32_t xi = (uint32_t)(((double)(X[i] - minx) / sx) * scale);
+        uint32_t yi = (uint32_t)(((double)(Y[i] - miny) / sy) * scale);
+        key[i] = hilbert_d(SIDE, xi, yi);
+    }
+    sort(order.begin(), order.end(), [&](int a, int b) {
+        if (key[a] != key[b]) return key[a] < key[b];
+        return a < b;
+    });
+    return order;
+}
+
+// ---------------------------------------------------------------------------
+// Held-Karp exact DP for tiny instances
+// ---------------------------------------------------------------------------
+static vector<int> held_karp() {
+    int n = N;
+    int full = 1 << n;
+    // dp[mask][i] = min cost starting at 0, visiting set 'mask', ending at i.
+    vector<vector<double>> dp(full, vector<double>(n, 1e18));
+    vector<vector<int>> par(full, vector<int>(n, -1));
+    dp[1][0] = 0.0;
+    for (int mask = 1; mask < full; ++mask) {
+        if (!(mask & 1)) continue;
+        for (int i = 0; i < n; ++i) {
+            if (dp[mask][i] >= 1e17) continue;
+            if (!(mask & (1 << i))) continue;
+            for (int j = 0; j < n; ++j) {
+                if (mask & (1 << j)) continue;
+                int nm = mask | (1 << j);
+                double nd = dp[mask][i] + dist(i, j);
+                if (nd < dp[nm][j]) {
+                    dp[nm][j] = nd;
+                    par[nm][j] = i;
+                }
+            }
+        }
+    }
+    int last = 0;
+    double best = 1e18;
+    for (int i = 1; i < n; ++i) {
+        double c = dp[full - 1][i] + dist(i, 0);
+        if (c < best) { best = c; last = i; }
+    }
+    vector<int> order;
+    int mask = full - 1, cur = last;
+    while (cur != -1) {
+        order.push_back(cur);
+        int p = par[mask][cur];
+        mask ^= (1 << cur);
+        cur = p;
+    }
+    reverse(order.begin(), order.end());
+    return order;
+}
+
+// ---------------------------------------------------------------------------
+// k-nearest-neighbour lists via a uniform grid (parallel build)
+// ---------------------------------------------------------------------------
+struct Grid {
+    int cols, rows;
+    double minx, miny, cellw, cellh;
+    vector<int> cellStart;   // size cols*rows+1
+    vector<int> items;       // points sorted by cell
+
+    void build() {
+        float mnx = X[0], mxx = X[0], mny = Y[0], mxy = Y[0];
+        for (int i = 1; i < N; ++i) {
+            mnx = min(mnx, X[i]); mxx = max(mxx, X[i]);
+            mny = min(mny, Y[i]); mxy = max(mxy, Y[i]);
+        }
+        minx = mnx; miny = mny;
+        double w = max(1e-9, (double)(mxx - mnx));
+        double h = max(1e-9, (double)(mxy - mny));
+        int target = max(1, (int)floor(sqrt((double)N / 2.0)));
+        cols = max(1, min(target, 1 << 15));
+        rows = cols;
+        cellw = w / cols;
+        cellh = h / rows;
+        int ncell = cols * rows;
+        vector<int> cnt(ncell + 1, 0);
+        vector<int> cellOf(N);
+        for (int i = 0; i < N; ++i) {
+            int cx = (int)((X[i] - minx) / cellw); if (cx >= cols) cx = cols - 1; if (cx < 0) cx = 0;
+            int cy = (int)((Y[i] - miny) / cellh); if (cy >= rows) cy = rows - 1; if (cy < 0) cy = 0;
+            int c = cy * cols + cx;
+            cellOf[i] = c;
+            cnt[c + 1]++;
+        }
+        for (int i = 0; i < ncell; ++i) cnt[i + 1] += cnt[i];
+        cellStart = cnt;
+        items.resize(N);
+        vector<int> fill = cellStart;
+        for (int i = 0; i < N; ++i) items[fill[cellOf[i]]++] = i;
+    }
+    inline int cellX(int i) const { int cx = (int)((X[i] - minx) / cellw); return cx < 0 ? 0 : (cx >= cols ? cols - 1 : cx); }
+    inline int cellY(int i) const { int cy = (int)((Y[i] - miny) / cellh); return cy < 0 ? 0 : (cy >= rows ? rows - 1 : cy); }
+};
+
+static int K;
+static vector<int> neigh;     // flat N*K
+static vector<int> neighCnt;  // per city count
+
+static void build_knn_range(const Grid& g, int lo, int hi) {
+    // scratch per thread
+    vector<pair<float,int>> cand;
+    for (int i = lo; i < hi; ++i) {
+        cand.clear();
+        int cx = g.cellX(i), cy = g.cellY(i);
+        int ring = 0;
+        int found = 0;
+        // expand rings until we have >= K candidates plus one extra ring for safety
+        int maxring = max(g.cols, g.rows);
+        int safety = -1;
+        while (ring <= maxring) {
+            int x0 = max(0, cx - ring), x1 = min(g.cols - 1, cx + ring);
+            int y0 = max(0, cy - ring), y1 = min(g.rows - 1, cy + ring);
+            // iterate only the perimeter of the current ring
+            for (int yy = y0; yy <= y1; ++yy) {
+                bool edgeRow = (yy == cy - ring || yy == cy + ring);
+                for (int xx = x0; xx <= x1; ++xx) {
+                    if (!edgeRow && xx != cx - ring && xx != cx + ring) continue;
+                    int c = yy * g.cols + xx;
+                    for (int t = g.cellStart[c]; t < g.cellStart[c + 1]; ++t) {
+                        int j = g.items[t];
+                        if (j == i) continue;
+                        double dx = (double)X[i] - X[j];
+                        double dy = (double)Y[i] - Y[j];
+                        cand.push_back({(float)(dx*dx+dy*dy), j});
+                        ++found;
+                    }
+                }
+            }
+            if (found >= K && safety < 0) safety = ring + 1; // one more ring for correctness
+            if (safety >= 0 && ring >= safety) break;
+            ++ring;
+        }
+        int kk = min((int)cand.size(), K);
+        partial_sort(cand.begin(), cand.begin() + kk, cand.end());
+        for (int t = 0; t < kk; ++t) neigh[(size_t)i * K + t] = cand[t].second;
+        neighCnt[i] = kk;
+    }
+}
+
+static void build_knn(const Grid& g) {
+    neigh.assign((size_t)N * K, -1);
+    neighCnt.assign(N, 0);
+    unsigned hc = thread::hardware_concurrency();
+    int nthreads = (int)max(1u, min(hc ? hc : 1u, 64u));
+    if (N < 2000) nthreads = 1;
+    vector<thread> th;
+    int chunk = (N + nthreads - 1) / nthreads;
+    for (int t = 0; t < nthreads; ++t) {
+        int lo = t * chunk, hi = min(N, lo + chunk);
+        if (lo >= hi) break;
+        th.emplace_back(build_knn_range, cref(g), lo, hi);
+    }
+    for (auto& x : th) x.join();
+}
+
+// ---------------------------------------------------------------------------
+// 2-opt + Or-opt local search with neighbour lists and don't-look bits
+// ---------------------------------------------------------------------------
+static vector<int> tour, posIn;
+
+static inline void reverse_segment(int p1, int p2) {
+    // Reverse the cyclic segment from position p1 to p2 (inclusive), going
+    // forward with wrap-around. Reverse the shorter of the two arcs.
+    int inner = (p2 - p1 + N) % N + 1;
+    if (inner > N - inner) {
+        // reverse the complementary arc instead (equivalent tour)
+        int np1 = (p2 + 1) % N;
+        int np2 = (p1 - 1 + N) % N;
+        p1 = np1; p2 = np2;
+        inner = N - inner;
+    }
+    int a = p1, b = p2;
+    for (int s = 0; s < inner / 2; ++s) {
+        int ca = tour[a], cb = tour[b];
+        tour[a] = cb; tour[b] = ca;
+        posIn[cb] = a; posIn[ca] = b;
+        a = (a + 1) % N;
+        b = (b - 1 + N) % N;
+    }
+}
+
+static void local_search(bool useOrOpt) {
+    posIn.resize(N);
+    for (int i = 0; i < N; ++i) posIn[tour[i]] = i;
+
+    vector<char> dontlook(N, 0);
+    // simple queue of active cities
+    vector<int> active(N);
+    for (int i = 0; i < N; ++i) active[i] = tour[i];
+    // Check the wall clock often enough that a worst-case O(N) segment
+    // reversal between checks cannot push us past the time limit.
+    int checkInterval = (N > 200000) ? 512 : 4096;
+    int sinceCheck = 0;
+
+    bool improvedAny = true;
+    while (improvedAny) {
+        improvedAny = false;
+        for (int idx = 0; idx < N; ++idx) {
+            int c1 = active[idx];
+            if (dontlook[c1]) continue;
+            if (++sinceCheck >= checkInterval) {
+                sinceCheck = 0;
+                if (elapsed() > TIME_LIMIT) return;
+            }
+            bool improvedCity = false;
+
+            // consider both tour neighbours (successor and predecessor) of c1
+            for (int dir = 0; dir < 2; ++dir) {
+                int p1 = posIn[c1];
+                int c2 = (dir == 0) ? tour[(p1 + 1) % N] : tour[(p1 - 1 + N) % N];
+                double d_c1c2 = dist(c1, c2);
+                const int* nb = &neigh[(size_t)c1 * K];
+                int kc = neighCnt[c1];
+                for (int t = 0; t < kc; ++t) {
+                    int c3 = nb[t];
+                    double d_c1c3 = dist(c1, c3);
+                    if (d_c1c3 >= d_c1c2) break; // sorted; no further gain possible
+                    int p3 = posIn[c3];
+                    int c4 = (dir == 0) ? tour[(p3 + 1) % N] : tour[(p3 - 1 + N) % N];
+                    if (c4 == c1) continue;
+                    double before = d_c1c2 + dist(c3, c4);
+                    double after = d_c1c3 + dist(c2, c4);
+                    if (after + 1e-9 < before) {
+                        // perform 2-opt: reverse segment between the edges
+                        int a, b;
+                        if (dir == 0) {
+                            a = (p1 + 1) % N; b = p3;
+                        } else {
+                            a = p3; b = (p1 - 1 + N) % N;
+                        }
+                        reverse_segment(a, b);
+                        dontlook[c1] = dontlook[c2] = dontlook[c3] = dontlook[c4] = 0;
+                        improvedCity = true;
+                        improvedAny = true;
+                        break;
+                    }
+                }
+                if (improvedCity) break;
+            }
+
+            // Or-opt: try moving segment of length L (1..3) starting at c1.
+            // The reinsertion below rebuilds the tour in O(N), so it is only
+            // enabled for smaller instances where it stays cheap.
+            if (!improvedCity && useOrOpt) {
+                for (int L = 1; L <= 3 && !improvedCity; ++L) {
+                    int p1 = posIn[c1];
+                    int pPrev = (p1 - 1 + N) % N;
+                    int pEnd = (p1 + L - 1) % N;
+                    int segEnd = tour[pEnd];
+                    int pNext = (pEnd + 1) % N;
+                    int prev = tour[pPrev];
+                    int next = tour[pNext];
+                    if (prev == segEnd || next == c1) break; // segment too large for N
+                    double removed = dist(prev, c1) + dist(segEnd, next) - dist(prev, next);
+                    if (removed <= 1e-9) continue;
+                    const int* nb = &neigh[(size_t)c1 * K];
+                    int kc = neighCnt[c1];
+                    for (int t = 0; t < kc; ++t) {
+                        int c = nb[t];
+                        int pc = posIn[c];
+                        // skip if c is inside the segment or is prev
+                        bool inside = false;
+                        for (int s = 0; s < L; ++s) if (tour[(p1 + s) % N] == c) { inside = true; break; }
+                        if (inside || c == prev) continue;
+                        int cn = tour[(pc + 1) % N];
+                        // skip if cn inside segment
+                        bool insideN = false;
+                        for (int s = 0; s < L; ++s) if (tour[(p1 + s) % N] == cn) { insideN = true; break; }
+                        if (insideN) continue;
+                        double added = dist(c, c1) + dist(segEnd, cn) - dist(c, cn);
+                        if (added + 1e-9 < removed) {
+                            // Rebuild via a small rotation: easiest robust approach is
+                            // to extract segment and reinsert. Do it with vector ops on
+                            // a copy of the involved order — but to stay O(L+shift) we
+                            // perform array manipulation.
+                            // Collect segment cities.
+                            int seg[3];
+                            for (int s = 0; s < L; ++s) seg[s] = tour[(p1 + s) % N];
+                            // Build new tour by walking from 'next' around, inserting seg after c.
+                            // This is O(N) worst-case; acceptable given don't-look bits.
+                            vector<int> nt; nt.reserve(N);
+                            // mark segment
+                            // walk starting right after segment end, i.e. from next, full cycle
+                            int cur = pNext;
+                            for (int cntw = 0; cntw < N - L; ++cntw) {
+                                int city = tour[cur];
+                                nt.push_back(city);
+                                if (city == c) {
+                                    for (int s = 0; s < L; ++s) nt.push_back(seg[s]);
+                                }
+                                cur = (cur + 1) % N;
+                            }
+                            tour.swap(nt);
+                            for (int q = 0; q < N; ++q) posIn[tour[q]] = q;
+                            dontlook[prev] = dontlook[next] = dontlook[c] = dontlook[cn] = 0;
+                            dontlook[c1] = dontlook[segEnd] = 0;
+                            improvedCity = true;
+                            improvedAny = true;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (!improvedCity) dontlook[c1] = 1;
+        }
+        if (elapsed() > TIME_LIMIT) break;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Output
+// ---------------------------------------------------------------------------
+static void output(const vector<int>& order) {
+    // Rotate so the tour starts at city 0.
+    int startPos = 0;
+    for (int i = 0; i < (int)order.size(); ++i) if (order[i] == 0) { startPos = i; break; }
+
+    string out;
+    out.reserve((size_t)N * 8);
+    char tmp[16];
+    int n = (int)order.size();
+    for (int k = 0; k < n; ++k) {
+        int v = order[(startPos + k) % n];
+        // itoa
+        int len = 0;
+        if (v == 0) tmp[len++] = '0';
+        else {
+            int x = v;
+            char rev[12]; int rl = 0;
+            while (x > 0) { rev[rl++] = char('0' + x % 10); x /= 10; }
+            while (rl > 0) tmp[len++] = rev[--rl];
+        }
+        if (k) out.push_back(' ');
+        out.append(tmp, len);
+    }
+    out.push_back('\n');
+    fwrite(out.data(), 1, out.size(), stdout);
+}
+
+// ---------------------------------------------------------------------------
+int main() {
+    g_start = Clock::now();
+    Reader rd;
+    long long nn;
+    if (!rd.nextInt(nn)) { return 0; }
+    N = (int)nn;
+    if (N <= 0) { printf("\n"); return 0; }
+
+    X.resize(N); Y.resize(N);
+    for (int i = 0; i < N; ++i) {
+        double x = 0, y = 0;
+        rd.next(x); rd.next(y);
+        X[i] = (float)x; Y[i] = (float)y;
+    }
+
+    if (N == 1) { printf("0\n"); return 0; }
+    if (N <= 3) {
+        // any permutation starting at 0 is optimal for the cycle
+        string s = "0";
+        for (int i = 1; i < N; ++i) { s += ' '; s += char('0' + i); }
+        s += '\n';
+        fwrite(s.data(), 1, s.size(), stdout);
+        return 0;
+    }
+
+    if (N <= 12) {
+        vector<int> order = held_karp();
+        output(order);
+        return 0;
+    }
+
+    // Initial tour from the Hilbert curve.
+    tour = hilbert_order();
+
+    // For all but the very largest instances, refine the Hilbert tour with
+    // neighbour-list 2-opt (plus Or-opt on smaller inputs). The local search
+    // is governed by a wall-clock budget, so it simply improves the tour for
+    // as long as time allows and then stops.
+    const int LS_LIMIT = 11000000;
+    if (N <= LS_LIMIT) {
+        K = (N <= 10000) ? 10 : (N <= 200000 ? 8 : 6);
+        bool useOrOpt = (N <= 100000);
+        Grid g; g.build();
+        build_knn(g);
+        local_search(useOrOpt);
+    }
+
+    output(tour);
+    return 0;
+}

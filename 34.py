@@ -27,6 +27,8 @@ tags = [
   "capacity constraints",
   "heuristics",
 ]
+
+resultFileTypes = ("py", "python")
 TIMEOUT_SECONDS = 30
 RANDOM_SEED = 34343434
 

@@ -1,0 +1,181 @@
+import math
+
+class AutoPilotState:
+    def __init__(self):
+        self.integral_speed_error = 0.0
+        self.integral_cte = 0.0
+        self.last_speed_error = 0.0
+        self.last_cte = 0.0
+        self.filtered_speed = 0.0
+
+autopilot_state = AutoPilotState()
+
+def get_median(values):
+    if not values:
+        return 0.0
+    sorted_vals = sorted(values)
+    n = len(sorted_vals)
+    if n % 2 == 1:
+        return sorted_vals[n // 2]
+    else:
+        return (sorted_vals[n // 2 - 1] + sorted_vals[n // 2]) / 2.0
+
+def autopilot_step(state: dict, dt: float) -> dict:
+    global autopilot_state
+    ap = autopilot_state
+
+    # 1. Estimate Speed (Sensor Fusion)
+    wheel_speeds = []
+    for ws in ['wheel_speed_fl', 'wheel_speed_fr', 'wheel_speed_rl', 'wheel_speed_rr']:
+        if state.get(f'{ws}_valid', False):
+            wheel_speeds.append(state.get(f'{ws}_kmh', 0.0))
+            
+    gps_speeds = []
+    if state.get('gps_1_valid', False): gps_speeds.append(state.get('gps_1_speed_kmh', 0.0))
+    if state.get('gps_2_valid', False): gps_speeds.append(state.get('gps_2_speed_kmh', 0.0))
+    
+    vehicle_speeds = []
+    if 'vehicle_speed_1_kmh' in state: vehicle_speeds.append(state['vehicle_speed_1_kmh'])
+    if 'vehicle_speed_2_kmh' in state: vehicle_speeds.append(state['vehicle_speed_2_kmh'])
+    
+    all_speeds = wheel_speeds + gps_speeds + vehicle_speeds
+    if all_speeds:
+        current_speed = get_median(all_speeds)
+        # simple low pass filter to handle flicker
+        ap.filtered_speed = 0.8 * ap.filtered_speed + 0.2 * current_speed
+    else:
+        current_speed = ap.filtered_speed
+        
+    # 2. Obstacle Detection (Vision & Lidar Fusion)
+    obstacle_dists = []
+    obstacle_rel_speeds = []
+    
+    for i in range(1, 4):
+        v = f'vision_{i}_'
+        if state.get(v + 'obstacle_valid', False) and state.get(v + 'obstacle_detected', False):
+            obstacle_dists.append(state.get(v + 'obstacle_dist_m', 1000.0))
+            obstacle_rel_speeds.append(state.get(v + 'obstacle_rel_speed_kmh', 0.0))
+            
+    # Include narrow-angle front lidar
+    for angle in ['+005', '-005', '+015', '-015']:
+        if state.get(f'lidar_{angle}_deg_valid', False):
+            dist = state.get(f'lidar_{angle}_deg_range_m', 1000.0)
+            if dist < 150.0:  # Only count as obstacle if reasonably close
+                obstacle_dists.append(dist)
+                
+    min_dist = min(obstacle_dists) if obstacle_dists else 1000.0
+    rel_speed = get_median(obstacle_rel_speeds) if obstacle_rel_speeds else 0.0
+    
+    # 3. Lane Keeping & Steering
+    left_dists = []
+    right_dists = []
+    
+    for i in range(1, 4):
+        v = f'vision_{i}_'
+        if state.get(v + 'left_line_valid', False):
+            left_dists.append(state.get(v + 'left_line_dist_m', 0.0))
+        if state.get(v + 'right_line_valid', False):
+            right_dists.append(state.get(v + 'right_line_dist_m', 0.0))
+            
+    cte = 0.0
+    if left_dists and right_dists:
+        # Assuming left is positive distance and right is positive distance from car center
+        # Center of lane is when left_dist == right_dist
+        cte = (get_median(right_dists) - get_median(left_dists)) / 2.0
+    elif left_dists:
+        cte = 1.8 - get_median(left_dists)  # Assume 3.6m lane width
+    elif right_dists:
+        cte = get_median(right_dists) - 1.8
+        
+    # Lane change offset
+    current_lane = state.get('current_lane', 1)
+    target_lane = state.get('target_lane', 1)
+    if current_lane != target_lane:
+        cte += (target_lane - current_lane) * 3.6
+        
+    ap.integral_cte += cte * dt
+    ap.integral_cte = max(-5.0, min(5.0, ap.integral_cte))
+    d_cte = (cte - ap.last_cte) / max(dt, 0.01)
+    ap.last_cte = cte
+    
+    # PID for steering
+    kp_st = 0.15
+    ki_st = 0.005
+    kd_st = 0.05
+    steering = kp_st * cte + ki_st * ap.integral_cte + kd_st * d_cte
+    steering = max(-1.0, min(1.0, steering))
+    
+    # 4. Target Speed & Speed Limits
+    speed_limits = []
+    for i in range(1, 4):
+        v = f'vision_{i}_'
+        if state.get(v + 'speed_limit_valid', False):
+            speed_limits.append(state.get(v + 'speed_limit_kmh', 1000.0))
+            
+    target_speed = state.get('target_speed_kmh', 0.0)
+    if speed_limits:
+        target_speed = min(target_speed, min(speed_limits))
+        
+    # Safety speed adjustment based on obstacles
+    mu = state.get('estimated_mu', 1.0)
+    safe_time_gap = 2.0 if mu > 0.7 else 4.0
+    safe_dist = (ap.filtered_speed / 3.6) * safe_time_gap + 5.0
+    
+    brake_override = 0.0
+    if min_dist < safe_dist:
+        # Slow down to match speed or stop
+        target_speed = min(target_speed, max(0.0, ap.filtered_speed + rel_speed))
+        if min_dist < safe_dist * 0.5:
+            target_speed = 0.0
+            brake_override = 1.0 - (min_dist / (safe_dist * 0.5))
+            
+    if min_dist < 10.0:
+        target_speed = 0.0
+        brake_override = 1.0
+        
+    # Traction limits
+    if mu < 0.4:
+        target_speed = min(target_speed, 40.0)
+        
+    # 5. Speed PID Control
+    speed_error = target_speed - ap.filtered_speed
+    ap.integral_speed_error += speed_error * dt
+    ap.integral_speed_error = max(-50.0, min(50.0, ap.integral_speed_error))
+    d_speed = (speed_error - ap.last_speed_error) / max(dt, 0.01)
+    ap.last_speed_error = speed_error
+    
+    kp_sp = 0.05
+    ki_sp = 0.01
+    kd_sp = 0.01
+    
+    speed_control = kp_sp * speed_error + ki_sp * ap.integral_speed_error + kd_sp * d_speed
+    
+    throttle = 0.0
+    brake = 0.0
+    
+    if speed_control > 0:
+        throttle = min(1.0, speed_control)
+    else:
+        brake = min(1.0, -speed_control)
+        
+    brake = max(brake, brake_override)
+    
+    # Handle slippery surfaces
+    if mu < 0.5:
+        throttle = min(0.4, throttle)
+        steering = max(-0.5, min(0.5, steering))
+        # Prevent harsh braking unless emergency
+        if brake_override < 0.5:
+            brake = min(0.3, brake)
+            
+    # Redundant control verification
+    if state.get('brake_pressure_1_valid', False) or state.get('brake_pressure_2_valid', False):
+        if brake > 0.8 and current_speed > 1.0 and state.get('brake_pressure_1_pct', 0.0) < 10.0:
+            # Possible brake failure, try to use engine braking or other means?
+            pass
+            
+    return {
+        'steering': float(steering),
+        'throttle': float(throttle),
+        'brake': float(brake)
+    }

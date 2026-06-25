@@ -1,0 +1,295 @@
+import math
+
+
+# Persistent estimator state.  The benchmark calls this function repeatedly
+# within one scenario, so this is intentionally module-level.
+_last_t = None
+_est_pos = None
+_est_vel = None
+_bad_count = 0
+
+
+def _clamp(x, lo, hi):
+    return lo if x < lo else hi if x > hi else x
+
+
+def _median(values):
+    values = sorted(values)
+    n = len(values)
+    if n == 0:
+        return None
+    if n & 1:
+        return values[n // 2]
+    return 0.5 * (values[n // 2 - 1] + values[n // 2])
+
+
+def _norm(v):
+    return math.sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2])
+
+
+def _valid_number(x, limit=1.0e8):
+    return isinstance(x, (int, float)) and math.isfinite(x) and abs(x) < limit
+
+
+def _axis_measurement(state, sensor, quantity, axis):
+    # sensor is "radar" or "lidar"; quantity is "pos" or "vel".
+    if quantity == "pos":
+        key = f"{sensor}_rel_pos_{axis}_m"
+        valid = f"{sensor}_rel_{axis}_valid"
+    else:
+        key = f"{sensor}_rel_vel_{axis}_ms"
+        valid = f"{sensor}_relv_{axis}_valid"
+    x = state.get(key)
+    if state.get(valid) and _valid_number(x):
+        return float(x)
+    return None
+
+
+def _fuse_vec(state, quantity, predicted=None):
+    fused = []
+    got_any = False
+    for i, axis in enumerate(("x", "y", "z")):
+        vals = []
+        for sensor in ("radar", "lidar"):
+            v = _axis_measurement(state, sensor, quantity, axis)
+            if v is not None:
+                vals.append(v)
+        if vals:
+            got_any = True
+            # Median rejects one failed redundant sensor without needing a model.
+            fused.append(_median(vals))
+        elif predicted is not None:
+            fused.append(predicted[i])
+        else:
+            fused.append(0.0)
+    return fused, got_any
+
+
+def _range_measurement(state):
+    vals = []
+    for i in (1, 2, 3):
+        r = state.get(f"range_{i}_m")
+        if state.get(f"range_{i}_valid") and _valid_number(r) and r >= 0.0:
+            vals.append(float(r))
+    r = state.get("dock_camera_range_m")
+    if state.get("dock_camera_active") and _valid_number(r) and r >= 0.0:
+        vals.append(float(r))
+    return _median(vals) if vals else None
+
+
+def _camera_position(state):
+    if not state.get("dock_camera_active"):
+        return None
+    r = state.get("dock_camera_range_m")
+    if not (_valid_number(r) and r >= 0.0):
+        return None
+    b = []
+    for axis in ("x", "y", "z"):
+        v = state.get(f"dock_camera_bearing_{axis}")
+        if not (state.get(f"dock_camera_bearing_{axis}_valid") and _valid_number(v)):
+            return None
+        b.append(float(v))
+    bn = _norm(b)
+    if bn < 1.0e-6:
+        return None
+    return [float(r) * b[i] / bn for i in range(3)]
+
+
+def _mean_motion(state):
+    # Default is a typical LEO orbit.  Use ground updates when present.
+    mu = 3.986004418e14
+    a = state.get("ground_semi_major_axis_m")
+    if state.get("ground_semi_major_axis_m_valid") and _valid_number(a) and a > 6.3e6:
+        return math.sqrt(mu / (float(a) ** 3))
+    alt = state.get("ground_altitude_km")
+    if state.get("ground_altitude_km_valid") and _valid_number(alt):
+        a = 6371000.0 + 1000.0 * float(alt)
+        if a > 6.3e6:
+            return math.sqrt(mu / (a ** 3))
+    return 0.00113
+
+
+def _predict_cw(pos, vel, dt, n):
+    # Short-step Clohessy-Wiltshire propagation for estimator continuity.
+    x, y, z = pos
+    vx, vy, vz = vel
+    ax = 3.0 * n * n * x + 2.0 * n * vy
+    ay = -2.0 * n * vx
+    az = -n * n * z
+    return [x + vx * dt + 0.5 * ax * dt * dt,
+            y + vy * dt + 0.5 * ay * dt * dt,
+            z + vz * dt + 0.5 * az * dt * dt], [vx + ax * dt,
+                                                 vy + ay * dt,
+                                                 vz + az * dt]
+
+
+def _estimate_state(state, dt):
+    global _est_pos, _est_vel, _bad_count
+
+    n = _mean_motion(state)
+    if _est_pos is not None and _est_vel is not None and dt > 0.0:
+        pred_pos, pred_vel = _predict_cw(_est_pos, _est_vel, min(float(dt), 5.0), n)
+    else:
+        pred_pos, pred_vel = None, None
+
+    pos, got_pos = _fuse_vec(state, "pos", pred_pos)
+    vel, got_vel = _fuse_vec(state, "vel", pred_vel)
+
+    cam_pos = _camera_position(state)
+    if cam_pos is not None:
+        if got_pos:
+            # Camera is most useful close in; blend rather than blindly replace.
+            rng = _norm(pos)
+            w = 0.65 if rng < 80.0 else 0.35
+            pos = [(1.0 - w) * pos[i] + w * cam_pos[i] for i in range(3)]
+        else:
+            pos = cam_pos
+            got_pos = True
+
+    scalar_r = _range_measurement(state)
+    if scalar_r is not None:
+        pn = _norm(pos)
+        if got_pos and pn > 1.0e-6 and (not math.isfinite(pn) or abs(pn - scalar_r) > max(15.0, 0.35 * scalar_r)):
+            # If vector sensors disagree badly with redundant scalar range,
+            # keep direction but correct magnitude.
+            scale = scalar_r / pn
+            pos = [p * scale for p in pos]
+
+    if got_pos or got_vel:
+        _bad_count = 0
+    else:
+        _bad_count += 1
+
+    if pred_pos is not None and got_pos:
+        # Smooth flicker/noise without making the controller sluggish.
+        alpha = 0.65 if scalar_r is None or scalar_r > 30.0 else 0.80
+        pos = [alpha * pos[i] + (1.0 - alpha) * pred_pos[i] for i in range(3)]
+    if pred_vel is not None and got_vel:
+        vel = [0.60 * vel[i] + 0.40 * pred_vel[i] for i in range(3)]
+
+    _est_pos, _est_vel = pos[:], vel[:]
+    return pos, vel, n, scalar_r
+
+
+def _attitude_rates(state):
+    # Hold a stable, near-zero body rate.  Use median gyro rates to reject bias.
+    out = {}
+    mapping = {"roll": "att_rate_roll", "pitch": "att_rate_pitch", "yaw": "att_rate_yaw"}
+    for axis, key in mapping.items():
+        vals = []
+        for i in (1, 2, 3):
+            v = state.get(f"gyro_{i}_{axis}_dps")
+            if state.get(f"gyro_{i}_{axis}_valid") and _valid_number(v, 1000.0):
+                vals.append(float(v) * math.pi / 180.0)
+        rate = _median(vals) or 0.0
+        out[key] = _clamp(-0.55 * rate, -0.035, 0.035)
+    return out
+
+
+def autopilot_step(state: dict, dt: float) -> dict:
+    pos, vel, n, scalar_range = _estimate_state(state, dt)
+    x, y, z = pos
+    vx, vy, vz = vel
+    r = scalar_range if scalar_range is not None else _norm(pos)
+    speed = _norm(vel)
+    fuel_pct = float(state.get("fuel_remaining_pct", 100.0) or 0.0)
+    low_fuel = fuel_pct < 15.0 or float(state.get("fuel_remaining_kg", 500.0) or 0.0) < 80.0
+
+    # Desired closing speed.  Negative radial velocity along the line-of-sight
+    # means the range is shrinking.
+    if r > 1000.0:
+        close = min(1.4, 0.00055 * r + 0.20)
+    elif r > 200.0:
+        close = min(0.75, 0.0013 * r + 0.12)
+    elif r > 50.0:
+        close = min(0.35, 0.0015 * r + 0.08)
+    elif r > 10.0:
+        close = 0.12 + 0.003 * (r - 10.0)
+    else:
+        close = 0.04 + 0.006 * max(0.0, r - 2.0)
+    target_speed = state.get("target_dock_speed_ms")
+    if _valid_number(target_speed) and target_speed > 0.0:
+        close = min(close, max(0.04, float(target_speed)))
+    if low_fuel:
+        close *= 0.75
+
+    if r > 1.0e-6:
+        los = [x / r, y / r, z / r]
+    else:
+        los = [0.0, 1.0, 0.0]
+    desired_vel = [-close * los[0], -close * los[1], -close * los[2]]
+
+    if r > 200.0:
+        # Far-field orbital logic: along-track closure is mainly achieved by
+        # changing orbital energy.  Behind (negative y): burn retrograde to drop
+        # lower and gain phase; ahead: burn prograde.  Avoid chasing radially.
+        kp_x, kd_x = 0.0008, 0.45
+        kp_y, kd_y = 0.00070, 0.65
+        kp_z, kd_z = 0.0010, 0.55
+        ay_cmd = kp_y * y - kd_y * vy
+        ax_cmd = -kp_x * x + kd_x * (desired_vel[0] - vx) + 2.0 * n * vy
+        az_cmd = -kp_z * z + kd_z * (desired_vel[2] - vz)
+        limit = 0.22 if low_fuel else 0.38
+    elif r > 50.0:
+        # Transition to V-bar: reduce radial/cross-track offsets, but keep the
+        # counter-intuitive y phasing term until close enough for direct control.
+        kp_x, kd_x = 0.0025, 0.80
+        kp_y, kd_y = 0.0012, 0.75
+        kp_z, kd_z = 0.0025, 0.80
+        # Blend orbital phasing into direct velocity matching.  At 200 m this
+        # still burns retrograde when behind; by 50 m it behaves linearly.
+        phase = _clamp((r - 50.0) / 150.0, 0.0, 1.0)
+        ay_phase = kp_y * y - kd_y * vy
+        ay_direct = -kp_y * y + kd_y * (desired_vel[1] - vy)
+        ay_cmd = phase * ay_phase + (1.0 - phase) * ay_direct
+        ax_cmd = -kp_x * x + kd_x * (desired_vel[0] - vx) + 2.0 * n * vy
+        az_cmd = -kp_z * z + kd_z * (desired_vel[2] - vz)
+        limit = 0.28 if low_fuel else 0.45
+    else:
+        # Close in, CW is effectively linear for this problem: go directly to
+        # the docking port and damp relative velocity hard.
+        kp = 0.010 if r > 10.0 else 0.018
+        kd = 1.05 if r > 10.0 else 1.35
+        ax_cmd = -kp * x + kd * (desired_vel[0] - vx)
+        ay_cmd = -kp * y + kd * (desired_vel[1] - vy)
+        az_cmd = -kp * z + kd * (desired_vel[2] - vz)
+        limit = 0.20 if r < 10.0 else 0.32
+
+    # Braking override for excessive closing speed, including the explicit
+    # "closing too fast" scenario.  Positive command along LOS increases range.
+    if r > 1.0e-6:
+        range_rate = (x * vx + y * vy + z * vz) / r
+        max_close = max(close * 1.45, 0.22 if r > 20.0 else 0.10)
+        if range_rate < -max_close:
+            excess = -range_rate - max_close
+            ax_cmd += 1.2 * excess * los[0]
+            ay_cmd += 1.2 * excess * los[1]
+            az_cmd += 1.2 * excess * los[2]
+
+    # Mild integral-free disturbance rejection: if measured velocity keeps
+    # drifting, the derivative term above cancels persistent small forces.
+    accel_to_thrust = 1.0 / 0.22  # assume roughly 1000 kg craft, 220 N thruster
+    tx = _clamp(ax_cmd * accel_to_thrust, -limit, limit)
+    ty = _clamp(ay_cmd * accel_to_thrust, -limit, limit)
+    tz = _clamp(az_cmd * accel_to_thrust, -limit, limit)
+
+    # Deadband saves fuel once already inside the success envelope.
+    if r < 2.0 and speed < 0.3:
+        tx = ty = tz = 0.0
+    elif low_fuel:
+        for name, val in (("tx", tx), ("ty", ty), ("tz", tz)):
+            if abs(val) < 0.025:
+                if name == "tx":
+                    tx = 0.0
+                elif name == "ty":
+                    ty = 0.0
+                else:
+                    tz = 0.0
+
+    out = {
+        "thrust_x": _clamp(tx, -1.0, 1.0),
+        "thrust_y": _clamp(ty, -1.0, 1.0),
+        "thrust_z": _clamp(tz, -1.0, 1.0),
+    }
+    out.update(_attitude_rates(state))
+    return out

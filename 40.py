@@ -25,6 +25,8 @@ tags = [
   "linear constraints",
   "combinatorial optimization",
 ]
+
+resultFileTypes = ("cpp", "cc", "cxx", "c++", "c", "h", "hpp", "hh", "hxx")
 TIMEOUT_SECONDS = 30
 RANDOM_SEED = 40404040
 

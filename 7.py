@@ -30,6 +30,7 @@ tags = [
   "collision detection",
 ]
 
+resultFileTypes = ("cpp", "cc", "cxx", "c++", "c", "h", "hpp", "hh", "hxx")
 # Timeout in seconds (30 seconds for testing)
 TIMEOUT_SECONDS = 30
 

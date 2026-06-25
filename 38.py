@@ -23,6 +23,8 @@ tags = [
   "exact cover",
   "backtracking",
 ]
+
+resultFileTypes = ("py", "python")
 TIMEOUT_SECONDS = 30
 RANDOM_SEED = 38383838
 

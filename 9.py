@@ -32,6 +32,7 @@ tags = [
   "bin packing",
 ]
 
+resultFileTypes = ("cs", "csharp")
 TIMEOUT_SECONDS = 300
 
 RANDOM_SEED = 88888

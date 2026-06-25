@@ -50,6 +50,7 @@ tags = [
   "spatial data",
 ]
 
+resultFileTypes = ("glsl", "frag", "comp", "vert")
 RANDOM_SEED = 50505050
 TIMEOUT_SECONDS = 60
 
