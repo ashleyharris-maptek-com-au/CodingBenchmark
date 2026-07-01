@@ -1,0 +1,390 @@
+"""
+Spacecraft Docking Autopilot
+Handles orbital rendezvous using Clohessy-Wiltshire dynamics and sensor fusion
+"""
+
+import math
+
+# Module-level persistence for state estimation
+_velocity_history = []
+_position_history = []
+_sensor_health = {}
+_integrated_velocity = [0.0, 0.0, 0.0]
+_last_time = None
+
+def autopilot_step(state: dict, dt: float) -> dict:
+    """
+    Main autopilot control loop for spacecraft docking
+
+    Args:
+        state: Dict with 110 sensor keys
+        dt: Time step in seconds
+
+    Returns:
+        Dict with thrust_x, thrust_y, thrust_z, att_rate_roll, att_rate_pitch, att_rate_yaw
+    """
+    global _velocity_history, _position_history, _sensor_health, _integrated_velocity, _last_time
+
+    # Initialize on first call
+    if _last_time is None:
+        _last_time = 0.0
+        _sensor_health = {}
+        _velocity_history = []
+        _position_history = []
+        _integrated_velocity = [0.0, 0.0, 0.0]
+
+    # 1. SENSOR FUSION - Get best estimate of position and velocity
+    pos, vel = fuse_sensors(state)
+
+    if pos is None:
+        # Fallback: return zero thrust if we can't determine position
+        return zero_thrust()
+
+    # 2. COMPUTE RANGE AND APPROACH METRICS
+    range_m = math.sqrt(pos[0]**2 + pos[1]**2 + pos[2]**2)
+    approach_speed = -(pos[0]*vel[0] + pos[1]*vel[1] + pos[2]*vel[2]) / max(range_m, 0.1)
+
+    # 3. DETERMINE CONTROL PHASE
+    fuel_kg = state.get('fuel_remaining_kg', 500.0)
+    low_fuel = fuel_kg < 100.0
+
+    if range_m < 10.0:
+        phase = 'final'
+    elif range_m < 50.0:
+        phase = 'close'
+    elif range_m < 200.0:
+        phase = 'medium'
+    else:
+        phase = 'far'
+
+    # 4. COMPUTE DESIRED VELOCITY
+    desired_vel = compute_desired_velocity(pos, vel, range_m, phase, approach_speed, low_fuel)
+
+    # 5. COMPUTE THRUST COMMANDS
+    thrust = compute_thrust_commands(pos, vel, desired_vel, range_m, phase, dt, low_fuel)
+
+    # 6. ATTITUDE CONTROL - Keep spacecraft stable
+    att_rates = compute_attitude_rates(state)
+
+    # Update history
+    _position_history.append(pos)
+    _velocity_history.append(vel)
+    if len(_position_history) > 50:
+        _position_history.pop(0)
+        _velocity_history.pop(0)
+
+    _last_time += dt
+
+    return {
+        'thrust_x': clamp(thrust[0], -1.0, 1.0),
+        'thrust_y': clamp(thrust[1], -1.0, 1.0),
+        'thrust_z': clamp(thrust[2], -1.0, 1.0),
+        'att_rate_roll': clamp(att_rates[0], -0.035, 0.035),
+        'att_rate_pitch': clamp(att_rates[1], -0.035, 0.035),
+        'att_rate_yaw': clamp(att_rates[2], -0.035, 0.035)
+    }
+
+
+def fuse_sensors(state: dict) -> tuple:
+    """
+    Fuse multiple sensor readings to get best position/velocity estimate
+    Handles sensor failures and noisy data
+    """
+    global _sensor_health
+
+    # Collect position estimates
+    pos_estimates = []
+    vel_estimates = []
+
+    # RADAR - Primary sensor
+    if (state.get('radar_rel_x_valid') and state.get('radar_rel_y_valid') and
+        state.get('radar_rel_z_valid')):
+        radar_pos = [
+            state.get('radar_rel_pos_x_m', 0),
+            state.get('radar_rel_pos_y_m', 0),
+            state.get('radar_rel_pos_z_m', 0)
+        ]
+        pos_estimates.append(('radar', radar_pos, 1.0))
+
+    if (state.get('radar_relv_x_valid') and state.get('radar_relv_y_valid') and
+        state.get('radar_relv_z_valid')):
+        radar_vel = [
+            state.get('radar_rel_vel_x_ms', 0),
+            state.get('radar_rel_vel_y_ms', 0),
+            state.get('radar_rel_vel_z_ms', 0)
+        ]
+        vel_estimates.append(('radar', radar_vel, 1.0))
+
+    # LIDAR - Secondary sensor
+    if (state.get('lidar_rel_x_valid') and state.get('lidar_rel_y_valid') and
+        state.get('lidar_rel_z_valid')):
+        lidar_pos = [
+            state.get('lidar_rel_pos_x_m', 0),
+            state.get('lidar_rel_pos_y_m', 0),
+            state.get('lidar_rel_pos_z_m', 0)
+        ]
+        pos_estimates.append(('lidar', lidar_pos, 0.9))
+
+    if (state.get('lidar_relv_x_valid') and state.get('lidar_relv_y_valid') and
+        state.get('lidar_relv_z_valid')):
+        lidar_vel = [
+            state.get('lidar_rel_vel_x_ms', 0),
+            state.get('lidar_rel_vel_y_ms', 0),
+            state.get('lidar_rel_vel_z_ms', 0)
+        ]
+        vel_estimates.append(('lidar', lidar_vel, 0.9))
+
+    # RANGE FINDERS - Fallback (give scalar distance only)
+    range_readings = []
+    for i in [1, 2, 3]:
+        if state.get(f'range_{i}_valid'):
+            r = state.get(f'range_{i}_m', 0)
+            if r > 0:
+                range_readings.append(r)
+
+    # If no 3D position available, use range finders with direction estimate
+    if not pos_estimates and range_readings:
+        median_range = sorted(range_readings)[len(range_readings)//2]
+        # Assume mostly along-track approach (common scenario)
+        pos_estimates.append(('range', [0, -median_range * 0.9, 0], 0.5))
+
+    # Fuse position estimates
+    if pos_estimates:
+        pos = weighted_average([p[1] for p in pos_estimates], [p[2] for p in pos_estimates])
+    else:
+        return None, [0, 0, 0]
+
+    # Fuse velocity estimates
+    if vel_estimates:
+        vel = weighted_average([v[1] for v in vel_estimates], [v[2] for v in vel_estimates])
+    else:
+        # Estimate velocity from position derivative
+        if len(_position_history) >= 2:
+            dt_estimate = 0.1  # typical dt
+            vel = [
+                (pos[i] - _position_history[-1][i]) / dt_estimate
+                for i in range(3)
+            ]
+        else:
+            vel = [0, 0, 0]
+
+    # Sanity checks
+    pos_mag = math.sqrt(sum(p**2 for p in pos))
+    vel_mag = math.sqrt(sum(v**2 for v in vel))
+
+    if pos_mag > 5000 or vel_mag > 20:
+        # Unreasonable values, use history if available
+        if _position_history:
+            pos = _position_history[-1]
+        if _velocity_history:
+            vel = _velocity_history[-1]
+
+    return pos, vel
+
+
+def compute_desired_velocity(pos, vel, range_m, phase, approach_speed, low_fuel):
+    """
+    Compute desired velocity vector based on current position and phase
+    Accounts for orbital mechanics (Clohessy-Wiltshire dynamics)
+    """
+
+    if phase == 'final':
+        # Very gentle final approach
+        # Target: slow approach speed (0.05-0.08 m/s)
+        target_speed = 0.06
+        if range_m < 3.0:
+            target_speed = 0.03
+
+        # Direct approach vector
+        pos_mag = max(math.sqrt(sum(p**2 for p in pos)), 0.1)
+        approach_dir = [-p/pos_mag for p in pos]
+
+        desired_vel = [target_speed * d for d in approach_dir]
+
+    elif phase == 'close':
+        # Linear control regime (10-50m)
+        # Target approach speed: 0.1-0.2 m/s
+        target_speed = 0.15 if range_m > 20 else 0.10
+
+        pos_mag = max(math.sqrt(sum(p**2 for p in pos)), 0.1)
+        approach_dir = [-p/pos_mag for p in pos]
+
+        desired_vel = [target_speed * d for d in approach_dir]
+
+    elif phase == 'medium':
+        # V-bar approach (50-200m)
+        # More conservative, account for orbital mechanics
+        target_speed = 0.3 if range_m > 100 else 0.2
+
+        # Primarily close along-track (y) gap
+        # Small corrections for radial (x) and cross-track (z)
+        desired_vel = [
+            -pos[0] * 0.01,  # Slow radial correction
+            -pos[1] * 0.01,  # Along-track closure
+            -pos[2] * 0.01   # Cross-track correction
+        ]
+
+        # Limit speed
+        vel_mag = math.sqrt(sum(v**2 for v in desired_vel))
+        if vel_mag > target_speed:
+            scale = target_speed / vel_mag
+            desired_vel = [v * scale for v in desired_vel]
+
+    else:  # far phase (>200m)
+        # Hohmann-like transfer using orbital mechanics
+        # Key insight: thrust RETROGRADE to catch up if behind
+
+        x, y, z = pos
+
+        # If behind station (negative y), need to lower orbit to catch up
+        if y < -50:
+            # Thrust retrograde (negative y direction) to lower orbit
+            # This increases orbital velocity relative to target
+            desired_vel_y = min(y * 0.005, 0.5)  # Retrograde
+        elif y > 50:
+            # Ahead of station, thrust prograde to raise orbit and slow down
+            desired_vel_y = max(y * 0.003, -0.3)
+        else:
+            desired_vel_y = -y * 0.01
+
+        # Radial and cross-track: gentle corrections
+        desired_vel = [
+            -x * 0.005,      # Radial
+            desired_vel_y,   # Along-track (orbital mechanics)
+            -z * 0.008       # Cross-track
+        ]
+
+        # Be more conservative with low fuel
+        if low_fuel:
+            desired_vel = [v * 0.5 for v in desired_vel]
+
+    return desired_vel
+
+
+def compute_thrust_commands(pos, vel, desired_vel, range_m, phase, dt, low_fuel):
+    """
+    PD controller to compute thrust commands
+    Accounts for Clohessy-Wiltshire orbital dynamics
+    """
+
+    # Velocity error
+    vel_error = [desired_vel[i] - vel[i] for i in range(3)]
+
+    # PD gains (vary by phase)
+    if phase == 'final':
+        Kp = 0.8
+        Kd = 0.4
+    elif phase == 'close':
+        Kp = 0.5
+        Kd = 0.3
+    elif phase == 'medium':
+        Kp = 0.3
+        Kd = 0.2
+    else:  # far
+        Kp = 0.2
+        Kd = 0.15
+
+    # Reduce gains if low fuel
+    if low_fuel:
+        Kp *= 0.6
+        Kd *= 0.6
+
+    # Position error term (proportional control on position)
+    pos_thrust = [-pos[i] * Kp * 0.01 for i in range(3)]
+
+    # Velocity error term (damping)
+    vel_thrust = [vel_error[i] * Kd for i in range(3)]
+
+    # Combined thrust
+    thrust = [pos_thrust[i] + vel_thrust[i] for i in range(3)]
+
+    # ORBITAL MECHANICS COMPENSATION (for far/medium phases)
+    if phase in ['far', 'medium'] and range_m > 50:
+        # Clohessy-Wiltshire dynamics compensation
+        # Approximate mean motion (n) for LEO
+        n = 0.001  # rad/s (approximate for 400km orbit)
+
+        # CW dynamics create coupling between axes
+        # Compensate for natural drift
+
+        # Along-track drift due to radial offset
+        thrust[1] += pos[0] * 2 * n * 0.1
+
+        # Radial oscillation damping
+        thrust[0] += vel[0] * 0.1
+
+    # Additional damping near docking
+    if range_m < 15.0:
+        # Strong damping to prevent overshoot
+        thrust = [thrust[i] - vel[i] * 0.5 for i in range(3)]
+
+    return thrust
+
+
+def compute_attitude_rates(state: dict):
+    """
+    Simple attitude control - keep spacecraft stable
+    Use gyro data if available, otherwise maintain zero rates
+    """
+
+    # Get gyro readings (averaged across working sensors)
+    gyro_rates = []
+
+    for i in [1, 2, 3]:
+        if (state.get(f'gyro_{i}_roll_valid') and
+            state.get(f'gyro_{i}_pitch_valid') and
+            state.get(f'gyro_{i}_yaw_valid')):
+
+            roll = state.get(f'gyro_{i}_roll_dps', 0) * math.pi / 180.0
+            pitch = state.get(f'gyro_{i}_pitch_dps', 0) * math.pi / 180.0
+            yaw = state.get(f'gyro_{i}_yaw_dps', 0) * math.pi / 180.0
+
+            gyro_rates.append([roll, pitch, yaw])
+
+    if gyro_rates:
+        # Average and apply damping
+        avg_rates = [
+            sum(g[i] for g in gyro_rates) / len(gyro_rates)
+            for i in range(3)
+        ]
+        # Dampen any rotation
+        att_rates = [-r * 0.3 for r in avg_rates]
+    else:
+        # No gyro data, maintain zero rates
+        att_rates = [0.0, 0.0, 0.0]
+
+    return att_rates
+
+
+def weighted_average(vectors, weights):
+    """Compute weighted average of vectors"""
+    if not vectors:
+        return [0, 0, 0]
+
+    total_weight = sum(weights)
+    if total_weight == 0:
+        return vectors[0]
+
+    result = [0, 0, 0]
+    for vec, weight in zip(vectors, weights):
+        for i in range(3):
+            result[i] += vec[i] * weight / total_weight
+
+    return result
+
+
+def clamp(value, min_val, max_val):
+    """Clamp value between min and max"""
+    return max(min_val, min(max_val, value))
+
+
+def zero_thrust():
+    """Return zero thrust command"""
+    return {
+        'thrust_x': 0.0,
+        'thrust_y': 0.0,
+        'thrust_z': 0.0,
+        'att_rate_roll': 0.0,
+        'att_rate_pitch': 0.0,
+        'att_rate_yaw': 0.0
+    }

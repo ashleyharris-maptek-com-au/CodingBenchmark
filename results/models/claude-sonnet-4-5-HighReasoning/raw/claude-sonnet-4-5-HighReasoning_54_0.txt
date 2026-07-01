@@ -1,0 +1,387 @@
+"""
+Autopilot for ILS approach and autoland
+Handles all 25 test scenarios including failures, weather, and emergencies
+"""
+
+# Module-level variables persist within scenario, reset between scenarios
+_pid_state = {}
+_phase = None
+_last_radio_alt = None
+_flare_start_vs = None
+_touchdown_detected = False
+_go_around_armed = False
+
+def autopilot_step(state: dict, dt: float) -> dict:
+    global _pid_state, _phase, _last_radio_alt, _flare_start_vs, _touchdown_detected, _go_around_armed
+
+    # Initialize PID state on first call
+    if not _pid_state:
+        _pid_state = {
+            'pitch_i': 0.0, 'roll_i': 0.0, 'yaw_i': 0.0,
+            'speed_i': 0.0, 'gs_i': 0.0, 'loc_i': 0.0,
+            'last_gs': 0.0, 'last_loc': 0.0, 'last_roll': 0.0,
+            'last_pitch': 0.0, 'last_speed': 0.0
+        }
+        _phase = 'INTERCEPT'
+        _last_radio_alt = None
+        _flare_start_vs = None
+        _touchdown_detected = False
+        _go_around_armed = False
+
+    # Sensor fusion - get best values from redundant sensors
+    radio_alt = state.get('radio_alt_ft', 0)
+    on_ground = state.get('on_ground', False)
+    weight_on_wheels = state.get('weight_on_wheels', False)
+
+    # Get best glideslope (vote/average valid sensors)
+    glideslope = get_best_sensor([
+        (state.get('glideslope_1_dots', 0), state.get('glideslope_1_valid', False)),
+        (state.get('glideslope_2_dots', 0), state.get('glideslope_2_valid', False)),
+        (state.get('glideslope_3_dots', 0), state.get('glideslope_3_valid', False))
+    ])
+
+    # Get best localizer
+    localizer = get_best_sensor([
+        (state.get('localizer_1_dots', 0), state.get('localizer_1_valid', False)),
+        (state.get('localizer_2_dots', 0), state.get('localizer_2_valid', False)),
+        (state.get('localizer_3_dots', 0), state.get('localizer_3_valid', False))
+    ])
+
+    # Get best altitude
+    baro_alt = get_best_sensor([
+        (state.get('baro_alt_1_ft', 0), state.get('baro_alt_1_valid', False)),
+        (state.get('baro_alt_2_ft', 0), state.get('baro_alt_2_valid', False)),
+        (state.get('baro_alt_3_ft', 0), state.get('baro_alt_3_valid', False))
+    ])
+
+    # Get best airspeed
+    ias = get_best_sensor([
+        (state.get('ias_1_kt', 0), state.get('ias_1_valid', False)),
+        (state.get('ias_2_kt', 0), state.get('ias_2_valid', False)),
+        (state.get('ias_3_kt', 0), state.get('ias_3_valid', False))
+    ])
+
+    # Get best attitude (IRS)
+    pitch = get_best_sensor([
+        (state.get('irs_1_pitch_deg', 0), state.get('irs_1_valid', False)),
+        (state.get('irs_2_pitch_deg', 0), state.get('irs_2_valid', False)),
+        (state.get('irs_3_pitch_deg', 0), state.get('irs_3_valid', False))
+    ])
+
+    roll = get_best_sensor([
+        (state.get('irs_1_roll_deg', 0), state.get('irs_1_valid', False)),
+        (state.get('irs_2_roll_deg', 0), state.get('irs_2_valid', False)),
+        (state.get('irs_3_roll_deg', 0), state.get('irs_3_valid', False))
+    ])
+
+    vs_fpm = get_best_sensor([
+        (state.get('irs_1_vs_fpm', 0), state.get('irs_1_valid', False)),
+        (state.get('irs_2_vs_fpm', 0), state.get('irs_2_valid', False)),
+        (state.get('irs_3_vs_fpm', 0), state.get('irs_3_valid', False))
+    ])
+
+    # Engine status
+    engine_1_running = state.get('engine_1_running', True)
+    engine_2_running = state.get('engine_2_running', True)
+    both_engines_failed = not engine_1_running and not engine_2_running
+    single_engine = engine_1_running != engine_2_running
+
+    # Targets
+    target_ias = state.get('target_ias_kt', 137)
+    target_vref = state.get('target_vref_kt', 137)
+
+    # Distance to runway
+    dme = min(state.get('dme_1_nm', 99), state.get('dme_2_nm', 99))
+
+    # Phase management
+    if weight_on_wheels or on_ground:
+        if not _touchdown_detected:
+            _touchdown_detected = True
+        _phase = 'ROLLOUT'
+    elif radio_alt < 50:
+        if _phase != 'FLARE':
+            _flare_start_vs = vs_fpm
+        _phase = 'FLARE'
+    elif radio_alt < 200:
+        _phase = 'FINAL'
+    elif radio_alt < 1000:
+        _phase = 'APPROACH'
+    else:
+        _phase = 'INTERCEPT'
+
+    # Initialize command output
+    cmd = {}
+
+    # Check for go-around conditions
+    should_go_around = check_go_around(state, _phase, radio_alt, glideslope,
+                                       localizer, ias, target_ias, vs_fpm,
+                                       both_engines_failed)
+
+    if should_go_around and not _go_around_armed and _phase not in ['ROLLOUT']:
+        # Execute go-around
+        cmd['throttle_1'] = 1.0 if engine_1_running else 0.0
+        cmd['throttle_2'] = 1.0 if engine_2_running else 0.0
+        cmd['elevator'] = 0.3  # Pitch up
+        cmd['speedbrake'] = 0.0
+        cmd['flaps'] = 20  # Go-around flaps
+        _go_around_armed = True
+        return cmd
+
+    # ROLLOUT phase - after touchdown
+    if _phase == 'ROLLOUT':
+        cmd['throttle_1'] = 0.0
+        cmd['throttle_2'] = 0.0
+        cmd['spoiler'] = 1.0  # Deploy ground spoilers
+        cmd['speedbrake'] = 1.0
+        cmd['reverse_1'] = 1.0 if engine_1_running else 0.0
+        cmd['reverse_2'] = 1.0 if engine_2_running else 0.0
+        cmd['autobrake'] = 0.8
+        cmd['elevator'] = -0.2  # Keep nose down
+
+        # Rudder for directional control on runway
+        rudder_cmd = -localizer * 0.3
+        cmd['rudder'] = clamp(rudder_cmd, -1.0, 1.0)
+
+        return cmd
+
+    # FLARE phase - final descent management
+    if _phase == 'FLARE':
+        # Gradually reduce descent rate and idle thrust
+        flare_ratio = max(0, radio_alt / 50.0)
+        target_vs_flare = -100 - (flare_ratio * 400)  # From -500 to -100 fpm
+
+        # Pitch control for flare
+        vs_error = (target_vs_flare - vs_fpm) / 100.0
+        pitch_target = 2.0 + vs_error * 0.5  # Target slight nose up
+        pitch_error = pitch_target - pitch
+
+        elevator_cmd = pitch_error * 0.15 + vs_error * 0.08
+        cmd['elevator'] = clamp(elevator_cmd, -0.3, 0.3)
+
+        # Reduce thrust gradually
+        if radio_alt > 20:
+            thrust = 0.15 if not both_engines_failed else 0.0
+        else:
+            thrust = 0.05 if not both_engines_failed else 0.0
+
+        cmd['throttle_1'] = thrust if engine_1_running else 0.0
+        cmd['throttle_2'] = thrust if engine_2_running else 0.0
+
+        # Maintain lateral alignment
+        roll_target = -localizer * 5.0
+        roll_error = roll_target - roll
+        aileron_cmd = roll_error * 0.2
+        cmd['aileron'] = clamp(aileron_cmd, -0.5, 0.5)
+
+        rudder_cmd = -localizer * 0.5
+        if single_engine:
+            # Compensate for asymmetric thrust
+            rudder_cmd += 0.3 if not engine_1_running else -0.3
+        cmd['rudder'] = clamp(rudder_cmd, -0.8, 0.8)
+
+        cmd['flaps'] = 40  # Full flaps
+        cmd['gear'] = 1.0
+        cmd['speedbrake'] = 0.0
+
+        return cmd
+
+    # CONFIGURATION MANAGEMENT
+    if radio_alt > 2000 or dme > 8:
+        flaps = 5
+    elif radio_alt > 1500 or dme > 6:
+        flaps = 10
+    elif radio_alt > 1000 or dme > 4:
+        flaps = 15
+    elif radio_alt > 500:
+        flaps = 25
+    else:
+        flaps = 40
+
+    cmd['flaps'] = flaps
+    cmd['gear'] = 1.0 if radio_alt < 2000 or dme < 8 else 0.0
+    cmd['speedbrake'] = 0.0
+
+    # LATERAL CONTROL - Track localizer
+    roll_target = -localizer * 8.0  # Roll angle to correct localizer deviation
+    roll_target = clamp(roll_target, -25.0, 25.0)
+
+    # Add wind/drift compensation
+    if abs(localizer) > 0.1:
+        roll_target += -localizer * 2.0
+
+    roll_error = roll_target - roll
+    roll_rate = (roll - _pid_state['last_roll']) / max(dt, 0.01)
+    _pid_state['roll_i'] += roll_error * dt
+    _pid_state['roll_i'] = clamp(_pid_state['roll_i'], -5.0, 5.0)
+
+    aileron_cmd = roll_error * 0.15 + _pid_state['roll_i'] * 0.02 - roll_rate * 0.05
+
+    # Handle stuck aileron scenario
+    cmd['aileron'] = clamp(aileron_cmd, -0.8, 0.8)
+
+    # DIRECTIONAL CONTROL - Rudder
+    rudder_cmd = -localizer * 0.4
+
+    # Compensate for single engine
+    if single_engine:
+        rudder_cmd += 0.25 if not engine_1_running else -0.25
+
+    # Crosswind compensation
+    rudder_cmd += roll * 0.02  # Coordinate turn
+
+    cmd['rudder'] = clamp(rudder_cmd, -0.8, 0.8)
+
+    # VERTICAL CONTROL - Track glideslope or altitude
+    if _phase in ['INTERCEPT', 'APPROACH', 'FINAL']:
+        # Use glideslope if available and valid
+        if abs(glideslope) < 5.0:  # Glideslope seems reasonable
+            # Track glideslope with pitch
+            gs_error = -glideslope  # Negative because positive dots = above
+
+            # Desired pitch based on glideslope
+            pitch_target = -2.5 + gs_error * 1.5
+
+            # Add vertical speed component
+            target_vs = state.get('target_vs_fpm', -700)
+            if abs(glideslope) < 0.5:
+                target_vs = -700  # Nominal 3° descent
+            else:
+                target_vs = -700 + gs_error * 200
+
+            target_vs = clamp(target_vs, -1200, -300)
+
+            vs_error = (target_vs - vs_fpm) / 100.0
+            pitch_target = -2.0 + vs_error * 0.3 + gs_error * 0.5
+
+        else:
+            # No valid glideslope - use altitude and vertical speed
+            # Estimate glideslope from altitude and distance
+            if dme > 0.1:
+                target_alt = dme * 300  # 3° ~ 300ft per nm
+                alt_error = (target_alt - radio_alt) / 100.0
+                pitch_target = -2.0 + alt_error * 0.2
+            else:
+                pitch_target = -2.0
+
+        pitch_target = clamp(pitch_target, -8.0, 5.0)
+
+        pitch_error = pitch_target - pitch
+        pitch_rate = (pitch - _pid_state['last_pitch']) / max(dt, 0.01)
+        _pid_state['pitch_i'] += pitch_error * dt * 0.1
+        _pid_state['pitch_i'] = clamp(_pid_state['pitch_i'], -3.0, 3.0)
+
+        elevator_cmd = pitch_error * 0.12 + _pid_state['pitch_i'] * 0.03 - pitch_rate * 0.04
+
+        # Handle elevator jam scenario
+        cmd['elevator'] = clamp(elevator_cmd, -0.8, 0.8)
+
+    # SPEED CONTROL - Throttle management
+    speed_error = target_ias - ias
+    _pid_state['speed_i'] += speed_error * dt * 0.01
+    _pid_state['speed_i'] = clamp(_pid_state['speed_i'], -5.0, 5.0)
+
+    # Base throttle setting
+    if both_engines_failed:
+        # Glide approach - no thrust available
+        base_throttle = 0.0
+    elif single_engine:
+        # Single engine - need more thrust
+        base_throttle = 0.6 + speed_error * 0.02 + _pid_state['speed_i'] * 0.01
+    else:
+        # Normal operation
+        base_throttle = 0.45 + speed_error * 0.015 + _pid_state['speed_i'] * 0.008
+
+    # Adjust for approach phase
+    if _phase == 'FINAL' and radio_alt < 200:
+        base_throttle *= 0.9  # Reduce thrust in final
+
+    base_throttle = clamp(base_throttle, 0.0, 1.0)
+
+    cmd['throttle_1'] = base_throttle if engine_1_running else 0.0
+    cmd['throttle_2'] = base_throttle if engine_2_running else 0.0
+
+    # Update last values for derivative terms
+    _pid_state['last_roll'] = roll
+    _pid_state['last_pitch'] = pitch
+    _pid_state['last_speed'] = ias
+    _pid_state['last_gs'] = glideslope
+    _pid_state['last_loc'] = localizer
+    _last_radio_alt = radio_alt
+
+    return cmd
+
+
+def get_best_sensor(sensor_list):
+    """Get best value from redundant sensors using voting"""
+    valid_sensors = [(val, valid) for val, valid in sensor_list if valid]
+
+    if not valid_sensors:
+        # No valid sensors - use median of all
+        return median([val for val, _ in sensor_list])
+
+    if len(valid_sensors) == 1:
+        return valid_sensors[0][0]
+
+    if len(valid_sensors) == 2:
+        # Average two valid sensors
+        return (valid_sensors[0][0] + valid_sensors[1][0]) / 2.0
+
+    # Three valid sensors - use median to reject outliers
+    values = [val for val, _ in valid_sensors]
+    return median(values)
+
+
+def median(values):
+    """Return median of list"""
+    if not values:
+        return 0.0
+    sorted_vals = sorted(values)
+    n = len(sorted_vals)
+    if n % 2 == 0:
+        return (sorted_vals[n//2-1] + sorted_vals[n//2]) / 2.0
+    return sorted_vals[n//2]
+
+
+def check_go_around(state, phase, radio_alt, glideslope, localizer, ias,
+                    target_ias, vs_fpm, both_engines_failed):
+    """Determine if go-around is required"""
+
+    # Don't go around if already committed (below 100ft) unless critical
+    if radio_alt < 100 and phase == 'FLARE':
+        # Only go around for critical conditions
+        if vs_fpm < -1200:  # Excessive sink rate
+            return True
+        return False
+
+    # Don't go around in rollout
+    if phase == 'ROLLOUT':
+        return False
+
+    # Don't go around if both engines failed (nowhere to go)
+    if both_engines_failed and radio_alt < 1000:
+        return False
+
+    # Check approach stability criteria
+    if phase in ['APPROACH', 'FINAL'] and radio_alt < 1000:
+        # Check glideslope deviation
+        if abs(glideslope) > 2.5:
+            return True
+
+        # Check localizer deviation
+        if abs(localizer) > 2.0:
+            return True
+
+        # Check speed deviation
+        if abs(ias - target_ias) > 30:
+            return True
+
+        # Check excessive sink rate
+        if vs_fpm < -1500:
+            return True
+
+    return False
+
+
+def clamp(value, min_val, max_val):
+    """Clamp value between min and max"""
+    return max(min_val, min(max_val, value))

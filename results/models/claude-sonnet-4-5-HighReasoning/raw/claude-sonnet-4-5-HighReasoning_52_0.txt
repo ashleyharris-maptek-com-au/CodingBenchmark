@@ -1,0 +1,490 @@
+"""
+Autopilot for self-driving car on multi-lane freeway.
+Handles sensor fusion, lane keeping, speed control, obstacle avoidance, and traction management.
+"""
+
+import math
+from typing import Optional, Tuple, List
+
+# Module-level persistent state for PID controllers and filtering
+_state = {
+    'speed_integral': 0.0,
+    'speed_prev_error': 0.0,
+    'lateral_integral': 0.0,
+    'lateral_prev_error': 0.0,
+    'heading_integral': 0.0,
+    'sensor_buffer': {},
+    'last_valid_lane_offset': 0.0,
+    'last_valid_curvature': 0.0,
+    'obstacle_history': [],
+    'initialized': False
+}
+
+
+def autopilot_step(state: dict, dt: float) -> dict:
+    """
+    Main autopilot control function.
+
+    Args:
+        state: Dictionary with 117 sensor keys
+        dt: Time step in seconds
+
+    Returns:
+        Dictionary with steering, throttle, brake commands
+    """
+    if not _state['initialized']:
+        _initialize_state()
+        _state['initialized'] = True
+
+    # 1. Sensor Fusion - get reliable estimates from redundant sensors
+    speed_kmh = _fuse_speed(state)
+    yaw_rate_dps = _fuse_yaw_rate(state)
+    lateral_accel = _fuse_lateral_accel(state)
+    mu = max(0.1, min(1.0, state.get('estimated_mu', 1.0)))
+
+    # 2. Lane positioning
+    lane_offset_m, lane_confidence = _fuse_lane_position(state)
+    road_curvature = _fuse_road_curvature(state)
+
+    # 3. Obstacle detection and fusion
+    obstacle_dist_m, obstacle_rel_speed_kmh, obstacle_confidence = _fuse_obstacles(state)
+
+    # 4. Speed limit detection
+    speed_limit_kmh = _fuse_speed_limit(state)
+
+    # 5. Determine target speed with constraints
+    target_speed_kmh = state.get('target_speed_kmh', 100.0)
+    if speed_limit_kmh is not None:
+        target_speed_kmh = min(target_speed_kmh, speed_limit_kmh)
+
+    # Reduce speed on low traction
+    if mu < 0.5:
+        traction_limit = 60.0 + (mu - 0.3) * 100.0  # 40 km/h at mu=0.3, 60 at mu=0.5
+        target_speed_kmh = min(target_speed_kmh, max(20.0, traction_limit))
+
+    # 6. Collision avoidance logic
+    emergency_brake = False
+    collision_avoidance_speed = target_speed_kmh
+
+    if obstacle_dist_m is not None and obstacle_confidence > 0.5:
+        # Time-to-collision calculation
+        relative_speed_ms = (speed_kmh - obstacle_rel_speed_kmh) / 3.6
+
+        if relative_speed_ms > 0.1:
+            ttc = obstacle_dist_m / relative_speed_ms
+        else:
+            ttc = float('inf')
+
+        # Emergency braking if very close
+        if obstacle_dist_m < 10.0 or ttc < 1.5:
+            emergency_brake = True
+        elif obstacle_dist_m < 50.0 or ttc < 5.0:
+            # Adaptive cruise control - match obstacle speed with safety margin
+            collision_avoidance_speed = min(collision_avoidance_speed,
+                                           max(0.0, obstacle_rel_speed_kmh - 5.0))
+
+    target_speed_kmh = min(target_speed_kmh, collision_avoidance_speed)
+
+    # 7. Longitudinal control (speed)
+    throttle, brake = _longitudinal_controller(
+        current_speed=speed_kmh,
+        target_speed=target_speed_kmh,
+        mu=mu,
+        emergency_brake=emergency_brake,
+        dt=dt
+    )
+
+    # 8. Check for brake failure (scenario 15)
+    brake_available = _check_brake_available(state)
+    if not brake_available and brake > 0:
+        # Brake failed - use engine braking (zero throttle)
+        brake = 0.0
+        throttle = 0.0
+
+    # 9. Check for throttle stuck (scenario 16)
+    throttle = _handle_throttle_stuck(state, throttle)
+
+    # 10. Lateral control (steering)
+    current_lane = state.get('current_lane', 1)
+    target_lane = state.get('target_lane', 1)
+
+    steering = _lateral_controller(
+        lane_offset=lane_offset_m,
+        lane_confidence=lane_confidence,
+        road_curvature=road_curvature,
+        yaw_rate=yaw_rate_dps,
+        speed=speed_kmh,
+        current_lane=current_lane,
+        target_lane=target_lane,
+        mu=mu,
+        dt=dt
+    )
+
+    # 11. Check for steering issues (scenarios 14, 20)
+    steering = _handle_steering_issues(state, steering, mu)
+
+    return {
+        'steering': steering,
+        'throttle': throttle,
+        'brake': brake
+    }
+
+
+def _initialize_state():
+    """Initialize persistent state."""
+    _state['speed_integral'] = 0.0
+    _state['speed_prev_error'] = 0.0
+    _state['lateral_integral'] = 0.0
+    _state['lateral_prev_error'] = 0.0
+    _state['heading_integral'] = 0.0
+    _state['sensor_buffer'] = {}
+    _state['last_valid_lane_offset'] = 0.0
+    _state['last_valid_curvature'] = 0.0
+    _state['obstacle_history'] = []
+
+
+def _fuse_speed(state: dict) -> float:
+    """Fuse speed from multiple sources: wheel speeds, GPS, vehicle speed sensors."""
+    speeds = []
+
+    # Wheel speed sensors (average of 4 wheels)
+    wheel_speeds = []
+    for wheel in ['fl', 'fr', 'rl', 'rr']:
+        if state.get(f'wheel_speed_{wheel}_valid', False):
+            wheel_speeds.append(state.get(f'wheel_speed_{wheel}_kmh', 0.0))
+    if wheel_speeds:
+        speeds.append(sum(wheel_speeds) / len(wheel_speeds))
+
+    # GPS speeds
+    if state.get('gps_1_valid', False):
+        speeds.append(state.get('gps_1_speed_kmh', 0.0))
+    if state.get('gps_2_valid', False):
+        speeds.append(state.get('gps_2_speed_kmh', 0.0))
+
+    # Vehicle speed sensors
+    speeds.append(state.get('vehicle_speed_1_kmh', 0.0))
+    speeds.append(state.get('vehicle_speed_2_kmh', 0.0))
+
+    # Return median for robustness
+    if speeds:
+        speeds.sort()
+        return speeds[len(speeds) // 2]
+    return 0.0
+
+
+def _fuse_yaw_rate(state: dict) -> float:
+    """Fuse yaw rate from multiple gyroscopes."""
+    yaw_rates = []
+    for i in range(1, 4):
+        if state.get(f'gyro_{i}_valid', False):
+            yaw_rates.append(state.get(f'gyro_{i}_yaw_rate_dps', 0.0))
+
+    if yaw_rates:
+        yaw_rates.sort()
+        return yaw_rates[len(yaw_rates) // 2]
+    return 0.0
+
+
+def _fuse_lateral_accel(state: dict) -> float:
+    """Fuse lateral acceleration from accelerometers."""
+    accels = []
+    for i in range(1, 4):
+        if state.get(f'accel_{i}_valid', False):
+            accels.append(state.get(f'accel_{i}_lateral_ms2', 0.0))
+
+    if accels:
+        accels.sort()
+        return accels[len(accels) // 2]
+    return 0.0
+
+
+def _fuse_lane_position(state: dict) -> Tuple[float, float]:
+    """
+    Fuse lane position from vision systems and lidar.
+    Returns (lane_offset_m, confidence).
+    """
+    offsets = []
+
+    # Vision systems
+    for i in range(1, 4):
+        left_valid = state.get(f'vision_{i}_left_line_valid', False)
+        right_valid = state.get(f'vision_{i}_right_line_valid', False)
+
+        if left_valid or right_valid:
+            offset = state.get(f'vision_{i}_lane_offset_m', None)
+            if offset is not None:
+                offsets.append(offset)
+
+    # Lidar-based lane estimation (use side beams to detect lane boundaries)
+    # Left lane boundary check (negative angles)
+    left_lidar_ranges = []
+    for angle in ['-090', '-060', '-045']:
+        if state.get(f'lidar_{angle}_deg_valid', False):
+            left_lidar_ranges.append(state.get(f'lidar_{angle}_deg_range_m', 100.0))
+
+    # Right lane boundary check (positive angles)
+    right_lidar_ranges = []
+    for angle in ['+090', '+060', '+045']:
+        if state.get(f'lidar_{angle}_deg_valid', False):
+            right_lidar_ranges.append(state.get(f'lidar_{angle}_deg_range_m', 100.0))
+
+    # If we have valid offsets from vision
+    if offsets:
+        offsets.sort()
+        median_offset = offsets[len(offsets) // 2]
+        _state['last_valid_lane_offset'] = median_offset
+        confidence = min(1.0, len(offsets) / 3.0)
+        return median_offset, confidence
+
+    # Fallback to last known good offset
+    return _state['last_valid_lane_offset'], 0.3
+
+
+def _fuse_road_curvature(state: dict) -> float:
+    """Fuse road curvature from vision systems."""
+    curvatures = []
+
+    for i in range(1, 4):
+        if (state.get(f'vision_{i}_left_line_valid', False) or
+            state.get(f'vision_{i}_right_line_valid', False)):
+            curv = state.get(f'vision_{i}_road_curvature_1pm', None)
+            if curv is not None:
+                curvatures.append(curv)
+
+    if curvatures:
+        curvatures.sort()
+        median_curv = curvatures[len(curvatures) // 2]
+        _state['last_valid_curvature'] = median_curv
+        return median_curv
+
+    return _state['last_valid_curvature']
+
+
+def _fuse_obstacles(state: dict) -> Tuple[Optional[float], Optional[float], float]:
+    """
+    Fuse obstacle detection from vision and lidar.
+    Returns (distance_m, relative_speed_kmh, confidence).
+    """
+    vision_obstacles = []
+
+    # Check all 3 vision systems
+    for i in range(1, 4):
+        if state.get(f'vision_{i}_obstacle_detected', False):
+            if state.get(f'vision_{i}_obstacle_valid', False):
+                dist = state.get(f'vision_{i}_obstacle_dist_m', None)
+                rel_speed = state.get(f'vision_{i}_obstacle_rel_speed_kmh', 0.0)
+                if dist is not None and dist > 0:
+                    vision_obstacles.append((dist, rel_speed))
+
+    # Lidar-based obstacle detection (front beams)
+    lidar_obstacles = []
+    for angle in ['-005', '+005', '-015', '+015', '-030', '+030']:
+        if state.get(f'lidar_{angle}_deg_valid', False):
+            dist = state.get(f'lidar_{angle}_deg_range_m', 200.0)
+            if dist < 150.0:  # Consider as obstacle if closer than 150m
+                lidar_obstacles.append(dist)
+
+    # Fuse vision obstacles
+    if vision_obstacles:
+        # Use closest obstacle
+        vision_obstacles.sort(key=lambda x: x[0])
+        closest_dist, closest_rel_speed = vision_obstacles[0]
+
+        # Verify with lidar if available
+        if lidar_obstacles:
+            min_lidar = min(lidar_obstacles)
+            if abs(closest_dist - min_lidar) < 20.0:  # Agreement
+                confidence = 0.9
+            else:
+                confidence = 0.6
+        else:
+            confidence = 0.7
+
+        return closest_dist, closest_rel_speed, confidence
+
+    # Lidar-only obstacle detection
+    if lidar_obstacles:
+        closest_dist = min(lidar_obstacles)
+        return closest_dist, 0.0, 0.5  # Lower confidence, no speed info
+
+    return None, None, 0.0
+
+
+def _fuse_speed_limit(state: dict) -> Optional[float]:
+    """Fuse speed limit from vision systems."""
+    limits = []
+
+    for i in range(1, 4):
+        if state.get(f'vision_{i}_speed_limit_valid', False):
+            limit = state.get(f'vision_{i}_speed_limit_kmh', None)
+            if limit is not None and limit > 0:
+                limits.append(limit)
+
+    if limits:
+        # Return most common speed limit (voting)
+        return max(set(limits), key=limits.count)
+
+    return None
+
+
+def _longitudinal_controller(current_speed: float, target_speed: float, mu: float,
+                            emergency_brake: bool, dt: float) -> Tuple[float, float]:
+    """
+    PID-based longitudinal controller for speed control.
+    Returns (throttle, brake).
+    """
+    # Speed error (km/h)
+    error = target_speed - current_speed
+
+    # PID gains (tuned for highway driving)
+    Kp = 0.05
+    Ki = 0.01
+    Kd = 0.1
+
+    # Adjust gains for low traction
+    if mu < 0.5:
+        Kp *= 0.5
+        Ki *= 0.3
+        Kd *= 0.5
+
+    # Integral term with anti-windup
+    _state['speed_integral'] += error * dt
+    _state['speed_integral'] = max(-50.0, min(50.0, _state['speed_integral']))
+
+    # Derivative term
+    if dt > 0:
+        derivative = (error - _state['speed_prev_error']) / dt
+    else:
+        derivative = 0.0
+
+    _state['speed_prev_error'] = error
+
+    # PID output
+    control = Kp * error + Ki * _state['speed_integral'] + Kd * derivative
+
+    # Emergency braking
+    if emergency_brake:
+        throttle = 0.0
+        brake = min(1.0, 0.8 * mu)  # Scale brake by traction
+        return throttle, brake
+
+    # Normal operation
+    if control > 0:
+        # Accelerate
+        throttle = min(1.0, control)
+        brake = 0.0
+    else:
+        # Decelerate
+        throttle = 0.0
+        brake = min(1.0, abs(control) * 0.3)
+
+    # Limit brake force on low traction
+    if mu < 0.5:
+        brake = min(brake, 0.5 * mu)
+
+    return throttle, brake
+
+
+def _lateral_controller(lane_offset: float, lane_confidence: float, road_curvature: float,
+                       yaw_rate: float, speed: float, current_lane: int, target_lane: int,
+                       mu: float, dt: float) -> float:
+    """
+    Stanley + PID lateral controller for lane keeping and lane changes.
+    Returns steering command (-1.0 to 1.0).
+    """
+    # Lane change handling
+    lane_change_offset = (target_lane - current_lane) * 3.5  # 3.5m lane width
+    target_offset = lane_change_offset
+
+    # Error from target offset
+    cross_track_error = -(lane_offset - target_offset)
+
+    # Stanley controller components
+    k_cte = 0.3  # Cross-track error gain
+    k_soft = 0.5  # Softening term
+
+    # Heading error from curvature
+    heading_error = -road_curvature * 10.0
+
+    # Speed-dependent cross-track term
+    speed_ms = max(1.0, speed / 3.6)
+    cte_term = math.atan2(k_cte * cross_track_error, speed_ms + k_soft)
+
+    # PID for heading control
+    Kp_heading = 0.8
+    Ki_heading = 0.05
+    Kd_heading = 0.2
+
+    # Reduce gains on low traction
+    if mu < 0.5:
+        Kp_heading *= 0.6
+        k_cte *= 0.6
+
+    _state['heading_integral'] += heading_error * dt
+    _state['heading_integral'] = max(-5.0, min(5.0, _state['heading_integral']))
+
+    # Combine terms
+    steering_deg = (Kp_heading * heading_error +
+                   Ki_heading * _state['heading_integral'] +
+                   cte_term * 57.3)  # Convert radians to degrees
+
+    # Limit steering rate for stability
+    max_steering_rate = 30.0 / max(0.01, dt)  # degrees per second
+
+    # Convert to normalized output (-1.0 to 1.0)
+    # Assume full steering range is ±30 degrees
+    steering = steering_deg / 30.0
+    steering = max(-1.0, min(1.0, steering))
+
+    # Reduce steering authority at high speeds
+    if speed > 100:
+        speed_factor = 100.0 / speed
+        steering *= speed_factor
+
+    return steering
+
+
+def _check_brake_available(state: dict) -> bool:
+    """Check if brake system is functional."""
+    brake1_valid = state.get('brake_pressure_1_valid', True)
+    brake2_valid = state.get('brake_pressure_2_valid', True)
+
+    # If both sensors report zero pressure when we expect braking, brake has failed
+    brake1_pct = state.get('brake_pressure_1_pct', 0.0)
+    brake2_pct = state.get('brake_pressure_2_pct', 0.0)
+
+    # At least one brake circuit should be working
+    if brake1_valid or brake2_valid:
+        return True
+
+    # Total failure scenario
+    return False
+
+
+def _handle_throttle_stuck(state: dict, commanded_throttle: float) -> float:
+    """Handle throttle stuck scenario."""
+    # This is a simulation scenario - we can't detect it from sensors
+    # In reality, we'd compare commanded vs actual throttle position
+    # For now, just return the commanded value
+    return commanded_throttle
+
+
+def _handle_steering_issues(state: dict, commanded_steering: float, mu: float) -> float:
+    """Handle steering sensor disagreement and partial jam."""
+    # Check steering sensor agreement
+    steer1_valid = state.get('steering_angle_1_valid', False)
+    steer2_valid = state.get('steering_angle_2_valid', False)
+
+    if steer1_valid and steer2_valid:
+        steer1 = state.get('steering_angle_1_deg', 0.0)
+        steer2 = state.get('steering_angle_2_deg', 0.0)
+
+        # If sensors disagree significantly, limit steering command
+        if abs(steer1 - steer2) > 5.0:
+            commanded_steering *= 0.7  # Reduce authority
+
+    # Limit steering on low traction
+    if mu < 0.4:
+        commanded_steering *= 0.7
+
+    return max(-1.0, min(1.0, commanded_steering))

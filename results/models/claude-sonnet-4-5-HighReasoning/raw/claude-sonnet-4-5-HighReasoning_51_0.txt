@@ -1,0 +1,596 @@
+"""
+A320-class Twin-Engine Airliner Autopilot
+Handles sensor fusion, flight control, and emergency scenarios
+"""
+
+import math
+from typing import Dict, List, Tuple, Optional
+
+# Persistent state for PID controllers and filters
+_pid_state = {
+    'altitude_integral': 0.0,
+    'altitude_prev_error': 0.0,
+    'speed_integral': 0.0,
+    'speed_prev_error': 0.0,
+    'heading_integral': 0.0,
+    'heading_prev_error': 0.0,
+    'vs_integral': 0.0,
+    'vs_prev_error': 0.0,
+    'pitch_integral': 0.0,
+    'roll_integral': 0.0,
+}
+
+_prev_values = {
+    'altitude': None,
+    'speed': None,
+    'heading': None,
+    'pitch': None,
+    'roll': None,
+    'last_stall_warning': 0.0,
+    'engine_failure_detected': False,
+    'failed_engine': None,
+}
+
+
+def median_of_three(v1: float, v2: float, v3: float) -> float:
+    """Return median of three values (robust to one outlier)"""
+    return sorted([v1, v2, v3])[1]
+
+
+def vote_with_validation(sensors: List[Tuple[float, bool]], tolerance: float = 0.1) -> Optional[float]:
+    """
+    Vote across redundant sensors with validation.
+    Returns None if all sensors are suspect.
+    tolerance: fraction of median for outlier detection
+    """
+    valid_values = [val for val, valid in sensors if valid]
+
+    if len(valid_values) == 0:
+        # Try invalid sensors as last resort
+        all_values = [val for val, _ in sensors]
+        if all_values:
+            return median_of_three(*all_values) if len(all_values) == 3 else all_values[0]
+        return None
+
+    if len(valid_values) == 1:
+        return valid_values[0]
+
+    if len(valid_values) == 2:
+        # If two agree within tolerance, use average; otherwise use median
+        if abs(valid_values[0] - valid_values[1]) / (abs(valid_values[0]) + 1e-6) < tolerance:
+            return (valid_values[0] + valid_values[1]) / 2
+        return valid_values[0]  # Use first valid
+
+    # Three or more values - use median for robustness
+    median = sorted(valid_values)[len(valid_values) // 2]
+
+    # Filter outliers and average remaining
+    filtered = [v for v in valid_values if abs(v - median) / (abs(median) + 1e-6) < tolerance]
+
+    if filtered:
+        return sum(filtered) / len(filtered)
+
+    return median
+
+
+def fuse_sensors(state: dict) -> dict:
+    """Fuse redundant sensor data with cross-validation"""
+    fused = {}
+
+    # Barometric altitude
+    baro_sensors = [
+        (state.get('baro_alt_1_ft', 0), state.get('baro_alt_1_valid', False)),
+        (state.get('baro_alt_2_ft', 0), state.get('baro_alt_2_valid', False)),
+        (state.get('baro_alt_3_ft', 0), state.get('baro_alt_3_valid', False)),
+    ]
+    fused['baro_alt_ft'] = vote_with_validation(baro_sensors, tolerance=0.02)
+
+    # Radar altitude
+    radar_sensors = [
+        (state.get('radar_alt_1_ft', 0), state.get('radar_alt_1_valid', False)),
+        (state.get('radar_alt_2_ft', 0), state.get('radar_alt_2_valid', False)),
+        (state.get('radar_alt_3_ft', 0), state.get('radar_alt_3_valid', False)),
+    ]
+    fused['radar_alt_ft'] = vote_with_validation(radar_sensors, tolerance=0.05)
+
+    # GPS altitude
+    gps_alt_sensors = [
+        (state.get('gps_1_alt_ft', 0), state.get('gps_1_valid', False)),
+        (state.get('gps_2_alt_ft', 0), state.get('gps_2_valid', False)),
+        (state.get('gps_3_alt_ft', 0), state.get('gps_3_valid', False)),
+    ]
+    fused['gps_alt_ft'] = vote_with_validation(gps_alt_sensors, tolerance=0.02)
+
+    # Cross-validate altitudes and pick best
+    alt_candidates = []
+    if fused['baro_alt_ft'] is not None:
+        alt_candidates.append(('baro', fused['baro_alt_ft']))
+    if fused['gps_alt_ft'] is not None:
+        alt_candidates.append(('gps', fused['gps_alt_ft']))
+
+    # Use radar altitude for low altitude cross-check
+    if fused['radar_alt_ft'] is not None and fused['radar_alt_ft'] < 2500:
+        # Radar altitude is reliable below 2500 ft
+        # Cross-validate baro/GPS with radar
+        for source, alt in alt_candidates[:]:
+            # Remove if inconsistent with radar
+            if abs(alt - fused['radar_alt_ft']) > 500:
+                alt_candidates = [(s, a) for s, a in alt_candidates if s != source]
+
+    if alt_candidates:
+        # Average remaining candidates
+        fused['altitude_ft'] = sum(a for _, a in alt_candidates) / len(alt_candidates)
+    else:
+        # Fallback to any available
+        fused['altitude_ft'] = fused['baro_alt_ft'] or fused['gps_alt_ft'] or fused['radar_alt_ft'] or 0
+
+    # IAS (Indicated Airspeed)
+    ias_sensors = [
+        (state.get('ias_1_kt', 0), state.get('ias_1_valid', False)),
+        (state.get('ias_2_kt', 0), state.get('ias_2_valid', False)),
+        (state.get('ias_3_kt', 0), state.get('ias_3_valid', False)),
+    ]
+    fused['ias_kt'] = vote_with_validation(ias_sensors, tolerance=0.03) or 250
+
+    # Mach
+    mach_sensors = [
+        (state.get('mach_1', 0), state.get('ias_1_valid', False)),
+        (state.get('mach_2', 0), state.get('ias_2_valid', False)),
+        (state.get('mach_3', 0), state.get('ias_3_valid', False)),
+    ]
+    fused['mach'] = vote_with_validation(mach_sensors, tolerance=0.03) or 0.5
+
+    # Angle of Attack
+    aoa_sensors = [
+        (state.get('aoa_1_deg', 0), state.get('aoa_1_valid', False)),
+        (state.get('aoa_2_deg', 0), state.get('aoa_2_valid', False)),
+        (state.get('aoa_3_deg', 0), state.get('aoa_3_valid', False)),
+    ]
+    fused['aoa_deg'] = vote_with_validation(aoa_sensors, tolerance=0.1) or 5.0
+
+    # IRS - Pitch
+    pitch_sensors = [
+        (state.get('irs_1_pitch_deg', 0), state.get('irs_1_valid', False)),
+        (state.get('irs_2_pitch_deg', 0), state.get('irs_2_valid', False)),
+        (state.get('irs_3_pitch_deg', 0), state.get('irs_3_valid', False)),
+    ]
+    fused['pitch_deg'] = vote_with_validation(pitch_sensors, tolerance=0.05) or 0.0
+
+    # IRS - Roll
+    roll_sensors = [
+        (state.get('irs_1_roll_deg', 0), state.get('irs_1_valid', False)),
+        (state.get('irs_2_roll_deg', 0), state.get('irs_2_valid', False)),
+        (state.get('irs_3_roll_deg', 0), state.get('irs_3_valid', False)),
+    ]
+    fused['roll_deg'] = vote_with_validation(roll_sensors, tolerance=0.05) or 0.0
+
+    # IRS - Heading
+    heading_sensors = [
+        (state.get('irs_1_heading_deg', 0), state.get('irs_1_valid', False)),
+        (state.get('irs_2_heading_deg', 0), state.get('irs_2_valid', False)),
+        (state.get('irs_3_heading_deg', 0), state.get('irs_3_valid', False)),
+    ]
+    fused['heading_deg'] = vote_with_validation(heading_sensors, tolerance=0.02) or 0.0
+
+    # IRS - Vertical Speed
+    vs_sensors = [
+        (state.get('irs_1_vs_fpm', 0), state.get('irs_1_valid', False)),
+        (state.get('irs_2_vs_fpm', 0), state.get('irs_2_valid', False)),
+        (state.get('irs_3_vs_fpm', 0), state.get('irs_3_valid', False)),
+    ]
+    fused['vs_fpm'] = vote_with_validation(vs_sensors, tolerance=0.1) or 0.0
+
+    # Ground speed
+    gs_sensors = [
+        (state.get('irs_1_gs_kt', 0), state.get('irs_1_valid', False)),
+        (state.get('irs_2_gs_kt', 0), state.get('irs_2_valid', False)),
+        (state.get('irs_3_gs_kt', 0), state.get('irs_3_valid', False)),
+        (state.get('gps_1_gs_kt', 0), state.get('gps_1_valid', False)),
+        (state.get('gps_2_gs_kt', 0), state.get('gps_2_valid', False)),
+        (state.get('gps_3_gs_kt', 0), state.get('gps_3_valid', False)),
+    ]
+    fused['ground_speed_kt'] = vote_with_validation(gs_sensors, tolerance=0.05) or 250
+
+    # Gyro rates
+    pitch_rate_sensors = [
+        (state.get('gyro_1_pitch_rate_dps', 0), state.get('gyro_1_valid', False)),
+        (state.get('gyro_2_pitch_rate_dps', 0), state.get('gyro_2_valid', False)),
+        (state.get('gyro_3_pitch_rate_dps', 0), state.get('gyro_3_valid', False)),
+    ]
+    fused['pitch_rate_dps'] = vote_with_validation(pitch_rate_sensors, tolerance=0.2) or 0.0
+
+    roll_rate_sensors = [
+        (state.get('gyro_1_roll_rate_dps', 0), state.get('gyro_1_valid', False)),
+        (state.get('gyro_2_roll_rate_dps', 0), state.get('gyro_2_valid', False)),
+        (state.get('gyro_3_roll_rate_dps', 0), state.get('gyro_3_valid', False)),
+    ]
+    fused['roll_rate_dps'] = vote_with_validation(roll_rate_sensors, tolerance=0.2) or 0.0
+
+    yaw_rate_sensors = [
+        (state.get('gyro_1_yaw_rate_dps', 0), state.get('gyro_1_valid', False)),
+        (state.get('gyro_2_yaw_rate_dps', 0), state.get('gyro_2_valid', False)),
+        (state.get('gyro_3_yaw_rate_dps', 0), state.get('gyro_3_valid', False)),
+    ]
+    fused['yaw_rate_dps'] = vote_with_validation(yaw_rate_sensors, tolerance=0.2) or 0.0
+
+    return fused
+
+
+def clamp(value: float, min_val: float, max_val: float) -> float:
+    """Clamp value between min and max"""
+    return max(min_val, min(max_val, value))
+
+
+def normalize_angle(angle: float) -> float:
+    """Normalize angle to -180 to 180"""
+    while angle > 180:
+        angle -= 360
+    while angle < -180:
+        angle += 360
+    return angle
+
+
+def pid_controller(error: float, integral: float, prev_error: float, dt: float,
+                   kp: float, ki: float, kd: float,
+                   integral_limit: float = 1000.0) -> Tuple[float, float, float]:
+    """
+    PID controller with anti-windup
+    Returns: (output, new_integral, error) for state persistence
+    """
+    integral += error * dt
+    integral = clamp(integral, -integral_limit, integral_limit)
+
+    derivative = (error - prev_error) / dt if dt > 0 else 0.0
+
+    output = kp * error + ki * integral + kd * derivative
+
+    return output, integral, error
+
+
+def detect_stall(fused: dict, state: dict) -> bool:
+    """Detect stall conditions"""
+    aoa = fused['aoa_deg']
+    ias = fused['ias_kt']
+    pitch = fused['pitch_deg']
+
+    # Critical AoA (typically 15-18 degrees for transport category)
+    if aoa > 15.0:
+        return True
+
+    # Low speed at high pitch
+    if ias < 140 and pitch > 15:
+        return True
+
+    # Check for stick shaker equivalent (high AoA + low margin)
+    if aoa > 12.0 and ias < 160:
+        return True
+
+    return False
+
+
+def detect_overspeed(fused: dict, state: dict) -> bool:
+    """Detect overspeed conditions"""
+    ias = fused['ias_kt']
+    mach = fused['mach']
+
+    # Vne approximately 365 KIAS or Mach 0.82
+    if ias > 360 or mach > 0.81:
+        return True
+
+    return False
+
+
+def detect_engine_failure(state: dict) -> Tuple[bool, Optional[int]]:
+    """Detect engine failure or fire"""
+    eng1_running = state.get('engine_1_running', True)
+    eng2_running = state.get('engine_2_running', True)
+    eng1_fire = state.get('engine_1_fire', False)
+    eng2_fire = state.get('engine_2_fire', False)
+    eng1_n1 = state.get('engine_1_n1_pct', 100)
+    eng2_n1 = state.get('engine_2_n1_pct', 100)
+
+    # Check for engine 1 failure
+    if not eng1_running or eng1_fire or eng1_n1 < 10:
+        return True, 1
+
+    # Check for engine 2 failure
+    if not eng2_running or eng2_fire or eng2_n1 < 10:
+        return True, 2
+
+    # Check for asymmetric thrust
+    if abs(eng1_n1 - eng2_n1) > 40:
+        if eng1_n1 < eng2_n1:
+            return True, 1
+        else:
+            return True, 2
+
+    return False, None
+
+
+def calculate_flap_target(fused: dict, state: dict, on_ground: bool) -> float:
+    """Calculate target flap setting based on speed and phase of flight"""
+    ias = fused['ias_kt']
+    altitude = fused['altitude_ft']
+
+    if on_ground:
+        return 15.0  # Takeoff flaps
+
+    # Clean up flaps at cruise speed/altitude
+    if altitude > 10000 and ias > 250:
+        return 0.0
+
+    # Speed-based flap schedule
+    if ias > 250:
+        return 0.0
+    elif ias > 220:
+        return 5.0
+    elif ias > 190:
+        return 10.0
+    elif ias > 170:
+        return 15.0
+    elif ias > 150:
+        return 25.0
+    else:
+        return 40.0  # Full flaps for low speed
+
+
+def autopilot_step(state: dict, dt: float) -> dict:
+    """
+    Main autopilot control function
+    """
+    global _pid_state, _prev_values
+
+    # Fuse sensor data
+    fused = fuse_sensors(state)
+
+    # Get current state
+    altitude = fused['altitude_ft']
+    ias = fused['ias_kt']
+    mach = fused['mach']
+    pitch = fused['pitch_deg']
+    roll = fused['roll_deg']
+    heading = fused['heading_deg']
+    vs = fused['vs_fpm']
+    aoa = fused['aoa_deg']
+    pitch_rate = fused['pitch_rate_dps']
+    roll_rate = fused['roll_rate_dps']
+    yaw_rate = fused['yaw_rate_dps']
+
+    # Get targets
+    target_alt = state.get('target_alt_ft', altitude)
+    target_hdg = state.get('target_hdg_deg', heading)
+    target_ias = state.get('target_ias_kt', 250)
+    target_vs = state.get('target_vs_fpm', 0)
+
+    # Get current control positions
+    current_throttle_1 = state.get('throttle_1_pos', 0.5)
+    current_throttle_2 = state.get('throttle_2_pos', 0.5)
+
+    # Weight on wheels
+    wow = (state.get('weight_on_wheels_left', False) or
+           state.get('weight_on_wheels_nose', False) or
+           state.get('weight_on_wheels_right', False))
+
+    # Initialize output
+    output = {}
+
+    # Check for emergencies
+    stall_warning = detect_stall(fused, state)
+    overspeed_warning = detect_overspeed(fused, state)
+    engine_failure, failed_engine = detect_engine_failure(state)
+
+    # Update persistent engine failure state
+    if engine_failure and not _prev_values['engine_failure_detected']:
+        _prev_values['engine_failure_detected'] = True
+        _prev_values['failed_engine'] = failed_engine
+    elif not engine_failure:
+        _prev_values['engine_failure_detected'] = False
+        _prev_values['failed_engine'] = None
+
+    # STALL RECOVERY (highest priority)
+    if stall_warning:
+        _prev_values['last_stall_warning'] = state.get('sim_time_s', 0)
+
+        # Aggressive nose down
+        output['elevator'] = -0.8
+        output['elevator_trim'] = clamp(state.get('elevator_trim_deg', 0) - 0.1, -1.0, 1.0)
+
+        # Full throttle
+        output['throttle_1'] = 1.0 if state.get('engine_1_running', True) else 0.0
+        output['throttle_2'] = 1.0 if state.get('engine_2_running', True) else 0.0
+
+        # Wings level
+        output['aileron'] = -roll * 0.05
+
+        # Coordinate with rudder
+        output['rudder'] = -yaw_rate * 0.02
+
+        # Retract speedbrakes
+        output['speedbrake'] = 0.0
+
+        return output
+
+    # OVERSPEED PROTECTION
+    if overspeed_warning:
+        # Reduce throttle
+        output['throttle_1'] = 0.0
+        output['throttle_2'] = 0.0
+
+        # Deploy speedbrakes if not near ground
+        if altitude > 1000:
+            output['speedbrake'] = 0.5
+
+        # Pitch up gently
+        pitch_error = 5.0 - pitch  # Target 5 degrees nose up
+        output['elevator'] = clamp(pitch_error * 0.1, -0.3, 0.3)
+
+    # ASYMMETRIC THRUST HANDLING
+    rudder_cmd = 0.0
+    if _prev_values['engine_failure_detected']:
+        failed_eng = _prev_values['failed_engine']
+
+        # Compensate for yaw with rudder
+        # If engine 1 (left) fails, need right rudder (positive)
+        # If engine 2 (right) fails, need left rudder (negative)
+        if failed_eng == 1:
+            rudder_cmd = 0.3  # Right rudder
+            # Reduce thrust on good engine if needed
+            output['throttle_2'] = current_throttle_2
+        elif failed_eng == 2:
+            rudder_cmd = -0.3  # Left rudder
+            output['throttle_1'] = current_throttle_1
+
+        # Compensate for roll tendency (dead engine wing drops)
+        aileron_cmd = 0.1 if failed_eng == 1 else -0.1
+        output['aileron'] = aileron_cmd - roll * 0.03
+
+    # ALTITUDE HOLD (if not in stall/overspeed)
+    if not stall_warning and not overspeed_warning:
+        alt_error = target_alt - altitude
+
+        # Compute vertical speed target based on altitude error
+        vs_target = clamp(alt_error * 0.5, -2000, 2000)
+
+        # If target VS is specified, use it
+        if abs(target_vs) > 10:
+            vs_target = target_vs
+
+        # VS tracking with PID
+        vs_error = vs_target - vs
+        vs_output, _pid_state['vs_integral'], _pid_state['vs_prev_error'] = pid_controller(
+            vs_error, _pid_state['vs_integral'], _pid_state['vs_prev_error'], dt,
+            kp=0.002, ki=0.0005, kd=0.001, integral_limit=500
+        )
+
+        # Convert VS command to pitch target
+        target_pitch = clamp(vs_output, -10, 15)
+
+        # Pitch hold with PID
+        pitch_error = target_pitch - pitch
+        pitch_output, _pid_state['pitch_integral'], _ = pid_controller(
+            pitch_error, _pid_state['pitch_integral'], pitch, dt,
+            kp=0.08, ki=0.01, kd=0.15, integral_limit=100
+        )
+
+        # Add pitch rate damping
+        pitch_output -= pitch_rate * 0.01
+
+        if 'elevator' not in output:
+            output['elevator'] = clamp(pitch_output, -1.0, 1.0)
+
+        # Trim adjustment (slowly trim to reduce steady-state elevator deflection)
+        if abs(pitch_output) > 0.1:
+            trim_adjustment = pitch_output * 0.005 * dt
+            current_trim = state.get('elevator_trim_deg', 0)
+            output['elevator_trim'] = clamp(current_trim + trim_adjustment, -1.0, 1.0)
+
+    # HEADING HOLD
+    if not _prev_values['engine_failure_detected']:  # Normal heading hold
+        hdg_error = normalize_angle(target_hdg - heading)
+
+        # Target bank angle based on heading error
+        target_bank = clamp(hdg_error * 0.5, -25, 25)
+
+        # Bank angle hold with PID
+        bank_error = target_bank - roll
+        bank_output, _pid_state['roll_integral'], _ = pid_controller(
+            bank_error, _pid_state['roll_integral'], roll, dt,
+            kp=0.05, ki=0.005, kd=0.1, integral_limit=100
+        )
+
+        # Add roll rate damping
+        bank_output -= roll_rate * 0.01
+
+        if 'aileron' not in output:
+            output['aileron'] = clamp(bank_output, -1.0, 1.0)
+
+        # Yaw damper (prevent adverse yaw)
+        if 'rudder' not in output:
+            output['rudder'] = clamp(-yaw_rate * 0.02 - roll_rate * 0.005, -1.0, 1.0)
+    else:
+        # During engine failure, maintain wings level with slight bank into good engine
+        target_bank = 2.0 if _prev_values['failed_engine'] == 1 else -2.0
+        bank_error = target_bank - roll
+        bank_output = bank_error * 0.05 - roll_rate * 0.01
+
+        if 'aileron' not in output:
+            output['aileron'] = clamp(bank_output, -1.0, 1.0)
+
+        if 'rudder' not in output:
+            output['rudder'] = clamp(rudder_cmd - yaw_rate * 0.02, -1.0, 1.0)
+
+    # AUTOTHROTTLE (Speed Hold)
+    if not stall_warning and not overspeed_warning:
+        speed_error = target_ias - ias
+
+        # PID for throttle
+        throttle_output, _pid_state['speed_integral'], _pid_state['speed_prev_error'] = pid_controller(
+            speed_error, _pid_state['speed_integral'], _pid_state['speed_prev_error'], dt,
+            kp=0.01, ki=0.002, kd=0.005, integral_limit=50
+        )
+
+        # Base throttle setting
+        base_throttle = 0.5
+
+        # Adjust for altitude (need more throttle at high altitude)
+        altitude_factor = 1.0 + (altitude / 100000.0)
+
+        throttle_cmd = base_throttle + throttle_output * altitude_factor
+
+        # Account for pitch (climbing needs more thrust)
+        if pitch > 5:
+            throttle_cmd += (pitch - 5) * 0.01
+
+        throttle_cmd = clamp(throttle_cmd, 0.0, 1.0)
+
+        if 'throttle_1' not in output:
+            if state.get('engine_1_running', True):
+                output['throttle_1'] = throttle_cmd
+            else:
+                output['throttle_1'] = 0.0
+
+        if 'throttle_2' not in output:
+            if state.get('engine_2_running', True):
+                output['throttle_2'] = throttle_cmd
+            else:
+                output['throttle_2'] = 0.0
+
+    # CONFIGURATION MANAGEMENT
+
+    # Flaps
+    target_flaps = calculate_flap_target(fused, state, wow)
+    current_flaps = (state.get('flap_pos_left_deg', 0) + state.get('flap_pos_right_deg', 0)) / 2
+
+    # Gradual flap changes
+    if abs(target_flaps - current_flaps) > 1:
+        if target_flaps > current_flaps:
+            output['flaps'] = min(current_flaps + 5, target_flaps)
+        else:
+            output['flaps'] = max(current_flaps - 5, target_flaps)
+
+    # Landing Gear
+    radar_alt = fused.get('radar_alt_ft', 10000)
+
+    if radar_alt < 1500 and ias < 250:
+        # Extend gear for landing
+        output['gear'] = 1
+    elif altitude > 1500 and ias > 180 and not wow:
+        # Retract gear after takeoff
+        output['gear'] = 0
+
+    # Speedbrakes
+    if 'speedbrake' not in output:
+        # Deploy speedbrakes if too fast and not in landing phase
+        if ias > target_ias + 20 and radar_alt > 500:
+            output['speedbrake'] = 0.3
+        else:
+            output['speedbrake'] = 0.0
+
+    # Update previous values
+    _prev_values['altitude'] = altitude
+    _prev_values['speed'] = ias
+    _prev_values['heading'] = heading
+    _prev_values['pitch'] = pitch
+    _prev_values['roll'] = roll
+
+    return output
