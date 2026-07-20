@@ -1,0 +1,788 @@
+// Graph Layout: Edge Crossing Minimization
+// Strategy:
+//   - Parse graph, drop self-loops, dedupe parallel edges.
+//   - Split into connected components; lay out each independently, then pack.
+//   - Trees  -> radial layout (guaranteed 0 crossings).
+//   - Simple cycles -> circle layout (0 crossings).
+//   - General graphs -> Fruchterman-Reingold force layout with Barnes-Hut
+//     quadtree repulsion (O(n log n)), multithreaded for large graphs.
+//   - Small components additionally get an exact crossing-count hill-climb
+//     refinement (and multi-restart best-of selection).
+// Global ~25s time budget shared across components proportional to work.
+
+use std::io::{self, Read, Write};
+use std::time::Instant;
+
+const TIME_BUDGET_SECS: f64 = 23.0;
+
+// ---------------- RNG (deterministic, no external crates) ----------------
+struct Rng(u64);
+impl Rng {
+    fn new(seed: u64) -> Self {
+        Rng(seed ^ 0x9E3779B97F4A7C15)
+    }
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        x
+    }
+    fn f64(&mut self) -> f64 {
+        (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
+    }
+}
+
+// ---------------- Barnes-Hut quadtree ----------------
+struct BhTree {
+    child: Vec<[i32; 4]>,
+    mass: Vec<f64>,
+    sumx: Vec<f64>,
+    sumy: Vec<f64>,
+    cx: Vec<f64>,
+    cy: Vec<f64>,
+    half: Vec<f64>,
+    pt: Vec<i32>,
+}
+
+const BH_MAX_DEPTH: usize = 48;
+
+impl BhTree {
+    fn build(pos: &[(f64, f64)]) -> BhTree {
+        let n = pos.len();
+        let (mut minx, mut miny) = (f64::INFINITY, f64::INFINITY);
+        let (mut maxx, mut maxy) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+        for &(x, y) in pos {
+            if x < minx { minx = x }
+            if y < miny { miny = y }
+            if x > maxx { maxx = x }
+            if y > maxy { maxy = y }
+        }
+        let half = (0.5 * (maxx - minx).max(maxy - miny)).max(1e-9) * 1.0001 + 1e-9;
+        let cap = (2 * n + 16).max(64);
+        let mut t = BhTree {
+            child: Vec::with_capacity(cap),
+            mass: Vec::with_capacity(cap),
+            sumx: Vec::with_capacity(cap),
+            sumy: Vec::with_capacity(cap),
+            cx: Vec::with_capacity(cap),
+            cy: Vec::with_capacity(cap),
+            half: Vec::with_capacity(cap),
+            pt: Vec::with_capacity(cap),
+        };
+        t.new_node(0.5 * (minx + maxx), 0.5 * (miny + maxy), half);
+        for i in 0..n {
+            t.insert(i as i32, pos);
+        }
+        t
+    }
+
+    fn new_node(&mut self, cx: f64, cy: f64, half: f64) -> i32 {
+        let id = self.mass.len() as i32;
+        self.child.push([-1; 4]);
+        self.mass.push(0.0);
+        self.sumx.push(0.0);
+        self.sumy.push(0.0);
+        self.cx.push(cx);
+        self.cy.push(cy);
+        self.half.push(half);
+        self.pt.push(-1);
+        id
+    }
+
+    fn insert(&mut self, i: i32, pos: &[(f64, f64)]) {
+        let (x, y) = pos[i as usize];
+        let mut node = 0usize;
+        let mut depth = 0usize;
+        loop {
+            self.mass[node] += 1.0;
+            self.sumx[node] += x;
+            self.sumy[node] += y;
+            let is_leaf = self.child[node] == [-1; 4];
+            if is_leaf {
+                if self.pt[node] == -1 && self.mass[node] <= 1.0 + 1e-9 {
+                    self.pt[node] = i;
+                    return;
+                }
+                if depth >= BH_MAX_DEPTH {
+                    // coincident points: aggregate into this leaf
+                    return;
+                }
+                // push existing point down one level
+                let j = self.pt[node];
+                self.pt[node] = -1;
+                if j >= 0 {
+                    let (jx, jy) = pos[j as usize];
+                    let q = self.quadrant(node, jx, jy);
+                    let c = self.make_child(node, q);
+                    self.mass[c] += 1.0;
+                    self.sumx[c] += jx;
+                    self.sumy[c] += jy;
+                    self.pt[c] = j;
+                }
+            }
+            let q = self.quadrant(node, x, y);
+            let c = if self.child[node][q] == -1 {
+                self.make_child(node, q)
+            } else {
+                self.child[node][q] as usize
+            };
+            node = c;
+            depth += 1;
+        }
+    }
+
+    fn quadrant(&self, node: usize, x: f64, y: f64) -> usize {
+        let mut q = 0;
+        if x > self.cx[node] { q |= 1 }
+        if y > self.cy[node] { q |= 2 }
+        q
+    }
+
+    fn make_child(&mut self, node: usize, q: usize) -> usize {
+        let h = self.half[node] * 0.5;
+        let cx = self.cx[node] + if q & 1 != 0 { h } else { -h };
+        let cy = self.cy[node] + if q & 2 != 0 { h } else { -h };
+        let c = self.new_node(cx, cy, h);
+        self.child[node][q] = c;
+        c as usize
+    }
+
+    // Repulsive force on point i: sum of mass * k^2 / d^2 along delta.
+    fn force(&self, i: usize, pos: &[(f64, f64)], k2: f64, theta2: f64, stack: &mut Vec<i32>) -> (f64, f64) {
+        let (x, y) = pos[i];
+        let (mut fx, mut fy) = (0.0f64, 0.0f64);
+        stack.clear();
+        stack.push(0);
+        while let Some(n) = stack.pop() {
+            let n = n as usize;
+            let m = self.mass[n];
+            if m <= 0.0 {
+                continue;
+            }
+            let dx = x - self.sumx[n] / m;
+            let dy = y - self.sumy[n] / m;
+            let d2 = dx * dx + dy * dy;
+            let is_leaf = self.child[n] == [-1; 4];
+            let size2 = 4.0 * self.half[n] * self.half[n];
+            if is_leaf || size2 < theta2 * d2 {
+                if is_leaf && self.pt[n] == i as i32 {
+                    continue; // self
+                }
+                let mut mm = m;
+                if is_leaf && self.pt[n] == -1 && d2 < 1e-18 {
+                    // aggregated coincident leaf that may include i
+                    mm = (m - 1.0).max(0.0);
+                }
+                let d2c = d2.max(1e-6);
+                let f = k2 * mm / d2c;
+                fx += dx * f;
+                fy += dy * f;
+            } else {
+                for &c in &self.child[n] {
+                    if c >= 0 {
+                        stack.push(c);
+                    }
+                }
+            }
+        }
+        (fx, fy)
+    }
+}
+
+// ---------------- Force-directed layout (FR + Barnes-Hut) ----------------
+fn layout_force(
+    n: usize,
+    edges: &[(u32, u32)],
+    rng: &mut Rng,
+    deadline: Instant,
+    pos_init: Option<Vec<(f64, f64)>>,
+) -> Vec<(f64, f64)> {
+    let side = (n as f64).sqrt().max(1.0) * 2.0;
+    let mut pos: Vec<(f64, f64)> = match pos_init {
+        Some(p) => p,
+        None => {
+            let mut p = Vec::with_capacity(n);
+            for _ in 0..n {
+                p.push((
+                    (rng.f64() - 0.5) * side,
+                    (rng.f64() - 0.5) * side,
+                ));
+            }
+            p
+        }
+    };
+    if n <= 1 {
+        return pos;
+    }
+    let k = 1.0f64; // ideal edge length
+    let k2 = k * k;
+    let theta2 = 0.64; // theta = 0.8
+    let iters: usize = if n <= 500 {
+        600
+    } else if n <= 5_000 {
+        400
+    } else if n <= 50_000 {
+        220
+    } else {
+        120
+    };
+    let t0 = 0.12 * side;
+    let mut disp: Vec<(f64, f64)> = vec![(0.0, 0.0); n];
+
+    let nthreads = if n >= 4000 {
+        std::thread::available_parallelism()
+            .map(|v| v.get())
+            .unwrap_or(8)
+            .min(32)
+    } else {
+        1
+    };
+
+    for it in 0..iters {
+        if Instant::now() >= deadline {
+            break;
+        }
+        let frac = it as f64 / iters as f64;
+        let t = t0 * (1.0 - frac).powi(2) + 0.005;
+
+        let tree = BhTree::build(&pos);
+
+        // repulsion
+        if nthreads > 1 {
+            let chunk = n.div_ceil(nthreads);
+            let posr: &[(f64, f64)] = &pos;
+            let treer = &tree;
+            std::thread::scope(|s| {
+                for (ti, dchunk) in disp.chunks_mut(chunk).enumerate() {
+                    let base = ti * chunk;
+                    s.spawn(move || {
+                        let mut stack: Vec<i32> = Vec::with_capacity(128);
+                        for (off, d) in dchunk.iter_mut().enumerate() {
+                            *d = treer.force(base + off, posr, k2, theta2, &mut stack);
+                        }
+                    });
+                }
+            });
+        } else {
+            let mut stack: Vec<i32> = Vec::with_capacity(128);
+            for i in 0..n {
+                disp[i] = tree.force(i, &pos, k2, theta2, &mut stack);
+            }
+        }
+
+        // attraction along edges
+        for &(u, v) in edges {
+            let (u, v) = (u as usize, v as usize);
+            let dx = pos[u].0 - pos[v].0;
+            let dy = pos[u].1 - pos[v].1;
+            let d = (dx * dx + dy * dy).sqrt().max(1e-9);
+            let f = d / k; // (d^2/k)/d
+            let fx = dx * f;
+            let fy = dy * f;
+            disp[u].0 -= fx;
+            disp[u].1 -= fy;
+            disp[v].0 += fx;
+            disp[v].1 += fy;
+        }
+
+        // gentle gravity to keep things compact
+        let g = 0.03;
+        for i in 0..n {
+            disp[i].0 -= pos[i].0 * g;
+            disp[i].1 -= pos[i].1 * g;
+        }
+
+        // move, capped by temperature
+        for i in 0..n {
+            let (dx, dy) = disp[i];
+            let len = (dx * dx + dy * dy).sqrt();
+            if len > 1e-12 {
+                let s = (len.min(t)) / len;
+                pos[i].0 += dx * s;
+                pos[i].1 += dy * s;
+            }
+        }
+    }
+    pos
+}
+
+// ---------------- Crossing counting & hill-climb refinement ----------------
+fn segs_cross(p1: (f64, f64), p2: (f64, f64), p3: (f64, f64), p4: (f64, f64)) -> bool {
+    fn orient(a: (f64, f64), b: (f64, f64), c: (f64, f64)) -> f64 {
+        (b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0)
+    }
+    let d1 = orient(p3, p4, p1);
+    let d2 = orient(p3, p4, p2);
+    let d3 = orient(p1, p2, p3);
+    let d4 = orient(p1, p2, p4);
+    ((d1 > 0.0 && d2 < 0.0) || (d1 < 0.0 && d2 > 0.0))
+        && ((d3 > 0.0 && d4 < 0.0) || (d3 < 0.0 && d4 > 0.0))
+}
+
+fn count_crossings(pos: &[(f64, f64)], edges: &[(u32, u32)]) -> usize {
+    let m = edges.len();
+    let mut c = 0;
+    for i in 0..m {
+        let (a, b) = edges[i];
+        for j in (i + 1)..m {
+            let (cc, d) = edges[j];
+            if a == cc || a == d || b == cc || b == d {
+                continue;
+            }
+            if segs_cross(
+                pos[a as usize],
+                pos[b as usize],
+                pos[cc as usize],
+                pos[d as usize],
+            ) {
+                c += 1;
+            }
+        }
+    }
+    c
+}
+
+// crossings involving edges incident to node v (with v at position p)
+fn crossings_for_node(
+    v: usize,
+    p: (f64, f64),
+    pos: &[(f64, f64)],
+    edges: &[(u32, u32)],
+    inc: &[usize],
+) -> usize {
+    let mut c = 0;
+    for &ei in inc {
+        let (a, b) = edges[ei];
+        let other = if a as usize == v { b } else { a } as usize;
+        let pa = p;
+        let pb = pos[other];
+        for (j, &(x, y)) in edges.iter().enumerate() {
+            if j == ei {
+                continue;
+            }
+            let (x, y) = (x as usize, y as usize);
+            if x == v || y == v || x == other || y == other {
+                continue;
+            }
+            if segs_cross(pa, pb, pos[x], pos[y]) {
+                c += 1;
+            }
+        }
+    }
+    c
+}
+
+fn hill_climb_crossings(
+    pos: &mut Vec<(f64, f64)>,
+    edges: &[(u32, u32)],
+    n: usize,
+    rng: &mut Rng,
+    deadline: Instant,
+) {
+    if n < 3 || edges.len() < 2 {
+        return;
+    }
+    // incident edge lists
+    let mut inc: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (ei, &(a, b)) in edges.iter().enumerate() {
+        inc[a as usize].push(ei);
+        inc[b as usize].push(ei);
+    }
+    let (mut minx, mut miny) = (f64::INFINITY, f64::INFINITY);
+    let (mut maxx, mut maxy) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+    for &(x, y) in pos.iter() {
+        minx = minx.min(x);
+        miny = miny.min(y);
+        maxx = maxx.max(x);
+        maxy = maxy.max(y);
+    }
+    let w = (maxx - minx).max(1.0);
+    let h = (maxy - miny).max(1.0);
+    let mut radius = 0.35 * w.max(h);
+
+    for _round in 0..60 {
+        let mut improved = false;
+        for v in 0..n {
+            if Instant::now() >= deadline {
+                return;
+            }
+            if inc[v].is_empty() {
+                continue;
+            }
+            let cur = crossings_for_node(v, pos[v], pos, edges, &inc[v]);
+            if cur == 0 {
+                continue;
+            }
+            // candidates: neighbor barycenter, ring samples, random points
+            let mut best = cur;
+            let mut best_p = pos[v];
+            let mut cands: Vec<(f64, f64)> = Vec::with_capacity(16);
+            let mut bx = 0.0;
+            let mut by = 0.0;
+            for &ei in &inc[v] {
+                let (a, b) = edges[ei];
+                let o = if a as usize == v { b } else { a } as usize;
+                bx += pos[o].0;
+                by += pos[o].1;
+            }
+            let deg = inc[v].len() as f64;
+            cands.push((bx / deg + (rng.f64() - 0.5) * 0.1, by / deg + (rng.f64() - 0.5) * 0.1));
+            for s in 0..8 {
+                let ang = s as f64 * std::f64::consts::PI / 4.0 + rng.f64() * 0.5;
+                cands.push((pos[v].0 + radius * ang.cos(), pos[v].1 + radius * ang.sin()));
+            }
+            for _ in 0..4 {
+                cands.push((minx + rng.f64() * w, miny + rng.f64() * h));
+            }
+            for cp in cands {
+                let c = crossings_for_node(v, cp, pos, edges, &inc[v]);
+                if c < best {
+                    best = c;
+                    best_p = cp;
+                }
+            }
+            if best < cur {
+                pos[v] = best_p;
+                improved = true;
+            }
+        }
+        radius *= 0.9;
+        if !improved {
+            break;
+        }
+    }
+}
+
+// ---------------- Tree layout (radial, crossing-free) ----------------
+fn layout_tree(n: usize, adj: &[Vec<u32>]) -> Vec<(f64, f64)> {
+    if n == 1 {
+        return vec![(0.0, 0.0)];
+    }
+    // find center of tree: midpoint of a longest path (double BFS)
+    let bfs_far = |start: usize| -> (usize, Vec<i32>, Vec<u32>) {
+        let mut parent = vec![-1i32; n];
+        let mut depth = vec![0u32; n];
+        let mut seen = vec![false; n];
+        let mut q = std::collections::VecDeque::new();
+        q.push_back(start);
+        seen[start] = true;
+        let mut last = start;
+        while let Some(u) = q.pop_front() {
+            last = u;
+            for &v in &adj[u] {
+                let v = v as usize;
+                if !seen[v] {
+                    seen[v] = true;
+                    parent[v] = u as i32;
+                    depth[v] = depth[u] + 1;
+                    q.push_back(v);
+                }
+            }
+        }
+        (last, parent, depth)
+    };
+    let (u, _, _) = bfs_far(0);
+    let (v, parent, depth) = bfs_far(u);
+    // walk halfway back from v toward u
+    let mut root = v;
+    let half = depth[v] as usize / 2;
+    for _ in 0..half {
+        root = parent[root] as usize;
+    }
+
+    // BFS from root, record order and parents
+    let mut par = vec![-1i32; n];
+    let mut dep = vec![0u32; n];
+    let mut order: Vec<u32> = Vec::with_capacity(n);
+    let mut seen = vec![false; n];
+    let mut q = std::collections::VecDeque::new();
+    q.push_back(root);
+    seen[root] = true;
+    while let Some(x) = q.pop_front() {
+        order.push(x as u32);
+        for &y in &adj[x] {
+            let y = y as usize;
+            if !seen[y] {
+                seen[y] = true;
+                par[y] = x as i32;
+                dep[y] = dep[x] + 1;
+                q.push_back(y);
+            }
+        }
+    }
+    // leaf counts (reverse BFS order)
+    let mut leaves = vec![0u32; n];
+    for &x in order.iter().rev() {
+        let x = x as usize;
+        if leaves[x] == 0 {
+            leaves[x] = 1;
+        }
+        if par[x] >= 0 {
+            leaves[par[x] as usize] += leaves[x];
+        }
+    }
+    let total_leaves = leaves[root] as f64;
+    let max_depth = *dep.iter().max().unwrap() as f64;
+    let rs = (total_leaves / (2.0 * std::f64::consts::PI * max_depth.max(1.0))).max(1.0);
+
+    // assign angular intervals (forward BFS order)
+    let mut a0 = vec![0.0f64; n];
+    let mut a1 = vec![0.0f64; n];
+    a0[root] = 0.0;
+    a1[root] = 2.0 * std::f64::consts::PI;
+    let mut cursor = vec![0.0f64; n]; // next child start angle offset
+    for &x in order.iter() {
+        let x = x as usize;
+        if x != root {
+            let p = par[x] as usize;
+            let span = (a1[p] - a0[p]) * leaves[x] as f64 / leaves[p].max(1) as f64;
+            let start = a0[p] + cursor[p];
+            a0[x] = start;
+            a1[x] = start + span;
+            cursor[p] += span;
+        }
+    }
+    let mut pos = vec![(0.0, 0.0); n];
+    for x in 0..n {
+        if x == root {
+            continue;
+        }
+        let ang = 0.5 * (a0[x] + a1[x]);
+        let r = dep[x] as f64 * rs;
+        pos[x] = (r * ang.cos(), r * ang.sin());
+    }
+    pos
+}
+
+// ---------------- Cycle layout ----------------
+fn layout_cycle(n: usize, adj: &[Vec<u32>]) -> Vec<(f64, f64)> {
+    let mut pos = vec![(0.0, 0.0); n];
+    let r = (n as f64 / (2.0 * std::f64::consts::PI)).max(1.0);
+    let mut prev = usize::MAX;
+    let mut cur = 0usize;
+    for i in 0..n {
+        let ang = 2.0 * std::f64::consts::PI * i as f64 / n as f64;
+        pos[cur] = (r * ang.cos(), r * ang.sin());
+        let mut nxt = adj[cur][0] as usize;
+        if nxt == prev {
+            nxt = adj[cur][1] as usize;
+        }
+        prev = cur;
+        cur = nxt;
+    }
+    pos
+}
+
+fn main() {
+    let start = Instant::now();
+    let mut input = String::new();
+    io::stdin().read_to_string(&mut input).ok();
+    let mut it = input.split_ascii_whitespace().map(|t| t.parse::<i64>().unwrap_or(0));
+    let n = it.next().unwrap_or(0).max(0) as usize;
+    let m = it.next().unwrap_or(0).max(0) as usize;
+
+    let stdout = io::stdout();
+    let mut out = io::BufWriter::new(stdout.lock());
+    if n == 0 {
+        return;
+    }
+
+    // read edges, drop self-loops, dedupe parallels
+    let mut ekeys: Vec<u64> = Vec::with_capacity(m);
+    for _ in 0..m {
+        let u = match it.next() {
+            Some(v) => v,
+            None => break,
+        };
+        let v = it.next().unwrap_or(0);
+        if u < 0 || v < 0 {
+            continue;
+        }
+        let (u, v) = (u as usize, v as usize);
+        if u >= n || v >= n || u == v {
+            continue;
+        }
+        let (a, b) = if u < v { (u, v) } else { (v, u) };
+        ekeys.push(((a as u64) << 32) | b as u64);
+    }
+    ekeys.sort_unstable();
+    ekeys.dedup();
+    let edges: Vec<(u32, u32)> = ekeys
+        .iter()
+        .map(|&k| ((k >> 32) as u32, (k & 0xFFFF_FFFF) as u32))
+        .collect();
+    drop(ekeys);
+
+    // adjacency
+    let mut deg = vec![0u32; n];
+    for &(a, b) in &edges {
+        deg[a as usize] += 1;
+        deg[b as usize] += 1;
+    }
+    let mut adj: Vec<Vec<u32>> = deg.iter().map(|&d| Vec::with_capacity(d as usize)).collect();
+    for &(a, b) in &edges {
+        adj[a as usize].push(b);
+        adj[b as usize].push(a);
+    }
+
+    // connected components
+    let mut comp = vec![u32::MAX; n];
+    let mut comps: Vec<Vec<u32>> = Vec::new();
+    {
+        let mut stack: Vec<u32> = Vec::new();
+        for s in 0..n {
+            if comp[s] != u32::MAX {
+                continue;
+            }
+            let cid = comps.len() as u32;
+            let mut members = Vec::new();
+            comp[s] = cid;
+            stack.push(s as u32);
+            while let Some(u) = stack.pop() {
+                members.push(u);
+                for &v in &adj[u as usize] {
+                    if comp[v as usize] == u32::MAX {
+                        comp[v as usize] = cid;
+                        stack.push(v);
+                    }
+                }
+            }
+            comps.push(members);
+        }
+    }
+
+    // per-component edge lists (local indices)
+    let ncomps = comps.len();
+    let mut local_id = vec![0u32; n];
+    for members in &comps {
+        for (li, &g) in members.iter().enumerate() {
+            local_id[g as usize] = li as u32;
+        }
+    }
+    let mut cedges: Vec<Vec<(u32, u32)>> = vec![Vec::new(); ncomps];
+    for &(a, b) in &edges {
+        let c = comp[a as usize] as usize;
+        cedges[c].push((local_id[a as usize], local_id[b as usize]));
+    }
+
+    // time budgeting proportional to work
+    let total_work: f64 = comps
+        .iter()
+        .enumerate()
+        .map(|(i, mem)| (mem.len() + cedges[i].len()) as f64)
+        .sum::<f64>()
+        .max(1.0);
+
+    let mut rng = Rng::new(0xC0FFEE_u64);
+    let mut placements: Vec<Vec<(f64, f64)>> = Vec::with_capacity(ncomps);
+    let mut work_done = 0.0f64;
+
+    for ci in 0..ncomps {
+        let members = &comps[ci];
+        let cn = members.len();
+        let ce = &cedges[ci];
+        let cm = ce.len();
+
+        let remaining = TIME_BUDGET_SECS - start.elapsed().as_secs_f64();
+        let my_work = (cn + cm) as f64;
+        let share = remaining.max(0.1) * (my_work / (total_work - work_done).max(1.0));
+        work_done += my_work;
+        let deadline = Instant::now() + std::time::Duration::from_secs_f64(share.max(0.05));
+
+        // local adjacency
+        let mut ladj: Vec<Vec<u32>> = vec![Vec::new(); cn];
+        for &(a, b) in ce {
+            ladj[a as usize].push(b);
+            ladj[b as usize].push(a);
+        }
+
+        let pos: Vec<(f64, f64)> = if cn == 1 {
+            vec![(0.0, 0.0)]
+        } else if cm == cn - 1 {
+            layout_tree(cn, &ladj)
+        } else if cm == cn && ladj.iter().all(|a| a.len() == 2) {
+            layout_cycle(cn, &ladj)
+        } else if cn <= 80 && cm <= 400 {
+            // small general graph: multi-restart FR + crossing hill-climb
+            let mut best_pos: Option<Vec<(f64, f64)>> = None;
+            let mut best_cross = usize::MAX;
+            for r in 0..3 {
+                if Instant::now() >= deadline && best_pos.is_some() {
+                    break;
+                }
+                rng.0 ^= 0x1234_5678u64.wrapping_mul(r as u64 + 1);
+                let mut p = layout_force(cn, ce, &mut rng, deadline, None);
+                hill_climb_crossings(&mut p, ce, cn, &mut rng, deadline);
+                let c = count_crossings(&p, ce);
+                if c < best_cross {
+                    best_cross = c;
+                    best_pos = Some(p);
+                }
+                if best_cross == 0 {
+                    break;
+                }
+            }
+            best_pos.unwrap()
+        } else {
+            let mut p = layout_force(cn, ce, &mut rng, deadline, None);
+            if cn <= 140 && cm <= 800 {
+                hill_climb_crossings(&mut p, ce, cn, &mut rng, deadline);
+            }
+            p
+        };
+        placements.push(pos);
+    }
+
+    // pack components: shelf packing by height
+    let mut boxes: Vec<(f64, f64, f64, f64)> = Vec::with_capacity(ncomps); // minx,miny,w,h
+    for pos in &placements {
+        let (mut minx, mut miny) = (f64::INFINITY, f64::INFINITY);
+        let (mut maxx, mut maxy) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+        for &(x, y) in pos {
+            minx = minx.min(x);
+            miny = miny.min(y);
+            maxx = maxx.max(x);
+            maxy = maxy.max(y);
+        }
+        let pad = 1.0 + 0.05 * (maxx - minx).max(maxy - miny).max(0.0);
+        boxes.push((minx - pad, miny - pad, maxx - minx + 2.0 * pad, maxy - miny + 2.0 * pad));
+    }
+    let mut order: Vec<usize> = (0..ncomps).collect();
+    order.sort_by(|&a, &b| boxes[b].3.partial_cmp(&boxes[a].3).unwrap_or(std::cmp::Ordering::Equal));
+    let total_area: f64 = boxes.iter().map(|b| b.2 * b.3).sum();
+    let target_w = total_area.sqrt().max(boxes.iter().map(|b| b.2).fold(0.0, f64::max)) * 1.1;
+
+    let mut offsets = vec![(0.0f64, 0.0f64); ncomps];
+    let (mut sx, mut sy, mut shelf_h) = (0.0f64, 0.0f64, 0.0f64);
+    for &ci in &order {
+        let (bx, by, bw, bh) = boxes[ci];
+        if sx > 0.0 && sx + bw > target_w {
+            sx = 0.0;
+            sy += shelf_h;
+            shelf_h = 0.0;
+        }
+        offsets[ci] = (sx - bx, sy - by);
+        sx += bw;
+        shelf_h = shelf_h.max(bh);
+    }
+
+    // final coordinates
+    let mut fx = vec![0.0f64; n];
+    let mut fy = vec![0.0f64; n];
+    for ci in 0..ncomps {
+        let (ox, oy) = offsets[ci];
+        for (li, &g) in comps[ci].iter().enumerate() {
+            fx[g as usize] = placements[ci][li].0 + ox;
+            fy[g as usize] = placements[ci][li].1 + oy;
+        }
+    }
+
+    let mut buf = String::with_capacity(n * 24);
+    for i in 0..n {
+        buf.push_str(&format!("{:.4} {:.4}\n", fx[i], fy[i]));
+    }
+    out.write_all(buf.as_bytes()).ok();
+    out.flush().ok();
+}

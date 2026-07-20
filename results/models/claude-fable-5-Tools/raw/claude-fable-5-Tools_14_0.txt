@@ -1,0 +1,698 @@
+// Minesweeper solver - adaptive strategy:
+//  1. Worklist-based single-constraint propagation (linear, handles huge boards).
+//  2. Pairwise subset inference between overlapping constraints (local 5x5 window).
+//  3. Exact enumeration of small connected constraint components (complete local CSP),
+//     with component-size and node budgets scaled to board size, run in parallel.
+// Only cells provably safe under every consistent mine assignment are reported.
+
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Text;
+using System.Threading.Tasks;
+
+public static class Program
+{
+    const byte UNK = 10;   // unrevealed ' '
+    const byte MINE = 9;   // flagged '*'
+    // values 0..8 are revealed numbers
+
+    static int H, W;
+    static int NC;                 // total cells
+    static byte[] cell;            // parsed board
+    static byte[] st;              // 0 = undetermined, 1 = deduced safe, 2 = deduced mine
+    static byte[] inQ;             // worklist membership flag for numbered cells
+    static int[] wstack;           // worklist stack of numbered-cell indices
+    static int sp;
+    static List<int> safeList = new List<int>();
+    static Stopwatch clock = Stopwatch.StartNew();
+    const long BudgetMs = 20000;   // soft budget for the refinement phases
+
+    public static void Main()
+    {
+        Parse();
+
+        st = new byte[NC];
+        inQ = new byte[NC];
+        wstack = new int[NC];
+        sp = 0;
+
+        BuildInitialWorklist();
+        Propagate();
+
+        bool small = NC <= 1000000;
+        int maxIter = small ? 10 : 4;
+        for (int iter = 0; iter < maxIter; iter++)
+        {
+            if (clock.ElapsedMilliseconds > BudgetMs) break;
+            bool changed = SubsetPhase();
+            Propagate();
+            if (clock.ElapsedMilliseconds <= BudgetMs)
+            {
+                changed |= EnumPhase(small);
+                Propagate();
+            }
+            if (!changed) break;
+        }
+
+        WriteOutput();
+    }
+
+    // ---------------- input ----------------
+
+    static byte[] data;
+    static int dataLen, pos;
+
+    static void Parse()
+    {
+        Stream s = Console.OpenStandardInput();
+        MemoryStream ms = new MemoryStream(1 << 20);
+        byte[] buf = new byte[1 << 20];
+        int n;
+        while ((n = s.Read(buf, 0, buf.Length)) > 0) ms.Write(buf, 0, n);
+        data = ms.GetBuffer();
+        dataLen = (int)ms.Length;
+        pos = 0;
+
+        H = ReadInt();
+        W = ReadInt();
+        // consume rest of header line
+        while (pos < dataLen && data[pos] != (byte)'\n') pos++;
+        if (pos < dataLen) pos++;
+
+        NC = H * W;
+        cell = new byte[NC];
+
+        for (int r = 0; r < H; r++)
+        {
+            int b0 = r * W;
+            int c = 0;
+            while (pos < dataLen)
+            {
+                byte b = data[pos++];
+                if (b == (byte)'\n') break;
+                if (b == (byte)'\r') continue;
+                if (c < W)
+                {
+                    byte v;
+                    if (b == (byte)'*') v = MINE;
+                    else if (b >= (byte)'0' && b <= (byte)'8') v = (byte)(b - (byte)'0');
+                    else v = UNK;
+                    cell[b0 + c] = v;
+                    c++;
+                }
+            }
+            while (c < W) cell[b0 + c++] = UNK;
+        }
+        data = null;
+    }
+
+    static int ReadInt()
+    {
+        while (pos < dataLen && (data[pos] < (byte)'0' || data[pos] > (byte)'9')) pos++;
+        int v = 0;
+        while (pos < dataLen && data[pos] >= (byte)'0' && data[pos] <= (byte)'9')
+        {
+            v = v * 10 + (data[pos] - (byte)'0');
+            pos++;
+        }
+        return v;
+    }
+
+    // ---------------- core helpers ----------------
+
+    static bool IsMine(int i) { return cell[i] == MINE || st[i] == 2; }
+    static bool IsUnk(int i) { return cell[i] == UNK && st[i] == 0; }
+
+    static void Push(int i)
+    {
+        if (inQ[i] == 0) { inQ[i] = 1; wstack[sp++] = i; }
+    }
+
+    // Gather the current constraint at numbered cell i: unknown neighbours and
+    // remaining mine count. Returns count of unknowns (0 => nothing to do).
+    static int GetConstraint(int i, int[] ubuf, out int rem)
+    {
+        int r = i / W, c = i % W;
+        int mines = 0, ucnt = 0;
+        int r0 = r > 0 ? r - 1 : 0, r1 = r < H - 1 ? r + 1 : H - 1;
+        int c0 = c > 0 ? c - 1 : 0, c1 = c < W - 1 ? c + 1 : W - 1;
+        for (int rr = r0; rr <= r1; rr++)
+        {
+            int rb = rr * W;
+            for (int cc = c0; cc <= c1; cc++)
+            {
+                int j = rb + cc;
+                if (j == i) continue;
+                if (cell[j] == MINE || st[j] == 2) mines++;
+                else if (cell[j] == UNK && st[j] == 0) ubuf[ucnt++] = j;
+            }
+        }
+        rem = cell[i] - mines;
+        return ucnt;
+    }
+
+    // Mark unknown cell j as safe (1) or mine (2); wake neighbouring constraints.
+    static bool Mark(int j, byte v)
+    {
+        if (st[j] != 0 || cell[j] != UNK) return false;
+        st[j] = v;
+        if (v == 1) safeList.Add(j);
+        int r = j / W, c = j % W;
+        int r0 = r > 0 ? r - 1 : 0, r1 = r < H - 1 ? r + 1 : H - 1;
+        int c0 = c > 0 ? c - 1 : 0, c1 = c < W - 1 ? c + 1 : W - 1;
+        for (int rr = r0; rr <= r1; rr++)
+        {
+            int rb = rr * W;
+            for (int cc = c0; cc <= c1; cc++)
+            {
+                int k = rb + cc;
+                if (cell[k] < 9) Push(k);
+            }
+        }
+        return true;
+    }
+
+    static void BuildInitialWorklist()
+    {
+        int rowsPerBlock = Math.Max(1, H / (Environment.ProcessorCount * 4));
+        int nBlocks = (H + rowsPerBlock - 1) / rowsPerBlock;
+        List<int>[] found = new List<int>[nBlocks];
+        Parallel.For(0, nBlocks, delegate(int blk)
+        {
+            List<int> loc = new List<int>();
+            int rStart = blk * rowsPerBlock;
+            int rEnd = Math.Min(H, rStart + rowsPerBlock);
+            for (int r = rStart; r < rEnd; r++)
+            {
+                int rb = r * W;
+                for (int c = 0; c < W; c++)
+                {
+                    int i = rb + c;
+                    if (cell[i] >= 9) continue;
+                    // numbered: does it touch any unknown?
+                    int r0 = r > 0 ? r - 1 : 0, r1 = r < H - 1 ? r + 1 : H - 1;
+                    int c0 = c > 0 ? c - 1 : 0, c1 = c < W - 1 ? c + 1 : W - 1;
+                    bool touch = false;
+                    for (int rr = r0; rr <= r1 && !touch; rr++)
+                    {
+                        int rb2 = rr * W;
+                        for (int cc = c0; cc <= c1; cc++)
+                        {
+                            if (cell[rb2 + cc] == UNK) { touch = true; break; }
+                        }
+                    }
+                    if (touch) loc.Add(i);
+                }
+            }
+            found[blk] = loc;
+        });
+        for (int b = 0; b < nBlocks; b++)
+        {
+            List<int> loc = found[b];
+            if (loc == null) continue;
+            for (int k = 0; k < loc.Count; k++) Push(loc[k]);
+        }
+    }
+
+    static int[] propBuf = new int[8];
+
+    // Round-based propagation: evaluate the pending constraints in parallel,
+    // then apply the resulting deductions serially (which wakes new constraints).
+    static void Propagate()
+    {
+        while (sp > 0)
+        {
+            int count = sp;
+            if (count < 8192) { PropagateSerial(); continue; }
+
+            ConcurrentBag<List<long>> bags = new ConcurrentBag<List<long>>();
+            int chunk = Math.Max(1024, count / (Environment.ProcessorCount * 8));
+            int nChunks = (count + chunk - 1) / chunk;
+            int[] cur = wstack;
+            Parallel.For(0, nChunks, delegate(int ch)
+            {
+                int[] ubuf = new int[8];
+                List<long> ded = null;
+                int start = ch * chunk;
+                int end = Math.Min(count, start + chunk);
+                for (int k = start; k < end; k++)
+                {
+                    int i = cur[k];
+                    int rem;
+                    int ucnt = GetConstraint(i, ubuf, out rem);
+                    if (ucnt == 0) continue;
+                    if (rem <= 0)
+                    {
+                        if (ded == null) ded = new List<long>();
+                        for (int m = 0; m < ucnt; m++) ded.Add((long)ubuf[m] << 1);
+                    }
+                    else if (rem >= ucnt)
+                    {
+                        if (ded == null) ded = new List<long>();
+                        for (int m = 0; m < ucnt; m++) ded.Add(((long)ubuf[m] << 1) | 1);
+                    }
+                }
+                if (ded != null) bags.Add(ded);
+            });
+
+            for (int k = 0; k < count; k++) inQ[cur[k]] = 0;
+            sp = 0;
+            foreach (List<long> ded in bags)
+            {
+                for (int k = 0; k < ded.Count; k++)
+                {
+                    long e = ded[k];
+                    Mark((int)(e >> 1), (e & 1) != 0 ? (byte)2 : (byte)1);
+                }
+            }
+        }
+    }
+
+    static void PropagateSerial()
+    {
+        while (sp > 0)
+        {
+            int i = wstack[--sp];
+            inQ[i] = 0;
+            int rem;
+            int ucnt = GetConstraint(i, propBuf, out rem);
+            if (ucnt == 0) continue;
+            if (rem <= 0)
+            {
+                for (int k = 0; k < ucnt; k++) Mark(propBuf[k], 1);
+            }
+            else if (rem >= ucnt)
+            {
+                for (int k = 0; k < ucnt; k++) Mark(propBuf[k], 2);
+            }
+        }
+    }
+
+    // Collect numbered cells that still have >=1 undetermined unknown neighbour.
+    static List<int> CollectActive()
+    {
+        int rowsPerBlock = Math.Max(1, H / (Environment.ProcessorCount * 4));
+        int nBlocks = (H + rowsPerBlock - 1) / rowsPerBlock;
+        List<int>[] found = new List<int>[nBlocks];
+        Parallel.For(0, nBlocks, delegate(int blk)
+        {
+            List<int> loc = new List<int>();
+            int rStart = blk * rowsPerBlock;
+            int rEnd = Math.Min(H, rStart + rowsPerBlock);
+            for (int r = rStart; r < rEnd; r++)
+            {
+                int rb = r * W;
+                for (int c = 0; c < W; c++)
+                {
+                    int i = rb + c;
+                    if (cell[i] >= 9) continue;
+                    int r0 = r > 0 ? r - 1 : 0, r1 = r < H - 1 ? r + 1 : H - 1;
+                    int c0 = c > 0 ? c - 1 : 0, c1 = c < W - 1 ? c + 1 : W - 1;
+                    bool touch = false;
+                    for (int rr = r0; rr <= r1 && !touch; rr++)
+                    {
+                        int rb2 = rr * W;
+                        for (int cc = c0; cc <= c1; cc++)
+                        {
+                            int j = rb2 + cc;
+                            if (cell[j] == UNK && st[j] == 0) { touch = true; break; }
+                        }
+                    }
+                    if (touch) loc.Add(i);
+                }
+            }
+            found[blk] = loc;
+        });
+        List<int> all = new List<int>();
+        for (int b = 0; b < nBlocks; b++) if (found[b] != null) all.AddRange(found[b]);
+        return all;
+    }
+
+    // ---------------- subset inference ----------------
+    // For constraints A subset-of B within a 5x5 window:
+    //   remB - remA == 0            => every cell in B\A is safe
+    //   remB - remA == |B\A|        => every cell in B\A is a mine
+
+    static bool SubsetPhase()
+    {
+        List<int> active = CollectActive();
+        if (active.Count == 0) return false;
+
+        ConcurrentBag<List<long>> bags = new ConcurrentBag<List<long>>();
+        int chunk = Math.Max(64, active.Count / (Environment.ProcessorCount * 8));
+        int nChunks = (active.Count + chunk - 1) / chunk;
+
+        Parallel.For(0, nChunks, delegate(int ch)
+        {
+            if (clock.ElapsedMilliseconds > BudgetMs) return;
+            int[] ubufA = new int[8];
+            int[] ubufB = new int[8];
+            List<long> ded = new List<long>();
+            int start = ch * chunk;
+            int end = Math.Min(active.Count, start + chunk);
+            for (int idx = start; idx < end; idx++)
+            {
+                int a = active[idx];
+                int remA;
+                int cntA = GetConstraint(a, ubufA, out remA);
+                if (cntA == 0) continue;
+                int ra = a / W, ca = a % W;
+                int r0 = Math.Max(0, ra - 2), r1 = Math.Min(H - 1, ra + 2);
+                int c0 = Math.Max(0, ca - 2), c1 = Math.Min(W - 1, ca + 2);
+                for (int rr = r0; rr <= r1; rr++)
+                {
+                    int rb = rr * W;
+                    for (int cc = c0; cc <= c1; cc++)
+                    {
+                        int b = rb + cc;
+                        if (b == a || cell[b] >= 9) continue;
+                        int remB;
+                        int cntB = GetConstraint(b, ubufB, out remB);
+                        if (cntB <= cntA) continue;
+                        // is A a subset of B?
+                        bool subset = true;
+                        for (int k = 0; k < cntA && subset; k++)
+                        {
+                            int u = ubufA[k];
+                            bool inB = false;
+                            for (int m = 0; m < cntB; m++)
+                                if (ubufB[m] == u) { inB = true; break; }
+                            if (!inB) subset = false;
+                        }
+                        if (!subset) continue;
+                        int dRem = remB - remA;
+                        int diffCnt = cntB - cntA;
+                        if (dRem <= 0)
+                        {
+                            // all cells in B\A are safe
+                            for (int m = 0; m < cntB; m++)
+                            {
+                                int u = ubufB[m];
+                                bool inA = false;
+                                for (int k = 0; k < cntA; k++)
+                                    if (ubufA[k] == u) { inA = true; break; }
+                                if (!inA) ded.Add(((long)u << 1));
+                            }
+                        }
+                        else if (dRem >= diffCnt)
+                        {
+                            for (int m = 0; m < cntB; m++)
+                            {
+                                int u = ubufB[m];
+                                bool inA = false;
+                                for (int k = 0; k < cntA; k++)
+                                    if (ubufA[k] == u) { inA = true; break; }
+                                if (!inA) ded.Add(((long)u << 1) | 1);
+                            }
+                        }
+                    }
+                }
+            }
+            if (ded.Count > 0) bags.Add(ded);
+        });
+
+        bool changed = false;
+        foreach (List<long> ded in bags)
+        {
+            for (int k = 0; k < ded.Count; k++)
+            {
+                long e = ded[k];
+                int u = (int)(e >> 1);
+                byte v = (e & 1) != 0 ? (byte)2 : (byte)1;
+                if (Mark(u, v)) changed = true;
+            }
+        }
+        return changed;
+    }
+
+    // ---------------- exact component enumeration ----------------
+
+    static bool EnumPhase(bool small)
+    {
+        List<int> active = CollectActive();
+        if (active.Count == 0) return false;
+        if (active.Count > 2000000) return false; // frontier too large: rely on local rules only
+
+        int maxVars = small ? 30 : 24;
+        long nodeBudget = small ? 20000000L : 2000000L;
+
+        int ncons = active.Count;
+        Dictionary<int, int> varMap = new Dictionary<int, int>();
+        List<int> varCells = new List<int>();
+        int[][] consVars = new int[ncons][];
+        int[] consRem = new int[ncons];
+        List<List<int>> varCons = new List<List<int>>();
+
+        int[] ubuf = new int[8];
+        for (int ci = 0; ci < ncons; ci++)
+        {
+            int rem;
+            int ucnt = GetConstraint(active[ci], ubuf, out rem);
+            int[] vs = new int[ucnt];
+            for (int k = 0; k < ucnt; k++)
+            {
+                int u = ubuf[k];
+                int vid;
+                if (!varMap.TryGetValue(u, out vid))
+                {
+                    vid = varCells.Count;
+                    varMap.Add(u, vid);
+                    varCells.Add(u);
+                    varCons.Add(new List<int>());
+                }
+                vs[k] = vid;
+                varCons[vid].Add(ci);
+            }
+            consVars[ci] = vs;
+            consRem[ci] = rem;
+        }
+
+        // connected components over constraints (share a variable)
+        bool[] visCons = new bool[ncons];
+        bool[] visVar = new bool[varCells.Count];
+        List<int[]> compConsList = new List<int[]>();
+        List<int[]> compVarsList = new List<int[]>();
+        Queue<int> bfs = new Queue<int>();
+        for (int seed = 0; seed < ncons; seed++)
+        {
+            if (visCons[seed]) continue;
+            List<int> ccons = new List<int>();
+            List<int> cvars = new List<int>();
+            visCons[seed] = true;
+            bfs.Enqueue(seed);
+            while (bfs.Count > 0)
+            {
+                int ci = bfs.Dequeue();
+                ccons.Add(ci);
+                int[] vs = consVars[ci];
+                for (int k = 0; k < vs.Length; k++)
+                {
+                    int v = vs[k];
+                    if (visVar[v]) continue;
+                    visVar[v] = true;
+                    cvars.Add(v);
+                    List<int> cs = varCons[v];
+                    for (int m = 0; m < cs.Count; m++)
+                    {
+                        int c2 = cs[m];
+                        if (!visCons[c2]) { visCons[c2] = true; bfs.Enqueue(c2); }
+                    }
+                }
+            }
+            if (cvars.Count >= 1 && cvars.Count <= maxVars)
+            {
+                compConsList.Add(ccons.ToArray());
+                compVarsList.Add(cvars.ToArray());
+            }
+        }
+
+        if (compConsList.Count == 0) return false;
+
+        ConcurrentBag<List<long>> bags = new ConcurrentBag<List<long>>();
+        Parallel.For(0, compConsList.Count, delegate(int comp)
+        {
+            if (clock.ElapsedMilliseconds > BudgetMs) return;
+            int[] ccons = compConsList[comp];
+            int[] cvars = compVarsList[comp];
+            int nv = cvars.Length;
+            int nc = ccons.Length;
+
+            // local ids
+            Dictionary<int, int> consLocal = new Dictionary<int, int>();
+            for (int k = 0; k < nc; k++) consLocal.Add(ccons[k], k);
+
+            // BFS variable ordering for good pruning locality
+            Dictionary<int, int> varLocal = new Dictionary<int, int>();
+            int[] order = new int[nv];
+            int filled = 0;
+            Queue<int> q = new Queue<int>();
+            for (int s = 0; s < nv && filled < nv; s++)
+            {
+                int gv = cvars[s];
+                if (varLocal.ContainsKey(gv)) continue;
+                varLocal.Add(gv, filled); order[filled++] = gv;
+                q.Enqueue(gv);
+                while (q.Count > 0)
+                {
+                    int v = q.Dequeue();
+                    List<int> cs = varCons[v];
+                    for (int m = 0; m < cs.Count; m++)
+                    {
+                        int[] vs2 = consVars[cs[m]];
+                        for (int t = 0; t < vs2.Length; t++)
+                        {
+                            int v2 = vs2[t];
+                            if (!varLocal.ContainsKey(v2))
+                            {
+                                varLocal.Add(v2, filled); order[filled++] = v2;
+                                q.Enqueue(v2);
+                            }
+                        }
+                    }
+                }
+            }
+
+            int[] rem = new int[nc];
+            int[] unass = new int[nc];
+            int[] mcnt = new int[nc];
+            List<int>[] vcl = new List<int>[nv];
+            for (int d = 0; d < nv; d++) vcl[d] = new List<int>();
+            for (int k = 0; k < nc; k++)
+            {
+                int gc = ccons[k];
+                rem[k] = consRem[gc];
+                unass[k] = consVars[gc].Length;
+                int[] vs = consVars[gc];
+                for (int t = 0; t < vs.Length; t++)
+                    vcl[varLocal[vs[t]]].Add(k);
+            }
+            int[][] varConsArr = new int[nv][];
+            for (int d = 0; d < nv; d++) varConsArr[d] = vcl[d].ToArray();
+
+            Enumerator en = new Enumerator();
+            en.nv = nv;
+            en.rem = rem; en.unass = unass; en.mcnt = mcnt;
+            en.varCons = varConsArr;
+            en.budget = nodeBudget;
+            en.always = ~0UL;
+            en.Rec(0, 0UL);
+
+            if (!en.aborted && en.sols > 0)
+            {
+                List<long> ded = new List<long>();
+                for (int d = 0; d < nv; d++)
+                {
+                    int cellIdx = varCells[order[d]];
+                    if (((en.ever >> d) & 1UL) == 0UL) ded.Add(((long)cellIdx << 1));
+                    else if (((en.always >> d) & 1UL) != 0UL) ded.Add(((long)cellIdx << 1) | 1);
+                }
+                if (ded.Count > 0) bags.Add(ded);
+            }
+        });
+
+        bool changed = false;
+        foreach (List<long> ded in bags)
+        {
+            for (int k = 0; k < ded.Count; k++)
+            {
+                long e = ded[k];
+                int u = (int)(e >> 1);
+                byte v = (e & 1) != 0 ? (byte)2 : (byte)1;
+                if (Mark(u, v)) changed = true;
+            }
+        }
+        return changed;
+    }
+
+    class Enumerator
+    {
+        public int nv;
+        public int[] rem, unass, mcnt;
+        public int[][] varCons;
+        public ulong ever, always;
+        public long sols, nodes, budget;
+        public bool aborted;
+
+        public void Rec(int d, ulong cur)
+        {
+            if (aborted) return;
+            if (++nodes > budget) { aborted = true; return; }
+            if (d == nv)
+            {
+                sols++;
+                ever |= cur;
+                always &= cur;
+                return;
+            }
+            int[] cs = varCons[d];
+            for (int m = 0; m <= 1; m++)
+            {
+                bool ok = true;
+                int applied = 0;
+                for (int k = 0; k < cs.Length; k++)
+                {
+                    int ci = cs[k];
+                    unass[ci]--;
+                    mcnt[ci] += m;
+                    applied++;
+                    if (mcnt[ci] > rem[ci] || rem[ci] - mcnt[ci] > unass[ci]) { ok = false; break; }
+                }
+                if (ok)
+                {
+                    Rec(d + 1, m == 1 ? (cur | (1UL << d)) : cur);
+                }
+                for (int k = 0; k < applied; k++)
+                {
+                    int ci = cs[k];
+                    unass[ci]++;
+                    mcnt[ci] -= m;
+                }
+                if (aborted) return;
+            }
+        }
+    }
+
+    // ---------------- output ----------------
+
+    static byte[] obuf = new byte[1 << 22];
+    static int obp;
+    static Stream ostream;
+
+    static void OFlush()
+    {
+        ostream.Write(obuf, 0, obp);
+        obp = 0;
+    }
+
+    static void OInt(int v)
+    {
+        if (obp > obuf.Length - 16) OFlush();
+        if (v == 0) { obuf[obp++] = (byte)'0'; return; }
+        int start = obp;
+        while (v > 0) { obuf[obp++] = (byte)('0' + v % 10); v /= 10; }
+        for (int a = start, b = obp - 1; a < b; a++, b--)
+        {
+            byte t = obuf[a]; obuf[a] = obuf[b]; obuf[b] = t;
+        }
+    }
+
+    static void WriteOutput()
+    {
+        ostream = Console.OpenStandardOutput();
+        OInt(safeList.Count);
+        obuf[obp++] = (byte)'\n';
+        for (int k = 0; k < safeList.Count; k++)
+        {
+            int i = safeList[k];
+            OInt(i % W);
+            obuf[obp++] = (byte)' ';
+            OInt(i / W);
+            obuf[obp++] = (byte)'\n';
+        }
+        OFlush();
+        ostream.Flush();
+    }
+}

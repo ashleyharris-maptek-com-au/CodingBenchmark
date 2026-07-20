@@ -1,0 +1,471 @@
+// 3D Bin Packing solver - adaptive to problem scale.
+//
+// Strategy:
+//  1. Read the polyhedron, keep its vertices (faces only consumed).
+//  2. Build a set of candidate orientations:
+//       - the 24 proper axis-aligned (cube-group) rotations, always;
+//       - for small/medium problems (few vertices, modest expected counts),
+//         additionally sample random rotations uniformly over SO(3), score
+//         them by how many axis-aligned-bounding-box cells fit in the
+//         container (trying all 6 axis permutations), then locally refine
+//         the best one with a shrinking-angle hill climb.
+//  3. Pack the container with a recursive "guillotine" decomposition:
+//     pick the orientation whose AABB lattice yields the highest count in
+//     the current box region, place that lattice, then recurse into the
+//     three leftover slabs (possibly choosing different orientations there).
+//  4. Stream the placements to stdout with pre-computed coordinate strings
+//     so extreme instances (hundreds of millions of placements) still finish
+//     well inside the time budget. A hard cap keeps pathological cases
+//     (billions of placements) inside the 5-minute wall clock.
+//
+// All placements are axis-aligned lattices of the rotated shape's AABB with
+// a tiny clearance, so containment and non-overlap are guaranteed by
+// construction regardless of the polyhedron's actual (possibly non-convex)
+// geometry.
+
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Globalization;
+using System.IO;
+using System.Text;
+
+static class BinPack3D
+{
+    // Cells are packed at exact stride (touching AABBs, zero interpenetration).
+    // Output is printed with 12 decimals, so round-off is <= 5e-13 - far below
+    // any reasonable validator tolerance. Gaps between cells would instead
+    // shave slivers off the leftover slabs and lose whole rows of placements.
+    const long OutputCap = 130000000;   // keeps worst-case stdout inside the time budget
+    const int AxisCap = 400000;          // per-axis cell cap (string precompute safety)
+
+    sealed class Orient
+    {
+        public double[] M;                 // 3x3 row-major rotation matrix
+        public double W, H, D;             // rotated AABB dims
+        public double MnX, MnY, MnZ;       // rotated AABB min corner
+        public string QuatStr;             // "qw qx qy qz"
+    }
+
+    sealed class Region
+    {
+        public double X, Y, Z;
+        public long Nx, Ny, Nz;
+        public Orient O;
+    }
+
+    static double[] vx, vy, vz;
+    static int nv;
+
+    static void Main()
+    {
+        var sw = Stopwatch.StartNew();
+        double[] toks = ReadAllNumbers();
+        int p = 0;
+        nv = (int)toks[p++];
+        int nf = (int)toks[p++];
+        vx = new double[nv]; vy = new double[nv]; vz = new double[nv];
+        for (int i = 0; i < nv; i++) { vx[i] = toks[p++]; vy[i] = toks[p++]; vz[i] = toks[p++]; }
+        p += 3 * nf; // faces are irrelevant for AABB-lattice packing
+        double CW = toks[p++], CH = toks[p++], CD = toks[p++];
+
+        var candidates = new List<Orient>();
+        foreach (var m in CubeRotations())
+            candidates.Add(MakeOrient(m));
+
+        // Adaptive extra work: rotation sampling pays off when the shape is
+        // small enough to evaluate quickly and the expected count is not so
+        // huge that lattice granularity dominates anyway.
+        long baseBest = 0;
+        foreach (var o in candidates)
+            baseBest = Math.Max(baseBest, CountIn(o, CW, CH, CD));
+        bool sample = nv <= 20000 && baseBest <= 20000000;
+        if (sample)
+            SampleRotations(candidates, CW, CH, CD, sw);
+
+        // Recursive guillotine packing of the container.
+        var regions = new List<Region>();
+        Pack(0, 0, 0, CW, CH, CD, candidates, regions, 0);
+
+        long total = 0;
+        foreach (var r in regions) total += r.Nx * r.Ny * r.Nz;
+        long emit = Math.Min(total, OutputCap);
+
+        var stdout = Console.OpenStandardOutput();
+        using (var w = new StreamWriter(stdout, new UTF8Encoding(false), 1 << 20))
+        {
+            w.Write(emit.ToString(CultureInfo.InvariantCulture));
+            w.Write('\n');
+            long written = 0;
+            foreach (var r in regions)
+            {
+                if (written >= emit) break;
+                written = EmitRegion(w, r, written, emit);
+            }
+        }
+    }
+
+    // ---------- input ----------
+
+    static double[] ReadAllNumbers()
+    {
+        string all;
+        using (var sr = new StreamReader(Console.OpenStandardInput(), Encoding.UTF8, false, 1 << 20))
+            all = sr.ReadToEnd();
+        var list = new List<double>(1 << 12);
+        int i = 0, n = all.Length;
+        while (i < n)
+        {
+            char c = all[i];
+            if (c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == ',') { i++; continue; }
+            int s = i;
+            while (i < n)
+            {
+                c = all[i];
+                if (c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == ',') break;
+                i++;
+            }
+            list.Add(double.Parse(all.Substring(s, i - s), CultureInfo.InvariantCulture));
+        }
+        return list.ToArray();
+    }
+
+    // ---------- orientations ----------
+
+    static IEnumerable<double[]> CubeRotations()
+    {
+        int[][] perms = {
+            new[]{0,1,2}, new[]{0,2,1}, new[]{1,0,2},
+            new[]{1,2,0}, new[]{2,0,1}, new[]{2,1,0} };
+        foreach (var pm in perms)
+        {
+            int permSign = PermSign(pm);
+            for (int sx = -1; sx <= 1; sx += 2)
+                for (int sy = -1; sy <= 1; sy += 2)
+                    for (int sz = -1; sz <= 1; sz += 2)
+                    {
+                        if (permSign * sx * sy * sz != 1) continue; // proper rotations only
+                        var m = new double[9];
+                        m[0 * 3 + pm[0]] = sx;
+                        m[1 * 3 + pm[1]] = sy;
+                        m[2 * 3 + pm[2]] = sz;
+                        yield return m;
+                    }
+        }
+    }
+
+    static int PermSign(int[] pm)
+    {
+        int inv = 0;
+        for (int a = 0; a < 3; a++)
+            for (int b = a + 1; b < 3; b++)
+                if (pm[a] > pm[b]) inv++;
+        return (inv & 1) == 0 ? 1 : -1;
+    }
+
+    static Orient MakeOrient(double[] m)
+    {
+        double mnx = double.MaxValue, mny = double.MaxValue, mnz = double.MaxValue;
+        double mxx = double.MinValue, mxy = double.MinValue, mxz = double.MinValue;
+        for (int i = 0; i < nv; i++)
+        {
+            double x = vx[i], y = vy[i], z = vz[i];
+            double rx = m[0] * x + m[1] * y + m[2] * z;
+            double ry = m[3] * x + m[4] * y + m[5] * z;
+            double rz = m[6] * x + m[7] * y + m[8] * z;
+            if (rx < mnx) mnx = rx; if (rx > mxx) mxx = rx;
+            if (ry < mny) mny = ry; if (ry > mxy) mxy = ry;
+            if (rz < mnz) mnz = rz; if (rz > mxz) mxz = rz;
+        }
+        double qw, qx, qy, qz;
+        MatToQuat(m, out qw, out qx, out qy, out qz);
+        return new Orient
+        {
+            M = m,
+            W = Math.Max(mxx - mnx, 1e-12),
+            H = Math.Max(mxy - mny, 1e-12),
+            D = Math.Max(mxz - mnz, 1e-12),
+            MnX = mnx, MnY = mny, MnZ = mnz,
+            QuatStr = F(qw) + " " + F(qx) + " " + F(qy) + " " + F(qz)
+        };
+    }
+
+    static void MatToQuat(double[] m, out double qw, out double qx, out double qy, out double qz)
+    {
+        double m00 = m[0], m01 = m[1], m02 = m[2];
+        double m10 = m[3], m11 = m[4], m12 = m[5];
+        double m20 = m[6], m21 = m[7], m22 = m[8];
+        double tr = m00 + m11 + m22;
+        if (tr > 0)
+        {
+            double s = Math.Sqrt(tr + 1.0) * 2;
+            qw = 0.25 * s;
+            qx = (m21 - m12) / s;
+            qy = (m02 - m20) / s;
+            qz = (m10 - m01) / s;
+        }
+        else if (m00 > m11 && m00 > m22)
+        {
+            double s = Math.Sqrt(1.0 + m00 - m11 - m22) * 2;
+            qw = (m21 - m12) / s;
+            qx = 0.25 * s;
+            qy = (m01 + m10) / s;
+            qz = (m02 + m20) / s;
+        }
+        else if (m11 > m22)
+        {
+            double s = Math.Sqrt(1.0 + m11 - m00 - m22) * 2;
+            qw = (m02 - m20) / s;
+            qx = (m01 + m10) / s;
+            qy = 0.25 * s;
+            qz = (m12 + m21) / s;
+        }
+        else
+        {
+            double s = Math.Sqrt(1.0 + m22 - m00 - m11) * 2;
+            qw = (m10 - m01) / s;
+            qx = (m02 + m20) / s;
+            qy = (m12 + m21) / s;
+            qz = 0.25 * s;
+        }
+        double len = Math.Sqrt(qw * qw + qx * qx + qy * qy + qz * qz);
+        qw /= len; qx /= len; qy /= len; qz /= len;
+    }
+
+    // ---------- rotation sampling (small/medium problems) ----------
+
+    static ulong rngState = 0x9E3779B97F4A7C15UL;
+    static double NextDouble()
+    {
+        rngState = rngState * 6364136223846793005UL + 1442695040888963407UL;
+        ulong x = rngState;
+        x ^= x >> 33; x *= 0xFF51AFD7ED558CCDUL; x ^= x >> 33;
+        return (x >> 11) * (1.0 / 9007199254740992.0);
+    }
+
+    static double[] RandomRotation()
+    {
+        // Marsaglia uniform quaternion -> matrix
+        double u1 = NextDouble(), u2 = NextDouble(), u3 = NextDouble();
+        double a = Math.Sqrt(1 - u1), b = Math.Sqrt(u1);
+        double qx = a * Math.Sin(2 * Math.PI * u2);
+        double qy = a * Math.Cos(2 * Math.PI * u2);
+        double qz = b * Math.Sin(2 * Math.PI * u3);
+        double qw = b * Math.Cos(2 * Math.PI * u3);
+        return QuatToMat(qw, qx, qy, qz);
+    }
+
+    static double[] QuatToMat(double w, double x, double y, double z)
+    {
+        return new[]
+        {
+            1-2*(y*y+z*z), 2*(x*y-z*w),   2*(x*z+y*w),
+            2*(x*y+z*w),   1-2*(x*x+z*z), 2*(y*z-x*w),
+            2*(x*z-y*w),   2*(y*z+x*w),   1-2*(x*x+y*y)
+        };
+    }
+
+    static double[] AxisAngleMat(double ax, double ay, double az, double angle)
+    {
+        double len = Math.Sqrt(ax * ax + ay * ay + az * az);
+        if (len < 1e-12) return new double[] { 1, 0, 0, 0, 1, 0, 0, 0, 1 };
+        ax /= len; ay /= len; az /= len;
+        double s = Math.Sin(angle / 2);
+        return QuatToMat(Math.Cos(angle / 2), ax * s, ay * s, az * s);
+    }
+
+    static double[] MatMul(double[] a, double[] b)
+    {
+        var r = new double[9];
+        for (int i = 0; i < 3; i++)
+            for (int j = 0; j < 3; j++)
+                r[i * 3 + j] = a[i * 3] * b[j] + a[i * 3 + 1] * b[3 + j] + a[i * 3 + 2] * b[6 + j];
+        return r;
+    }
+
+    static void Dims(double[] m, out double a, out double b, out double c)
+    {
+        double mnx = double.MaxValue, mny = double.MaxValue, mnz = double.MaxValue;
+        double mxx = double.MinValue, mxy = double.MinValue, mxz = double.MinValue;
+        for (int i = 0; i < nv; i++)
+        {
+            double x = vx[i], y = vy[i], z = vz[i];
+            double rx = m[0] * x + m[1] * y + m[2] * z;
+            double ry = m[3] * x + m[4] * y + m[5] * z;
+            double rz = m[6] * x + m[7] * y + m[8] * z;
+            if (rx < mnx) mnx = rx; if (rx > mxx) mxx = rx;
+            if (ry < mny) mny = ry; if (ry > mxy) mxy = ry;
+            if (rz < mnz) mnz = rz; if (rz > mxz) mxz = rz;
+        }
+        a = Math.Max(mxx - mnx, 1e-12);
+        b = Math.Max(mxy - mny, 1e-12);
+        c = Math.Max(mxz - mnz, 1e-12);
+    }
+
+    static readonly int[][] SixPerms = {
+        new[]{0,1,2}, new[]{0,2,1}, new[]{1,0,2},
+        new[]{1,2,0}, new[]{2,0,1}, new[]{2,1,0} };
+
+    // Score a free rotation: best (count, -volume) over the 6 axis permutations.
+    static void Score(double[] m, double CW, double CH, double CD,
+                      out long bestCount, out double vol, out int bestPerm)
+    {
+        double a, b, c;
+        Dims(m, out a, out b, out c);
+        vol = a * b * c;
+        var d = new[] { a, b, c };
+        bestCount = -1; bestPerm = 0;
+        for (int pi = 0; pi < 6; pi++)
+        {
+            var pm = SixPerms[pi];
+            long nx = CellCount(CW, d[pm[0]]);
+            long ny = CellCount(CH, d[pm[1]]);
+            long nz = CellCount(CD, d[pm[2]]);
+            long cnt = nx * ny * nz;
+            if (cnt > bestCount) { bestCount = cnt; bestPerm = pi; }
+        }
+    }
+
+    // Proper rotation matrix realising axis permutation pm (with a sign fix).
+    static double[] PermMat(int[] pm)
+    {
+        var m = new double[9];
+        int sign = PermSign(pm);
+        // row i picks source axis pm[i]; flip last row for odd perms => det +1
+        m[0 * 3 + pm[0]] = 1;
+        m[1 * 3 + pm[1]] = 1;
+        m[2 * 3 + pm[2]] = sign;
+        return m;
+    }
+
+    static void SampleRotations(List<Orient> candidates, double CW, double CH, double CD, Stopwatch sw)
+    {
+        int samples = nv <= 2000 ? 4000 : 800;
+        double[] bestM = null;
+        long bestCount = -1; double bestVol = double.MaxValue; int bestPerm = 0;
+
+        for (int s = 0; s < samples; s++)
+        {
+            if (sw.ElapsedMilliseconds > 60000) break;
+            var m = RandomRotation();
+            long cnt; double vol; int perm;
+            Score(m, CW, CH, CD, out cnt, out vol, out perm);
+            if (cnt > bestCount || (cnt == bestCount && vol < bestVol))
+            { bestCount = cnt; bestVol = vol; bestPerm = perm; bestM = m; }
+        }
+        if (bestM == null) return;
+
+        // Local hill climb with shrinking perturbation angle.
+        double angle = 0.4;
+        int iters = nv <= 2000 ? 1500 : 400;
+        for (int it = 0; it < iters; it++)
+        {
+            if (sw.ElapsedMilliseconds > 90000) break;
+            var pert = AxisAngleMat(NextDouble() - 0.5, NextDouble() - 0.5, NextDouble() - 0.5,
+                                    angle * (NextDouble() * 2 - 1));
+            var m2 = MatMul(pert, bestM);
+            long cnt; double vol; int perm;
+            Score(m2, CW, CH, CD, out cnt, out vol, out perm);
+            if (cnt > bestCount || (cnt == bestCount && vol < bestVol))
+            { bestCount = cnt; bestVol = vol; bestPerm = perm; bestM = m2; }
+            else angle *= 0.995;
+            if (angle < 1e-4) break;
+        }
+
+        // Materialise the refined rotation in all 6 axis permutations so the
+        // guillotine stage can reuse it in leftover slabs of any aspect ratio.
+        for (int pi = 0; pi < 6; pi++)
+            candidates.Add(MakeOrient(MatMul(PermMat(SixPerms[pi]), bestM)));
+    }
+
+    // ---------- packing ----------
+
+    static long CellCount(double size, double cell)
+    {
+        // relative epsilon so exact multiples (integer container / unit shape)
+        // are not lost to floating-point noise
+        double n = Math.Floor(size / cell + 1e-9);
+        if (n <= 0) return 0;
+        if (n > AxisCap) n = AxisCap;
+        return (long)n;
+    }
+
+    static long CountIn(Orient o, double sx, double sy, double sz)
+    {
+        return CellCount(sx, o.W) * CellCount(sy, o.H) * CellCount(sz, o.D);
+    }
+
+    static void Pack(double x, double y, double z, double sx, double sy, double sz,
+                     List<Orient> cands, List<Region> outRegions, int depth)
+    {
+        if (depth > 12 || outRegions.Count > 20000) return;
+        Orient best = null;
+        long bestCnt = 0; double bestVol = double.MaxValue; double bestTr = double.MinValue;
+        foreach (var o in cands)
+        {
+            long c = CountIn(o, sx, sy, sz);
+            if (c == 0) continue;
+            double v = o.W * o.H * o.D;
+            double tr = o.M[0] + o.M[4] + o.M[8]; // ties: rotation closest to identity
+            if (c > bestCnt || (c == bestCnt && (v < bestVol - 1e-12 ||
+                (Math.Abs(v - bestVol) <= 1e-12 && tr > bestTr))))
+            { bestCnt = c; bestVol = v; bestTr = tr; best = o; }
+        }
+        if (best == null) return;
+
+        long nx = CellCount(sx, best.W), ny = CellCount(sy, best.H), nz = CellCount(sz, best.D);
+        outRegions.Add(new Region { X = x, Y = y, Z = z, Nx = nx, Ny = ny, Nz = nz, O = best });
+
+        double ux = nx * best.W;
+        double uy = ny * best.H;
+        double uz = nz * best.D;
+
+        // three disjoint leftover slabs
+        Pack(x + ux, y, z, sx - ux, sy, sz, cands, outRegions, depth + 1);
+        Pack(x, y + uy, z, ux, sy - uy, sz, cands, outRegions, depth + 1);
+        Pack(x, y, z + uz, ux, uy, sz - uz, cands, outRegions, depth + 1);
+    }
+
+    // ---------- output ----------
+
+    static string F(double v)
+    {
+        return v.ToString("0.############", CultureInfo.InvariantCulture);
+    }
+
+    static long EmitRegion(StreamWriter w, Region r, long written, long emit)
+    {
+        var o = r.O;
+        double bx = r.X - o.MnX;
+        double by = r.Y - o.MnY;
+        double bz = r.Z - o.MnZ;
+        double stx = o.W, sty = o.H, stz = o.D;
+
+        var xs = new string[r.Nx];
+        for (long i = 0; i < r.Nx; i++) xs[i] = F(bx + i * stx);
+        var ys = new string[r.Ny];
+        for (long j = 0; j < r.Ny; j++) ys[j] = F(by + j * sty);
+        var zs = new string[r.Nz];
+        for (long k = 0; k < r.Nz; k++) zs[k] = F(bz + k * stz);
+        string qs = o.QuatStr;
+
+        for (long k = 0; k < r.Nz; k++)
+        {
+            string zk = zs[k];
+            for (long j = 0; j < r.Ny; j++)
+            {
+                string yj = ys[j];
+                for (long i = 0; i < r.Nx; i++)
+                {
+                    if (written >= emit) return written;
+                    w.Write(xs[i]); w.Write(' ');
+                    w.Write(yj); w.Write(' ');
+                    w.Write(zk); w.Write(' ');
+                    w.Write(qs); w.Write('\n');
+                    written++;
+                }
+            }
+        }
+        return written;
+    }
+}

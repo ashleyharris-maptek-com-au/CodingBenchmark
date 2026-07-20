@@ -1,0 +1,723 @@
+// Voxel open-pit mining planner.
+//
+// Strategy overview (adaptive by problem scale):
+//  - Small/medium worlds (<= 300M voxels): keep the full voxel grid in memory,
+//    allowing arbitrarily deep column mining plans.
+//  - Huge worlds (up to 5000^3 = 125G voxels): stream the input and keep only a
+//    compact per-column stack of the top-K solid voxels plus a heightmap.
+//    Input reading is also time-capped; unread terrain is treated as impassable
+//    and untouchable so all emitted operations stay valid.
+//  - Each column gets a profit plan: dig down through its top voxels, sending
+//    profitable ore to the plant at (0,0) and dumping overburden/junk on nearby
+//    waste columns. Columns are processed greedily by estimated profit.
+//  - Every haul path is found with a slope-constrained A* (|dz| <= 1 per step,
+//    $5/ton uphill, $1/ton flat, free downhill) over the live heightmap, so
+//    dumped dirt (which raises the ground) is always accounted for.
+//  - Paths to the plant are cached per column and re-validated against current
+//    heights before reuse.
+//  - Ore is only delivered if revenue (1000 * value * mass) exceeds actual fuel
+//    cost; otherwise it is treated as waste and dumped nearby.
+//
+// Output op format: N digX digY digZ [stepX stepY]*N destX destY
+// Steps are the intermediate cells strictly between the dig cell and the
+// destination; consecutive cells (dig -> steps -> dest) are 4-connected.
+
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Text;
+
+static class MinerProgram
+{
+    static int NX, NY, NZ;
+    static int cols;
+    static int[] surf;              // z index of topmost solid voxel, -1 if column empty
+    static bool fullMode;
+    static byte[] grid;             // full mode: voxel bytes, index (col*NZ + z)
+    static int K;                   // compact mode: solids kept per column
+    static ushort[] stZ;            // compact stacks: z of i-th solid from top
+    static byte[] stD;              // compact stacks: voxel byte
+    static byte[] stCnt;            // solids stored
+    static byte[] stPtr;            // solids already dug
+    static bool[] stTrunc;          // true if column had more solids than K
+    static bool[] noDump;           // cannot dump here (planned dig site / plant / unknown)
+    static int[] plannedDepth;      // remaining digs scheduled for this column
+
+    static readonly Stopwatch sw = Stopwatch.StartNew();
+    const long ReadDeadlineMs = 150_000;
+    const long PlanDeadlineMs = 235_000;
+    const long MaxOutBytes = 1_300_000_000;
+
+    // Search scratch (shared by A* and dump BFS, epoch-stamped).
+    static int[] seenEp, closedEp, parentC, gC;
+    static int ep;
+    // Plant-rooted Dijkstra field over initial terrain: per-ton haul cost to
+    // the plant and tree parents (next hop toward the plant).
+    static int[] distT, dparent;
+    const int INF = int.MaxValue / 4;
+    static long[] openH = new long[1 << 12];
+    static int openN;
+    static int[] bfsQueue;
+
+    // Main plan heap (max-heap on score).
+    static long[] hK = new long[1 << 12];
+    static int[] hV = new int[1 << 12];
+    static int hN;
+
+    static void ReadFully(Stream s, byte[] buf, int off, int len)
+    {
+        while (len > 0)
+        {
+            int r = s.Read(buf, off, len);
+            if (r <= 0) { Array.Clear(buf, off, len); return; }
+            off += r; len -= r;
+        }
+    }
+
+    static void HeapPush(long key, int val)
+    {
+        if (hN == hK.Length)
+        {
+            Array.Resize(ref hK, hN * 2);
+            Array.Resize(ref hV, hN * 2);
+        }
+        int i = hN++;
+        while (i > 0)
+        {
+            int p = (i - 1) >> 1;
+            if (hK[p] >= key) break;
+            hK[i] = hK[p]; hV[i] = hV[p]; i = p;
+        }
+        hK[i] = key; hV[i] = val;
+    }
+
+    static bool HeapPop(out long key, out int val)
+    {
+        if (hN == 0) { key = 0; val = 0; return false; }
+        key = hK[0]; val = hV[0];
+        hN--;
+        if (hN > 0)
+        {
+            long lk = hK[hN]; int lv = hV[hN];
+            int i = 0;
+            while (true)
+            {
+                int c1 = 2 * i + 1, c2 = c1 + 1, m = i;
+                if (c1 < hN && hK[c1] > lk) m = c1;
+                if (c2 < hN && hK[c2] > (m == i ? lk : hK[c1])) m = c2;
+                if (m == i) break;
+                hK[i] = hK[m]; hV[i] = hV[m]; i = m;
+            }
+            hK[i] = lk; hV[i] = lv;
+        }
+        return true;
+    }
+
+    static void OpenPush(long key)
+    {
+        if (openN == openH.Length) Array.Resize(ref openH, openN * 2);
+        int i = openN++;
+        while (i > 0)
+        {
+            int p = (i - 1) >> 1;
+            if (openH[p] <= key) break;
+            openH[i] = openH[p]; i = p;
+        }
+        openH[i] = key;
+    }
+
+    static long OpenPop()
+    {
+        long top = openH[0];
+        openN--;
+        if (openN > 0)
+        {
+            long last = openH[openN];
+            int i = 0;
+            while (true)
+            {
+                int c1 = 2 * i + 1, c2 = c1 + 1, m = i;
+                long mv = last;
+                if (c1 < openN && openH[c1] < mv) { m = c1; mv = openH[c1]; }
+                if (c2 < openN && openH[c2] < mv) m = c2;
+                if (m == i) break;
+                openH[i] = openH[m]; i = m;
+            }
+            openH[i] = last;
+        }
+        return top;
+    }
+
+    // ---- column voxel accessors ----
+
+    static bool TryCurrentTop(int c, out int z, out byte d)
+    {
+        if (fullMode)
+        {
+            z = surf[c]; d = 0;
+            if (z < 0 || z >= NZ) return false;
+            d = grid[(long)c * NZ + z];
+            return (d & 15) != 0;
+        }
+        else
+        {
+            int ptr = stPtr[c], cnt = stCnt[c];
+            z = -1; d = 0;
+            if (ptr >= cnt) return false;
+            long b = (long)c * K + ptr;
+            z = stZ[b]; d = stD[b];
+            return true;
+        }
+    }
+
+    static int NextSurfAfterDig(int c)
+    {
+        if (fullMode)
+        {
+            long b = (long)c * NZ;
+            for (int z = surf[c] - 1; z >= 0; z--)
+                if ((grid[b + z] & 15) != 0) return z;
+            return -1;
+        }
+        else
+        {
+            int ptr = stPtr[c] + 1;
+            if (ptr < stCnt[c]) return stZ[(long)c * K + ptr];
+            return -1; // plan caps guarantee this is only reached on fully-known columns
+        }
+    }
+
+    static void CommitDig(int c, int digZ, int newSurf)
+    {
+        if (fullMode) grid[(long)c * NZ + digZ] = 0;
+        else stPtr[c]++;
+        surf[c] = newSurf;
+    }
+
+    // Waste raises the destination column by 1 and (where representable)
+    // stores the voxel byte so later waves can re-dig it. If the voxel can't
+    // be recorded, the dig-only-at-known-surface guard keeps output valid.
+    static void RecordDump(int c, byte d)
+    {
+        int nz = surf[c] + 1;
+        if (fullMode)
+        {
+            if (nz >= 0 && nz < NZ) grid[(long)c * NZ + nz] = d;
+        }
+        else
+        {
+            int ptr = stPtr[c], cnt = stCnt[c];
+            long b = (long)c * K;
+            if (ptr > 0)
+            {
+                ptr--; stPtr[c] = (byte)ptr;
+                stZ[b + ptr] = (ushort)nz; stD[b + ptr] = d;
+            }
+            else
+            {
+                int lim = cnt < K ? cnt : K - 1;
+                for (int i = lim; i > 0; i--) { stZ[b + i] = stZ[b + i - 1]; stD[b + i] = stD[b + i - 1]; }
+                stZ[b] = (ushort)nz; stD[b] = d;
+                if (cnt < K) stCnt[c] = (byte)(cnt + 1);
+                else stTrunc[c] = true; // bottom entry dropped
+            }
+        }
+        surf[c] = nz;
+    }
+
+    // ---- pathfinding ----
+
+    static int PathCostPerTon(int[] path)
+    {
+        int cost = 0;
+        for (int i = 0; i + 1 < path.Length; i++)
+        {
+            int dz = surf[path[i + 1]] - surf[path[i]];
+            if (dz > 0) cost += 5;
+            else if (dz == 0) cost += 1;
+        }
+        return cost;
+    }
+
+    static bool ValidPath(int[] path, int startCol)
+    {
+        if (path.Length == 0 || path[0] != startCol || path[path.Length - 1] != 0) return false;
+        for (int i = 0; i + 1 < path.Length; i++)
+        {
+            int dz = surf[path[i + 1]] - surf[path[i]];
+            if (dz > 1 || dz < -1) return false;
+        }
+        return true;
+    }
+
+    static readonly int[] dxs = { 1, -1, 0, 0 };
+    static readonly int[] dys = { 0, 0, 1, -1 };
+
+    // A* from startCol to the plant (col 0). Heuristic = manhattan distance
+    // (inadmissible because downhill is free, but paths are still valid and
+    // near-optimal; validity matters most here).
+    static int[] AStar(int startCol, int expansionCap, out bool capped)
+    {
+        capped = false;
+        if (startCol == 0) return new int[] { 0 };
+        ep++;
+        openN = 0;
+        gC[startCol] = 0; seenEp[startCol] = ep; parentC[startCol] = -1;
+        int hx = startCol / NY + startCol % NY;
+        OpenPush(((long)hx << 32) | (uint)startCol);
+        int expansions = 0;
+        while (openN > 0)
+        {
+            long node = OpenPop();
+            int u = (int)(node & 0xFFFFFFFFL);
+            if (closedEp[u] == ep) continue;
+            closedEp[u] = ep;
+            if (u == 0) break;
+            if (++expansions > expansionCap) { capped = true; return null; }
+            int ux = u / NY, uy = u % NY, su = surf[u];
+            int gu = gC[u];
+            for (int k = 0; k < 4; k++)
+            {
+                int vx = ux + dxs[k], vy = uy + dys[k];
+                if (vx < 0 || vx >= NX || vy < 0 || vy >= NY) continue;
+                int v = vx * NY + vy;
+                if (closedEp[v] == ep) continue;
+                int dz = surf[v] - su;
+                if (dz > 1 || dz < -1) continue;
+                int w = dz > 0 ? 5 : (dz == 0 ? 1 : 0);
+                int ng = gu + w;
+                if (seenEp[v] == ep && gC[v] <= ng) continue;
+                seenEp[v] = ep; gC[v] = ng; parentC[v] = u;
+                OpenPush(((long)(ng + vx + vy) << 32) | (uint)v);
+            }
+        }
+        if (closedEp[0] != ep) return null;
+        var rev = new List<int>();
+        for (int c = 0; c != -1; c = parentC[c]) { rev.Add(c); if (c == startCol) break; }
+        if (rev[rev.Count - 1] != startCol) return null;
+        var path = new int[rev.Count];
+        for (int i = 0; i < rev.Count; i++) path[i] = rev[rev.Count - 1 - i];
+        return path;
+    }
+
+    // One Dijkstra rooted at the plant over the initial heightmap. Edge cost
+    // is the truck's cost moving TOWARD the plant (relaxing settled u to
+    // neighbour v prices the segment v -> u). Gives exact reachability and
+    // per-ton haul cost for every column at once, so no per-column A* is
+    // needed to discover that ore can never be delivered.
+    static void PlantDijkstra()
+    {
+        distT = new int[cols];
+        dparent = new int[cols];
+        for (int i = 0; i < cols; i++) { distT[i] = INF; dparent[i] = -1; }
+        ep++;
+        openN = 0;
+        distT[0] = 0;
+        OpenPush(0L);
+        while (openN > 0)
+        {
+            long node = OpenPop();
+            int u = (int)(node & 0xFFFFFFFFL);
+            int du = (int)(node >> 32);
+            if (du > distT[u]) continue;
+            int ux = u / NY, uy = u % NY, su = surf[u];
+            for (int k = 0; k < 4; k++)
+            {
+                int vx = ux + dxs[k], vy = uy + dys[k];
+                if (vx < 0 || vx >= NX || vy < 0 || vy >= NY) continue;
+                int v = vx * NY + vy;
+                int dz = surf[v] - su;
+                if (dz > 1 || dz < -1) continue;
+                // truck moves v -> u; uphill if surf[u] > surf[v]
+                int w = dz < 0 ? 5 : (dz == 0 ? 1 : 0);
+                int nd = du + w;
+                if (nd < distT[v]) { distT[v] = nd; dparent[v] = u; OpenPush(((long)nd << 32) | (uint)v); }
+            }
+        }
+    }
+
+    // Path to the plant via the Dijkstra tree, validated against CURRENT
+    // heights (mining lowers cells by 1 per dig, dumps raise by 1, so tree
+    // paths degrade slowly and usually stay legal).
+    static int[] TreePath(int startCol)
+    {
+        if (dparent[startCol] < 0 && startCol != 0) return null;
+        int len = 1;
+        for (int c = startCol; c != 0; c = dparent[c])
+        {
+            len++;
+            if (len > cols) return null;
+        }
+        var path = new int[len];
+        int i = 0;
+        for (int c = startCol; ; c = dparent[c])
+        {
+            path[i++] = c;
+            if (c == 0) break;
+        }
+        return ValidPath(path, startCol) ? path : null;
+    }
+
+    // BFS from startCol to the nearest column where dumping is allowed.
+    // Dump target must not rise above the approach cell after the dump
+    // (surf[dest] <= surf[parent]) so it never blocks its own access.
+    static int[] DumpBfs(int startCol, int nodeCap)
+    {
+        ep++;
+        int qh = 0, qt = 0;
+        bfsQueue[qt++] = startCol;
+        seenEp[startCol] = ep; parentC[startCol] = -1;
+        int found = -1;
+        while (qh < qt && found < 0)
+        {
+            int u = bfsQueue[qh++];
+            if (qh > nodeCap) break;
+            int ux = u / NY, uy = u % NY, su = surf[u];
+            for (int k = 0; k < 4; k++)
+            {
+                int vx = ux + dxs[k], vy = uy + dys[k];
+                if (vx < 0 || vx >= NX || vy < 0 || vy >= NY) continue;
+                int v = vx * NY + vy;
+                if (seenEp[v] == ep) continue;
+                int dz = surf[v] - su;
+                if (dz > 1 || dz < -1) continue;
+                seenEp[v] = ep; parentC[v] = u;
+                if (!noDump[v] && surf[v] <= su) { found = v; break; }
+                if (qt < bfsQueue.Length) bfsQueue[qt++] = v;
+            }
+        }
+        if (found < 0) return null;
+        var rev = new List<int>();
+        for (int c = found; c != -1; c = parentC[c]) rev.Add(c);
+        var path = new int[rev.Count];
+        for (int i = 0; i < rev.Count; i++) path[i] = rev[rev.Count - 1 - i];
+        return path;
+    }
+
+    // ---- output ----
+
+    static void EmitOp(StreamWriter w, int[] path, int digZ)
+    {
+        int n = path.Length >= 2 ? path.Length - 2 : 0;
+        w.Write(n); w.Write(' ');
+        w.Write(path[0] / NY); w.Write(' ');
+        w.Write(path[0] % NY); w.Write(' ');
+        w.Write(digZ);
+        for (int i = 1; i + 1 < path.Length; i++)
+        {
+            w.Write(' '); w.Write(path[i] / NY);
+            w.Write(' '); w.Write(path[i] % NY);
+        }
+        int dest = path[path.Length - 1];
+        w.Write(' '); w.Write(dest / NY);
+        w.Write(' '); w.Write(dest % NY);
+        w.Write('\n');
+    }
+
+    static void Main()
+    {
+        var inp = new BufferedStream(Console.OpenStandardInput(), 1 << 22);
+        var hb = new StringBuilder();
+        int chh;
+        while ((chh = inp.ReadByte()) != -1 && chh != '\n') hb.Append((char)chh);
+        var parts = hb.ToString().Split(new[] { ' ', '\t', '\r' }, StringSplitOptions.RemoveEmptyEntries);
+        NX = int.Parse(parts[0]); NY = int.Parse(parts[1]); NZ = int.Parse(parts[2]);
+        cols = NX * NY;
+        long total = (long)cols * NZ;
+
+        // Scale-adaptive storage selection.
+        fullMode = total <= 300_000_000;
+        K = cols > 4_000_000 ? 12 : 48;
+
+        surf = new int[cols];
+        noDump = new bool[cols];
+        plannedDepth = new int[cols];
+        if (fullMode) grid = new byte[total];
+        else
+        {
+            stZ = new ushort[(long)cols * K];
+            stD = new byte[(long)cols * K];
+            stCnt = new byte[cols];
+            stPtr = new byte[cols];
+            stTrunc = new bool[cols];
+        }
+
+        // ---- read voxels (streamed; column data is contiguous) ----
+        var colBuf = new byte[NZ];
+        for (int x = 0; x < NX; x++)
+        {
+            if (sw.ElapsedMilliseconds > ReadDeadlineMs)
+            {
+                // Time-capped read: unread terrain is impassable and untouchable.
+                for (int c = x * NY; c < cols; c++) { surf[c] = 1 << 28; noDump[c] = true; }
+                break;
+            }
+            for (int y = 0; y < NY; y++)
+            {
+                int c = x * NY + y;
+                if (fullMode)
+                {
+                    // grid length <= 300M so int offsets are safe
+                    ReadFully(inp, grid, c * NZ, NZ);
+                    int s = -1;
+                    int b = c * NZ;
+                    for (int z = NZ - 1; z >= 0; z--)
+                        if ((grid[b + z] & 15) != 0) { s = z; break; }
+                    surf[c] = s;
+                }
+                else
+                {
+                    ReadFully(inp, colBuf, 0, NZ);
+                    int cnt = 0, s = -1;
+                    long b = (long)c * K;
+                    for (int z = NZ - 1; z >= 0; z--)
+                    {
+                        byte d = colBuf[z];
+                        if ((d & 15) == 0) continue;
+                        if (s < 0) s = z;
+                        if (cnt < K) { stZ[b + cnt] = (ushort)z; stD[b + cnt] = d; cnt++; }
+                        else { stTrunc[c] = true; break; }
+                    }
+                    surf[c] = s;
+                    stCnt[c] = (byte)cnt;
+                }
+            }
+        }
+
+        seenEp = new int[cols];
+        closedEp = new int[cols];
+        parentC = new int[cols];
+        gC = new int[cols];
+        bfsQueue = new int[Math.Min(cols, 1 << 20)];
+
+        var ops = new MemoryStream();
+        var w = new StreamWriter(ops, Encoding.ASCII, 1 << 20, true);
+        long M = 0;
+        var pathCache = new Dictionary<int, int[]>();
+        long cachedInts = 0;
+        long it = 0, itAtDij = 0, opsAtDij = 0;
+        long dijInterval = Math.Max(512, cols >> 9);
+        var stalledK = new List<long>();
+        var stalledC = new List<int>();
+        int dumpCap = cols > 4_000_000 ? 40_000 : 200_000;
+        // Exact A* fallback is affordable only on small grids; on large ones a
+        // failed search floods the whole reachable region, so rely on periodic
+        // field rebuilds instead.
+        int astarCap = cols <= 65_536 ? cols : 0;
+        int sinceFlush = 0;
+        bool outOfTime = false;
+
+        // Mining proceeds in waves: plan all columns on current terrain,
+        // execute until the plan heap drains, then re-plan. Later waves pick
+        // up ore that earlier digging made reachable or cheaper to haul.
+        for (int wave = 0; wave < 12 && !outOfTime; wave++)
+        {
+            if (sw.ElapsedMilliseconds > PlanDeadlineMs) break;
+            PlantDijkstra();
+            hN = 0;
+            stalledK.Clear(); stalledC.Clear();
+            pathCache.Clear(); cachedInts = 0;
+            Array.Clear(plannedDepth, 0, cols);
+            itAtDij = it; opsAtDij = M;
+            long mWave = M;
+
+        // ---- per-column profit plans ----
+        // Scan each column top-down; ore that likely covers its haul cost adds
+        // revenue, everything else charges a waste-dump cost. The best prefix
+        // depth (if net positive) becomes the column's dig plan.
+        int planCap = fullMode ? 64 : 0; // compact cap applied per column below
+        for (int c = 0; c < cols; c++)
+        {
+            noDump[c] = surf[c] >= (1 << 28);
+            if (surf[c] < 0 || surf[c] >= NZ) continue;
+            // per-ton haul cost from the Dijkstra field; unreachable columns
+            // can never earn ore revenue so they get no plan.
+            long dist = distT[c] >= INF ? (long)1 << 40 : distT[c] + (distT[c] >> 3) + 2;
+            long cum = 0, best = 0;
+            int bestDepth = 0;
+            if (fullMode)
+            {
+                int b = c * NZ, found = 0;
+                for (int z = surf[c]; z >= 0 && found < planCap; z--)
+                {
+                    byte d = grid[b + z];
+                    int mass = d & 15;
+                    if (mass == 0) continue;
+                    found++;
+                    int val = d >> 4;
+                    long rev = 1000L * val * mass;
+                    long haul = dist * mass;
+                    cum += rev > haul ? rev - haul : -(mass * 30L);
+                    if (cum > best) { best = cum; bestDepth = found; }
+                }
+            }
+            else
+            {
+                int maxD = stCnt[c] - (stTrunc[c] ? 1 : 0);
+                long b = (long)c * K;
+                for (int i = stPtr[c]; i < maxD; i++)
+                {
+                    byte d = stD[b + i];
+                    int mass = d & 15, val = d >> 4;
+                    long rev = 1000L * val * mass;
+                    long haul = dist * mass;
+                    cum += rev > haul ? rev - haul : -(mass * 30L);
+                    if (cum > best) { best = cum; bestDepth = i + 1 - stPtr[c]; }
+                }
+            }
+            if (best > 0)
+            {
+                plannedDepth[c] = bestDepth;
+                noDump[c] = true;
+                HeapPush(best, c);
+            }
+        }
+        noDump[0] = true; // never bury the plant
+        if (hN == 0) break; // nothing profitable remains
+
+        // ---- execution ----
+        try
+        {
+            while (true)
+            {
+                it++;
+                if ((it & 63) == 0 && sw.ElapsedMilliseconds > PlanDeadlineMs) { outOfTime = true; break; }
+                if (hN == 0)
+                {
+                    if (stalledC.Count == 0) break;
+                    if (M == opsAtDij) break; // nothing changed since last rebuild; stalled work is dead
+                    PlantDijkstra();
+                    itAtDij = it; opsAtDij = M;
+                    for (int i = 0; i < stalledC.Count; i++) HeapPush(stalledK[i], stalledC[i]);
+                    stalledK.Clear(); stalledC.Clear();
+                    continue;
+                }
+                HeapPop(out long score, out int c);
+                if (plannedDepth[c] <= 0) continue;
+                if (!TryCurrentTop(c, out int digZ, out byte d)) { plannedDepth[c] = 0; continue; }
+                // Only the true surface voxel is diggable; a column buried by
+                // an unrecorded dump pile must be abandoned.
+                if (digZ != surf[c]) { plannedDepth[c] = 0; continue; }
+                int mass = d & 15, val = d >> 4;
+                int oldSurf = surf[c];
+                int newSurf = NextSurfAfterDig(c);
+                surf[c] = newSurf; // tentative, so pathfinding sees the post-dig height
+
+                long rev = 1000L * val * mass;
+                int[] path = null;
+                bool toPlant = false;
+
+                if (rev > 0)
+                {
+                    if (c == 0)
+                    {
+                        // Dig at the plant itself: hop to a neighbour and back.
+                        for (int k = 0; k < 4; k++)
+                        {
+                            int vx = dxs[k], vy = dys[k];
+                            if (vx >= NX || vy >= NY || vx < 0 || vy < 0) continue;
+                            int v = vx * NY + vy;
+                            int dz = surf[v] - surf[0];
+                            if (dz > 1 || dz < -1) continue;
+                            path = new int[] { 0, v, 0 };
+                            break;
+                        }
+                        if (path == null)
+                        {
+                            surf[c] = oldSurf;
+                            plannedDepth[c] = 0;
+                            continue;
+                        }
+                    }
+                    else if (pathCache.TryGetValue(c, out var cp) && ValidPath(cp, c))
+                        path = cp;
+                    else
+                    {
+                        path = TreePath(c);
+                        bool capped = false;
+                        if (path == null)
+                        {
+                            if (astarCap > 0)
+                                path = AStar(c, astarCap, out capped); // exact on current terrain
+                            else
+                                capped = true; // no exact search; treat as inconclusive
+                        }
+                        if (path == null && capped && M != opsAtDij && it - itAtDij >= dijInterval)
+                        {
+                            // Terrain has churned and A* was inconclusive;
+                            // rebuild the plant field (repairs every broken
+                            // tree path at once) and release waiting columns.
+                            PlantDijkstra();
+                            itAtDij = it; opsAtDij = M;
+                            for (int i = 0; i < stalledC.Count; i++) HeapPush(stalledK[i], stalledC[i]);
+                            stalledK.Clear(); stalledC.Clear();
+                            path = TreePath(c);
+                        }
+                        if (path != null)
+                        {
+                            if (cachedInts > 50_000_000) { pathCache.Clear(); cachedInts = 0; }
+                            pathCache[c] = path;
+                            cachedInts += path.Length;
+                        }
+                        else
+                        {
+                            pathCache.Remove(c);
+                            surf[c] = oldSurf; // undo tentative dig
+                            if (!capped || M == opsAtDij)
+                                plannedDepth[c] = 0; // definitively unroutable
+                            else
+                            {
+                                // Inconclusive: park the column until the
+                                // next field rebuild.
+                                stalledK.Add(score); stalledC.Add(c);
+                            }
+                            continue;
+                        }
+                    }
+                    long cost = (long)PathCostPerTon(path) * mass;
+                    if (rev > cost) toPlant = true;
+                }
+                if (!toPlant)
+                {
+                    path = DumpBfs(c, dumpCap);
+                    if (path == null)
+                    {
+                        surf[c] = oldSurf; // undo tentative dig; column is stuck
+                        plannedDepth[c] = 0;
+                        continue;
+                    }
+                }
+
+                CommitDig(c, digZ, newSurf);
+                plannedDepth[c]--;
+                if (!toPlant) RecordDump(path[path.Length - 1], d); // waste raises the ground
+                EmitOp(w, path, digZ);
+                M++;
+
+                if (++sinceFlush >= 256)
+                {
+                    sinceFlush = 0;
+                    w.Flush();
+                    if (ops.Length > MaxOutBytes) { outOfTime = true; break; }
+                }
+                if (plannedDepth[c] > 0) HeapPush(score, c);
+            }
+        }
+        catch
+        {
+            // Keep whatever valid operations were already committed.
+            outOfTime = true;
+        }
+        if (M == mWave) break; // no progress this wave
+        } // wave loop
+
+        w.Flush();
+        var stdout = new BufferedStream(Console.OpenStandardOutput(), 1 << 20);
+        var head = Encoding.ASCII.GetBytes(M.ToString() + "\n");
+        stdout.Write(head, 0, head.Length);
+        ops.Position = 0;
+        ops.CopyTo(stdout);
+        stdout.Flush();
+    }
+}

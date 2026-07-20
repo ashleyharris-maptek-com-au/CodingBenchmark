@@ -1,0 +1,402 @@
+// N-Dimensional Snake solver.
+//
+// The whole game state (bounds, foods, obstacles) is given up front and the
+// world is static apart from the snake itself, so the game can be planned
+// offline: we simulate the snake ourselves and emit the full move list.
+//
+// Strategy:
+//  - Plan food-by-food: pick the nearest remaining food (Manhattan order) and
+//    run a time-aware A* to it.  Body cells are not hard obstacles: a segment
+//    that is k steps from the tail vacates after k+1 moves, so arriving later
+//    than that is allowed.  This lets the snake follow its own tail through
+//    tight spaces.
+//  - On small boards, before committing to a path, simulate it and check that
+//    the tail is still reachable from the new head (classic anti-self-trap
+//    heuristic).  If not, prefer a different food.
+//  - If no food is currently reachable (usually because our own body is in
+//    the way), make a safe "wander" move and re-plan next turn; body motion
+//    frees cells over time.
+//  - Every planned move is re-validated against the actual simulated state
+//    before being emitted; any mismatch triggers a re-plan.
+//
+// Scaling: positions are encoded into a 64-bit mixed-radix key whenever the
+// cell count fits in 64 bits (covers everything up to ~8^20); otherwise a
+// 64-bit hash of the coordinates is used.  A* node expansions are capped so a
+// single plan can never blow the time budget, and coordinates are kept in a
+// flat int16 pool to keep memory compact in 20 dimensions.
+
+#include <cstdio>
+#include <cstdint>
+#include <cstdlib>
+#include <vector>
+#include <deque>
+#include <queue>
+#include <unordered_map>
+#include <unordered_set>
+#include <algorithm>
+#include <chrono>
+
+using namespace std;
+using Coord = int16_t;
+
+static int D = 0;
+static long long maxTurns = 0;
+static vector<int> B;                 // bounds per dimension
+static bool radixOK = true;           // does the whole space fit in a u64 key?
+static vector<uint64_t> radixMul;
+static uint64_t totalCells = 0;       // valid only when radixOK
+
+static inline uint64_t keyOf(const Coord* p) {
+    if (radixOK) {
+        uint64_t k = 0;
+        for (int i = 0; i < D; i++) k += (uint64_t)(uint16_t)p[i] * radixMul[i];
+        return k;
+    }
+    // Fallback for spaces larger than 2^64 cells: strong 64-bit mix.
+    uint64_t h = 0x243F6A8885A308D3ull;
+    for (int i = 0; i < D; i++) {
+        h ^= (uint64_t)(uint16_t)p[i] + 0x9E3779B97F4A7C15ull + (h << 12) + (h >> 4);
+        h *= 0xFF51AFD7ED558CCDull;
+        h ^= h >> 29;
+    }
+    return h;
+}
+
+// ----- world state -----
+static unordered_set<uint64_t> obst;
+static vector<vector<Coord>> foods;
+static unordered_map<uint64_t, int> foodAt;   // key -> index into foods
+static deque<vector<Coord>> body;             // front = head, back = tail
+static unordered_map<uint64_t, int> occ;      // key -> segment count
+
+static chrono::steady_clock::time_point t0;
+static double elapsedSec() {
+    return chrono::duration<double>(chrono::steady_clock::now() - t0).count();
+}
+
+static void removeFood(uint64_t k) {
+    auto it = foodAt.find(k);
+    if (it == foodAt.end()) return;
+    int idx = it->second;
+    foodAt.erase(it);
+    if (idx != (int)foods.size() - 1) {
+        foods[idx] = foods.back();
+        foodAt[keyOf(foods[idx].data())] = idx;
+    }
+    foods.pop_back();
+}
+
+// vacate map: cell key -> number of moves after which the cell is free
+static void buildVac(const deque<vector<Coord>>& b, unordered_map<uint64_t, int>& vac) {
+    vac.clear();
+    vac.reserve(b.size() * 2);
+    int len = (int)b.size();
+    for (int j = 0; j < len; j++) {          // j = 0 is head
+        int fromTail = len - 1 - j;
+        uint64_t k = keyOf(b[j].data());
+        int v = fromTail + 1;
+        auto it = vac.find(k);
+        if (it == vac.end() || it->second < v) vac[k] = v;
+    }
+}
+
+// ----- time-aware A* -----
+struct PQE { int f; int g; int idx; };
+struct PQCmp {
+    bool operator()(const PQE& a, const PQE& b) const {
+        if (a.f != b.f) return a.f > b.f;
+        return a.g < b.g;                    // prefer deeper nodes on ties
+    }
+};
+
+static vector<Coord> nodePool;   // D coords per node
+static vector<int>   nodeParent;
+static vector<int8_t> nodeMoveAxis;
+static vector<int8_t> nodeMoveDir;
+static vector<int>   nodeG;
+
+// Returns list of (axis, dir) moves from start to goal, empty on failure.
+static vector<pair<int, int>> astar(const Coord* start, const Coord* goal,
+                                    const unordered_map<uint64_t, int>& vac,
+                                    size_t capNodes)
+{
+    nodePool.clear(); nodeParent.clear(); nodeMoveAxis.clear();
+    nodeMoveDir.clear(); nodeG.clear();
+
+    unordered_map<uint64_t, int> bestG;
+    bestG.reserve(4096);
+    priority_queue<PQE, vector<PQE>, PQCmp> pq;
+
+    auto addNode = [&](const Coord* p, int g, int par, int axis, int dir) -> int {
+        int idx = (int)(nodePool.size() / D);
+        nodePool.insert(nodePool.end(), p, p + D);
+        nodeParent.push_back(par);
+        nodeMoveAxis.push_back((int8_t)axis);
+        nodeMoveDir.push_back((int8_t)dir);
+        nodeG.push_back(g);
+        return idx;
+    };
+    auto hOf = [&](const Coord* p) {
+        int h = 0;
+        for (int i = 0; i < D; i++) h += abs((int)p[i] - (int)goal[i]);
+        return h;
+    };
+
+    uint64_t goalKey = keyOf(goal);
+    uint64_t startKey = keyOf(start);
+    if (startKey == goalKey) return {};      // already there (shouldn't happen)
+
+    int s = addNode(start, 0, -1, -1, 0);
+    bestG[startKey] = 0;
+    pq.push({ hOf(start), 0, s });
+
+    vector<Coord> nc((size_t)D);
+    while (!pq.empty()) {
+        PQE e = pq.top(); pq.pop();
+        const Coord* p = &nodePool[(size_t)e.idx * D];
+        uint64_t pk = keyOf(p);
+        auto bit = bestG.find(pk);
+        if (bit == bestG.end() || bit->second != e.g) continue;   // stale entry
+
+        if (pk == goalKey) {
+            vector<pair<int, int>> moves;
+            int cur = e.idx;
+            while (nodeParent[cur] != -1) {
+                moves.push_back({ (int)nodeMoveAxis[cur], (int)nodeMoveDir[cur] });
+                cur = nodeParent[cur];
+            }
+            reverse(moves.begin(), moves.end());
+            return moves;
+        }
+
+        int ng = e.g + 1;
+        for (int axis = 0; axis < D; axis++) {
+            if (B[axis] <= 1) continue;
+            for (int dir = -1; dir <= 1; dir += 2) {
+                int v = (int)p[axis] + dir;
+                if (v < 0 || v >= B[axis]) continue;
+                for (int i = 0; i < D; i++) nc[i] = p[i];
+                nc[axis] = (Coord)v;
+                uint64_t k = keyOf(nc.data());
+                if (obst.count(k)) continue;
+                auto vit = vac.find(k);
+                if (vit != vac.end() && ng < vit->second) continue;  // body still there
+                auto git = bestG.find(k);
+                if (git != bestG.end() && git->second <= ng) continue;
+                if (nodeG.size() >= capNodes) return {};             // budget blown
+                int ni = addNode(nc.data(), ng, e.idx, axis, dir);
+                bestG[k] = ng;
+                pq.push({ ng + hOf(nc.data()), ng, ni });
+            }
+        }
+    }
+    return {};
+}
+
+// ----- move legality against the real simulated state -----
+static bool legalMove(int axis, int dir, bool& eats) {
+    const vector<Coord>& head = body.front();
+    int v = (int)head[axis] + dir;
+    if (v < 0 || v >= B[axis]) return false;
+    vector<Coord> nh = head;
+    nh[axis] = (Coord)v;
+    uint64_t k = keyOf(nh.data());
+    if (obst.count(k)) return false;
+    eats = foodAt.count(k) != 0;
+    auto it = occ.find(k);
+    if (it != occ.end()) {
+        if (eats) return false;                          // tail won't move when growing
+        if (it->second == 1 && body.size() >= 2 && k == keyOf(body.back().data()))
+            return true;                                 // stepping into vacating tail cell
+        return false;
+    }
+    return true;
+}
+
+static void applyMove(int axis, int dir, bool eats) {
+    vector<Coord> nh = body.front();
+    nh[axis] = (Coord)(nh[axis] + dir);
+    uint64_t hk = keyOf(nh.data());
+    body.push_front(nh);
+    occ[hk]++;
+    if (eats) {
+        removeFood(hk);
+    } else {
+        uint64_t tk = keyOf(body.back().data());
+        auto it = occ.find(tk);
+        if (it != occ.end() && --(it->second) == 0) occ.erase(it);
+        body.pop_back();
+    }
+}
+
+// Simulate a path on copies and check the tail is still reachable from the
+// new head (time-aware).  Cheap anti-self-trap filter for small boards.
+static bool survivable(const vector<pair<int, int>>& path) {
+    deque<vector<Coord>> b = body;
+    unordered_map<uint64_t, int> fAt = foodAt;
+    for (auto& mv : path) {
+        vector<Coord> nh = b.front();
+        nh[mv.first] = (Coord)(nh[mv.first] + mv.second);
+        uint64_t k = keyOf(nh.data());
+        bool eats = fAt.count(k) != 0;
+        b.push_front(nh);
+        if (eats) fAt.erase(k); else b.pop_back();
+    }
+    if (b.size() < 4) return true;
+    unordered_map<uint64_t, int> vac;
+    buildVac(b, vac);
+    // Head cell itself must not count as blocked start; astar handles that.
+    auto p = astar(b.front().data(), b.back().data(), vac, 60000);
+    return !p.empty();
+}
+
+int main() {
+    t0 = chrono::steady_clock::now();
+
+    if (scanf("%d %lld", &D, &maxTurns) != 2) return 0;
+    B.resize(D);
+    for (int i = 0; i < D; i++) scanf("%d", &B[i]);
+
+    radixMul.resize(D);
+    {
+        uint64_t m = 1;
+        radixOK = true;
+        for (int i = 0; i < D; i++) {
+            radixMul[i] = m;
+            if (B[i] > 0 && m > (uint64_t)0x3FFFFFFFFFFFFFFFull / (uint64_t)B[i]) {
+                radixOK = false;
+            }
+            if (radixOK) m *= (uint64_t)B[i];
+        }
+        totalCells = radixOK ? m : 0;
+    }
+
+    long long snakeLen;
+    scanf("%lld", &snakeLen);
+    vector<Coord> start((size_t)D);
+    for (int i = 0; i < D; i++) { int x; scanf("%d", &x); start[i] = (Coord)x; }
+
+    // Only the head position is given: model the initial snake as coiled at
+    // the start cell; segments emerge as it moves.
+    if (snakeLen < 1) snakeLen = 1;
+    for (long long i = 0; i < snakeLen; i++) body.push_back(start);
+    occ[keyOf(start.data())] = (int)snakeLen;
+
+    int F = 0;
+    scanf("%d", &F);
+    foods.reserve(F);
+    for (int f = 0; f < F; f++) {
+        vector<Coord> p((size_t)D);
+        for (int i = 0; i < D; i++) { int x; scanf("%d", &x); p[i] = (Coord)x; }
+        uint64_t k = keyOf(p.data());
+        if (!foodAt.count(k)) {
+            foodAt[k] = (int)foods.size();
+            foods.push_back(p);
+        }
+    }
+    int O = 0;
+    scanf("%d", &O);
+    for (int o = 0; o < O; o++) {
+        vector<Coord> p((size_t)D);
+        for (int i = 0; i < D; i++) { int x; scanf("%d", &x); p[i] = (Coord)x; }
+        obst.insert(keyOf(p.data()));
+    }
+
+    const bool smallBoard = radixOK && totalCells <= 100000;
+    const double SOFT_LIMIT = 15.0, HARD_LIMIT = 55.0;
+
+    string out;
+    out.reserve(1 << 20);
+    char buf[32];
+
+    long long turn = 0;
+    long long failStreak = 0;
+
+    while (turn < maxTurns && !foods.empty()) {
+        if (elapsedSec() > HARD_LIMIT) break;
+        size_t cap = elapsedSec() > SOFT_LIMIT ? 80000 : 2000000;
+
+        // Order remaining foods by Manhattan distance from the head.
+        const vector<Coord>& head = body.front();
+        vector<pair<int, int>> order;   // (dist, food idx)
+        order.reserve(foods.size());
+        for (int i = 0; i < (int)foods.size(); i++) {
+            int d = 0;
+            for (int j = 0; j < D; j++) d += abs((int)foods[i][j] - (int)head[j]);
+            order.push_back({ d, i });
+        }
+        sort(order.begin(), order.end());
+
+        unordered_map<uint64_t, int> vac;
+        buildVac(body, vac);
+
+        vector<pair<int, int>> plan, firstFound;
+        for (auto& od : order) {
+            auto path = astar(head.data(), foods[od.second].data(), vac, cap);
+            if (path.empty()) continue;
+            bool lastFood = foods.size() == 1;
+            if (!lastFood && smallBoard && body.size() >= 4) {
+                if (firstFound.empty()) firstFound = path;
+                if (!survivable(path)) continue;   // would trap us: try another food
+            }
+            plan = path;
+            break;
+        }
+        if (plan.empty()) plan = firstFound;       // risky beats stalled
+
+        if (plan.empty()) {
+            // No food reachable right now; wander safely so the body frees cells.
+            failStreak++;
+            if (failStreak > (long long)body.size() + 32) break;
+            int bestAxis = -1, bestDir = 0, bestScore = -1;
+            bool bestEats = false;
+            vector<Coord> nb((size_t)D);
+            for (int axis = 0; axis < D; axis++) {
+                for (int dir = -1; dir <= 1; dir += 2) {
+                    bool eats = false;
+                    if (!legalMove(axis, dir, eats)) continue;
+                    // score = free neighbours of the resulting head cell
+                    for (int i = 0; i < D; i++) nb[i] = body.front()[i];
+                    nb[axis] = (Coord)(nb[axis] + dir);
+                    int score = eats ? 1000 : 0;
+                    for (int a2 = 0; a2 < D; a2++) {
+                        for (int d2 = -1; d2 <= 1; d2 += 2) {
+                            int v = (int)nb[a2] + d2;
+                            if (v < 0 || v >= B[a2]) continue;
+                            Coord sv = nb[a2];
+                            nb[a2] = (Coord)v;
+                            uint64_t k = keyOf(nb.data());
+                            nb[a2] = sv;
+                            if (!obst.count(k) && !occ.count(k)) score++;
+                        }
+                    }
+                    if (score > bestScore) {
+                        bestScore = score; bestAxis = axis; bestDir = dir; bestEats = eats;
+                    }
+                }
+            }
+            if (bestAxis < 0) break;               // completely stuck
+            applyMove(bestAxis, bestDir, bestEats);
+            int n = snprintf(buf, sizeof(buf), "%d %d\n", bestAxis, bestDir);
+            out.append(buf, n);
+            turn++;
+            continue;
+        }
+
+        failStreak = 0;
+        for (auto& mv : plan) {
+            if (turn >= maxTurns) break;
+            bool eats = false;
+            if (!legalMove(mv.first, mv.second, eats)) break;   // world drifted: re-plan
+            applyMove(mv.first, mv.second, eats);
+            int n = snprintf(buf, sizeof(buf), "%d %d\n", mv.first, mv.second);
+            out.append(buf, n);
+            turn++;
+            if (eats) break;                                    // re-plan after growth
+        }
+    }
+
+    fwrite(out.data(), 1, out.size(), stdout);
+    fflush(stdout);
+    return 0;
+}

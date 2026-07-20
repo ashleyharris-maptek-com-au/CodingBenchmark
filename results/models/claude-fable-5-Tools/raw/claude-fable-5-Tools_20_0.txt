@@ -1,0 +1,511 @@
+// Drillhole assay outlier detector.
+//
+// Strategy:
+//   * Parse everything up front (tokens -> flat f32 arrays, sample-major).
+//   * Per property: robust global stats (median / MAD) on a stride-sampled
+//     subset; auto log-transform heavily right-skewed positive data so a
+//     "decimal point typo" becomes an additive offset.
+//   * Per sample: compare against local neighbours - a window of samples
+//     along the same hole, plus (for short holes) k-nearest samples from
+//     other holes found via a packed sorted spatial grid.
+//   * Score = robust z (|v - median(neighbours)| / max(MAD-sigma, floor)).
+//   * Adaptive by scale: window size, spatial-search eligibility, stats
+//     sampling stride and thread batching all adjust to dataset size.
+//   * Parallel scoring over holes with std::thread::scope + atomic work
+//     stealing (std-only, no external crates).
+
+use std::io::{self, Read, Write};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::thread;
+
+struct Hole {
+    id: String,
+    s0: usize, // first sample index in the flat arrays
+    n: usize,  // number of samples
+}
+
+#[derive(Clone, Copy)]
+struct PropStat {
+    active: bool,
+    uselog: bool,
+    eps: f32,   // shift used inside ln()
+    med: f32,   // global median (transformed space)
+    sigma: f32, // global robust sigma (transformed space)
+}
+
+fn median_sorted(buf: &mut [f32]) -> f32 {
+    buf.sort_unstable_by(|a, b| a.total_cmp(b));
+    let m = buf.len();
+    if m == 0 {
+        return f32::NAN;
+    }
+    if m % 2 == 1 {
+        buf[m / 2]
+    } else {
+        0.5 * (buf[m / 2 - 1] + buf[m / 2])
+    }
+}
+
+fn percentile(sorted: &[f32], q: f64) -> f32 {
+    if sorted.is_empty() {
+        return f32::NAN;
+    }
+    let idx = (q * (sorted.len() - 1) as f64).round() as usize;
+    sorted[idx.min(sorted.len() - 1)]
+}
+
+const COORD_BITS: u32 = 21;
+const COORD_MAX: i64 = (1i64 << COORD_BITS) - 1;
+
+#[inline]
+fn pack_key(cx: i64, cy: i64, cz: i64) -> u64 {
+    let cx = cx.clamp(0, COORD_MAX) as u64;
+    let cy = cy.clamp(0, COORD_MAX) as u64;
+    let cz = cz.clamp(0, COORD_MAX) as u64;
+    (cx << (2 * COORD_BITS)) | (cy << COORD_BITS) | cz
+}
+
+fn main() {
+    // ---------- read & tokenize ----------
+    let mut raw = Vec::new();
+    if io::stdin().read_to_end(&mut raw).is_err() {
+        println!("0");
+        return;
+    }
+    let input: String = match String::from_utf8(raw) {
+        Ok(s) => s,
+        Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+    };
+    let mut it = input.split_ascii_whitespace().peekable();
+
+    macro_rules! next_f {
+        () => {
+            it.next().and_then(|s| s.parse::<f64>().ok()).unwrap_or(f64::NAN)
+        };
+    }
+
+    let nh: usize = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let np: usize = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    if nh == 0 || np == 0 {
+        println!("0");
+        return;
+    }
+    let mut pnames: Vec<String> = Vec::with_capacity(np);
+    for i in 0..np {
+        pnames.push(it.next().map(|s| s.to_string()).unwrap_or_else(|| format!("prop{}", i)));
+    }
+
+    // ---------- parse holes ----------
+    let mut holes: Vec<Hole> = Vec::with_capacity(nh.min(1 << 22));
+    let mut depths: Vec<f32> = Vec::new();
+    let mut pos: Vec<[f32; 3]> = Vec::new();
+    let mut hole_of: Vec<u32> = Vec::new();
+    let mut vals: Vec<f32> = Vec::new(); // sample-major: vals[s*np + p]
+
+    const MAX_TOTAL_SAMPLES: usize = 400_000_000;
+    for _ in 0..nh {
+        if it.peek().is_none() {
+            break;
+        }
+        let id = match it.next() {
+            Some(t) => t.to_string(),
+            None => break,
+        };
+        let sx = next_f!();
+        let sy = next_f!();
+        let sz = next_f!();
+        let dx = next_f!();
+        let dy = next_f!();
+        let dz = next_f!();
+        let _len = next_f!();
+        let ns: usize = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let ns = ns.min(MAX_TOTAL_SAMPLES.saturating_sub(depths.len()));
+
+        let norm = (dx * dx + dy * dy + dz * dz).sqrt();
+        let (ux, uy, uz) = if norm.is_finite() && norm > 1e-12 {
+            (dx / norm, dy / norm, dz / norm)
+        } else {
+            (0.0, 0.0, -1.0)
+        };
+
+        let s0 = depths.len();
+        let hidx = holes.len() as u32;
+        for _ in 0..ns {
+            if it.peek().is_none() {
+                break;
+            }
+            let d = next_f!();
+            depths.push(d as f32);
+            let dd = if d.is_finite() { d } else { 0.0 };
+            pos.push([
+                (sx + ux * dd) as f32,
+                (sy + uy * dd) as f32,
+                (sz + uz * dd) as f32,
+            ]);
+            hole_of.push(hidx);
+            for _ in 0..np {
+                vals.push(next_f!() as f32);
+            }
+        }
+        let n = depths.len() - s0;
+        holes.push(Hole { id, s0, n });
+    }
+    let ntot = depths.len();
+    if ntot == 0 {
+        println!("0");
+        return;
+    }
+
+    // ---------- adaptive knobs ----------
+    let window: usize = if ntot < 200_000 { 6 } else { 4 };
+    let short_hole_limit: usize = if ntot < 500_000 { 32 } else { 16 };
+    let kn: usize = 16; // spatial neighbours kept
+    let stats_stride = (ntot / 1_000_000).max(1);
+
+    // ---------- per-property stats + transformed values ----------
+    let mut pstats: Vec<PropStat> = Vec::with_capacity(np);
+    let mut tv: Vec<Vec<f32>> = Vec::with_capacity(np); // transformed values per property
+    for p in 0..np {
+        let mut sampled: Vec<f32> = Vec::with_capacity(ntot / stats_stride + 1);
+        let mut i = 0;
+        while i < ntot {
+            let v = vals[i * np + p];
+            if v.is_finite() {
+                sampled.push(v);
+            }
+            i += stats_stride;
+        }
+        if sampled.len() < 4 {
+            pstats.push(PropStat { active: false, uselog: false, eps: 0.0, med: 0.0, sigma: 1.0 });
+            tv.push(Vec::new());
+            continue;
+        }
+        sampled.sort_unstable_by(|a, b| a.total_cmp(b));
+        let minv = sampled[0];
+        let p50 = percentile(&sampled, 0.50);
+        let p95 = percentile(&sampled, 0.95);
+        let p99 = percentile(&sampled, 0.99);
+        let uselog = minv >= 0.0 && p99 > 8.0 * p50.max(1e-9) && p99.is_finite();
+        let eps = if uselog { (0.01 * p95.max(1e-6)).max(1e-9) } else { 0.0 };
+
+        let tf = |v: f32| -> f32 {
+            if !v.is_finite() {
+                f32::NAN
+            } else if uselog {
+                if v >= 0.0 { (v + eps).ln() } else { f32::NAN }
+            } else {
+                v
+            }
+        };
+
+        let mut col: Vec<f32> = Vec::with_capacity(ntot);
+        for s in 0..ntot {
+            col.push(tf(vals[s * np + p]));
+        }
+
+        // global robust stats in transformed space
+        let mut ts: Vec<f32> = sampled.iter().map(|&v| tf(v)).filter(|v| v.is_finite()).collect();
+        let med = median_sorted(&mut ts);
+        for v in ts.iter_mut() {
+            *v = (*v - med).abs();
+        }
+        let mad = median_sorted(&mut ts);
+        let mut sigma = mad * 1.4826;
+        if !sigma.is_finite() || sigma <= 0.0 {
+            sigma = (med.abs() * 1e-4).max(1e-6);
+        }
+        pstats.push(PropStat { active: true, uselog, eps, med, sigma });
+        tv.push(col);
+    }
+
+    // ---------- spatial grid (only where needed) ----------
+    let spatial_hole: Vec<bool> = holes
+        .iter()
+        .map(|h| h.n < short_hole_limit && h.n < ntot && holes.len() > 1)
+        .collect();
+    let any_spatial = spatial_hole.iter().any(|&b| b);
+
+    // bounding box
+    let mut minb = [f32::INFINITY; 3];
+    let mut maxb = [f32::NEG_INFINITY; 3];
+    for q in pos.iter() {
+        for a in 0..3 {
+            if q[a].is_finite() {
+                if q[a] < minb[a] {
+                    minb[a] = q[a];
+                }
+                if q[a] > maxb[a] {
+                    maxb[a] = q[a];
+                }
+            }
+        }
+    }
+    let bbox_ok = minb.iter().all(|v| v.is_finite()) && maxb.iter().all(|v| v.is_finite());
+
+    // cell size: from typical nearest-hole spacing and along-hole sample spacing
+    let mut h_cell: f32 = 1.0;
+    if any_spatial && bbox_ok {
+        // hole start positions
+        let starts: Vec<[f32; 3]> = holes
+            .iter()
+            .filter(|h| h.n > 0)
+            .map(|h| pos[h.s0])
+            .filter(|q| q.iter().all(|v| v.is_finite()))
+            .collect();
+        let mut dists: Vec<f32> = Vec::new();
+        if starts.len() >= 2 {
+            let step_a = (starts.len() / 256).max(1);
+            let step_b = (starts.len() / 8192).max(1);
+            let mut a = 0;
+            while a < starts.len() {
+                let pa = starts[a];
+                let mut best = f32::INFINITY;
+                let mut b = 0;
+                while b < starts.len() {
+                    if b != a {
+                        let pb = starts[b];
+                        let d2 = (pa[0] - pb[0]).powi(2)
+                            + (pa[1] - pb[1]).powi(2)
+                            + (pa[2] - pb[2]).powi(2);
+                        if d2 < best {
+                            best = d2;
+                        }
+                    }
+                    b += step_b;
+                }
+                if best.is_finite() {
+                    dists.push(best.sqrt());
+                }
+                a += step_a;
+            }
+        }
+        let hole_gap = if dists.is_empty() { 1.0 } else { median_sorted(&mut dists) };
+        // along-hole spacing
+        let mut sps: Vec<f32> = Vec::new();
+        let hstep = (holes.len() / 4096).max(1);
+        let mut hi = 0;
+        while hi < holes.len() {
+            let hh = &holes[hi];
+            if hh.n >= 2 {
+                let d = (depths[hh.s0 + 1] - depths[hh.s0]).abs();
+                if d.is_finite() && d > 0.0 {
+                    sps.push(d);
+                }
+            }
+            hi += hstep;
+        }
+        let spacing = if sps.is_empty() { 1.0 } else { median_sorted(&mut sps) };
+        h_cell = (hole_gap * 1.2).max(spacing * 1.5).max(1e-6);
+        // keep cell coordinates inside 21 bits
+        let ext = (maxb[0] - minb[0]).max(maxb[1] - minb[1]).max(maxb[2] - minb[2]);
+        if ext.is_finite() && ext > 0.0 {
+            h_cell = h_cell.max(ext / (COORD_MAX as f32 - 2.0));
+        }
+    }
+
+    let cell_of = |q: [f32; 3]| -> Option<[i64; 3]> {
+        if !(q[0].is_finite() && q[1].is_finite() && q[2].is_finite()) {
+            return None;
+        }
+        Some([
+            (((q[0] - minb[0]) / h_cell) as i64).clamp(0, COORD_MAX),
+            (((q[1] - minb[1]) / h_cell) as i64).clamp(0, COORD_MAX),
+            (((q[2] - minb[2]) / h_cell) as i64).clamp(0, COORD_MAX),
+        ])
+    };
+
+    // packed sorted grid: (cell_key, sample_index)
+    let mut cells: Vec<(u64, u32)> = Vec::new();
+    if any_spatial && bbox_ok {
+        cells.reserve(ntot);
+        for (i, q) in pos.iter().enumerate() {
+            if let Some(c) = cell_of(*q) {
+                cells.push((pack_key(c[0], c[1], c[2]), i as u32));
+            }
+        }
+        cells.sort_unstable_by_key(|e| e.0);
+    }
+    let use_spatial = any_spatial && bbox_ok && !cells.is_empty();
+
+    // k-nearest query among other holes, searching the 3x3x3 cell block
+    let query = |gi: usize, nb: &mut Vec<(f32, u32)>| {
+        nb.clear();
+        let q = pos[gi];
+        let c = match cell_of(q) {
+            Some(c) => c,
+            None => return,
+        };
+        let my_hole = hole_of[gi];
+        let mut scanned = 0usize;
+        for ddz in -1i64..=1 {
+            for ddy in -1i64..=1 {
+                for ddx in -1i64..=1 {
+                    let key = pack_key(c[0] + ddx, c[1] + ddy, c[2] + ddz);
+                    let s = cells.partition_point(|e| e.0 < key);
+                    let e = s + cells[s..].partition_point(|e| e.0 <= key);
+                    for &(_, idx) in &cells[s..e] {
+                        let j = idx as usize;
+                        if hole_of[j] == my_hole {
+                            continue;
+                        }
+                        let r = pos[j];
+                        let d2 = (q[0] - r[0]).powi(2)
+                            + (q[1] - r[1]).powi(2)
+                            + (q[2] - r[2]).powi(2);
+                        if !d2.is_finite() {
+                            continue;
+                        }
+                        if nb.len() < kn {
+                            nb.push((d2, idx));
+                            if nb.len() == kn {
+                                nb.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+                            }
+                        } else if d2 < nb[kn - 1].0 {
+                            nb[kn - 1] = (d2, idx);
+                            let mut k = kn - 1;
+                            while k > 0 && nb[k].0 < nb[k - 1].0 {
+                                nb.swap(k, k - 1);
+                                k -= 1;
+                            }
+                        }
+                        scanned += 1;
+                        if scanned > 4096 {
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    // ---------- parallel scoring ----------
+    let nthreads = thread::available_parallelism().map(|n| n.get()).unwrap_or(8).min(64);
+    let batch = (holes.len() / (nthreads * 16)).max(1);
+    let counter = AtomicUsize::new(0);
+    const THRESH: f32 = 5.0;
+
+    let holes_ref = &holes;
+    let tv_ref = &tv;
+    let pstats_ref = &pstats;
+    let spatial_hole_ref = &spatial_hole;
+    let query_ref = &query;
+    let counter_ref = &counter;
+
+    let mut findings: Vec<(f32, u32, u32, u16)> = thread::scope(|s| {
+        let mut handles = Vec::with_capacity(nthreads);
+        for _ in 0..nthreads {
+            handles.push(s.spawn(move || {
+                let mut out: Vec<(f32, u32, u32, u16)> = Vec::new();
+                let mut buf: Vec<f32> = Vec::with_capacity(2 * window + kn + 4);
+                let mut nb: Vec<(f32, u32)> = Vec::with_capacity(kn + 1);
+                loop {
+                    let h0 = counter_ref.fetch_add(batch, Ordering::Relaxed);
+                    if h0 >= holes_ref.len() {
+                        break;
+                    }
+                    let h1 = (h0 + batch).min(holes_ref.len());
+                    for hidx in h0..h1 {
+                        let hole = &holes_ref[hidx];
+                        let want_spatial = use_spatial && spatial_hole_ref[hidx];
+                        for si in 0..hole.n {
+                            let gi = hole.s0 + si;
+                            if want_spatial {
+                                query_ref(gi, &mut nb);
+                            } else {
+                                nb.clear();
+                            }
+                            for p in 0..np {
+                                let st = &pstats_ref[p];
+                                if !st.active {
+                                    continue;
+                                }
+                                let col = &tv_ref[p];
+                                let t = col[gi];
+                                if !t.is_finite() {
+                                    continue;
+                                }
+                                buf.clear();
+                                let lo = si.saturating_sub(window);
+                                let hiw = (si + window).min(hole.n - 1);
+                                for j in lo..=hiw {
+                                    if j != si {
+                                        let v = col[hole.s0 + j];
+                                        if v.is_finite() {
+                                            buf.push(v);
+                                        }
+                                    }
+                                }
+                                for &(_, ni) in nb.iter() {
+                                    let v = col[ni as usize];
+                                    if v.is_finite() {
+                                        buf.push(v);
+                                    }
+                                }
+                                let z = if buf.len() >= 4 {
+                                    let med = median_sorted(&mut buf);
+                                    for v in buf.iter_mut() {
+                                        *v = (*v - med).abs();
+                                    }
+                                    let mad = median_sorted(&mut buf);
+                                    let sigma = (mad * 1.4826)
+                                        .max(0.08 * st.sigma)
+                                        .max(1e-9);
+                                    (t - med).abs() / sigma
+                                } else {
+                                    // too few neighbours: fall back to global stats,
+                                    // discounted (less local evidence)
+                                    0.7 * (t - st.med).abs() / st.sigma.max(1e-9)
+                                };
+                                if z.is_finite() && z >= THRESH {
+                                    out.push((z, hidx as u32, si as u32, p as u16));
+                                }
+                            }
+                        }
+                    }
+                }
+                out
+            }));
+        }
+        let mut all = Vec::new();
+        for h in handles {
+            if let Ok(mut v) = h.join() {
+                all.append(&mut v);
+            }
+        }
+        all
+    });
+
+    // ---------- rank & emit ----------
+    findings.sort_unstable_by(|a, b| {
+        b.0.total_cmp(&a.0)
+            .then_with(|| a.1.cmp(&b.1))
+            .then_with(|| a.2.cmp(&b.2))
+    });
+    let cap = ((ntot.saturating_mul(np)) / 50).max(1000);
+    if findings.len() > cap {
+        findings.truncate(cap);
+    }
+
+    let stdout = io::stdout();
+    let mut out = io::BufWriter::new(stdout.lock());
+    let mut buf = String::with_capacity(findings.len() * 40 + 16);
+    buf.push_str(&findings.len().to_string());
+    buf.push('\n');
+    for &(z, hidx, si, p) in &findings {
+        let conf = z / (z + 10.0); // monotone map of robust-z into (0,1)
+        buf.push_str(&holes[hidx as usize].id);
+        buf.push(' ');
+        buf.push_str(&si.to_string());
+        buf.push(' ');
+        buf.push_str(&pnames[p as usize]);
+        buf.push(' ');
+        buf.push_str(&format!("{:.4}", conf));
+        buf.push('\n');
+        if buf.len() > 1 << 20 {
+            let _ = out.write_all(buf.as_bytes());
+            buf.clear();
+        }
+    }
+    let _ = out.write_all(buf.as_bytes());
+    let _ = out.flush();
+}

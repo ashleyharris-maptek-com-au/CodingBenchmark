@@ -1,0 +1,463 @@
+// Tetris player - adaptive heuristic AI
+// Reads: width height num_pieces, then piece letters; outputs "rotation column" per piece.
+// Strategy:
+//   * Dellacherie-style evaluation (landing height, eroded cells, transitions, holes, wells)
+//     with extra safety terms, weights adapted to danger level (stack height).
+//   * Adaptive search depth: expectimax over all 7 possible next pieces (depth 2) when the
+//     move budget allows; falls back to greedy (depth 1) on very large boards / slow moves.
+//   * Parallel evaluation of first-level placements on multi-core machines.
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Text;
+using System.Threading.Tasks;
+
+static class TetrisPlayer
+{
+    // ---------- Piece definitions ----------
+    // Spawn shapes, row 0 = top row of the shape grid.
+    static readonly string[][] SpawnShapes = new string[][]
+    {
+        new[] { "XXXX" },           // I
+        new[] { "XX", "XX" },       // O
+        new[] { "XXX", ".X." },     // T
+        new[] { ".XX", "XX." },     // S
+        new[] { "XX.", ".XX" },     // Z
+        new[] { "X..", "XXX" },     // J
+        new[] { "..X", "XXX" },     // L
+    };
+
+    sealed class Orient
+    {
+        public int Rot;          // rotation index (0-3, clockwise) that produces this shape
+        public int W, H;         // bounding box
+        public int[] MinFromBot; // per shape-column: lowest cell's distance from shape bottom
+        public int[] CellRow;    // cells: row from bottom (0 = shape bottom row)
+        public int[] CellCol;
+    }
+
+    static Orient[][] Orients = new Orient[7][]; // per piece type: distinct orientations
+
+    static void BuildOrients()
+    {
+        for (int p = 0; p < 7; p++)
+        {
+            var list = new List<Orient>();
+            var seen = new HashSet<string>();
+            bool[,] g = ToGrid(SpawnShapes[p]);
+            for (int rot = 0; rot < 4; rot++)
+            {
+                string key = GridKey(g);
+                if (seen.Add(key)) list.Add(MakeOrient(g, rot));
+                g = RotateCW(g);
+            }
+            Orients[p] = list.ToArray();
+        }
+    }
+
+    static bool[,] ToGrid(string[] rows)
+    {
+        int h = rows.Length, w = rows[0].Length;
+        var g = new bool[h, w];
+        for (int r = 0; r < h; r++)
+            for (int c = 0; c < w; c++)
+                g[r, c] = rows[r][c] == 'X';
+        return g;
+    }
+
+    static bool[,] RotateCW(bool[,] g)
+    {
+        int h = g.GetLength(0), w = g.GetLength(1);
+        var n = new bool[w, h];
+        for (int r = 0; r < h; r++)
+            for (int c = 0; c < w; c++)
+                n[c, h - 1 - r] = g[r, c];
+        return n;
+    }
+
+    static string GridKey(bool[,] g)
+    {
+        int h = g.GetLength(0), w = g.GetLength(1);
+        var sb = new StringBuilder();
+        sb.Append(h).Append('x').Append(w).Append(':');
+        for (int r = 0; r < h; r++)
+            for (int c = 0; c < w; c++)
+                sb.Append(g[r, c] ? '1' : '0');
+        return sb.ToString();
+    }
+
+    static Orient MakeOrient(bool[,] g, int rot)
+    {
+        int h = g.GetLength(0), w = g.GetLength(1);
+        var o = new Orient { Rot = rot, W = w, H = h };
+        o.MinFromBot = new int[w];
+        var rows = new List<int>();
+        var cols = new List<int>();
+        for (int c = 0; c < w; c++) o.MinFromBot[c] = int.MaxValue;
+        for (int r = 0; r < h; r++)
+        {
+            for (int c = 0; c < w; c++)
+            {
+                if (!g[r, c]) continue;
+                int fromBot = h - 1 - r;
+                rows.Add(fromBot);
+                cols.Add(c);
+                if (fromBot < o.MinFromBot[c]) o.MinFromBot[c] = fromBot;
+            }
+        }
+        o.CellRow = rows.ToArray();
+        o.CellCol = cols.ToArray();
+        return o;
+    }
+
+    static int PieceIndex(string t)
+    {
+        switch (char.ToUpperInvariant(t[0]))
+        {
+            case 'I': return 0;
+            case 'O': return 1;
+            case 'T': return 2;
+            case 'S': return 3;
+            case 'Z': return 4;
+            case 'J': return 5;
+            case 'L': return 6;
+            default: return -1;
+        }
+    }
+
+    // ---------- Board ----------
+    static int W, H;
+    static ulong FullRow;
+
+    // rows[0] = bottom row; bit c = column c occupied.
+    static int Heights(ulong[] rows, int[] heights)
+    {
+        int max = 0;
+        for (int c = 0; c < W; c++)
+        {
+            ulong bit = 1UL << c;
+            int h = 0;
+            for (int r = H - 1; r >= 0; r--)
+            {
+                if ((rows[r] & bit) != 0) { h = r + 1; break; }
+            }
+            heights[c] = h;
+            if (h > max) max = h;
+        }
+        return max;
+    }
+
+    // Drop piece orientation o with leftmost column col onto rows (already-known col heights).
+    // Returns base row (board row of shape bottom) or -1 if it doesn't fit (overflows top).
+    static int DropRow(int[] heights, Orient o, int col)
+    {
+        int baseRow = 0;
+        for (int c = 0; c < o.W; c++)
+        {
+            int b = heights[col + c] - o.MinFromBot[c];
+            if (b > baseRow) baseRow = b;
+        }
+        if (baseRow + o.H > H) return -1;
+        return baseRow;
+    }
+
+    // Place, clear lines. Returns lines cleared; erodedCells = piece cells in cleared rows.
+    static int Place(ulong[] rows, Orient o, int col, int baseRow, out int erodedCells)
+    {
+        for (int i = 0; i < o.CellRow.Length; i++)
+            rows[baseRow + o.CellRow[i]] |= 1UL << (col + o.CellCol[i]);
+
+        int cleared = 0; erodedCells = 0;
+        int top = Math.Min(H, baseRow + o.H);
+        // collect full rows within the affected span (only rows the piece touched can newly fill)
+        for (int r = baseRow; r < top; r++)
+        {
+            if (rows[r] == FullRow)
+            {
+                cleared++;
+                for (int i = 0; i < o.CellRow.Length; i++)
+                    if (baseRow + o.CellRow[i] == r) erodedCells++;
+            }
+        }
+        if (cleared > 0)
+        {
+            int dst = 0;
+            for (int r = 0; r < H; r++)
+            {
+                if (rows[r] == FullRow) continue;
+                rows[dst++] = rows[r];
+            }
+            for (; dst < H; dst++) rows[dst] = 0;
+        }
+        return cleared;
+    }
+
+    // ---------- Evaluation ----------
+    struct Weights
+    {
+        public double LandingHeight, Eroded, RowTrans, ColTrans, Holes, Wells, MaxH, HoleDepth;
+    }
+
+    // Dellacherie base weights + mild extras.
+    static readonly Weights Normal = new Weights
+    {
+        LandingHeight = -4.500158825,
+        Eroded = 3.4181268101,
+        RowTrans = -3.2178882868,
+        ColTrans = -9.348695305,
+        Holes = -7.899265427,
+        Wells = -3.3855972247,
+        MaxH = 0.0,
+        HoleDepth = -0.8,
+    };
+
+    // Danger mode: survival first - hammer height and holes, care less about setting up clears.
+    static readonly Weights Danger = new Weights
+    {
+        LandingHeight = -7.0,
+        Eroded = 6.0,
+        RowTrans = -3.2,
+        ColTrans = -9.3,
+        Holes = -12.0,
+        Wells = -3.4,
+        MaxH = -2.5,
+        HoleDepth = -1.2,
+    };
+
+    static double Evaluate(ulong[] rows, int[] heights, int maxH, double landingHeight,
+                           int cleared, int erodedCells, Weights w)
+    {
+        // Row transitions (walls count as filled).
+        int rowTrans = 0;
+        for (int r = 0; r < H; r++)
+        {
+            ulong row = rows[r];
+            if (row == 0) { rowTrans += 2; continue; } // wall->empty and empty->wall
+            ulong prevFilled = 1; // left wall
+            for (int c = 0; c < W; c++)
+            {
+                ulong f = (row >> c) & 1;
+                if (f != prevFilled) rowTrans++;
+                prevFilled = f;
+            }
+            if (prevFilled == 0) rowTrans++; // right wall
+        }
+
+        // Column transitions, holes, hole depth, wells.
+        int colTrans = 0, holes = 0, holeDepth = 0, wellSum = 0;
+        for (int c = 0; c < W; c++)
+        {
+            ulong bit = 1UL << c;
+            bool prev = true; // floor is filled
+            int h = heights[c];
+            for (int r = 0; r < H; r++)
+            {
+                bool filled = (rows[r] & bit) != 0;
+                if (filled != prev) colTrans++;
+                if (!filled && r < h)
+                {
+                    holes++;
+                    holeDepth += h - r; // cells above this hole in the column
+                }
+                prev = filled;
+            }
+            if (!prev) colTrans++; // top border is empty; transition if column top filled
+            // Wells: empty cells above column height with both neighbors filled at that row.
+            int lh = c == 0 ? H : heights[c - 1];
+            int rh = c == W - 1 ? H : heights[c + 1];
+            int wallMin = Math.Min(lh, rh);
+            if (wallMin > h)
+            {
+                int d = wallMin - h;
+                wellSum += d * (d + 1) / 2;
+            }
+        }
+
+        return w.LandingHeight * landingHeight
+             + w.Eroded * (cleared * erodedCells)
+             + w.RowTrans * rowTrans
+             + w.ColTrans * colTrans
+             + w.Holes * holes
+             + w.Wells * wellSum
+             + w.MaxH * maxH
+             + w.HoleDepth * holeDepth;
+    }
+
+    // Best evaluation achievable by placing piece p on this board (depth-1). Returns
+    // double.NegativeInfinity if no legal placement (board is effectively lost).
+    static double BestGreedy(ulong[] rows, int[] heights, int p, Weights w)
+    {
+        double best = double.NegativeInfinity;
+        var tmpRows = new ulong[H];
+        var tmpHeights = new int[W];
+        foreach (var o in Orients[p])
+        {
+            for (int col = 0; col + o.W <= W; col++)
+            {
+                int baseRow = DropRow(heights, o, col);
+                if (baseRow < 0) continue;
+                Array.Copy(rows, tmpRows, H);
+                int eroded;
+                int cleared = Place(tmpRows, o, col, baseRow, out eroded);
+                int maxH = Heights(tmpRows, tmpHeights);
+                double landing = baseRow + (o.H - 1) * 0.5;
+                double s = Evaluate(tmpRows, tmpHeights, maxH, landing, cleared, eroded, w);
+                if (s > best) best = s;
+            }
+        }
+        return best;
+    }
+
+    struct Move { public int Rot, Col; public double Score; }
+
+    static Move ChooseMove(ulong[] board, int piece, bool useExpectimax, Weights w)
+    {
+        var heights = new int[W];
+        Heights(board, heights);
+
+        // Enumerate all first-level placements.
+        var placements = new List<Move>();
+        var shapes = new List<Orient>();
+        var baseRows = new List<int>();
+        foreach (var o in Orients[piece])
+        {
+            for (int col = 0; col + o.W <= W; col++)
+            {
+                int baseRow = DropRow(heights, o, col);
+                if (baseRow < 0) continue;
+                placements.Add(new Move { Rot = o.Rot, Col = col });
+                shapes.Add(o);
+                baseRows.Add(baseRow);
+            }
+        }
+        if (placements.Count == 0)
+            return new Move { Rot = 0, Col = 0, Score = double.NegativeInfinity }; // lost anyway
+
+        var scores = new double[placements.Count];
+        Action<int> evalOne = i =>
+        {
+            var o = shapes[i];
+            var mv = placements[i];
+            var rows = new ulong[H];
+            Array.Copy(board, rows, H);
+            int eroded;
+            int cleared = Place(rows, o, mv.Col, baseRows[i], out eroded);
+            var hts = new int[W];
+            int maxH = Heights(rows, hts);
+            double landing = baseRows[i] + (o.H - 1) * 0.5;
+            double s = Evaluate(rows, hts, maxH, landing, cleared, eroded, w);
+            if (useExpectimax)
+            {
+                // Average of best replies over the 7 equally likely next pieces.
+                double sum = 0;
+                for (int p2 = 0; p2 < 7; p2++)
+                {
+                    double b = BestGreedy(rows, hts, p2, w);
+                    if (double.IsNegativeInfinity(b)) b = -1e6; // that next piece loses
+                    sum += b;
+                }
+                s += sum / 7.0;
+            }
+            scores[i] = s;
+        };
+
+        if (useExpectimax && placements.Count >= 8)
+            Parallel.For(0, placements.Count, i => evalOne(i));
+        else
+            for (int i = 0; i < placements.Count; i++) evalOne(i);
+
+        int bestIdx = 0;
+        for (int i = 1; i < placements.Count; i++)
+            if (scores[i] > scores[bestIdx]) bestIdx = i;
+        var best = placements[bestIdx];
+        best.Score = scores[bestIdx];
+        return best;
+    }
+
+    // ---------- IO ----------
+    static TextReader In;
+    static string NextToken()
+    {
+        int ch;
+        var sb = new StringBuilder();
+        while ((ch = In.Read()) != -1)
+        {
+            if (char.IsWhiteSpace((char)ch))
+            {
+                if (sb.Length > 0) return sb.ToString();
+            }
+            else sb.Append((char)ch);
+        }
+        return sb.Length > 0 ? sb.ToString() : null;
+    }
+
+    static void Main()
+    {
+        In = new StreamReader(Console.OpenStandardInput(), Encoding.ASCII, false, 1 << 16);
+        var Out = new StreamWriter(Console.OpenStandardOutput(), Encoding.ASCII) { AutoFlush = false };
+
+        BuildOrients();
+
+        string tw = NextToken(), th = NextToken(), tn = NextToken();
+        if (tw == null || th == null || tn == null) return;
+        W = int.Parse(tw); H = int.Parse(th);
+        long numPieces; long.TryParse(tn, out numPieces);
+        if (W < 1) W = 1; if (W > 62) W = 62;
+        if (H < 1) H = 1;
+        FullRow = (W == 62) ? ((1UL << 62) - 1) : ((1UL << W) - 1);
+
+        var board = new ulong[H];
+        var heights = new int[W];
+        var sw = new Stopwatch();
+
+        // Adaptive complexity control: start with 2-ply expectimax; if a move ever gets
+        // close to the 5s budget (huge boards), permanently drop to fast greedy mode.
+        bool expectimax = true;
+        const double BudgetMs = 5000.0;
+
+        for (long i = 0; numPieces <= 0 || i < numPieces; i++)
+        {
+            string pt = NextToken();
+            if (pt == null) break;
+            int p = PieceIndex(pt);
+            if (p < 0) break; // unexpected token; stop cleanly
+
+            // Danger assessment for weight adaptation.
+            int maxH = Heights(board, heights);
+            Weights w = (maxH >= H - 4 || maxH > (int)(H * 0.72)) ? Danger : Normal;
+
+            sw.Restart();
+            Move mv = ChooseMove(board, p, expectimax, w);
+            sw.Stop();
+            if (expectimax && sw.Elapsed.TotalMilliseconds > BudgetMs * 0.35)
+                expectimax = false; // stay far inside the 5s/piece limit from now on
+
+            Out.Write(mv.Rot);
+            Out.Write(' ');
+            Out.Write(mv.Col);
+            Out.Write('\n');
+            Out.Flush();
+
+            // Apply the move to our own board model.
+            Orient chosen = null;
+            foreach (var o in Orients[p]) if (o.Rot == mv.Rot) { chosen = o; break; }
+            if (chosen != null)
+            {
+                Heights(board, heights);
+                int baseRow = DropRow(heights, chosen, mv.Col);
+                if (baseRow >= 0)
+                {
+                    int eroded;
+                    Place(board, chosen, mv.Col, baseRow, out eroded);
+                }
+            }
+
+            string result = NextToken();
+            if (result == null) break;
+            if (result.StartsWith("gameover", StringComparison.OrdinalIgnoreCase)) break;
+            // "ok" / "cleared_N": our simulation already accounts for clears.
+        }
+        Out.Flush();
+    }
+}

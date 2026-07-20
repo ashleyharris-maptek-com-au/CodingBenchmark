@@ -1,0 +1,927 @@
+// CSG Union of two watertight manifold triangle meshes.
+// Strategy:
+//  - Read meshes, weld all vertices into a global point registry (spatial hash).
+//  - BVH per mesh; find intersecting triangle pairs, compute intersection segments.
+//  - Retriangulate each cut triangle with the segments as constraints (incremental
+//    locate-split triangulation + constraint edge recovery by flipping).
+//  - Classify pieces: near-coplanar pieces by normal agreement rule; others by
+//    ray-cast parity (point-in-mesh) against the other mesh.
+//  - Uncut triangles are classified per connected component (flood via shared edges),
+//    one ray cast per component, so huge meshes need very few per-face ray casts.
+//  - Union keep rules: A-piece kept if outside B (or coplanar same-facing);
+//    B-piece kept if strictly outside A.
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <cmath>
+#include <cstdint>
+#include <vector>
+#include <array>
+#include <unordered_map>
+#include <algorithm>
+#include <atomic>
+#include <thread>
+
+struct V3 {
+    double x, y, z;
+};
+static inline V3 operator+(V3 a, V3 b) { return {a.x + b.x, a.y + b.y, a.z + b.z}; }
+static inline V3 operator-(V3 a, V3 b) { return {a.x - b.x, a.y - b.y, a.z - b.z}; }
+static inline V3 operator*(V3 a, double s) { return {a.x * s, a.y * s, a.z * s}; }
+static inline double dot(V3 a, V3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+static inline V3 cross(V3 a, V3 b) {
+    return {a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x};
+}
+static inline double len2(V3 a) { return dot(a, a); }
+static inline double len(V3 a) { return std::sqrt(len2(a)); }
+static inline V3 vmin(V3 a, V3 b) { return {std::min(a.x, b.x), std::min(a.y, b.y), std::min(a.z, b.z)}; }
+static inline V3 vmax(V3 a, V3 b) { return {std::max(a.x, b.x), std::max(a.y, b.y), std::max(a.z, b.z)}; }
+
+typedef std::array<int, 3> Tri;
+
+struct Mesh {
+    std::vector<V3> v;
+    std::vector<Tri> f;
+};
+
+// ------------------------- parallel_for -------------------------
+template <class F>
+static void parallel_for(size_t n, F f) {
+    unsigned nt = std::thread::hardware_concurrency();
+    if (nt == 0) nt = 4;
+    if (nt > 64) nt = 64;
+    if (n < 2048 || nt <= 1) {
+        for (size_t i = 0; i < n; i++) f(i);
+        return;
+    }
+    std::atomic<size_t> next{0};
+    size_t chunk = n / (size_t)(nt * 32);
+    if (chunk < 64) chunk = 64;
+    std::vector<std::thread> ts;
+    ts.reserve(nt);
+    for (unsigned t = 0; t < nt; t++) {
+        ts.emplace_back([&]() {
+            for (;;) {
+                size_t i0 = next.fetch_add(chunk);
+                if (i0 >= n) break;
+                size_t i1 = std::min(i0 + chunk, n);
+                for (size_t i = i0; i < i1; i++) f(i);
+            }
+        });
+    }
+    for (auto& th : ts) th.join();
+}
+
+// ------------------------- BVH -------------------------
+struct BVH {
+    struct Node {
+        V3 bmin, bmax;
+        int left;   // internal: left child (right = left+1); leaf: -1
+        int start, count;
+    };
+    std::vector<Node> nodes;
+    std::vector<int> order;          // triangle indices
+    const Mesh* mesh = nullptr;
+
+    void build(const Mesh& m) {
+        mesh = &m;
+        int n = (int)m.f.size();
+        if (n == 0) return;
+        order.resize(n);
+        std::vector<V3> cent(n), tmin(n), tmax(n);
+        for (int i = 0; i < n; i++) {
+            order[i] = i;
+            V3 a = m.v[m.f[i][0]], b = m.v[m.f[i][1]], c = m.v[m.f[i][2]];
+            tmin[i] = vmin(a, vmin(b, c));
+            tmax[i] = vmax(a, vmax(b, c));
+            cent[i] = (tmin[i] + tmax[i]) * 0.5;
+        }
+        nodes.clear();
+        nodes.reserve((size_t)std::max(1, 2 * n));
+        struct Job { int node, start, count; };
+        std::vector<Job> stack;
+        nodes.push_back(Node());
+        stack.push_back({0, 0, n});
+        while (!stack.empty()) {
+            Job j = stack.back();
+            stack.pop_back();
+            V3 bmin = {1e300, 1e300, 1e300}, bmax = {-1e300, -1e300, -1e300};
+            V3 cmin = bmin, cmax = bmax;
+            for (int i = j.start; i < j.start + j.count; i++) {
+                int t = order[i];
+                bmin = vmin(bmin, tmin[t]);
+                bmax = vmax(bmax, tmax[t]);
+                cmin = vmin(cmin, cent[t]);
+                cmax = vmax(cmax, cent[t]);
+            }
+            Node& nd = nodes[j.node];
+            nd.bmin = bmin;
+            nd.bmax = bmax;
+            if (j.count <= 4) {
+                nd.left = -1;
+                nd.start = j.start;
+                nd.count = j.count;
+                continue;
+            }
+            V3 ext = cmax - cmin;
+            int axis = 0;
+            if (ext.y > ext.x) axis = 1;
+            if (ext.z > (axis == 0 ? ext.x : ext.y)) axis = 2;
+            int mid = j.start + j.count / 2;
+            std::nth_element(order.begin() + j.start, order.begin() + mid,
+                             order.begin() + j.start + j.count,
+                             [&](int a, int b) {
+                                 double ca = axis == 0 ? cent[a].x : axis == 1 ? cent[a].y : cent[a].z;
+                                 double cb = axis == 0 ? cent[b].x : axis == 1 ? cent[b].y : cent[b].z;
+                                 return ca < cb;
+                             });
+            int lc = (int)nodes.size();
+            nodes.push_back(Node());
+            nodes.push_back(Node());
+            nodes[j.node].left = lc;
+            stack.push_back({lc, j.start, mid - j.start});
+            stack.push_back({lc + 1, mid, j.start + j.count - mid});
+        }
+    }
+};
+
+static inline double boxDist2(V3 p, V3 bmin, V3 bmax) {
+    double d = 0, t;
+    t = (p.x < bmin.x) ? bmin.x - p.x : (p.x > bmax.x ? p.x - bmax.x : 0); d += t * t;
+    t = (p.y < bmin.y) ? bmin.y - p.y : (p.y > bmax.y ? p.y - bmax.y : 0); d += t * t;
+    t = (p.z < bmin.z) ? bmin.z - p.z : (p.z > bmax.z ? p.z - bmax.z : 0); d += t * t;
+    return d;
+}
+
+static inline bool boxOverlap(V3 amin, V3 amax, V3 bmin, V3 bmax) {
+    return amin.x <= bmax.x && amax.x >= bmin.x &&
+           amin.y <= bmax.y && amax.y >= bmin.y &&
+           amin.z <= bmax.z && amax.z >= bmin.z;
+}
+
+// closest point on triangle (Ericson)
+static V3 closestPtTri(V3 p, V3 a, V3 b, V3 c) {
+    V3 ab = b - a, ac = c - a, ap = p - a;
+    double d1 = dot(ab, ap), d2 = dot(ac, ap);
+    if (d1 <= 0 && d2 <= 0) return a;
+    V3 bp = p - b;
+    double d3 = dot(ab, bp), d4 = dot(ac, bp);
+    if (d3 >= 0 && d4 <= d3) return b;
+    double vc = d1 * d4 - d3 * d2;
+    if (vc <= 0 && d1 >= 0 && d3 <= 0) { double t = d1 / (d1 - d3); return a + ab * t; }
+    V3 cp = p - c;
+    double d5 = dot(ab, cp), d6 = dot(ac, cp);
+    if (d6 >= 0 && d5 <= d6) return c;
+    double vb = d5 * d2 - d1 * d6;
+    if (vb <= 0 && d2 >= 0 && d6 <= 0) { double t = d2 / (d2 - d6); return a + ac * t; }
+    double va = d3 * d6 - d5 * d4;
+    if (va <= 0 && (d4 - d3) >= 0 && (d5 - d6) >= 0) {
+        double t = (d4 - d3) / ((d4 - d3) + (d5 - d6));
+        return b + (c - b) * t;
+    }
+    double denom = 1.0 / (va + vb + vc);
+    double v = vb * denom, w = vc * denom;
+    return a + ab * v + ac * w;
+}
+
+// nearest triangle within maxDist; returns tri index or -1
+static int nearestWithin(V3 p, const BVH& bvh, double maxDist) {
+    if (bvh.nodes.empty()) return -1;
+    double best = maxDist * maxDist;
+    int bestTri = -1;
+    int stack[128];
+    int sp = 0;
+    stack[sp++] = 0;
+    const Mesh& m = *bvh.mesh;
+    while (sp) {
+        int ni = stack[--sp];
+        const BVH::Node& nd = bvh.nodes[ni];
+        if (boxDist2(p, nd.bmin, nd.bmax) > best) continue;
+        if (nd.left < 0) {
+            for (int i = nd.start; i < nd.start + nd.count; i++) {
+                int t = bvh.order[i];
+                V3 q = closestPtTri(p, m.v[m.f[t][0]], m.v[m.f[t][1]], m.v[m.f[t][2]]);
+                double d = len2(p - q);
+                if (d < best) { best = d; bestTri = t; }
+            }
+        } else {
+            if (sp < 126) { stack[sp++] = nd.left; stack[sp++] = nd.left + 1; }
+        }
+    }
+    return bestTri;
+}
+
+// ------------------------- ray cast parity -------------------------
+static const double DIRS[32][3] = {
+    {0.577350, 0.577350, 0.577350}, {-0.319, 0.842, 0.435}, {0.912, -0.201, 0.357},
+    {0.146, -0.674, 0.724}, {-0.812, -0.334, 0.478}, {0.401, 0.219, -0.889},
+    {-0.554, 0.712, -0.432}, {0.238, -0.917, -0.320}, {0.669, 0.541, -0.510},
+    {-0.905, 0.278, 0.322}, {0.104, 0.988, -0.114}, {-0.436, -0.552, -0.710},
+    {0.777, -0.611, 0.152}, {-0.207, 0.353, 0.912}, {0.503, 0.803, 0.320},
+    {-0.651, -0.108, 0.751}, {0.929, 0.301, 0.215}, {-0.115, -0.212, -0.970},
+    {0.356, -0.478, 0.803}, {-0.734, 0.598, 0.322}, {0.611, -0.201, -0.766},
+    {-0.322, -0.899, 0.296}, {0.187, 0.641, -0.744}, {-0.856, -0.478, -0.196},
+    {0.412, 0.115, 0.904}, {-0.101, 0.766, 0.635}, {0.699, -0.699, -0.151},
+    {-0.478, 0.211, -0.853}, {0.255, -0.322, -0.912}, {-0.611, 0.744, 0.271},
+    {0.833, 0.101, -0.544}, {-0.196, -0.611, 0.767}
+};
+
+// returns 1 hit, 0 miss, -1 ambiguous
+static inline int rayTri(V3 o, V3 d, V3 v0, V3 v1, V3 v2, double tTol) {
+    V3 e1 = v1 - v0, e2 = v2 - v0;
+    V3 pv = cross(d, e2);
+    double det = dot(e1, pv);
+    double scale = std::sqrt(len2(e1) * len2(e2));
+    if (scale == 0) return 0;
+    if (std::fabs(det) < 1e-12 * scale) {
+        // near-parallel: ambiguous only if ray origin is very close to the tri plane
+        V3 n = cross(e1, e2);
+        double nl = len(n);
+        if (nl > 1e-30 && std::fabs(dot(n, o - v0)) < 1e-7 * nl * std::sqrt(scale)) return -1;
+        return 0;
+    }
+    double inv = 1.0 / det;
+    V3 tv = o - v0;
+    double u = dot(tv, pv) * inv;
+    const double btol = 1e-9;
+    if (u < -btol || u > 1 + btol) return 0;
+    V3 qv = cross(tv, e1);
+    double v = dot(d, qv) * inv;
+    if (v < -btol || u + v > 1 + btol) return 0;
+    double t = dot(e2, qv) * inv;
+    if (t < -tTol) return 0;
+    if (u < btol || v < btol || u + v > 1 - btol || t < tTol) return -1;
+    return 1;
+}
+
+static inline bool rayBox(V3 o, V3 inv, V3 bmin, V3 bmax) {
+    double t1 = (bmin.x - o.x) * inv.x, t2 = (bmax.x - o.x) * inv.x;
+    double tmin = std::min(t1, t2), tmax = std::max(t1, t2);
+    t1 = (bmin.y - o.y) * inv.y; t2 = (bmax.y - o.y) * inv.y;
+    tmin = std::max(tmin, std::min(t1, t2)); tmax = std::min(tmax, std::max(t1, t2));
+    t1 = (bmin.z - o.z) * inv.z; t2 = (bmax.z - o.z) * inv.z;
+    tmin = std::max(tmin, std::min(t1, t2)); tmax = std::min(tmax, std::max(t1, t2));
+    return tmax >= tmin && tmax >= 0;
+}
+
+static double g_tTol = 1e-12;
+
+static bool insideMesh(V3 p, const BVH& bvh) {
+    if (bvh.nodes.empty()) return false;
+    const Mesh& m = *bvh.mesh;
+    int lastParity = 0;
+    for (int att = 0; att < 32; att++) {
+        V3 d = {DIRS[att][0], DIRS[att][1], DIRS[att][2]};
+        V3 inv = {1.0 / d.x, 1.0 / d.y, 1.0 / d.z};
+        int cnt = 0;
+        bool ok = true;
+        int stack[128];
+        int sp = 0;
+        stack[sp++] = 0;
+        while (sp && ok) {
+            int ni = stack[--sp];
+            const BVH::Node& nd = bvh.nodes[ni];
+            if (!rayBox(p, inv, nd.bmin, nd.bmax)) continue;
+            if (nd.left < 0) {
+                for (int i = nd.start; i < nd.start + nd.count && ok; i++) {
+                    int t = bvh.order[i];
+                    int r = rayTri(p, d, m.v[m.f[t][0]], m.v[m.f[t][1]], m.v[m.f[t][2]], g_tTol);
+                    if (r < 0) ok = false;
+                    else cnt += r;
+                }
+            } else {
+                if (sp < 126) { stack[sp++] = nd.left; stack[sp++] = nd.left + 1; }
+            }
+        }
+        lastParity = cnt & 1;
+        if (ok) return lastParity != 0;
+    }
+    return lastParity != 0;
+}
+
+// ------------------------- global point registry -------------------------
+struct Registry {
+    std::vector<V3> pts;
+    std::unordered_map<uint64_t, std::vector<int>> grid;
+    double inv;   // 1/cell
+    double eps2;
+    void init(double eps, size_t reserveN) {
+        inv = 1.0 / (eps * 4.0);
+        eps2 = eps * eps;
+        grid.reserve(reserveN * 2);
+        pts.reserve(reserveN);
+    }
+    static uint64_t hash3(int64_t x, int64_t y, int64_t z) {
+        return (uint64_t)x * 73856093ULL ^ (uint64_t)y * 19349663ULL ^ (uint64_t)z * 83492791ULL;
+    }
+    int add(V3 p) {
+        int64_t cx = (int64_t)std::floor(p.x * inv);
+        int64_t cy = (int64_t)std::floor(p.y * inv);
+        int64_t cz = (int64_t)std::floor(p.z * inv);
+        for (int dx = -1; dx <= 1; dx++)
+            for (int dy = -1; dy <= 1; dy++)
+                for (int dz = -1; dz <= 1; dz++) {
+                    auto it = grid.find(hash3(cx + dx, cy + dy, cz + dz));
+                    if (it == grid.end()) continue;
+                    for (int id : it->second)
+                        if (len2(pts[id] - p) <= eps2) return id;
+                }
+        int id = (int)pts.size();
+        pts.push_back(p);
+        grid[hash3(cx, cy, cz)].push_back(id);
+        return id;
+    }
+};
+
+// ------------------------- triangle-triangle intersection segment ----------
+static bool triTriSegment(const V3 V[3], const V3 U[3], V3& s0, V3& s1) {
+    V3 n2 = cross(U[1] - U[0], U[2] - U[0]);
+    double n2l = len(n2);
+    if (n2l == 0) return false;
+    double L = 0;
+    for (int i = 0; i < 3; i++) {
+        L = std::max(L, len(V[i] - U[0]));
+        L = std::max(L, len(U[i] - U[0]));
+    }
+    if (L <= 0) return false;
+    double epsP = 1e-12 * n2l * L;
+    double dv[3];
+    int pos = 0, neg = 0;
+    for (int i = 0; i < 3; i++) {
+        dv[i] = dot(n2, V[i] - U[0]);
+        if (std::fabs(dv[i]) < epsP) dv[i] = 0;
+        else if (dv[i] > 0) pos++;
+        else neg++;
+    }
+    if (pos == 0 || neg == 0) return false;
+
+    V3 n1 = cross(V[1] - V[0], V[2] - V[0]);
+    double n1l = len(n1);
+    if (n1l == 0) return false;
+    double epsQ = 1e-12 * n1l * L;
+    double du[3];
+    pos = neg = 0;
+    for (int i = 0; i < 3; i++) {
+        du[i] = dot(n1, U[i] - V[0]);
+        if (std::fabs(du[i]) < epsQ) du[i] = 0;
+        else if (du[i] > 0) pos++;
+        else neg++;
+    }
+    if (pos == 0 || neg == 0) return false;
+
+    V3 D = cross(n1, n2);
+    double Dl = len(D);
+    if (Dl < 1e-14 * n1l * n2l) return false;
+
+    auto crossPts = [&](const V3 A[3], const double d[3], V3 out[2]) -> int {
+        int m = 0;
+        for (int i = 0; i < 3 && m < 2; i++) {
+            if (d[i] == 0) { out[m++] = A[i]; continue; }
+            int j = (i + 1) % 3;
+            if (d[j] != 0 && d[i] * d[j] < 0)
+                out[m++] = A[i] + (A[j] - A[i]) * (d[i] / (d[i] - d[j]));
+        }
+        return m;
+    };
+    V3 a[2], b[2];
+    if (crossPts(V, dv, a) != 2) return false;
+    if (crossPts(U, du, b) != 2) return false;
+
+    double ta0 = dot(D, a[0]), ta1 = dot(D, a[1]);
+    double tb0 = dot(D, b[0]), tb1 = dot(D, b[1]);
+    if (ta0 > ta1) { std::swap(ta0, ta1); std::swap(a[0], a[1]); }
+    if (tb0 > tb1) { std::swap(tb0, tb1); std::swap(b[0], b[1]); }
+    double lo = std::max(ta0, tb0), hi = std::min(ta1, tb1);
+    double epsT = 1e-12 * Dl * L;
+    if (hi - lo <= epsT) return false;
+    s0 = (ta0 >= tb0) ? a[0] : b[0];
+    s1 = (ta1 <= tb1) ? a[1] : b[1];
+    return true;
+}
+
+// ------------------------- small constrained triangulation -----------------
+struct CTri2 {
+    std::vector<std::array<double, 2>> P;
+    std::vector<Tri> T;
+    double eps = 1e-12;
+
+    static double orient(const std::array<double, 2>& a, const std::array<double, 2>& b,
+                         const std::array<double, 2>& c) {
+        return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+    }
+    void init(std::array<double, 2> a, std::array<double, 2> b, std::array<double, 2> c) {
+        P.clear(); T.clear();
+        P.push_back(a); P.push_back(b); P.push_back(c);
+        T.push_back({0, 1, 2});
+    }
+    // insert point already appended to P at index pi
+    void insert(int pi) {
+        const auto& p = P[pi];
+        int bestT = -1, bestEdge = -1;
+        double bestMin = -1e300;
+        for (int t = 0; t < (int)T.size(); t++) {
+            double o0 = orient(P[T[t][0]], P[T[t][1]], p);
+            double o1 = orient(P[T[t][1]], P[T[t][2]], p);
+            double o2 = orient(P[T[t][2]], P[T[t][0]], p);
+            double mn = std::min(o0, std::min(o1, o2));
+            if (mn > bestMin) {
+                bestMin = mn;
+                bestT = t;
+                bestEdge = (o0 <= o1 && o0 <= o2) ? 0 : (o1 <= o2 ? 1 : 2);
+            }
+        }
+        if (bestT < 0 || bestMin < -eps) return; // outside (shouldn't happen)
+        Tri tr = T[bestT];
+        if (bestMin > eps) {
+            // strictly inside: split into 3
+            T[bestT] = {tr[0], tr[1], pi};
+            T.push_back({tr[1], tr[2], pi});
+            T.push_back({tr[2], tr[0], pi});
+        } else {
+            // on edge bestEdge (verts e0=tr[bestEdge], e1=tr[(bestEdge+1)%3])
+            int e0 = tr[bestEdge], e1 = tr[(bestEdge + 1) % 3], op = tr[(bestEdge + 2) % 3];
+            T[bestT] = {e0, pi, op};
+            T.push_back({pi, e1, op});
+            // neighbor sharing edge (e1,e0)
+            int nT = (int)T.size() - 1;
+            for (int t = 0; t < (int)T.size(); t++) {
+                if (t == bestT || t == nT) continue;
+                for (int k = 0; k < 3; k++) {
+                    if (T[t][k] == e1 && T[t][(k + 1) % 3] == e0) {
+                        int op2 = T[t][(k + 2) % 3];
+                        T[t] = {e1, pi, op2};
+                        T.push_back({pi, e0, op2});
+                        return;
+                    }
+                }
+            }
+        }
+    }
+    bool edgeExists(int a, int b) const {
+        for (const Tri& t : T)
+            for (int k = 0; k < 3; k++)
+                if ((t[k] == a && t[(k + 1) % 3] == b) || (t[k] == b && t[(k + 1) % 3] == a))
+                    return true;
+        return false;
+    }
+    void enforce(int s, int t) {
+        if (s == t) return;
+        for (int iter = 0; iter < 2000; iter++) {
+            if (edgeExists(s, t)) return;
+            bool flipped = false;
+            for (int ti = 0; ti < (int)T.size() && !flipped; ti++) {
+                for (int k = 0; k < 3 && !flipped; k++) {
+                    int a = T[ti][k], b = T[ti][(k + 1) % 3];
+                    if (a == s || a == t || b == s || b == t) continue;
+                    if (a > b) continue; // consider each edge once
+                    double o1 = orient(P[s], P[t], P[a]);
+                    double o2 = orient(P[s], P[t], P[b]);
+                    if (o1 * o2 >= 0) continue;
+                    double o3 = orient(P[a], P[b], P[s]);
+                    double o4 = orient(P[a], P[b], P[t]);
+                    if (o3 * o4 >= 0) continue;
+                    // find the two triangles sharing edge (a,b)
+                    int t1 = -1, t2 = -1, x = -1, y = -1;
+                    for (int u = 0; u < (int)T.size(); u++) {
+                        for (int m = 0; m < 3; m++) {
+                            if (T[u][m] == a && T[u][(m + 1) % 3] == b) { t1 = u; x = T[u][(m + 2) % 3]; }
+                            if (T[u][m] == b && T[u][(m + 1) % 3] == a) { t2 = u; y = T[u][(m + 2) % 3]; }
+                        }
+                    }
+                    if (t1 < 0 || t2 < 0) continue;
+                    // flip only if new edge (x,y) properly crosses (a,b)
+                    double q1 = orient(P[x], P[y], P[a]);
+                    double q2 = orient(P[x], P[y], P[b]);
+                    if (q1 * q2 >= 0) continue;
+                    T[t1] = {x, y, b};
+                    T[t2] = {y, x, a};
+                    flipped = true;
+                }
+            }
+            if (!flipped) return; // stuck (degenerate); leave as is
+        }
+    }
+};
+
+// ------------------------- fast input -------------------------
+static char* g_buf = nullptr;
+static char* g_cur = nullptr;
+
+static void readAllStdin() {
+    size_t cap = 1 << 24, sz = 0;
+    g_buf = (char*)malloc(cap);
+    for (;;) {
+        if (sz + (1 << 22) + 1 > cap) {
+            cap *= 2;
+            g_buf = (char*)realloc(g_buf, cap);
+        }
+        size_t r = fread(g_buf + sz, 1, 1 << 22, stdin);
+        sz += r;
+        if (r == 0) break;
+    }
+    g_buf[sz] = 0;
+    g_cur = g_buf;
+}
+static inline long long nextInt() {
+    while (*g_cur && (*g_cur < '0' || *g_cur > '9') && *g_cur != '-') g_cur++;
+    return strtoll(g_cur, &g_cur, 10);
+}
+static inline double nextDouble() {
+    while (*g_cur && *g_cur != '-' && *g_cur != '+' && *g_cur != '.' &&
+           (*g_cur < '0' || *g_cur > '9')) g_cur++;
+    return strtod(g_cur, &g_cur);
+}
+
+// union-find
+struct UF {
+    std::vector<int> p;
+    void init(int n) { p.resize(n); for (int i = 0; i < n; i++) p[i] = i; }
+    int find(int x) { while (p[x] != x) { p[x] = p[p[x]]; x = p[x]; } return x; }
+    void unite(int a, int b) { a = find(a); b = find(b); if (a != b) p[a] = b; }
+};
+
+int main() {
+    readAllStdin();
+    long long VA = nextInt(), FA = nextInt(), VB = nextInt(), FB = nextInt();
+    Mesh A, B;
+    A.v.resize(VA); A.f.resize(FA);
+    B.v.resize(VB); B.f.resize(FB);
+    for (long long i = 0; i < VA; i++) { A.v[i].x = nextDouble(); A.v[i].y = nextDouble(); A.v[i].z = nextDouble(); }
+    for (long long i = 0; i < FA; i++) { A.f[i][0] = (int)nextInt(); A.f[i][1] = (int)nextInt(); A.f[i][2] = (int)nextInt(); }
+    for (long long i = 0; i < VB; i++) { B.v[i].x = nextDouble(); B.v[i].y = nextDouble(); B.v[i].z = nextDouble(); }
+    for (long long i = 0; i < FB; i++) { B.f[i][0] = (int)nextInt(); B.f[i][1] = (int)nextInt(); B.f[i][2] = (int)nextInt(); }
+    free(g_buf);
+
+    V3 bmin = {1e300, 1e300, 1e300}, bmax = {-1e300, -1e300, -1e300};
+    for (auto& p : A.v) { bmin = vmin(bmin, p); bmax = vmax(bmax, p); }
+    for (auto& p : B.v) { bmin = vmin(bmin, p); bmax = vmax(bmax, p); }
+    double diag = len(bmax - bmin);
+    if (!(diag > 0)) diag = 1.0;
+    double epsWeld = 1e-9 * diag;
+    double epsOn = 1e-7 * diag;
+    g_tTol = 1e-12 * diag;
+
+    // global registry: all original vertices first
+    Registry reg;
+    reg.init(epsWeld, (size_t)(VA + VB) + 1024);
+    std::vector<int> aId(VA), bId(VB);
+    for (long long i = 0; i < VA; i++) aId[i] = reg.add(A.v[i]);
+    for (long long i = 0; i < VB; i++) bId[i] = reg.add(B.v[i]);
+
+    BVH bvhA, bvhB;
+    bvhA.build(A);
+    bvhB.build(B);
+
+    // ---- find intersecting pairs & segments (parallel over A faces) ----
+    struct RawSeg { int fb; V3 p, q; };
+    std::vector<std::vector<RawSeg>> raw(FA);
+    if (!bvhB.nodes.empty() && FA > 0) {
+        parallel_for((size_t)FA, [&](size_t fa) {
+            V3 Va[3] = {A.v[A.f[fa][0]], A.v[A.f[fa][1]], A.v[A.f[fa][2]]};
+            V3 amin = vmin(Va[0], vmin(Va[1], Va[2]));
+            V3 amax = vmax(Va[0], vmax(Va[1], Va[2]));
+            int stack[128];
+            int sp = 0;
+            stack[sp++] = 0;
+            while (sp) {
+                int ni = stack[--sp];
+                const BVH::Node& nd = bvhB.nodes[ni];
+                if (!boxOverlap(amin, amax, nd.bmin, nd.bmax)) continue;
+                if (nd.left < 0) {
+                    for (int i = nd.start; i < nd.start + nd.count; i++) {
+                        int fb = bvhB.order[i];
+                        V3 Ub[3] = {B.v[B.f[fb][0]], B.v[B.f[fb][1]], B.v[B.f[fb][2]]};
+                        V3 s0, s1;
+                        if (triTriSegment(Va, Ub, s0, s1))
+                            raw[fa].push_back({fb, s0, s1});
+                    }
+                } else {
+                    if (sp < 126) { stack[sp++] = nd.left; stack[sp++] = nd.left + 1; }
+                }
+            }
+        });
+    }
+
+    // sequential registration of intersection points
+    std::vector<std::vector<std::pair<int, int>>> segsA(FA), segsB(FB);
+    for (long long fa = 0; fa < FA; fa++) {
+        for (const RawSeg& rs : raw[fa]) {
+            int i0 = reg.add(rs.p), i1 = reg.add(rs.q);
+            if (i0 == i1) continue;
+            segsA[fa].push_back({i0, i1});
+            segsB[rs.fb].push_back({i0, i1});
+        }
+    }
+    raw.clear();
+    raw.shrink_to_fit();
+
+    const std::vector<V3>& G = reg.pts;
+
+    auto faceNormal = [](const Mesh& m, int f) -> V3 {
+        V3 n = cross(m.v[m.f[f][1]] - m.v[m.f[f][0]], m.v[m.f[f][2]] - m.v[m.f[f][0]]);
+        double l = len(n);
+        return l > 0 ? n * (1.0 / l) : V3{0, 0, 1};
+    };
+
+    // classify a piece for union. isA: piece from mesh A. n = piece normal (unit-ish).
+    auto keepPiece = [&](V3 c, V3 n, const BVH& other, const Mesh& om, bool isA) -> bool {
+        int nt = nearestWithin(c, other, epsOn);
+        if (nt >= 0) {
+            V3 q = closestPtTri(c, om.v[om.f[nt][0]], om.v[om.f[nt][1]], om.v[om.f[nt][2]]);
+            if (len2(c - q) <= epsOn * epsOn) {
+                V3 on = cross(om.v[om.f[nt][1]] - om.v[om.f[nt][0]],
+                              om.v[om.f[nt][2]] - om.v[om.f[nt][0]]);
+                double ol = len(on);
+                if (ol > 0) {
+                    double d = dot(n, on) / ol;
+                    if (std::fabs(d) > 0.9) return isA ? (d > 0) : false;
+                }
+            }
+        }
+        return !insideMesh(c, other);
+    };
+
+    std::vector<Tri> outTris;
+
+    auto processMesh = [&](const Mesh& M, const std::vector<int>& vid,
+                           std::vector<std::vector<std::pair<int, int>>>& segs,
+                           const BVH& other, const Mesh& om, bool isA) {
+        int F = (int)M.f.size();
+        // face states: 0 = plain (component classify), 1 = cut, 2 = ON-keep, 3 = ON-drop
+        std::vector<uint8_t> state(F, 0);
+        parallel_for((size_t)F, [&](size_t f) {
+            if (!segs[f].empty()) { state[f] = 1; return; }
+            V3 c = (M.v[M.f[f][0]] + M.v[M.f[f][1]] + M.v[M.f[f][2]]) * (1.0 / 3.0);
+            int nt = nearestWithin(c, other, epsOn);
+            if (nt < 0) return;
+            V3 q = closestPtTri(c, om.v[om.f[nt][0]], om.v[om.f[nt][1]], om.v[om.f[nt][2]]);
+            if (len2(c - q) > epsOn * epsOn) return;
+            V3 n = faceNormal(M, (int)f);
+            V3 on = cross(om.v[om.f[nt][1]] - om.v[om.f[nt][0]],
+                          om.v[om.f[nt][2]] - om.v[om.f[nt][0]]);
+            double ol = len(on);
+            if (ol == 0) return;
+            double d = dot(n, on) / ol;
+            if (std::fabs(d) > 0.9) state[f] = (isA && d > 0) ? 2 : 3;
+        });
+
+        // connected components of plain faces via shared edges
+        UF uf;
+        uf.init(F);
+        {
+            std::unordered_map<uint64_t, int> edgeFace;
+            edgeFace.reserve((size_t)F * 2);
+            for (int f = 0; f < F; f++) {
+                if (state[f] != 0) continue;
+                for (int k = 0; k < 3; k++) {
+                    uint32_t a = (uint32_t)M.f[f][k], b = (uint32_t)M.f[f][(k + 1) % 3];
+                    uint64_t key = a < b ? ((uint64_t)a << 32) | b : ((uint64_t)b << 32) | a;
+                    auto it = edgeFace.find(key);
+                    if (it == edgeFace.end()) edgeFace[key] = f;
+                    else uf.unite(f, it->second);
+                }
+            }
+        }
+        std::unordered_map<int, int> repOf; // root -> representative face
+        for (int f = 0; f < F; f++)
+            if (state[f] == 0) {
+                int r = uf.find(f);
+                if (!repOf.count(r)) repOf[r] = f;
+            }
+        std::vector<std::pair<int, int>> reps(repOf.begin(), repOf.end());
+        std::vector<uint8_t> compKeep(reps.size(), 0);
+        parallel_for(reps.size(), [&](size_t i) {
+            int f = reps[i].second;
+            V3 c = (M.v[M.f[f][0]] + M.v[M.f[f][1]] + M.v[M.f[f][2]]) * (1.0 / 3.0);
+            compKeep[i] = insideMesh(c, other) ? 0 : 1;
+        });
+        std::unordered_map<int, uint8_t> keepOfRoot;
+        for (size_t i = 0; i < reps.size(); i++) keepOfRoot[reps[i].first] = compKeep[i];
+
+        // emit plain + ON faces
+        for (int f = 0; f < F; f++) {
+            if (state[f] == 1) continue;
+            bool keep;
+            if (state[f] == 0) keep = keepOfRoot[uf.find(f)] != 0;
+            else keep = (state[f] == 2);
+            if (keep) {
+                Tri t = {vid[M.f[f][0]], vid[M.f[f][1]], vid[M.f[f][2]]};
+                if (t[0] != t[1] && t[1] != t[2] && t[0] != t[2]) outTris.push_back(t);
+            }
+        }
+
+        // cut faces: retriangulate + classify pieces (parallel)
+        std::vector<int> cutFaces;
+        for (int f = 0; f < F; f++)
+            if (state[f] == 1) cutFaces.push_back(f);
+        std::vector<std::vector<Tri>> cutOut(cutFaces.size());
+        parallel_for(cutFaces.size(), [&](size_t ci) {
+            int f = cutFaces[ci];
+            V3 c0 = M.v[M.f[f][0]], c1 = M.v[M.f[f][1]], c2 = M.v[M.f[f][2]];
+            V3 e0 = c1 - c0, e1 = c2 - c0;
+            V3 n = cross(e0, e1);
+            double nl = len(n);
+            if (nl == 0) return;
+            n = n * (1.0 / nl);
+            double e0l = len(e0);
+            if (e0l == 0) return;
+            V3 u = e0 * (1.0 / e0l);
+            V3 v = cross(n, u);
+            double sc = std::max(e0l, len(e1));
+            double isc = 1.0 / sc;
+            auto to2 = [&](V3 p) -> std::array<double, 2> {
+                V3 d = p - c0;
+                return {dot(d, u) * isc, dot(d, v) * isc};
+            };
+            CTri2 ct;
+            ct.init(to2(c0), to2(c1), to2(c2));
+            std::vector<int> gidOf = {vid[M.f[f][0]], vid[M.f[f][1]], vid[M.f[f][2]]};
+            std::unordered_map<int, int> localOf;
+            for (int k = 0; k < 3; k++) localOf[gidOf[k]] = k;
+            auto addPt = [&](int gid) -> int {
+                auto it = localOf.find(gid);
+                if (it != localOf.end()) return it->second;
+                std::array<double, 2> p = to2(G[gid]);
+                for (int k = 0; k < (int)ct.P.size(); k++) {
+                    double dx = ct.P[k][0] - p[0], dy = ct.P[k][1] - p[1];
+                    if (dx * dx + dy * dy < 1e-20) { localOf[gid] = k; return k; }
+                }
+                int li = (int)ct.P.size();
+                ct.P.push_back(p);
+                ct.insert(li);
+                localOf[gid] = li;
+                gidOf.push_back(gid);
+                return li;
+            };
+            std::vector<std::pair<int, int>> cons;
+            for (auto& sg : segs[f]) {
+                int l0 = addPt(sg.first), l1 = addPt(sg.second);
+                if (l0 != l1) cons.push_back({l0, l1});
+            }
+            for (auto& cn : cons) ct.enforce(cn.first, cn.second);
+            for (const Tri& t : ct.T) {
+                int g0 = 0, g1 = 0, g2 = 0;
+                if (t[0] < (int)gidOf.size()) g0 = gidOf[t[0]];
+                if (t[1] < (int)gidOf.size()) g1 = gidOf[t[1]];
+                if (t[2] < (int)gidOf.size()) g2 = gidOf[t[2]];
+                if (g0 == g1 || g1 == g2 || g0 == g2) continue;
+                V3 cc = (G[g0] + G[g1] + G[g2]) * (1.0 / 3.0);
+                if (keepPiece(cc, n, other, om, isA))
+                    cutOut[ci].push_back({g0, g1, g2});
+            }
+        });
+        for (auto& v2 : cutOut)
+            for (auto& t : v2) outTris.push_back(t);
+    };
+
+    processMesh(A, aId, segsA, bvhB, B, true);
+    processMesh(B, bId, segsB, bvhA, A, false);
+
+    // ---- T-junction repair: split edges that have a hanging vertex on them ----
+    {
+        auto ekey = [](int a, int b) -> uint64_t {
+            return ((uint64_t)(uint32_t)a << 32) | (uint32_t)b;
+        };
+        double tol = epsWeld * 8;
+        for (int pass = 0; pass < 8; pass++) {
+            std::unordered_map<uint64_t, int> dir;
+            dir.reserve(outTris.size() * 4);
+            for (const Tri& t : outTris)
+                for (int k = 0; k < 3; k++)
+                    dir[ekey(t[k], t[(k + 1) % 3])]++;
+            // hanging vertices = endpoints of unmatched edges
+            std::vector<int> hang;
+            bool anyUnmatched = false;
+            for (auto& kv : dir) {
+                int a = (int)(kv.first >> 32), b = (int)(uint32_t)kv.first;
+                auto it = dir.find(ekey(b, a));
+                int rc = (it == dir.end()) ? 0 : it->second;
+                if (kv.second != rc) {
+                    anyUnmatched = true;
+                    hang.push_back(a);
+                    hang.push_back(b);
+                }
+            }
+            if (!anyUnmatched) break;
+            std::sort(hang.begin(), hang.end());
+            hang.erase(std::unique(hang.begin(), hang.end()), hang.end());
+            bool changed = false;
+            size_t nOld = outTris.size();
+            for (size_t ti = 0; ti < nOld; ti++) {
+                Tri t = outTris[ti];
+                for (int k = 0; k < 3; k++) {
+                    int a = t[k], b = t[(k + 1) % 3], c = t[(k + 2) % 3];
+                    auto it = dir.find(ekey(b, a));
+                    int rc = (it == dir.end()) ? 0 : it->second;
+                    if (dir[ekey(a, b)] == rc) continue; // matched edge
+                    // find hanging vertices strictly inside segment (a,b)
+                    V3 pa = G[a], pb = G[b];
+                    V3 ab = pb - pa;
+                    double abl2 = len2(ab);
+                    if (abl2 <= 0) continue;
+                    std::vector<std::pair<double, int>> onSeg;
+                    for (int hv : hang) {
+                        if (hv == a || hv == b || hv == c) continue;
+                        double s = dot(G[hv] - pa, ab) / abl2;
+                        if (s <= 1e-9 || s >= 1 - 1e-9) continue;
+                        V3 proj = pa + ab * s;
+                        if (len2(G[hv] - proj) < tol * tol)
+                            onSeg.push_back({s, hv});
+                    }
+                    if (onSeg.empty()) continue;
+                    std::sort(onSeg.begin(), onSeg.end());
+                    // replace triangle with fan a->p1->...->b around c
+                    int prev = a;
+                    bool first = true;
+                    for (auto& sp : onSeg) {
+                        Tri nt = {prev, sp.second, c};
+                        if (first) { outTris[ti] = nt; first = false; }
+                        else outTris.push_back(nt);
+                        prev = sp.second;
+                    }
+                    outTris.push_back({prev, b, c});
+                    changed = true;
+                    break; // one edge per triangle per pass
+                }
+            }
+            if (!changed) break;
+        }
+    }
+
+    // ---- hole filling: fan-fill any remaining boundary loops ----
+    {
+        auto ekey = [](int a, int b) -> uint64_t {
+            return ((uint64_t)(uint32_t)a << 32) | (uint32_t)b;
+        };
+        std::unordered_map<uint64_t, int> dir;
+        dir.reserve(outTris.size() * 4);
+        for (const Tri& t : outTris)
+            for (int k = 0; k < 3; k++)
+                dir[ekey(t[k], t[(k + 1) % 3])]++;
+        // reversed unmatched edges = edges the fill triangles must contain
+        std::unordered_map<int, std::vector<int>> succ; // b -> list of a for unmatched (a,b)
+        int nUn = 0;
+        for (auto& kv : dir) {
+            int a = (int)(kv.first >> 32), b = (int)(uint32_t)kv.first;
+            auto it = dir.find(ekey(b, a));
+            int rc = (it == dir.end()) ? 0 : it->second;
+            for (int r = rc; r < kv.second; r++) { succ[b].push_back(a); nUn++; }
+        }
+        if (nUn > 0 && nUn < 100000) {
+            std::unordered_map<int, size_t> pos; // consumption position per vertex
+            for (auto& kv : succ) pos[kv.first] = 0;
+            for (auto& kv : succ) {
+                int start = kv.first;
+                while (pos[start] < succ[start].size()) {
+                    // walk a loop of reversed edges starting at 'start'
+                    std::vector<int> loop;
+                    int cur = start;
+                    bool ok = true;
+                    for (int step = 0; step < 512; step++) {
+                        loop.push_back(cur);
+                        auto sit = succ.find(cur);
+                        if (sit == succ.end() || pos[cur] >= sit->second.size()) { ok = false; break; }
+                        int nxt = sit->second[pos[cur]++];
+                        cur = nxt;
+                        if (cur == start) break;
+                        if (step == 511) ok = false;
+                    }
+                    if (!ok || loop.size() < 3 || cur != start) break;
+                    for (size_t i = 1; i + 1 < loop.size(); i++)
+                        outTris.push_back({loop[0], loop[i], loop[i + 1]});
+                }
+            }
+        }
+    }
+
+    // ---- compact vertices & output ----
+    std::vector<int> remap(G.size(), -1);
+    int nv = 0;
+    for (const Tri& t : outTris)
+        for (int k = 0; k < 3; k++)
+            if (remap[t[k]] < 0) remap[t[k]] = nv++;
+    std::vector<int> invmap(nv);
+    for (size_t i = 0; i < remap.size(); i++)
+        if (remap[i] >= 0) invmap[remap[i]] = (int)i;
+
+    size_t bufCap = 1 << 22;
+    char* out = (char*)malloc(bufCap);
+    size_t op = 0;
+    auto flushIf = [&](size_t need) {
+        if (op + need > bufCap) { fwrite(out, 1, op, stdout); op = 0; }
+    };
+    op += snprintf(out + op, bufCap - op, "%d %zu\n", nv, outTris.size());
+    for (int i = 0; i < nv; i++) {
+        flushIf(128);
+        V3 p = G[invmap[i]];
+        op += snprintf(out + op, bufCap - op, "%.10g %.10g %.10g\n", p.x, p.y, p.z);
+    }
+    for (const Tri& t : outTris) {
+        flushIf(64);
+        op += snprintf(out + op, bufCap - op, "%d %d %d\n",
+                       remap[t[0]], remap[t[1]], remap[t[2]]);
+    }
+    fwrite(out, 1, op, stdout);
+    fflush(stdout);
+    return 0;
+}

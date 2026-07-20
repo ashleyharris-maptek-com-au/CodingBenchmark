@@ -1,0 +1,387 @@
+// Graph layout / edge-crossing minimization solver.
+// Strategy:
+//  - Parse input fast.
+//  - Split into connected components.
+//  - Lay out each component with a force-directed algorithm
+//    (Fruchterman-Reingold style) using a uniform spatial grid for
+//    approximate repulsion so it scales to 200k nodes.
+//  - Iteration count adapts to graph size and a global time budget.
+//  - Components are packed into a grid of bounding boxes.
+// Self-loops and parallel edges are ignored for forces (harmless).
+
+use std::io::{self, Read, Write};
+use std::time::Instant;
+
+struct Rng(u64);
+impl Rng {
+    fn next(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        x
+    }
+    fn f(&mut self) -> f32 {
+        (self.next() >> 11) as f32 / (1u64 << 53) as f32
+    }
+}
+
+fn main() {
+    let start = Instant::now();
+    let mut input = String::new();
+    io::stdin().read_to_string(&mut input).unwrap();
+    let mut it = input.split_ascii_whitespace().map(|t| t.parse::<usize>().unwrap_or(0));
+    let n = it.next().unwrap_or(0);
+    let m = it.next().unwrap_or(0);
+
+    let mut edges: Vec<(u32, u32)> = Vec::with_capacity(m);
+    for _ in 0..m {
+        let u = it.next().unwrap_or(0) as u32;
+        let v = it.next().unwrap_or(0) as u32;
+        if (u as usize) < n && (v as usize) < n && u != v {
+            edges.push((u, v));
+        }
+    }
+    // Dedup parallel edges
+    edges.sort_unstable_by_key(|&(a, b)| if a < b { (a, b) } else { (b, a) });
+    edges.dedup_by(|a, b| {
+        let ka = if a.0 < a.1 { (a.0, a.1) } else { (a.1, a.0) };
+        let kb = if b.0 < b.1 { (b.0, b.1) } else { (b.1, b.0) };
+        ka == kb
+    });
+
+    if n == 0 {
+        return;
+    }
+
+    // Build CSR adjacency
+    let mut deg = vec![0u32; n];
+    for &(u, v) in &edges {
+        deg[u as usize] += 1;
+        deg[v as usize] += 1;
+    }
+    let mut off = vec![0u32; n + 1];
+    for i in 0..n {
+        off[i + 1] = off[i] + deg[i];
+    }
+    let mut adj = vec![0u32; off[n] as usize];
+    let mut cur = off.clone();
+    for &(u, v) in &edges {
+        adj[cur[u as usize] as usize] = v;
+        cur[u as usize] += 1;
+        adj[cur[v as usize] as usize] = u;
+        cur[v as usize] += 1;
+    }
+
+    // Connected components via BFS
+    let mut comp = vec![u32::MAX; n];
+    let mut comps: Vec<Vec<u32>> = Vec::new();
+    let mut queue: Vec<u32> = Vec::new();
+    for s in 0..n {
+        if comp[s] != u32::MAX {
+            continue;
+        }
+        let cid = comps.len() as u32;
+        comp[s] = cid;
+        queue.clear();
+        queue.push(s as u32);
+        let mut members = vec![s as u32];
+        let mut head = 0;
+        while head < queue.len() {
+            let u = queue[head];
+            head += 1;
+            for &v in &adj[off[u as usize] as usize..off[u as usize + 1] as usize] {
+                if comp[v as usize] == u32::MAX {
+                    comp[v as usize] = cid;
+                    queue.push(v);
+                    members.push(v);
+                }
+            }
+        }
+        comps.push(members);
+    }
+
+    let mut px = vec![0f32; n];
+    let mut py = vec![0f32; n];
+    let mut rng = Rng(0x9E3779B97F4A7C15);
+
+    // Time budget: ~24s total, split proportional to component size.
+    let budget = 20.0f32;
+    let total_nodes = n as f32;
+
+    // Layout each component independently, then pack.
+    // Sort components by size descending for packing.
+    let mut order: Vec<usize> = (0..comps.len()).collect();
+    order.sort_unstable_by_key(|&i| std::cmp::Reverse(comps[i].len()));
+
+    // Per-component bounding boxes after layout
+    let mut boxes: Vec<(f32, f32, f32, f32, usize)> = Vec::new(); // minx,miny,maxx,maxy,compidx
+
+    // global -> local index map, shared across components (they are disjoint)
+    let mut map = vec![u32::MAX; n];
+
+    for &ci in &order {
+        let members = &comps[ci];
+        let cn = members.len();
+        if cn == 1 {
+            let u = members[0] as usize;
+            px[u] = 0.0;
+            py[u] = 0.0;
+            boxes.push((-0.5, -0.5, 0.5, 0.5, ci));
+            continue;
+        }
+        for (li, &g) in members.iter().enumerate() {
+            map[g as usize] = li as u32;
+        }
+
+        // Local CSR
+        let mut ldeg = vec![0u32; cn];
+        for (li, &g) in members.iter().enumerate() {
+            ldeg[li] = deg[g as usize];
+        }
+        let mut loff = vec![0u32; cn + 1];
+        for i in 0..cn {
+            loff[i + 1] = loff[i] + ldeg[i];
+        }
+        let mut ladj = vec![0u32; loff[cn] as usize];
+        let mut lcur = loff.clone();
+        for (li, &g) in members.iter().enumerate() {
+            for &v in &adj[off[g as usize] as usize..off[g as usize + 1] as usize] {
+                ladj[lcur[li] as usize] = map[v as usize];
+                lcur[li] += 1;
+            }
+        }
+
+        // Initial placement: BFS layering on a circle-ish disc (deterministic random)
+        let k = 1.0f32; // ideal edge length
+        let radius = (cn as f32).sqrt() * k * 0.6 + 0.5;
+        let mut x = vec![0f32; cn];
+        let mut y = vec![0f32; cn];
+        for i in 0..cn {
+            let a = rng.f() * std::f32::consts::TAU;
+            let r = radius * rng.f().sqrt();
+            x[i] = r * a.cos();
+            y[i] = r * a.sin();
+        }
+
+        // Iterations budgeted by size share
+        let share = budget * (cn as f32 / total_nodes);
+        let iters: usize = if cn <= 50 {
+            600
+        } else if cn <= 500 {
+            400
+        } else if cn <= 5000 {
+            250
+        } else if cn <= 50000 {
+            120
+        } else {
+            60
+        };
+
+        let mut dx = vec![0f32; cn];
+        let mut dy = vec![0f32; cn];
+        let area_k = k;
+        let mut temp = radius * 0.25;
+        let cool = 0.97f32;
+
+        // Spatial grid for repulsion
+        let cell = area_k * 2.0;
+        for iter in 0..iters {
+            // time check
+            if start.elapsed().as_secs_f32() > budget {
+                break;
+            }
+            let _ = share;
+            for i in 0..cn {
+                dx[i] = 0.0;
+                dy[i] = 0.0;
+            }
+            // Repulsion via grid: only nearby cells (3x3 neighborhood)
+            // Build grid
+            let mut minx = f32::MAX;
+            let mut miny = f32::MAX;
+            for i in 0..cn {
+                if x[i] < minx {
+                    minx = x[i];
+                }
+                if y[i] < miny {
+                    miny = y[i];
+                }
+            }
+            let mut maxgx = 0u32;
+            let mut maxgy = 0u32;
+            let mut gx = vec![0u32; cn];
+            let mut gy = vec![0u32; cn];
+            for i in 0..cn {
+                gx[i] = ((x[i] - minx) / cell) as u32;
+                gy[i] = ((y[i] - miny) / cell) as u32;
+                if gx[i] > maxgx {
+                    maxgx = gx[i];
+                }
+                if gy[i] > maxgy {
+                    maxgy = gy[i];
+                }
+            }
+            let gw = (maxgx + 1) as usize;
+            let gh = (maxgy + 1) as usize;
+            let ncell = gw * gh;
+            let mut count = vec![0u32; ncell + 1];
+            for i in 0..cn {
+                count[(gy[i] as usize * gw + gx[i] as usize) + 1] += 1;
+            }
+            for c in 0..ncell {
+                count[c + 1] += count[c];
+            }
+            let mut cells = vec![0u32; cn];
+            let mut cc = count.clone();
+            for i in 0..cn {
+                let c = gy[i] as usize * gw + gx[i] as usize;
+                cells[cc[c] as usize] = i as u32;
+                cc[c] += 1;
+            }
+            // Also compute cell centroids for far-field approximation
+            let mut cxs = vec![0f32; ncell];
+            let mut cys = vec![0f32; ncell];
+            let mut cnts = vec![0f32; ncell];
+            for i in 0..cn {
+                let c = gy[i] as usize * gw + gx[i] as usize;
+                cxs[c] += x[i];
+                cys[c] += y[i];
+                cnts[c] += 1.0;
+            }
+            for c in 0..ncell {
+                if cnts[c] > 0.0 {
+                    cxs[c] /= cnts[c];
+                    cys[c] /= cnts[c];
+                }
+            }
+            let k2 = area_k * area_k;
+            for i in 0..cn {
+                let cgx = gx[i] as i64;
+                let cgy = gy[i] as i64;
+                let mut fx = 0f32;
+                let mut fy = 0f32;
+                // near-field: 3x3 cells pairwise
+                for oy in -1..=1i64 {
+                    let yy = cgy + oy;
+                    if yy < 0 || yy >= gh as i64 {
+                        continue;
+                    }
+                    for ox in -1..=1i64 {
+                        let xx = cgx + ox;
+                        if xx < 0 || xx >= gw as i64 {
+                            continue;
+                        }
+                        let c = yy as usize * gw + xx as usize;
+                        for &j in &cells[count[c] as usize..count[c + 1] as usize] {
+                            let j = j as usize;
+                            if j == i {
+                                continue;
+                            }
+                            let ddx = x[i] - x[j];
+                            let ddy = y[i] - y[j];
+                            let d2 = (ddx * ddx + ddy * ddy).max(1e-4);
+                            let f = k2 / d2;
+                            fx += ddx * f;
+                            fy += ddy * f;
+                        }
+                    }
+                }
+                // far-field: cell centroids (skip 3x3 near cells)
+                // Only do far-field occasionally / for moderate grid sizes.
+                if ncell <= 4096 {
+                    for cy2 in 0..gh {
+                        for cx2 in 0..gw {
+                            if (cx2 as i64 - cgx).abs() <= 1 && (cy2 as i64 - cgy).abs() <= 1 {
+                                continue;
+                            }
+                            let c = cy2 * gw + cx2;
+                            let w = cnts[c];
+                            if w == 0.0 {
+                                continue;
+                            }
+                            let ddx = x[i] - cxs[c];
+                            let ddy = y[i] - cys[c];
+                            let d2 = (ddx * ddx + ddy * ddy).max(1e-4);
+                            let f = w * k2 / d2;
+                            fx += ddx * f;
+                            fy += ddy * f;
+                        }
+                    }
+                }
+                dx[i] += fx;
+                dy[i] += fy;
+            }
+            // Attraction along edges
+            for i in 0..cn {
+                for &jv in &ladj[loff[i] as usize..loff[i + 1] as usize] {
+                    let j = jv as usize;
+                    let ddx = x[i] - x[j];
+                    let ddy = y[i] - y[j];
+                    let d = (ddx * ddx + ddy * ddy).sqrt().max(1e-4);
+                    let f = d * d / area_k / d; // = d/k
+                    dx[i] -= ddx * f;
+                    dy[i] -= ddy * f;
+                }
+            }
+            // Apply with temperature clamp
+            for i in 0..cn {
+                let d = (dx[i] * dx[i] + dy[i] * dy[i]).sqrt().max(1e-6);
+                let lim = temp.min(d);
+                x[i] += dx[i] / d * lim;
+                y[i] += dy[i] / d * lim;
+            }
+            temp = (temp * cool).max(0.01);
+            let _ = iter;
+        }
+
+        // Bounding box
+        let mut mnx = f32::MAX;
+        let mut mny = f32::MAX;
+        let mut mxx = f32::MIN;
+        let mut mxy = f32::MIN;
+        for i in 0..cn {
+            mnx = mnx.min(x[i]);
+            mny = mny.min(y[i]);
+            mxx = mxx.max(x[i]);
+            mxy = mxy.max(y[i]);
+        }
+        for (li, &g) in members.iter().enumerate() {
+            px[g as usize] = x[li];
+            py[g as usize] = y[li];
+        }
+        boxes.push((mnx, mny, mxx, mxy, ci));
+    }
+
+    // Pack component boxes left-to-right in rows.
+    let total_w: f32 = boxes.iter().map(|b| b.2 - b.0 + 2.0).sum();
+    let row_w = (total_w * (total_w / boxes.len().max(1) as f32).sqrt()).sqrt().max(total_w.sqrt());
+    let mut curx = 0f32;
+    let mut cury = 0f32;
+    let mut rowh = 0f32;
+    for &(mnx, mny, mxx, mxy, ci) in &boxes {
+        let w = mxx - mnx + 2.0;
+        let h = mxy - mny + 2.0;
+        if curx > 0.0 && curx + w > row_w {
+            curx = 0.0;
+            cury += rowh;
+            rowh = 0.0;
+        }
+        let ox = curx - mnx;
+        let oy = cury - mny;
+        for &g in &comps[ci] {
+            px[g as usize] += ox;
+            py[g as usize] += oy;
+        }
+        curx += w;
+        rowh = rowh.max(h);
+    }
+
+    // Output
+    let mut out = String::with_capacity(n * 24);
+    for i in 0..n {
+        out.push_str(&format!("{:.4} {:.4}\n", px[i], py[i]));
+    }
+    io::stdout().write_all(out.as_bytes()).unwrap();
+}

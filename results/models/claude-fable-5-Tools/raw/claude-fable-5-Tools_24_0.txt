@@ -1,0 +1,563 @@
+// 3D Lunar Lander controller.
+//
+// Architecture:
+//  - main thread: parses header, then reads state tokens from stdin forever.
+//  - writer thread: emits "thrust pitch yaw roll" at 20 Hz regardless of stdin.
+//  - terrain thread: streams the (possibly multi-GB) terrain file, building
+//    a coarse max-height grid for corridor clearance plus fine patches around
+//    the start and target for landing / overhang handling.
+//
+// Guidance: cruise at a safe altitude above everything along the corridor to
+// the target, brake with a sqrt(2*a*d) velocity profile, then descend onto the
+// pad with a controlled vertical speed profile. If a floating rock covers the
+// target, descend at a standoff point outside the overhang and approach
+// horizontally through the air gap.
+
+#define _CRT_SECURE_NO_WARNINGS
+#include <cstdio>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <cmath>
+#include <string>
+#include <vector>
+#include <atomic>
+#include <mutex>
+#include <thread>
+#include <chrono>
+#include <algorithm>
+
+static const double PI = 3.14159265358979323846;
+
+static inline double clampd(double v, double lo, double hi) { return v < lo ? lo : (v > hi ? hi : v); }
+static inline double wrapPi(double a) {
+    while (a > PI) a -= 2 * PI;
+    while (a < -PI) a += 2 * PI;
+    return a;
+}
+
+// ---------------- header data ----------------
+static int    Wm = 1, Dm = 1, Hm = 1;
+static double GRAV = 1.62, TMAX = 10.0, FUEL0 = 100.0;
+static double SX = 0, SY = 0, SZ = 0, TX = 0, TY = 0, TZ = 0;
+static double LANDR = 5.0, SLOWR = 60.0;
+
+// ---------------- shared command ----------------
+struct Cmd { double t = 0, p = 0, y = 0, r = 0; };
+static std::mutex cmdMx;
+static Cmd gCmd;
+static std::atomic<bool> gDone{ false };
+
+// ---------------- terrain ----------------
+static std::atomic<bool> gTerrainReady{ false };
+static std::atomic<bool> gAbort{ false };
+static std::atomic<bool> gTerrainMissing{ false };
+static int CS = 1;             // coarse cell size (meters per coarse cell)
+static int CXn = 1, CYn = 1;   // coarse grid dims
+static std::vector<uint16_t> gTop;  // max(ground top, floating top) per coarse cell
+static std::vector<uint16_t> gGnd;  // max ground top per coarse cell
+
+struct Patch {
+    int x0 = 0, y0 = 0, w = 0, h = 0;
+    std::vector<uint16_t> d;
+    void init(double cx, double cy, int rad) {
+        x0 = std::max(0, (int)cx - rad);
+        y0 = std::max(0, (int)cy - rad);
+        int x1 = std::min(Wm - 1, (int)cx + rad);
+        int y1 = std::min(Dm - 1, (int)cy + rad);
+        w = std::max(0, x1 - x0 + 1);
+        h = std::max(0, y1 - y0 + 1);
+        d.assign((size_t)w * h * 3, 0);
+    }
+    inline void store(int x, int y, uint16_t a, uint16_t b, uint16_t c) {
+        unsigned ix = (unsigned)(x - x0), iy = (unsigned)(y - y0);
+        if (ix < (unsigned)w && iy < (unsigned)h) {
+            size_t k = ((size_t)ix * h + iy) * 3;
+            d[k] = a; d[k + 1] = b; d[k + 2] = c;
+        }
+    }
+    inline bool get(int x, int y, uint16_t& a, uint16_t& b, uint16_t& c) const {
+        unsigned ix = (unsigned)(x - x0), iy = (unsigned)(y - y0);
+        if (ix >= (unsigned)w || iy >= (unsigned)h) return false;
+        size_t k = ((size_t)ix * h + iy) * 3;
+        a = d[k]; b = d[k + 1]; c = d[k + 2];
+        return true;
+    }
+};
+static Patch gTP, gSP;
+
+static void terrainThread(std::string path) {
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) {
+        gTerrainMissing.store(true);
+        gTerrainReady.store(true, std::memory_order_release);
+        return;
+    }
+    const size_t BUFSZ = 1u << 22;
+    std::vector<unsigned char> buf(BUFSZ + 16);
+    size_t carry = 0;
+    int64_t i = 0, total = (int64_t)Wm * Dm;
+    int xx = 0, yy = 0;
+    while (i < total && !gAbort.load(std::memory_order_relaxed)) {
+        size_t got = fread(buf.data() + carry, 1, BUFSZ, f);
+        if (got == 0) break;
+        size_t avail = carry + got;
+        size_t ncell = avail / 6;
+        const unsigned char* p = buf.data();
+        for (size_t k = 0; k < ncell && i < total; k++, p += 6, i++) {
+            uint16_t a, b, c;
+            memcpy(&a, p, 2); memcpy(&b, p + 2, 2); memcpy(&c, p + 4, 2);
+            uint16_t top = a;
+            if (c > b && c > top) top = c;
+            size_t ci = (size_t)(xx / CS) * CYn + (size_t)(yy / CS);
+            if (top > gTop[ci]) gTop[ci] = top;
+            if (a > gGnd[ci]) gGnd[ci] = a;
+            gTP.store(xx, yy, a, b, c);
+            gSP.store(xx, yy, a, b, c);
+            if (++yy == Dm) { yy = 0; ++xx; }
+        }
+        size_t used = ncell * 6;
+        carry = avail - used;
+        if (carry) memmove(buf.data(), buf.data() + used, carry);
+    }
+    fclose(f);
+    gTerrainReady.store(true, std::memory_order_release);
+}
+
+// ---------------- terrain queries ----------------
+static double sampleTopDil(double x, double y) {
+    int cx = (int)clampd(x, 0, Wm - 1) / CS;
+    int cy = (int)clampd(y, 0, Dm - 1) / CS;
+    double m = 0;
+    for (int i = -1; i <= 1; i++) for (int j = -1; j <= 1; j++) {
+        int a = cx + i, b = cy + j;
+        if (a < 0 || b < 0 || a >= CXn || b >= CYn) continue;
+        double v = (double)gTop[(size_t)a * CYn + b];
+        if (v > m) m = v;
+    }
+    return m;
+}
+static double sampleGndDil(double x, double y) {
+    int cx = (int)clampd(x, 0, Wm - 1) / CS;
+    int cy = (int)clampd(y, 0, Dm - 1) / CS;
+    double m = 0;
+    for (int i = -1; i <= 1; i++) for (int j = -1; j <= 1; j++) {
+        int a = cx + i, b = cy + j;
+        if (a < 0 || b < 0 || a >= CXn || b >= CYn) continue;
+        double v = (double)gGnd[(size_t)a * CYn + b];
+        if (v > m) m = v;
+    }
+    return m;
+}
+// distance along (ux,uy) to the first coarse sample whose top is at/above
+// altitude zRef - margin (i.e. terrain we have not yet cleared); maxLen if none
+static double firstBlockDist(double x0, double y0, double ux, double uy,
+                             double maxLen, double zRef) {
+    double step = std::max(1.0, (double)CS);
+    for (double d = 0; d <= maxLen; d += step) {
+        if (sampleTopDil(x0 + ux * d, y0 + uy * d) + 5.0 > zRef)
+            return d;
+        if (d > 3000.0 * step) break; // bounded work per tick
+    }
+    return maxLen;
+}
+static double corridorTop(double x0, double y0, double x1, double y1) {
+    double d = std::hypot(x1 - x0, y1 - y0);
+    int n = (int)std::min(3000.0, d / std::max(1, CS)) + 1;
+    double m = 0;
+    for (int i = 0; i <= n; i++) {
+        double t = (double)i / n;
+        double v = sampleTopDil(x0 + (x1 - x0) * t, y0 + (y1 - y0) * t);
+        if (v > m) m = v;
+    }
+    return m;
+}
+// ground below us: prefer fine target patch data when inside it
+static double gndUnder(double x, double y) {
+    int xi = (int)std::floor(x), yi = (int)std::floor(y);
+    uint16_t a, b, c;
+    double g = 0; bool anyf = false;
+    for (int i = -2; i <= 2; i++) for (int j = -2; j <= 2; j++) {
+        if (gTP.get(xi + i, yi + j, a, b, c)) { if ((double)a > g) g = (double)a; anyf = true; }
+    }
+    if (anyf) return g;
+    return sampleGndDil(x, y);
+}
+// lowest floating-rock underside at/above altitude Z near (X,Y); 1e18 if open sky
+static double ceilCapAt(double X, double Y, double Z) {
+    int xi = (int)std::floor(X), yi = (int)std::floor(Y);
+    double m = 1e18;
+    uint16_t a, b, c;
+    for (int i = -2; i <= 2; i++) for (int j = -2; j <= 2; j++) {
+        if (gTP.get(xi + i, yi + j, a, b, c) || gSP.get(xi + i, yi + j, a, b, c)) {
+            if (c > b && (double)b >= Z - 1.0 && (double)b < m) m = (double)b;
+        }
+    }
+    return m;
+}
+
+// ---------------- approach plan (overhang above target) ----------------
+struct ApproachPlan { bool computed = false, hasCeil = false; double alt = 0, sx = 0, sy = 0; };
+static ApproachPlan gAp;
+
+static void computeApproach() {
+    gAp.computed = true;
+    uint16_t a, b, c;
+    int txi = (int)TX, tyi = (int)TY;
+    int r = (int)std::ceil(LANDR) + 3;
+    double ceilMin = 1e18;
+    for (int i = -r; i <= r; i++) for (int j = -r; j <= r; j++) {
+        if ((double)i * i + (double)j * j > (double)r * r) continue;
+        if (!gTP.get(txi + i, tyi + j, a, b, c)) continue;
+        if (c > b && (double)c > TZ + 1.0 && (double)b > TZ - 1.0)
+            ceilMin = std::min(ceilMin, (double)b);
+    }
+    if (ceilMin > 1e17) return;
+    gAp.hasCeil = true;
+    // Fly roughly through the middle of the air gap, never closer than 5 m to
+    // the rock underside and at least 2.5 m above the pad.
+    gAp.alt = clampd(TZ + 0.4 * (ceilMin - TZ), TZ + 2.5, std::max(TZ + 2.5, ceilMin - 5.0));
+    double a0 = std::atan2(SY - TY, SX - TX);
+    if (!std::isfinite(a0)) a0 = 0;
+    double bestD = 1e18, alt = gAp.alt;
+    int maxS = std::max(gTP.w, gTP.h);
+    for (int k = 0; k < 16; k++) {
+        double ang = a0 + k * (PI / 8.0);
+        double ca = std::cos(ang), sa = std::sin(ang);
+        for (double sd = LANDR + 2; sd < maxS; sd += 1.0) {
+            int px = (int)(TX + ca * sd), py = (int)(TY + sa * sd);
+            if (!gTP.get(px, py, a, b, c)) break;
+            bool air = ((double)a <= alt - 0.5) && !((double)b <= alt && alt < (double)c);
+            if (!air) break; // approach path blocked in this direction
+            bool openAbove = (b >= c) || ((double)c <= alt + 0.5);
+            if (openAbove && (double)a <= alt - 2.0) {
+                if (sd + 2 < bestD) {
+                    bestD = sd + 2;
+                    gAp.sx = TX + ca * (sd + 2);
+                    gAp.sy = TY + sa * (sd + 2);
+                }
+                break;
+            }
+        }
+    }
+    if (bestD > 1e17) {
+        gAp.sx = TX + std::cos(a0) * (LANDR + 8);
+        gAp.sy = TY + std::sin(a0) * (LANDR + 8);
+    }
+}
+
+// ---------------- controller ----------------
+struct State {
+    double x, y, z, vx, vy, vz, pitch, yaw, roll, pr, yr, rr, fuel;
+};
+
+enum Mode { HOLD, CRUISE, APPROACH, DESCS, LAND };
+
+static double gLastThrustN = 0;
+static int    gYawS = 1;          // believed sign of the sim's yaw rotation sense
+static double gCorr = 0;
+static bool   gHavePrev = false;
+static double gPvx = 0, gPvy = 0;
+
+static void control(const State& s) {
+    const double dt = 0.1;
+
+    // Estimate the sim's yaw sign convention from observed lateral acceleration.
+    if (gHavePrev) {
+        double ayObs = (s.vy - gPvy) / dt;
+        double predA = -gLastThrustN * std::sin(s.pitch) * std::sin(s.yaw);
+        if (std::fabs(predA) > 0.5) {
+            gCorr = gCorr * 0.995 + ayObs * predA;
+            if (gCorr > 3.0) gYawS = 1;
+            else if (gCorr < -3.0) gYawS = -1;
+        }
+    }
+    gPvx = s.vx; gPvy = s.vy; gHavePrev = true;
+
+    bool ready = gTerrainReady.load(std::memory_order_acquire);
+    if (ready && !gAp.computed) {
+        computeApproach();
+#ifdef LL_DEBUG
+        fprintf(stderr, "[dbg] plan hasCeil=%d alt=%.1f s=(%.1f,%.1f)\n",
+                (int)gAp.hasCeil, gAp.alt, gAp.sx, gAp.sy);
+#endif
+    }
+
+    double x = s.x, y = s.y, z = s.z;
+    double dx = TX - x, dy = TY - y;
+    double dh = std::sqrt(dx * dx + dy * dy);
+    double aUp = std::max(0.15, 0.88 * TMAX - GRAV);
+    double ahMax = (TMAX > 1.05 * GRAV)
+        ? std::sqrt(std::max(0.02, 0.9025 * TMAX * TMAX - GRAV * GRAV))
+        : 0.15 * TMAX;
+    double abrake = 0.7 * ahMax;
+
+    double vdx = 0, vdy = 0, vdz = 0;
+    int mode = HOLD;
+    bool emerg = false;
+
+    if (!ready) {
+        // Hover near the start altitude until we know the terrain.
+        vdz = clampd(0.3 * (SZ - z), -1.0, 2.0);
+    } else {
+        bool ceilC = gAp.hasCeil;
+        double gx = TX, gy = TY;
+        if (ceilC) {
+            double dS = std::hypot(gAp.sx - x, gAp.sy - y);
+            bool underRock = ceilCapAt(x, y, z) < 1e17;
+            if (underRock || z <= gAp.alt + 2.5) {
+                // Committed to the low-level approach; never climb back out.
+                mode = (dh <= std::max(3.0, LANDR * 0.7)) ? LAND : APPROACH;
+            }
+            else if (dS <= 6.0) mode = DESCS;
+            else { mode = CRUISE; gx = gAp.sx; gy = gAp.sy; }
+        } else if (dh > SLOWR) {
+            mode = CRUISE;
+        } else {
+            // Only descend toward the pad once we're above everything on the
+            // straight line to it; otherwise keep cruising (climb/route).
+            double corrPad = corridorTop(x, y, TX, TY);
+            mode = (z >= corrPad + 2.0 || dh <= LANDR) ? LAND : CRUISE;
+        }
+
+        if (mode == CRUISE) {
+            double dgx = gx - x, dgy = gy - y;
+            double dg = std::hypot(dgx, dgy);
+            double corridor = corridorTop(x, y, gx, gy);
+            if (gTerrainMissing.load()) corridor = std::max(corridor, std::max(SZ, TZ));
+            double clearM = clampd(6.0 + 0.02 * dg, 10.0, 150.0);
+            double zdes = std::min(corridor + clearM, (double)Hm - 6.0);
+            double cc = ceilCapAt(x, y, z);
+            if (cc < 1e17) zdes = std::min(zdes, cc - 4.0);
+            double gU = gndUnder(x, y);
+            zdes = std::max(zdes, std::min(gU + 8.0, (double)Hm - 6.0));
+
+            double ux = dg > 1e-9 ? dgx / dg : 0.0;
+            double uy = dg > 1e-9 ? dgy / dg : 0.0;
+            double vh = std::hypot(s.vx, s.vy);
+            double look = std::min(dg, vh * vh / (2 * abrake) + 5 * vh + 2.0 * CS + 20.0);
+            double obst = corridorTop(x, y, x + ux * look, y + uy * look);
+            double vcap = std::min(0.85 * std::sqrt(2 * abrake * std::max(0.0, dg - 3.0)), 900.0);
+            // Don't fly toward terrain we haven't cleared yet: limit speed so we
+            // can stop before the first blocking sample, and climb first.
+            double dblock = firstBlockDist(x, y, ux, uy, dg, z);
+            vcap = std::min(vcap, 0.8 * std::sqrt(2 * abrake * std::max(0.0, dblock - 8.0)));
+            if (z < obst + 6.0) vcap = std::min(vcap, 2.0);
+            else if (z < obst + clearM * 0.5) vcap = std::min(vcap, 2.0 + 0.4 * (z - obst - 6.0));
+            vdx = ux * vcap; vdy = uy * vcap;
+
+            double vupc = 0.85 * std::sqrt(2 * aUp * std::max(0.0, zdes - z)) + 0.8;
+            double floorA = std::max(obst, gU) + 5.0;
+            double vdn = 0.8 * std::sqrt(2 * aUp * std::max(0.0, z - std::max(zdes - 3.0, floorA))) + 0.4;
+            vdz = clampd(0.8 * (zdes - z), -vdn, vupc);
+
+            double stopD = s.vz < 0 ? s.vz * s.vz / (2 * aUp) : 0.0;
+            if (z - stopD < gU + 5.0 && z < zdes) emerg = true;
+        } else if (mode == APPROACH) {
+            vdz = clampd(0.8 * (gAp.alt - z), -2.0, 2.0);
+            double ux = dx / std::max(dh, 1e-9), uy = dy / std::max(dh, 1e-9);
+            double vcap = std::min(4.0, 0.35 * dh + 0.25);
+            vdx = ux * vcap; vdy = uy * vcap;
+        } else if (mode == DESCS) {
+            vdx = clampd(0.8 * (gAp.sx - x), -4, 4);
+            vdy = clampd(0.8 * (gAp.sy - y), -4, 4);
+            double vdn = 0.7 * std::sqrt(2 * aUp * std::max(0.0, z - gAp.alt)) + 0.5;
+            vdz = clampd(0.8 * (gAp.alt - z), -vdn, 3.0);
+        } else { // LAND
+            double h = z - TZ;
+            double ux = dh > 1e-9 ? dx / dh : 0.0;
+            double uy = dh > 1e-9 ? dy / dh : 0.0;
+            double vcapH = std::min(0.8 * std::sqrt(2 * abrake * std::max(0.0, dh)),
+                                    std::max(1.0 + 0.22 * std::max(0.0, h), 0.15 * dh));
+            double vmag = std::min(0.8 * dh, vcapH);
+            vdx = ux * vmag; vdy = uy * vmag;
+            if (dh > std::max(3.0, LANDR * 0.6) && h < 20.0) {
+                vdz = 0.0; // recenter over the pad before descending further
+            } else {
+                double vmaxDn = 0.85 * std::sqrt(2 * aUp * std::max(0.0, h - 1.0)) + 0.6;
+                double prof = 0.28 * std::max(0.0, h) + 0.5;
+                vdz = -std::min(prof, vmaxDn);
+                if (h < 2.0) vdz = -0.65;
+            }
+            // Under an overhang, never climb back toward the rock underside.
+            if (ceilC) vdz = std::min(vdz, 0.5 * (gAp.alt - z));
+        }
+    }
+
+#ifdef LL_DEBUG
+    {
+        static int dbgN = 0;
+        if (++dbgN % 20 == 0)
+            fprintf(stderr, "[dbg] mode=%d pos=(%.1f,%.1f,%.1f) v=(%.1f,%.1f,%.1f) dh=%.1f vdes=(%.1f,%.1f,%.1f)\n",
+                    mode, x, y, z, s.vx, s.vy, s.vz, dh, vdx, vdy, vdz);
+    }
+#endif
+    // Soft world-boundary guards.
+    if (x < 5) vdx = std::max(vdx, 0.5 * (5 - x));
+    if (x > Wm - 5) vdx = std::min(vdx, -0.5 * (x - (Wm - 5)));
+    if (y < 5) vdy = std::max(vdy, 0.5 * (5 - y));
+    if (y > Dm - 5) vdy = std::min(vdy, -0.5 * (y - (Dm - 5)));
+    vdz = std::min(vdz, 0.8 * ((double)Hm - 4.0 - z));
+
+    // Velocity tracking -> desired acceleration.
+    // Vertical is guaranteed up to ~1.25g (hover + margin); horizontal demand
+    // is served next; any leftover authority goes to extra climb rate. This
+    // keeps braking authority available while climbing over obstacles.
+    double ax = 1.4 * (vdx - s.vx), ay = 1.4 * (vdy - s.vy);
+    double ahn = std::hypot(ax, ay);
+    if (ahn > ahMax && ahn > 1e-9) { ax *= ahMax / ahn; ay *= ahMax / ahn; }
+    double az = GRAV + 1.6 * (vdz - s.vz);
+    az = clampd(az, 0.0, 0.97 * TMAX);
+    double azReserve = std::min(az, std::min(1.25 * GRAV, 0.97 * TMAX));
+    double fhMax = std::sqrt(std::max(0.0, 0.9409 * TMAX * TMAX - azReserve * azReserve));
+    ahn = std::hypot(ax, ay);
+    if (ahn > fhMax && ahn > 1e-9) { ax *= fhMax / ahn; ay *= fhMax / ahn; ahn = fhMax; }
+    double azMax = std::sqrt(std::max(0.0, 0.9409 * TMAX * TMAX - ahn * ahn));
+    az = clampd(az, 0.0, std::max(azReserve, azMax));
+    if (emerg) { ax = 0; ay = 0; az = 0.97 * TMAX; ahn = 0; }
+
+    // Convert desired force to attitude targets.
+    double pdes = 0, wdes = s.yaw;
+    if (ahn > 0.02 * TMAX) {
+        double pmag = std::atan2(ahn, std::max(az, 0.05 * TMAX));
+        double pLim = (mode == LAND && (z - TZ) < 40.0) ? 0.45 : (mode == APPROACH ? 0.5 : 1.15);
+        if (pmag > pLim) pmag = pLim;
+        double ux = ax / ahn, uy = ay / ahn;
+        double wA = std::atan2(-uy * (double)gYawS, -ux);
+        double dA = std::fabs(wrapPi(wA - s.yaw));
+        double wB = wrapPi(wA + PI);
+        double dB = std::fabs(wrapPi(wB - s.yaw));
+        if (dB < dA) { pdes = -pmag; wdes = wB; }
+        else { pdes = pmag; wdes = wA; }
+    }
+    double cp = clampd(6.0 * (pdes - s.pitch) - 3.5 * s.pr, -1, 1);
+    double cy = clampd(6.0 * wrapPi(wdes - s.yaw) - 3.5 * s.yr, -1, 1);
+    double cr = clampd(-1.0 * wrapPi(s.roll) - 1.0 * s.rr, -1, 1);
+
+    // Thrust = projection of desired force onto the current thrust axis.
+    double cpc = std::cos(s.pitch), spc = std::sin(s.pitch);
+    double dxr = -spc * std::cos(s.yaw);
+    double dyr = -spc * std::sin(s.yaw) * (double)gYawS;
+    double dzr = cpc;
+    double dotv = ax * dxr + ay * dyr + az * dzr;
+    double frac = clampd(dotv / TMAX, 0.0, 1.0);
+    if (emerg) frac = 1.0;
+    if (!std::isfinite(frac)) frac = 0.0;
+
+    gLastThrustN = frac * TMAX;
+    std::lock_guard<std::mutex> lk(cmdMx);
+    gCmd.t = frac; gCmd.p = cp; gCmd.y = cy; gCmd.r = cr;
+}
+
+// ---------------- IO ----------------
+static void writerThread() {
+    auto next = std::chrono::steady_clock::now();
+    while (!gDone.load(std::memory_order_relaxed)) {
+        Cmd c;
+        {
+            std::lock_guard<std::mutex> lk(cmdMx);
+            c = gCmd;
+        }
+        printf("%.4f %.4f %.4f %.4f\n", c.t, c.p, c.y, c.r);
+        fflush(stdout);
+        next += std::chrono::milliseconds(50);
+        auto now = std::chrono::steady_clock::now();
+        if (next < now - std::chrono::milliseconds(200)) next = now;
+        std::this_thread::sleep_until(next);
+    }
+}
+
+static bool readToken(char* buf, int cap) {
+    int ch;
+    do { ch = getc(stdin); } while (ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n');
+    if (ch == EOF) return false;
+    int n = 0;
+    while (ch != EOF && ch != ' ' && ch != '\t' && ch != '\r' && ch != '\n') {
+        if (n < cap - 1) buf[n++] = (char)ch;
+        ch = getc(stdin);
+    }
+    if (ch != EOF) ungetc(ch, stdin); // don't swallow the line terminator
+    buf[n] = 0;
+    return true;
+}
+
+static bool readNumber(double& out) {
+    char tok[128];
+    while (readToken(tok, sizeof tok)) {
+        char* end = nullptr;
+        double v = strtod(tok, &end);
+        if (end != tok && *end == 0) { out = v; return true; }
+        // non-numeric token (e.g. "STATE") -> skip
+    }
+    return false;
+}
+
+int main() {
+    double hdr[12];
+    for (int i = 0; i < 12; i++) {
+        if (!readNumber(hdr[i])) return 0;
+    }
+    Wm = std::max(1, (int)hdr[0]);
+    Dm = std::max(1, (int)hdr[1]);
+    Hm = std::max(1, (int)hdr[2]);
+    GRAV = std::fabs(hdr[3]) > 1e-6 ? std::fabs(hdr[3]) : 1.62;
+    TMAX = hdr[4] > 1e-6 ? hdr[4] : 10.0;
+    FUEL0 = hdr[5];
+    SX = hdr[6]; SY = hdr[7]; SZ = hdr[8];
+    TX = hdr[9]; TY = hdr[10]; TZ = hdr[11];
+
+    LANDR = std::max(5.0, std::min(Wm, Dm) * 0.02);
+    SLOWR = std::max(4.0 * LANDR, 60.0);
+
+    // consume rest of current line, then the terrain path line (may contain spaces)
+    {
+        int ch;
+        do { ch = getc(stdin); } while (ch != '\n' && ch != EOF);
+    }
+    std::string path;
+    for (;;) {
+        std::string line;
+        int ch;
+        while ((ch = getc(stdin)) != EOF && ch != '\n') line.push_back((char)ch);
+        // trim
+        size_t b = line.find_first_not_of(" \t\r");
+        size_t e = line.find_last_not_of(" \t\r");
+        std::string t = (b == std::string::npos) ? std::string() : line.substr(b, e - b + 1);
+        if (!t.empty()) { path = t; break; }
+        if (ch == EOF) break;
+    }
+
+    // coarse grid setup
+    CS = std::max(1, (int)std::ceil(std::max(Wm, Dm) / 1024.0));
+    CXn = (Wm + CS - 1) / CS;
+    CYn = (Dm + CS - 1) / CS;
+    gTop.assign((size_t)CXn * CYn, 0);
+    gGnd.assign((size_t)CXn * CYn, 0);
+
+    int rt = (int)clampd(LANDR * 2.0 + 200.0, 200.0, 4000.0);
+    gTP.init(TX, TY, rt);
+    gSP.init(SX, SY, 64);
+
+    std::thread tw(writerThread);
+    std::thread tt(terrainThread, path);
+
+    // state loop
+    double v[13];
+    int nv = 0;
+    double num;
+    while (readNumber(num)) {
+        v[nv++] = num;
+        if (nv == 13) {
+            nv = 0;
+            State st{ v[0], v[1], v[2], v[3], v[4], v[5], v[6],
+                      v[7], v[8], v[9], v[10], v[11], v[12] };
+            control(st);
+        }
+    }
+
+    gDone.store(true);
+    gAbort.store(true);
+    tw.join();
+    tt.join();
+    return 0;
+}

@@ -1,0 +1,404 @@
+// Job-Shop Scheduling solver (adaptive).
+//
+// Strategy by scale:
+//  - Small/medium (N*J affordable): randomized Giffler-Thompson active-schedule
+//    generation, multi-restart with several dispatch rules.
+//  - Huge instances: event-driven list scheduling (O(N log N)) with a few
+//    dispatch rules.
+//  - All sizes: critical-path adjacent-swap local search (iterated hill
+//    climbing with perturbation) until the time budget expires.
+//
+// Compile: cl /O2 /std:c++20 solution.cpp   (or g++ -O2 -std=c++20)
+
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <cstdint>
+#include <climits>
+#include <vector>
+#include <string>
+#include <queue>
+#include <algorithm>
+#include <random>
+#include <chrono>
+
+using namespace std;
+using ll = long long;
+
+static double elapsed(const chrono::steady_clock::time_point &t0) {
+    return chrono::duration<double>(chrono::steady_clock::now() - t0).count();
+}
+
+// ---------------- fast input ----------------
+static vector<char> readAll() {
+    vector<char> buf;
+    buf.reserve(1 << 20);
+    char tmp[1 << 16];
+    size_t n;
+    while ((n = fread(tmp, 1, sizeof(tmp), stdin)) > 0) buf.insert(buf.end(), tmp, tmp + n);
+    buf.push_back(0);
+    return buf;
+}
+struct Scanner {
+    const char *p;
+    explicit Scanner(const char *s) : p(s) {}
+    bool nextInt(ll &out) {
+        while (*p && (*p < '0' || *p > '9') && *p != '-') ++p;
+        if (!*p) return false;
+        bool neg = false;
+        if (*p == '-') { neg = true; ++p; }
+        ll v = 0;
+        while (*p >= '0' && *p <= '9') v = v * 10 + (*p++ - '0');
+        out = neg ? -v : v;
+        return true;
+    }
+};
+
+// ---------------- problem data ----------------
+static int J, M, N;                 // jobs, machines, total ops
+static vector<int> jobT;            // tasks per job
+static vector<int> jobOff;          // first global op id of job
+static vector<int> opMach, opJob;   // per global op
+static vector<ll>  opDur;
+static vector<ll>  jobWork;         // total work per job
+
+static inline int jobPredOp(int op) { // -1 if first op of its job
+    return (op > jobOff[opJob[op]]) ? op - 1 : -1;
+}
+
+// =====================================================================
+// Giffler-Thompson active schedule generation with a dispatch rule.
+// rule: 0=MWR 1=SPT 2=LPT 3=LWR 4=FCFS 5=random
+// =====================================================================
+static ll gifflerThompson(vector<ll> &start, int rule, mt19937_64 &rng) {
+    vector<int> nxt(J, 0);
+    vector<ll> jr(J, 0), mr(M, 0), rem(jobWork);
+    int done = 0;
+    ll makespan = 0;
+    while (done < N) {
+        // find op with minimum earliest completion time
+        ll bestECT = LLONG_MAX;
+        int bestMach = -1, bestOp = -1;
+        for (int j = 0; j < J; ++j) {
+            if (nxt[j] >= jobT[j]) continue;
+            int op = jobOff[j] + nxt[j];
+            int m = opMach[op];
+            ll est = jr[j] > mr[m] ? jr[j] : mr[m];
+            ll ect = est + opDur[op];
+            if (ect < bestECT) { bestECT = ect; bestMach = m; bestOp = op; }
+        }
+        // conflict set: ready ops on bestMach that could start before bestECT
+        // (may be empty when the argmin op has zero duration — fall back to it)
+        int pick = -1;
+        ll bestKey = 0;
+        ll tie = 0;
+        for (int j = 0; j < J; ++j) {
+            if (nxt[j] >= jobT[j]) continue;
+            int op = jobOff[j] + nxt[j];
+            if (opMach[op] != bestMach) continue;
+            ll est = jr[j] > mr[bestMach] ? jr[j] : mr[bestMach];
+            if (est >= bestECT) continue;
+            ll key;
+            switch (rule) {
+                case 0: key = -rem[j]; break;             // most work remaining
+                case 1: key = opDur[op]; break;           // shortest processing time
+                case 2: key = -opDur[op]; break;          // longest processing time
+                case 3: key = rem[j]; break;              // least work remaining
+                case 4: key = est; break;                 // earliest start
+                default: key = (ll)(rng() >> 1); break;   // random
+            }
+            ll t = (ll)(rng() >> 1); // random tie-break
+            if (pick < 0 || key < bestKey || (key == bestKey && t < tie)) {
+                pick = op; bestKey = key; tie = t;
+            }
+        }
+        if (pick < 0) pick = bestOp;
+        int j = opJob[pick];
+        int m = opMach[pick];
+        ll st = jr[j] > mr[m] ? jr[j] : mr[m];
+        start[pick] = st;
+        ll en = st + opDur[pick];
+        jr[j] = mr[m] = en;
+        rem[j] -= opDur[pick];
+        ++nxt[j];
+        ++done;
+        if (en > makespan) makespan = en;
+    }
+    return makespan;
+}
+
+// =====================================================================
+// Event-driven list scheduling for huge instances. O(N log N).
+// rule: 0=MWR 1=SPT 2=LWR
+// =====================================================================
+static ll eventGreedy(vector<ll> &start, int rule) {
+    vector<ll> rem(jobWork);
+    // per-machine heap of available ops: pair(key, op), min-heap by key
+    vector<priority_queue<pair<ll, int>, vector<pair<ll, int>>, greater<>>> avail(M);
+    auto keyOf = [&](int op) -> ll {
+        switch (rule) {
+            case 0: return -rem[opJob[op]];
+            case 1: return opDur[op];
+            default: return rem[opJob[op]];
+        }
+    };
+    vector<char> idle(M, 1);
+    // events: (time, kind, id). kind 0 = op becomes available, 1 = machine frees.
+    priority_queue<tuple<ll, int, int>, vector<tuple<ll, int, int>>, greater<>> ev;
+    for (int j = 0; j < J; ++j)
+        if (jobT[j] > 0) ev.emplace(0, 0, jobOff[j]);
+    ll makespan = 0;
+    auto dispatch = [&](int m, ll t) {
+        if (avail[m].empty()) { idle[m] = 1; return; }
+        int op = avail[m].top().second;
+        avail[m].pop();
+        idle[m] = 0;
+        start[op] = t;
+        ll en = t + opDur[op];
+        rem[opJob[op]] -= opDur[op];
+        if (en > makespan) makespan = en;
+        int j = opJob[op];
+        if (op + 1 < jobOff[j] + jobT[j]) ev.emplace(en, 0, op + 1);
+        ev.emplace(en, 1, m);
+    };
+    while (!ev.empty()) {
+        auto [t, kind, id] = ev.top();
+        ev.pop();
+        if (kind == 0) {
+            int m = opMach[id];
+            avail[m].emplace(keyOf(id), id);
+            if (idle[m]) dispatch(m, t);
+        } else {
+            dispatch(id, t);
+        }
+    }
+    return makespan;
+}
+
+// =====================================================================
+// Schedule evaluation from machine sequences (disjunctive graph, Kahn).
+// Returns makespan, or -1 if the sequences are cyclic (infeasible).
+// =====================================================================
+static ll evalSeq(const vector<vector<int>> &seq, vector<ll> &start,
+                  vector<int> &mpred) {
+    static vector<int> indeg, q;
+    indeg.assign(N, 0);
+    mpred.assign(N, -1);
+    for (int m = 0; m < M; ++m)
+        for (size_t i = 1; i < seq[m].size(); ++i) mpred[seq[m][i]] = seq[m][i - 1];
+    static vector<int> msucc;
+    msucc.assign(N, -1);
+    for (int op = 0; op < N; ++op)
+        if (mpred[op] >= 0) msucc[mpred[op]] = op;
+    for (int op = 0; op < N; ++op) {
+        if (jobPredOp(op) >= 0) indeg[op]++;
+        if (mpred[op] >= 0) indeg[op]++;
+    }
+    q.clear();
+    for (int op = 0; op < N; ++op)
+        if (indeg[op] == 0) q.push_back(op);
+    ll makespan = 0;
+    size_t head = 0;
+    int processed = 0;
+    while (head < q.size()) {
+        int op = q[head++];
+        ++processed;
+        ll s = 0;
+        int jp = jobPredOp(op);
+        if (jp >= 0) { ll e = start[jp] + opDur[jp]; if (e > s) s = e; }
+        int mp = mpred[op];
+        if (mp >= 0) { ll e = start[mp] + opDur[mp]; if (e > s) s = e; }
+        start[op] = s;
+        ll en = s + opDur[op];
+        if (en > makespan) makespan = en;
+        int js = (op + 1 < jobOff[opJob[op]] + jobT[opJob[op]]) ? op + 1 : -1;
+        if (js >= 0 && --indeg[js] == 0) q.push_back(js);
+        int ms = msucc[op];
+        if (ms >= 0 && --indeg[ms] == 0) q.push_back(ms);
+    }
+    return processed == N ? makespan : -1;
+}
+
+static void buildSeqFromStarts(const vector<ll> &start, vector<vector<int>> &seq) {
+    seq.assign(M, {});
+    for (int op = 0; op < N; ++op) seq[opMach[op]].push_back(op);
+    for (int m = 0; m < M; ++m)
+        sort(seq[m].begin(), seq[m].end(), [&](int a, int b) {
+            if (start[a] != start[b]) return start[a] < start[b];
+            return a < b;
+        });
+}
+
+// Collect critical same-machine adjacent pairs by backtracking from the sink.
+static void criticalPairs(const vector<ll> &start, const vector<int> &mpred,
+                          ll makespan, vector<pair<int, int>> &pairs) {
+    pairs.clear();
+    int cur = -1;
+    for (int op = 0; op < N; ++op)
+        if (start[op] + opDur[op] == makespan) { cur = op; break; }
+    while (cur >= 0) {
+        ll s = start[cur];
+        int mp = mpred[cur];
+        int jp = jobPredOp(cur);
+        if (mp >= 0 && start[mp] + opDur[mp] == s) {
+            if (opJob[mp] != opJob[cur]) pairs.push_back({mp, cur});
+            cur = mp;
+        } else if (jp >= 0 && start[jp] + opDur[jp] == s) {
+            cur = jp;
+        } else {
+            break; // start == 0 (or slack due to zero durations)
+        }
+    }
+}
+
+// =====================================================================
+int main() {
+    auto t0 = chrono::steady_clock::now();
+    vector<char> input = readAll();
+    Scanner sc(input.data());
+    ll v;
+    if (!sc.nextInt(v)) return 0;
+    J = (int)v;
+    sc.nextInt(v);
+    M = (int)v;
+    jobT.resize(J);
+    jobOff.resize(J);
+    N = 0;
+    for (int j = 0; j < J; ++j) {
+        sc.nextInt(v);
+        jobT[j] = (int)v;
+        jobOff[j] = N;
+        N += jobT[j];
+        for (int t = 0; t < jobT[j]; ++t) {
+            ll m, d;
+            sc.nextInt(m);
+            sc.nextInt(d);
+            opMach.push_back((int)m);
+            opDur.push_back(d);
+            opJob.push_back(j);
+        }
+    }
+    jobWork.assign(J, 0);
+    for (int op = 0; op < N; ++op) jobWork[opJob[op]] += opDur[op];
+
+    if (N == 0) {
+        for (int j = 0; j < J; ++j) putchar('\n');
+        return 0;
+    }
+
+    mt19937_64 rng(0x9E3779B97F4A7C15ULL);
+
+    // time budget scales with size, capped
+    double budget = 0.8 + (double)N / 8000.0 * 6.0;
+    if (budget > 8.0) budget = 8.0;
+    if (budget < 1.0) budget = 1.0;
+
+    vector<ll> bestStart(N, 0), curStart(N, 0);
+    ll bestMs = LLONG_MAX;
+
+    // ---------- phase 1: construction ----------
+    bool hugeMode = (ll)N * (ll)J > 300000000LL; // GT pass too expensive
+    if (hugeMode) {
+        for (int rule = 0; rule < 3; ++rule) {
+            ll ms = eventGreedy(curStart, rule);
+            if (ms < bestMs) { bestMs = ms; bestStart = curStart; }
+            if (elapsed(t0) > budget * 0.5) break;
+        }
+    } else {
+        double consBudget = budget * 0.5;
+        int pass = 0;
+        do {
+            int rule = (pass < 5) ? pass : (int)(rng() % 6);
+            ll ms = gifflerThompson(curStart, rule, rng);
+            if (ms < bestMs) { bestMs = ms; bestStart = curStart; }
+            ++pass;
+        } while (elapsed(t0) < consBudget);
+    }
+
+    // ---------- phase 2: critical-path local search (ILS) ----------
+    {
+        vector<vector<int>> seq;
+        buildSeqFromStarts(bestStart, seq);
+        vector<int> mpred;
+        vector<ll> st(N);
+        ll curMs = evalSeq(seq, st, mpred);
+        if (curMs >= 0 && curMs < bestMs) { bestMs = curMs; bestStart = st; }
+        vector<pair<int, int>> pairs;
+        vector<int> pos(N); // position of op in its machine sequence
+        auto rebuildPos = [&]() {
+            for (int m = 0; m < M; ++m)
+                for (size_t i = 0; i < seq[m].size(); ++i) pos[seq[m][i]] = (int)i;
+        };
+        rebuildPos();
+        auto doSwap = [&](int a, int b) { // a,b adjacent on same machine
+            int m = opMach[a];
+            swap(seq[m][pos[a]], seq[m][pos[b]]);
+            swap(pos[a], pos[b]);
+        };
+        int sinceImp = 0;
+        vector<vector<int>> bestSeq = seq;
+        while (curMs >= 0 && elapsed(t0) < budget) {
+            criticalPairs(st, mpred, curMs, pairs);
+            if (pairs.empty()) break;
+            shuffle(pairs.begin(), pairs.end(), rng);
+            bool improved = false;
+            for (auto &[a, b] : pairs) {
+                if (pos[a] + 1 != pos[b] || opMach[a] != opMach[b]) continue;
+                doSwap(a, b);
+                ll ms = evalSeq(seq, st, mpred);
+                if (ms >= 0 && ms < curMs) {
+                    curMs = ms;
+                    improved = true;
+                    break;
+                }
+                doSwap(b, a);
+                if (elapsed(t0) > budget) break;
+            }
+            if (improved) {
+                if (curMs < bestMs) { bestMs = curMs; bestStart = st; bestSeq = seq; }
+                sinceImp = 0;
+            } else {
+                // perturbation: force a random critical swap
+                ++sinceImp;
+                if (sinceImp > 40) { // restart from best
+                    seq = bestSeq;
+                    rebuildPos();
+                    sinceImp = 0;
+                }
+                bool kicked = false;
+                for (int tries = 0; tries < 8 && !kicked && !pairs.empty(); ++tries) {
+                    auto &[a, b] = pairs[rng() % pairs.size()];
+                    if (pos[a] + 1 != pos[b] || opMach[a] != opMach[b]) continue;
+                    doSwap(a, b);
+                    ll ms = evalSeq(seq, st, mpred);
+                    if (ms < 0) { doSwap(b, a); continue; }
+                    curMs = ms;
+                    kicked = true;
+                }
+                if (!kicked) break;
+            }
+            // refresh st/mpred for the accepted state (evalSeq already left them
+            // consistent with `seq` when a move was accepted)
+            ll ms = evalSeq(seq, st, mpred);
+            if (ms < 0) break;
+            curMs = ms;
+            if (ms < bestMs) { bestMs = ms; bestStart = st; bestSeq = seq; }
+        }
+    }
+
+    // ---------- output ----------
+    string out;
+    out.reserve((size_t)N * 12 + J);
+    char buf[32];
+    for (int j = 0; j < J; ++j) {
+        for (int t = 0; t < jobT[j]; ++t) {
+            int op = jobOff[j] + t;
+            if (t) out += ' ';
+            int len = snprintf(buf, sizeof(buf), "%lld %d", bestStart[op], opMach[op]);
+            out.append(buf, len);
+        }
+        out += '\n';
+    }
+    fwrite(out.data(), 1, out.size(), stdout);
+    return 0;
+}

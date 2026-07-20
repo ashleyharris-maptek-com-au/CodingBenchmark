@@ -1,0 +1,811 @@
+// 2D Polygon Cutting Stock via conservative grid rasterization + bitmask nesting.
+//
+// Strategy:
+//  - Rasterize the stock polygon onto an adaptive-resolution grid. A cell is FREE
+//    only if it is entirely inside the stock (center inside, and no polygon edge
+//    passes through the cell) -> conservative under-approximation.
+//  - Each piece (after choosing a good rotation via min-area bounding rectangle of
+//    its convex hull) is rasterized conservatively: every cell its polygon touches
+//    is marked occupied -> conservative over-approximation.
+//  - Placement therefore guarantees validity: piece polygon subset of its cells,
+//    cells subset of free stock cells, and disjoint cell sets => disjoint pieces.
+//  - Packing: first-fit-decreasing, bottom-left scan with 64-bit word AND tests,
+//    per-row free-count pruning and per-stock fail-size pruning.
+//  - Scalability: grid resolution adapts to piece count/size; for large instances
+//    pieces are partitioned round-robin (after sorting) across threads, each thread
+//    packing its share into its own set of stocks (stocks are independent).
+
+use std::io::{self, Read, Write};
+use std::time::Instant;
+
+const SHIFT_FRAC: f64 = 0.29371; // sub-cell offset so piece boundaries avoid grid lines
+const EPS: f64 = 1e-7;
+const TIME_LIMIT_SOFT: f64 = 235.0; // seconds; after this, degrade to fast placement
+
+#[derive(Clone, Copy)]
+struct Pt {
+    x: f64,
+    y: f64,
+}
+
+fn bbox(p: &[Pt]) -> (f64, f64, f64, f64) {
+    let (mut a, mut b, mut c, mut d) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+    for q in p {
+        a = a.min(q.x);
+        b = b.min(q.y);
+        c = c.max(q.x);
+        d = d.max(q.y);
+    }
+    (a, b, c, d)
+}
+
+fn cross(o: Pt, a: Pt, b: Pt) -> f64 {
+    (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x)
+}
+
+fn convex_hull(pts: &[Pt]) -> Vec<Pt> {
+    let mut p = pts.to_vec();
+    p.sort_by(|a, b| {
+        a.x.partial_cmp(&b.x)
+            .unwrap()
+            .then(a.y.partial_cmp(&b.y).unwrap())
+    });
+    p.dedup_by(|a, b| (a.x - b.x).abs() < 1e-12 && (a.y - b.y).abs() < 1e-12);
+    let n = p.len();
+    if n < 3 {
+        return p;
+    }
+    let mut hull: Vec<Pt> = Vec::with_capacity(2 * n);
+    for &q in &p {
+        while hull.len() >= 2 && cross(hull[hull.len() - 2], hull[hull.len() - 1], q) <= 0.0 {
+            hull.pop();
+        }
+        hull.push(q);
+    }
+    let lower = hull.len() + 1;
+    for &q in p.iter().rev().skip(1) {
+        while hull.len() >= lower && cross(hull[hull.len() - 2], hull[hull.len() - 1], q) <= 0.0 {
+            hull.pop();
+        }
+        hull.push(q);
+    }
+    hull.pop();
+    hull
+}
+
+/// Candidate rotations: identity, plus the angle aligning the min-area bounding
+/// rectangle of the convex hull with the axes (and that +90 deg).
+fn candidate_angles(pts: &[Pt]) -> Vec<f64> {
+    let mut angs = vec![0.0f64];
+    let h = convex_hull(pts);
+    if h.len() >= 3 {
+        let step = if h.len() > 64 { h.len() / 64 + 1 } else { 1 };
+        let mut best = f64::MAX;
+        let mut ba = 0.0f64;
+        let mut k = 0usize;
+        while k < h.len() {
+            let a = h[k];
+            let b = h[(k + 1) % h.len()];
+            let ang = (b.y - a.y).atan2(b.x - a.x);
+            let (s, c) = ang.sin_cos();
+            let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+            for q in &h {
+                // rotate by -ang
+                let rx = q.x * c + q.y * s;
+                let ry = -q.x * s + q.y * c;
+                x0 = x0.min(rx);
+                y0 = y0.min(ry);
+                x1 = x1.max(rx);
+                y1 = y1.max(ry);
+            }
+            let area = (x1 - x0) * (y1 - y0);
+            if area < best {
+                best = area;
+                ba = -ang;
+            }
+            k += step;
+        }
+        angs.push(ba);
+        angs.push(ba + std::f64::consts::FRAC_PI_2);
+    } else {
+        angs.push(std::f64::consts::FRAC_PI_2);
+    }
+    angs
+}
+
+/// Rasterize a polygon. Returns (edge_cells, center_inside_cells) as bitmaps of
+/// stride `wpr = ceil(gw/64)` words per row. edge_cells conservatively contains
+/// every cell any polygon edge touches.
+fn rasterize(poly: &[Pt], ox: f64, oy: f64, c: f64, gw: usize, gh: usize) -> (Vec<u64>, Vec<u64>) {
+    let wpr = (gw + 63) / 64;
+    let mut edge = vec![0u64; wpr * gh];
+    let mut inside = vec![0u64; wpr * gh];
+    let n = poly.len();
+    if n == 0 || gw == 0 || gh == 0 {
+        return (edge, inside);
+    }
+    // Edge cells: for each edge, walk its cell columns and mark the y-span per column.
+    for k in 0..n {
+        let a = poly[k];
+        let b = poly[(k + 1) % n];
+        let ax = (a.x - ox) / c;
+        let ay = (a.y - oy) / c;
+        let bx = (b.x - ox) / c;
+        let by = (b.y - oy) / c;
+        let (x0, x1) = if ax <= bx { (ax, bx) } else { (bx, ax) };
+        let i0 = ((x0 - EPS).floor().max(0.0)) as usize;
+        let i1f = (x1 + EPS).floor();
+        if i1f < 0.0 {
+            continue;
+        }
+        let i1 = (i1f as usize).min(gw - 1);
+        if i0 > i1 {
+            continue;
+        }
+        let vert = (bx - ax).abs() < 1e-12;
+        for i in i0..=i1 {
+            let (ys, ye) = if vert {
+                (ay.min(by), ay.max(by))
+            } else {
+                let xs = x0.max(i as f64);
+                let xe = x1.min((i + 1) as f64);
+                let t0 = (xs - ax) / (bx - ax);
+                let t1 = (xe - ax) / (bx - ax);
+                let ya = ay + t0 * (by - ay);
+                let yb = ay + t1 * (by - ay);
+                (ya.min(yb), ya.max(yb))
+            };
+            let j0 = ((ys - EPS).floor().max(0.0)) as usize;
+            let j1f = (ye + EPS).floor();
+            if j1f < 0.0 {
+                continue;
+            }
+            let j1 = (j1f as usize).min(gh - 1);
+            if j0 > j1 {
+                continue;
+            }
+            for j in j0..=j1 {
+                edge[j * wpr + (i >> 6)] |= 1u64 << (i & 63);
+            }
+        }
+    }
+    // Center-inside cells via scanline (even-odd rule).
+    let mut xs: Vec<f64> = Vec::with_capacity(16);
+    for j in 0..gh {
+        let yc = oy + (j as f64 + 0.5) * c;
+        xs.clear();
+        for k in 0..n {
+            let a = poly[k];
+            let b = poly[(k + 1) % n];
+            if (a.y > yc) != (b.y > yc) {
+                xs.push(a.x + (yc - a.y) * (b.x - a.x) / (b.y - a.y));
+            }
+        }
+        xs.sort_by(|u, v| u.partial_cmp(v).unwrap());
+        let mut m = 0;
+        while m + 1 < xs.len() {
+            let i0f = ((xs[m] - ox) / c - 0.5).ceil();
+            let i1f = ((xs[m + 1] - ox) / c - 0.5).floor();
+            if i1f >= 0.0 && i1f >= i0f {
+                let i0 = i0f.max(0.0) as usize;
+                let i1 = (i1f as usize).min(gw - 1);
+                for i in i0..=i1 {
+                    inside[j * wpr + (i >> 6)] |= 1u64 << (i & 63);
+                }
+            }
+            m += 2;
+        }
+    }
+    (edge, inside)
+}
+
+/// A piece's conservative occupancy mask at a fixed rotation.
+struct Mask {
+    w: usize,
+    h: usize,
+    wp: usize,      // words per row
+    rows: Vec<u64>, // h * wp
+    prc: Vec<u32>,  // popcount per row
+    cells: usize,
+    ox: f64, // world coordinate of grid cell (0,0) origin
+    oy: f64,
+    angle: f64,
+}
+
+fn build_mask(poly: &[Pt], angle: f64, cell: f64) -> Option<Mask> {
+    let (s, c) = angle.sin_cos();
+    let rp: Vec<Pt> = poly
+        .iter()
+        .map(|q| Pt {
+            x: q.x * c - q.y * s,
+            y: q.x * s + q.y * c,
+        })
+        .collect();
+    let (mx, my, gx, gy) = bbox(&rp);
+    if !mx.is_finite() || !gx.is_finite() {
+        return None;
+    }
+    let ox = mx - SHIFT_FRAC * cell;
+    let oy = my - SHIFT_FRAC * cell;
+    let gw = (((gx - ox) / cell).floor() as usize).saturating_add(2);
+    let gh = (((gy - oy) / cell).floor() as usize).saturating_add(2);
+    if gw > 200_000 || gh > 200_000 || gw.saturating_mul(gh) > 64_000_000 {
+        return None;
+    }
+    let (edge, inside) = rasterize(&rp, ox, oy, cell, gw, gh);
+    let wpr = (gw + 63) / 64;
+    // occupied = edge | inside; find tight bounds
+    let mut maxr = 0usize;
+    let mut maxcbit = 0usize;
+    let mut any = false;
+    for j in 0..gh {
+        for k in 0..wpr {
+            let v = edge[j * wpr + k] | inside[j * wpr + k];
+            if v != 0 {
+                any = true;
+                maxr = maxr.max(j);
+                let hb = 63 - v.leading_zeros() as usize + k * 64;
+                maxcbit = maxcbit.max(hb);
+            }
+        }
+    }
+    if !any {
+        // Degenerate/tiny piece: occupy one cell.
+        let w = 1;
+        let h = 1;
+        return Some(Mask {
+            w,
+            h,
+            wp: 1,
+            rows: vec![1u64],
+            prc: vec![1],
+            cells: 1,
+            ox,
+            oy,
+            angle,
+        });
+    }
+    let w = maxcbit + 1;
+    let h = maxr + 1;
+    let wp = (w + 63) / 64;
+    let mut rows = vec![0u64; h * wp];
+    let mut prc = vec![0u32; h];
+    let mut cells = 0usize;
+    for j in 0..h {
+        let mut pc = 0u32;
+        for k in 0..wp {
+            let v = edge[j * wpr + k] | inside[j * wpr + k];
+            rows[j * wp + k] = v;
+            pc += v.count_ones();
+        }
+        prc[j] = pc;
+        cells += pc as usize;
+    }
+    Some(Mask {
+        w,
+        h,
+        wp,
+        rows,
+        prc,
+        cells,
+        ox,
+        oy,
+        angle,
+    })
+}
+
+struct StockG {
+    occ: Vec<u64>, // gh rows * stride words; 1 = blocked/occupied
+    row_free: Vec<u32>,
+    free: usize,
+    min_fail: usize, // smallest bbox cell-area that failed to fit here
+}
+
+#[inline]
+fn fits(occ: &[u64], stride: usize, m: &Mask, px: usize, py: usize) -> bool {
+    let ws = px >> 6;
+    let bs = px & 63;
+    if bs == 0 {
+        for r in 0..m.h {
+            let base = (py + r) * stride + ws;
+            let pr = r * m.wp;
+            for k in 0..m.wp {
+                if m.rows[pr + k] & occ[base + k] != 0 {
+                    return false;
+                }
+            }
+        }
+    } else {
+        let inv = 64 - bs;
+        for r in 0..m.h {
+            let base = (py + r) * stride + ws;
+            let pr = r * m.wp;
+            let mut carry = 0u64;
+            for k in 0..m.wp {
+                let w = m.rows[pr + k];
+                let v = (w << bs) | carry;
+                carry = w >> inv;
+                if v & occ[base + k] != 0 {
+                    return false;
+                }
+            }
+            if carry != 0 && carry & occ[base + m.wp] != 0 {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn commit(st: &mut StockG, m: &Mask, px: usize, py: usize, stride: usize) {
+    let ws = px >> 6;
+    let bs = px & 63;
+    for r in 0..m.h {
+        let base = (py + r) * stride + ws;
+        let pr = r * m.wp;
+        if bs == 0 {
+            for k in 0..m.wp {
+                st.occ[base + k] |= m.rows[pr + k];
+            }
+        } else {
+            let inv = 64 - bs;
+            let mut carry = 0u64;
+            for k in 0..m.wp {
+                let w = m.rows[pr + k];
+                st.occ[base + k] |= (w << bs) | carry;
+                carry = w >> inv;
+            }
+            if carry != 0 {
+                st.occ[base + m.wp] |= carry;
+            }
+        }
+        st.row_free[py + r] -= m.prc[r];
+    }
+    st.free -= m.cells;
+}
+
+/// Bottom-left scan for the first valid position of mask `m` on stock `st`.
+fn try_place(
+    st: &mut StockG,
+    m: &Mask,
+    gw: usize,
+    gh: usize,
+    stride: usize,
+) -> Option<(usize, usize)> {
+    if m.w > gw || m.h > gh {
+        return None;
+    }
+    if m.cells > st.free {
+        return None;
+    }
+    if m.w * m.h >= st.min_fail {
+        return None;
+    }
+    let mut py = 0usize;
+    while py + m.h <= gh {
+        // Quick per-row prune: each piece row needs at least prc[r] free cells.
+        let mut skip = usize::MAX;
+        for r in (0..m.h).rev() {
+            if st.row_free[py + r] < m.prc[r] {
+                skip = py + r;
+                break;
+            }
+        }
+        if skip != usize::MAX {
+            py = skip + 1;
+            continue;
+        }
+        for px in 0..=(gw - m.w) {
+            if fits(&st.occ, stride, m, px, py) {
+                commit(st, m, px, py, stride);
+                return Some((px, py));
+            }
+        }
+        py += 1;
+    }
+    st.min_fail = st.min_fail.min(m.w * m.h);
+    None
+}
+
+struct Placement {
+    piece: usize,
+    stock: usize, // local index within the packing run
+    px: usize,
+    py: usize,
+    forced: bool,
+}
+
+/// Pack `order` (piece indices, largest first) into a fresh set of stocks.
+#[allow(clippy::too_many_arguments)]
+fn pack(
+    masks: &[Mask],
+    order: &[usize],
+    occ0: &[u64],
+    row_free0: &[u32],
+    free0: usize,
+    gw: usize,
+    gh: usize,
+    stride: usize,
+    t0: &Instant,
+) -> (Vec<StockG>, Vec<Placement>) {
+    let mut stocks: Vec<StockG> = Vec::new();
+    let mut out: Vec<Placement> = Vec::with_capacity(order.len());
+    let mut degraded = false;
+    for (cnt, &pi) in order.iter().enumerate() {
+        if cnt % 32 == 0 && t0.elapsed().as_secs_f64() > TIME_LIMIT_SOFT {
+            degraded = true;
+        }
+        let m = &masks[pi];
+        let mut placed = false;
+        let start = if degraded {
+            stocks.len().saturating_sub(1)
+        } else {
+            0
+        };
+        for si in start..stocks.len() {
+            if let Some((px, py)) = try_place(&mut stocks[si], m, gw, gh, stride) {
+                out.push(Placement {
+                    piece: pi,
+                    stock: si,
+                    px,
+                    py,
+                    forced: false,
+                });
+                placed = true;
+                break;
+            }
+        }
+        if !placed {
+            // Open a new stock.
+            stocks.push(StockG {
+                occ: occ0.to_vec(),
+                row_free: row_free0.to_vec(),
+                free: free0,
+                min_fail: usize::MAX,
+            });
+            let si = stocks.len() - 1;
+            if let Some((px, py)) = try_place(&mut stocks[si], m, gw, gh, stride) {
+                out.push(Placement {
+                    piece: pi,
+                    stock: si,
+                    px,
+                    py,
+                    forced: false,
+                });
+            } else {
+                // Piece does not fit even an empty stock at this resolution:
+                // force best-effort placement on its own stock.
+                stocks[si].free = 0;
+                stocks[si].min_fail = 0;
+                out.push(Placement {
+                    piece: pi,
+                    stock: si,
+                    px: 0,
+                    py: 0,
+                    forced: true,
+                });
+            }
+        }
+    }
+    (stocks, out)
+}
+
+fn main() {
+    let t0 = Instant::now();
+    let mut input = String::new();
+    io::stdin().read_to_string(&mut input).unwrap();
+    let mut it = input.split_ascii_whitespace().map(|s| s.parse::<f64>().unwrap());
+    let sv = it.next().unwrap_or(0.0) as usize;
+    let np = it.next().unwrap_or(0.0) as usize;
+    let mut stock = Vec::with_capacity(sv);
+    for _ in 0..sv {
+        let x = it.next().unwrap();
+        let y = it.next().unwrap();
+        stock.push(Pt { x, y });
+    }
+    let mut pieces: Vec<Vec<Pt>> = Vec::with_capacity(np);
+    for _ in 0..np {
+        let pv = it.next().unwrap() as usize;
+        let mut p = Vec::with_capacity(pv);
+        for _ in 0..pv {
+            let x = it.next().unwrap();
+            let y = it.next().unwrap();
+            p.push(Pt { x, y });
+        }
+        pieces.push(p);
+    }
+
+    let stdout = io::stdout();
+    let mut w = io::BufWriter::new(stdout.lock());
+    if np == 0 {
+        writeln!(w, "0").unwrap();
+        return;
+    }
+
+    let (sminx, sminy, smaxx, smaxy) = bbox(&stock);
+    let sw = (smaxx - sminx).max(1e-9);
+    let sh = (smaxy - sminy).max(1e-9);
+
+    // Adaptive base resolution: finer grids for small instances.
+    let gbase: f64 = if np <= 30 {
+        1024.0
+    } else if np <= 200 {
+        768.0
+    } else if np <= 2000 {
+        512.0
+    } else if np <= 8000 {
+        448.0
+    } else {
+        384.0
+    };
+    let mut cell = sw.max(sh) / gbase;
+    // Anisotropic stock: need enough cells across the thin dimension too.
+    let thin = sw.min(sh) / 32.0;
+    if thin < cell {
+        cell = thin;
+    }
+    // Refine if pieces are much smaller than a cell (capped so the grid stays sane).
+    let mut dims: Vec<f64> = pieces
+        .iter()
+        .map(|p| {
+            let (a, b, c2, d) = bbox(p);
+            (c2 - a).max(d - b)
+        })
+        .collect();
+    dims.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let med = dims[dims.len() / 2].max(1e-12);
+    if med / 4.0 < cell {
+        cell = (med / 4.0).max(sw.max(sh) / 3072.0);
+    }
+    // Hard cap on total grid size.
+    let cmin = (sw * sh / 32_000_000.0).sqrt();
+    if cell < cmin {
+        cell = cmin;
+    }
+    if !cell.is_finite() || cell <= 0.0 {
+        cell = 1.0;
+    }
+
+    // Build the stock free-space template; retry finer if the grid is too coarse
+    // to expose any interior.
+    let (mut gw, mut gh, mut stride);
+    let (mut occ0, mut row_free0, mut free0);
+    loop {
+        gw = ((sw / cell).ceil() as usize).saturating_add(1).max(1);
+        gh = ((sh / cell).ceil() as usize).saturating_add(1).max(1);
+        let wpr = (gw + 63) / 64;
+        stride = wpr + 2;
+        let (edge, inside) = rasterize(&stock, sminx, sminy, cell, gw, gh);
+        let mut occ = vec![!0u64; stride * gh];
+        let mut rf = vec![0u32; gh];
+        let mut free = 0usize;
+        for j in 0..gh {
+            let mut cnt = 0u32;
+            for k in 0..wpr {
+                let mut fw = inside[j * wpr + k] & !edge[j * wpr + k];
+                // Clear bits beyond gw in the last real word.
+                if k == wpr - 1 && (gw & 63) != 0 {
+                    fw &= (1u64 << (gw & 63)) - 1;
+                }
+                occ[j * stride + k] = !fw;
+                cnt += fw.count_ones();
+            }
+            rf[j] = cnt;
+            free += cnt as usize;
+        }
+        occ0 = occ;
+        row_free0 = rf;
+        free0 = free;
+        if free0 > 0 || gw.saturating_mul(gh) >= 32_000_000 {
+            break;
+        }
+        cell *= 0.5; // grid too coarse for this stock shape; refine
+    }
+
+    // Build one mask per piece (best rotation by occupied-cell count, then bbox).
+    let mut masks: Vec<Mask> = Vec::with_capacity(np);
+    for p in &pieces {
+        let mut best: Option<Mask> = None;
+        for a in candidate_angles(p) {
+            if let Some(m) = build_mask(p, a, cell) {
+                let key = (m.cells, m.w * m.h, m.h);
+                let better = match &best {
+                    None => true,
+                    Some(b) => key < (b.cells, b.w * b.h, b.h),
+                };
+                if better {
+                    best = Some(m);
+                }
+            }
+        }
+        masks.push(best.unwrap_or(Mask {
+            w: 1,
+            h: 1,
+            wp: 1,
+            rows: vec![1],
+            prc: vec![1],
+            cells: 1,
+            ox: 0.0,
+            oy: 0.0,
+            angle: 0.0,
+        }));
+    }
+
+    // Sort pieces by size (cells) descending.
+    let mut order: Vec<usize> = (0..np).collect();
+    order.sort_by(|&a, &b| masks[b].cells.cmp(&masks[a].cells));
+
+    // Partition across threads for large instances (each thread owns its stocks).
+    let hw = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    // Threads trade some packing quality for safety on very large instances.
+    let nt = if np >= 4000 {
+        (np / 2000).min(hw).min(8).max(2)
+    } else {
+        1
+    };
+
+    let mut results: Vec<(Vec<StockG>, Vec<Placement>)> = Vec::new();
+    if nt <= 1 {
+        results.push(pack(
+            &masks, &order, &occ0, &row_free0, free0, gw, gh, stride, &t0,
+        ));
+    } else {
+        let mut groups: Vec<Vec<usize>> = vec![Vec::new(); nt];
+        for (i, &pi) in order.iter().enumerate() {
+            groups[i % nt].push(pi);
+        }
+        let masks_ref = &masks;
+        let occ_ref = &occ0;
+        let rf_ref = &row_free0;
+        let t0_ref = &t0;
+        results = std::thread::scope(|s| {
+            let handles: Vec<_> = groups
+                .iter()
+                .map(|g| {
+                    s.spawn(move || {
+                        pack(masks_ref, g, occ_ref, rf_ref, free0, gw, gh, stride, t0_ref)
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+    }
+
+    // Merge results into a single global set of stocks and placements.
+    let mut stocks: Vec<StockG> = Vec::new();
+    // per piece: (stock, px, py, forced)
+    let mut place: Vec<(usize, usize, usize, bool)> = vec![(0, 0, 0, false); np];
+    for (local_stocks, placements) in results {
+        let off = stocks.len();
+        stocks.extend(local_stocks);
+        for pl in placements {
+            place[pl.piece] = (off + pl.stock, pl.px, pl.py, pl.forced);
+        }
+    }
+
+    // Consolidation: repeatedly try to empty the least-filled stocks by relocating
+    // their pieces onto other stocks (fullest-first). Skipped for huge stock counts
+    // or when close to the time budget.
+    if stocks.len() > 1 && stocks.len() <= 4000 {
+        let ns = stocks.len();
+        let mut by_stock: Vec<Vec<usize>> = vec![Vec::new(); ns];
+        for pi in 0..np {
+            if !place[pi].3 {
+                by_stock[place[pi].0].push(pi);
+            }
+        }
+        for v in by_stock.iter_mut() {
+            v.sort_by(|&a, &b| masks[b].cells.cmp(&masks[a].cells));
+        }
+        let mut alive = vec![true; ns];
+        let mut src_order: Vec<usize> = (0..ns).collect();
+        src_order.sort_by_key(|&s| free0 - stocks[s].free.min(free0)); // emptiest (least used) first
+        'outer: for &s in &src_order {
+            if t0.elapsed().as_secs_f64() > TIME_LIMIT_SOFT * 0.8 {
+                break;
+            }
+            let used_s = free0 - stocks[s].free.min(free0);
+            if used_s == 0 || by_stock[s].is_empty() {
+                if by_stock[s].is_empty() && stocks[s].free == free0 {
+                    alive[s] = false;
+                }
+                continue;
+            }
+            let others_free: usize = (0..ns)
+                .filter(|&t| t != s && alive[t])
+                .map(|t| stocks[t].free)
+                .sum();
+            if others_free < used_s {
+                continue;
+            }
+            // Candidate targets, fullest first.
+            let mut targets: Vec<usize> =
+                (0..ns).filter(|&t| t != s && alive[t] && stocks[t].free > 0).collect();
+            targets.sort_by_key(|&t| stocks[t].free);
+            let pieces_s = std::mem::take(&mut by_stock[s]);
+            let mut remaining: Vec<usize> = Vec::new();
+            for &pi in &pieces_s {
+                if t0.elapsed().as_secs_f64() > TIME_LIMIT_SOFT * 0.85 {
+                    remaining.extend(pieces_s.iter().skip_while(|&&q| q != pi).copied());
+                    by_stock[s] = remaining;
+                    break 'outer;
+                }
+                let m = &masks[pi];
+                let mut moved = false;
+                for &t in &targets {
+                    if let Some((px, py)) = try_place(&mut stocks[t], m, gw, gh, stride) {
+                        place[pi] = (t, px, py, false);
+                        by_stock[t].push(pi);
+                        moved = true;
+                        break;
+                    }
+                }
+                if !moved {
+                    remaining.push(pi);
+                }
+            }
+            if remaining.is_empty() {
+                alive[s] = false;
+            }
+            by_stock[s] = remaining;
+        }
+        // Compact stock indices: a stock is in use iff some piece references it.
+        let mut remap = vec![usize::MAX; ns];
+        let mut nxt = 0usize;
+        let mut used_flag = vec![false; ns];
+        for pi in 0..np {
+            used_flag[place[pi].0] = true;
+        }
+        for s in 0..ns {
+            if used_flag[s] {
+                remap[s] = nxt;
+                nxt += 1;
+            }
+        }
+        for pi in 0..np {
+            place[pi].0 = remap[place[pi].0];
+        }
+        stocks.truncate(0); // occupancy no longer needed
+        let total = nxt;
+        emit(&mut w, np, total, &place, &masks, sminx, sminy, sw, sh, cell);
+        return;
+    }
+
+    let total = stocks.len();
+    emit(&mut w, np, total, &place, &masks, sminx, sminy, sw, sh, cell);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit<W: Write>(
+    w: &mut W,
+    np: usize,
+    total_stocks: usize,
+    place: &[(usize, usize, usize, bool)],
+    masks: &[Mask],
+    sminx: f64,
+    sminy: f64,
+    sw: f64,
+    sh: f64,
+    cell: f64,
+) {
+    writeln!(w, "{}", total_stocks.max(1)).unwrap();
+    for pi in 0..np {
+        let (si, px, py, forced) = place[pi];
+        let m = &masks[pi];
+        let (x, y) = if forced {
+            // Best effort: center piece bbox on stock bbox.
+            (
+                sminx + sw * 0.5 - (m.ox + m.w as f64 * cell * 0.5),
+                sminy + sh * 0.5 - (m.oy + m.h as f64 * cell * 0.5),
+            )
+        } else {
+            (
+                sminx + px as f64 * cell - m.ox,
+                sminy + py as f64 * cell - m.oy,
+            )
+        };
+        writeln!(w, "{} {:.9} {:.9} {:.9}", si, x, y, m.angle).unwrap();
+    }
+}

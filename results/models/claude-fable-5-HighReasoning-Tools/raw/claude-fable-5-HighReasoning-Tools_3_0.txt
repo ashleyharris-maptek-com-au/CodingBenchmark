@@ -1,0 +1,583 @@
+// Graph Layout — Edge Crossing Minimization
+//
+// Strategy (scale adaptive):
+//  * Parse graph, drop self-loops and duplicate/parallel edges for layout purposes.
+//  * Split into connected components; lay out each independently, then pack
+//    component bounding boxes into a grid.
+//  * Per component: BFS-radial initial placement (concentric rings by BFS depth,
+//    which is already near-planar for trees), then refine with a
+//    Fruchterman–Reingold force-directed pass.
+//      - Repulsion is computed with a uniform spatial grid (only nodes in the
+//        3x3 neighbouring cells interact), giving ~O(n) per iteration.
+//      - Iteration count and time are budgeted by graph size so the whole run
+//        stays well under the 30 s limit even at 200k nodes.
+//  * Deterministic xorshift RNG so output is reproducible.
+
+use std::io::{self, Read, Write};
+use std::time::Instant;
+
+struct Rng(u64);
+impl Rng {
+    fn new(seed: u64) -> Self {
+        Rng(seed ^ 0x9E3779B97F4A7C15)
+    }
+    fn next(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        x
+    }
+    fn f64(&mut self) -> f64 {
+        // uniform in [0,1)
+        (self.next() >> 11) as f64 / (1u64 << 53) as f64
+    }
+}
+
+fn main() {
+    let start = Instant::now();
+
+    // ---------- input ----------
+    let mut input = String::new();
+    io::stdin().read_to_string(&mut input).expect("read stdin");
+    let mut it = input
+        .split_ascii_whitespace()
+        .map(|t| t.parse::<i64>().unwrap_or(0));
+    let n = it.next().unwrap_or(0).max(0) as usize;
+    let m = it.next().unwrap_or(0).max(0) as usize;
+
+    if n == 0 {
+        return;
+    }
+
+    let mut edges: Vec<(u32, u32)> = Vec::with_capacity(m);
+    for _ in 0..m {
+        let u = match it.next() {
+            Some(v) => v,
+            None => break,
+        };
+        let v = match it.next() {
+            Some(v) => v,
+            None => break,
+        };
+        if u < 0 || v < 0 {
+            continue;
+        }
+        let (u, v) = (u as usize, v as usize);
+        if u >= n || v >= n || u == v {
+            continue; // ignore out-of-range and self-loops
+        }
+        let (a, b) = if u < v { (u, v) } else { (v, u) };
+        edges.push((a as u32, b as u32));
+    }
+    // dedup parallel edges
+    edges.sort_unstable();
+    edges.dedup();
+    let m = edges.len();
+
+    // ---------- adjacency (CSR) ----------
+    let mut deg = vec![0u32; n];
+    for &(a, b) in &edges {
+        deg[a as usize] += 1;
+        deg[b as usize] += 1;
+    }
+    let mut off = vec![0usize; n + 1];
+    for i in 0..n {
+        off[i + 1] = off[i] + deg[i] as usize;
+    }
+    let mut adj = vec![0u32; 2 * m];
+    let mut cur = off.clone();
+    for &(a, b) in &edges {
+        adj[cur[a as usize]] = b;
+        cur[a as usize] += 1;
+        adj[cur[b as usize]] = a;
+        cur[b as usize] += 1;
+    }
+
+    // ---------- connected components ----------
+    let mut comp = vec![u32::MAX; n];
+    let mut comps: Vec<Vec<u32>> = Vec::new();
+    let mut queue: Vec<u32> = Vec::new();
+    for s in 0..n {
+        if comp[s] != u32::MAX {
+            continue;
+        }
+        let cid = comps.len() as u32;
+        comp[s] = cid;
+        queue.clear();
+        queue.push(s as u32);
+        let mut members = vec![s as u32];
+        let mut head = 0;
+        while head < queue.len() {
+            let v = queue[head] as usize;
+            head += 1;
+            for &w in &adj[off[v]..off[v + 1]] {
+                if comp[w as usize] == u32::MAX {
+                    comp[w as usize] = cid;
+                    queue.push(w);
+                    members.push(w);
+                }
+            }
+        }
+        comps.push(members);
+    }
+
+    let mut px = vec![0.0f64; n];
+    let mut py = vec![0.0f64; n];
+    let mut rng = Rng::new(0xC0FFEE);
+
+    // time budget for the whole program
+    let budget_secs = 20.0f64;
+
+    // total "work units" ~ nodes, used to share the time budget among components
+    let total_nodes = n as f64;
+
+    // ---------- layout each component ----------
+    // Local scratch reused across components.
+    let mut local_index = vec![u32::MAX; n]; // global -> local id
+    let mut bboxes: Vec<(f64, f64, f64, f64)> = Vec::with_capacity(comps.len());
+
+    for members in &comps {
+        let cn = members.len();
+        if cn == 1 {
+            let g = members[0] as usize;
+            px[g] = 0.0;
+            py[g] = 0.0;
+            bboxes.push((0.0, 0.0, 0.0, 0.0));
+            continue;
+        }
+        for (li, &g) in members.iter().enumerate() {
+            local_index[g as usize] = li as u32;
+        }
+
+        // local CSR
+        let mut ldeg = vec![0u32; cn];
+        for &g in members {
+            ldeg[local_index[g as usize] as usize] = deg[g as usize];
+        }
+        let mut loff = vec![0usize; cn + 1];
+        for i in 0..cn {
+            loff[i + 1] = loff[i] + ldeg[i] as usize;
+        }
+        let lm = loff[cn];
+        let mut ladj = vec![0u32; lm];
+        let mut lcur = loff.clone();
+        for (li, &g) in members.iter().enumerate() {
+            let g = g as usize;
+            for &w in &adj[off[g]..off[g + 1]] {
+                ladj[lcur[li]] = local_index[w as usize];
+                lcur[li] += 1;
+            }
+        }
+
+        // ----- BFS ring initialisation -----
+        let k = 1.0f64; // ideal edge length
+        let mut depth = vec![u32::MAX; cn];
+        let mut order: Vec<u32> = Vec::with_capacity(cn);
+        // start from highest-degree node for a nicer radial layout
+        let root = (0..cn).max_by_key(|&i| ldeg[i]).unwrap_or(0);
+        depth[root] = 0;
+        order.push(root as u32);
+        let mut head = 0;
+        while head < order.len() {
+            let v = order[head] as usize;
+            head += 1;
+            for &w in &ladj[loff[v]..loff[v + 1]] {
+                if depth[w as usize] == u32::MAX {
+                    depth[w as usize] = depth[v] + 1;
+                    order.push(w);
+                }
+            }
+        }
+        let max_depth = order.iter().map(|&v| depth[v as usize]).max().unwrap_or(0);
+        // nodes per ring
+        let mut ring_count = vec![0u32; max_depth as usize + 1];
+        for &v in &order {
+            ring_count[depth[v as usize] as usize] += 1;
+        }
+        let mut ring_seen = vec![0u32; max_depth as usize + 1];
+        let mut lx = vec![0.0f64; cn];
+        let mut ly = vec![0.0f64; cn];
+        for &v in &order {
+            let v = v as usize;
+            let d = depth[v] as usize;
+            let cnt = ring_count[d].max(1) as f64;
+            let idx = ring_seen[d] as f64;
+            ring_seen[d] += 1;
+            // radius grows so ring circumference can hold its nodes
+            let r_ring = (d as f64) * k * 1.2;
+            let r_needed = cnt * k / (2.0 * std::f64::consts::PI);
+            let r = r_ring.max(r_needed * (d.min(1)) as f64);
+            let ang = 2.0 * std::f64::consts::PI * idx / cnt
+                + 0.5 * (d as f64) // stagger rings
+                + 0.05 * rng.f64();
+            lx[v] = r * ang.cos() + 0.01 * (rng.f64() - 0.5);
+            ly[v] = r * ang.sin() + 0.01 * (rng.f64() - 0.5);
+        }
+        // Rescale initial placement to the target density: a box of side
+        // ~sqrt(cn)*k. Huge BFS rings otherwise blow up the spatial grid.
+        {
+            let mut maxr = 1e-9f64;
+            for i in 0..cn {
+                let r = (lx[i] * lx[i] + ly[i] * ly[i]).sqrt();
+                if r > maxr {
+                    maxr = r;
+                }
+            }
+            let target = (cn as f64).sqrt() * k * 0.75;
+            let s = target / maxr;
+            if s < 1.0 {
+                for i in 0..cn {
+                    lx[i] *= s;
+                    ly[i] *= s;
+                }
+            }
+        }
+
+        // ----- force-directed refinement (FR with grid repulsion) -----
+        // iteration budget by size
+        let iters: usize = if cn <= 50 {
+            600
+        } else if cn <= 500 {
+            300
+        } else if cn <= 5_000 {
+            150
+        } else if cn <= 50_000 {
+            80
+        } else {
+            40
+        };
+        let comp_budget = budget_secs * (cn as f64 / total_nodes).max(0.001);
+
+        let mut dx = vec![0.0f64; cn];
+        let mut dy = vec![0.0f64; cn];
+
+        // spatial grid scratch
+        let cell = 2.0 * k;
+        let mut cell_of = vec![0u32; cn];
+
+        let span0 = (cn as f64).sqrt() * k * 1.5 + 1.0;
+        let mut t = span0 * 0.1; // initial temperature
+        let cool = (0.02f64 / t.max(1e-9)).powf(1.0 / iters.max(1) as f64);
+
+        let comp_start = start.elapsed().as_secs_f64();
+        for it_i in 0..iters {
+            if it_i % 2 == 0 || cn > 10_000 {
+                let el = start.elapsed().as_secs_f64();
+                if el - comp_start > comp_budget || el > budget_secs {
+                    break;
+                }
+            }
+            for i in 0..cn {
+                dx[i] = 0.0;
+                dy[i] = 0.0;
+            }
+
+            // --- repulsion via uniform grid ---
+            let mut minx = f64::INFINITY;
+            let mut miny = f64::INFINITY;
+            let mut maxx = f64::NEG_INFINITY;
+            let mut maxy = f64::NEG_INFINITY;
+            for i in 0..cn {
+                if lx[i] < minx {
+                    minx = lx[i]
+                }
+                if lx[i] > maxx {
+                    maxx = lx[i]
+                }
+                if ly[i] < miny {
+                    miny = ly[i]
+                }
+                if ly[i] > maxy {
+                    maxy = ly[i]
+                }
+            }
+            // Cap total cell count at ~4*cn so grid allocation stays O(n)
+            // even if the layout has spread out.
+            let spanx = (maxx - minx).max(1e-9);
+            let spany = (maxy - miny).max(1e-9);
+            let mut cell = cell;
+            let max_cells = (4 * cn).max(64) as f64;
+            let need = (spanx / cell + 1.0) * (spany / cell + 1.0);
+            if need > max_cells {
+                cell *= (need / max_cells).sqrt();
+            }
+            let gw = ((spanx / cell).floor() as usize + 1).max(1);
+            let gh = ((spany / cell).floor() as usize + 1).max(1);
+            let ncells = gw * gh;
+            // counting sort of nodes into cells
+            let mut cstart = vec![0u32; ncells + 1];
+            for i in 0..cn {
+                let cx = ((lx[i] - minx) / cell) as usize;
+                let cy = ((ly[i] - miny) / cell) as usize;
+                let c = (cy.min(gh - 1) * gw + cx.min(gw - 1)) as u32;
+                cell_of[i] = c;
+                cstart[c as usize + 1] += 1;
+            }
+            for c in 0..ncells {
+                cstart[c + 1] += cstart[c];
+            }
+            let mut cnodes = vec![0u32; cn];
+            {
+                let mut tmp = cstart.clone();
+                for i in 0..cn {
+                    let c = cell_of[i] as usize;
+                    cnodes[tmp[c] as usize] = i as u32;
+                    tmp[c] += 1;
+                }
+            }
+            let k2 = k * k;
+            for i in 0..cn {
+                let c = cell_of[i] as usize;
+                let cy = c / gw;
+                let cx = c % gw;
+                let xi = lx[i];
+                let yi = ly[i];
+                let mut fx = 0.0;
+                let mut fy = 0.0;
+                let y0 = cy.saturating_sub(1);
+                let y1 = (cy + 1).min(gh - 1);
+                let x0 = cx.saturating_sub(1);
+                let x1 = (cx + 1).min(gw - 1);
+                // Cap work per cell: if a cell is overcrowded, sample a
+                // strided subset and scale the force by the missing factor.
+                const CELL_CAP: usize = 24;
+                for gy in y0..=y1 {
+                    for gx in x0..=x1 {
+                        let cc = gy * gw + gx;
+                        let s0 = cstart[cc] as usize;
+                        let s1 = cstart[cc + 1] as usize;
+                        let cnt = s1 - s0;
+                        let (step, scale) = if cnt > CELL_CAP {
+                            let st = cnt.div_ceil(CELL_CAP);
+                            (st, st as f64)
+                        } else {
+                            (1, 1.0)
+                        };
+                        let mut idx = s0 + (i % step.max(1));
+                        while idx < s1 {
+                            let j = cnodes[idx] as usize;
+                            idx += step;
+                            if j == i {
+                                continue;
+                            }
+                            let ddx = xi - lx[j];
+                            let ddy = yi - ly[j];
+                            let d2 = (ddx * ddx + ddy * ddy).max(1e-6);
+                            let f = scale * k2 / d2; // FR repulsion / distance
+                            fx += ddx * f;
+                            fy += ddy * f;
+                        }
+                    }
+                }
+                dx[i] += fx;
+                dy[i] += fy;
+            }
+
+            // --- attraction along edges ---
+            for v in 0..cn {
+                let xv = lx[v];
+                let yv = ly[v];
+                let mut fx = 0.0;
+                let mut fy = 0.0;
+                for &w in &ladj[loff[v]..loff[v + 1]] {
+                    let w = w as usize;
+                    let ddx = xv - lx[w];
+                    let ddy = yv - ly[w];
+                    let d = (ddx * ddx + ddy * ddy).sqrt().max(1e-6);
+                    let f = d / k; // FR attraction: d^2/k, divided by d
+                    fx -= ddx * f;
+                    fy -= ddy * f;
+                }
+                dx[v] += fx;
+                dy[v] += fy;
+            }
+
+            // --- apply displacements, capped by temperature ---
+            for i in 0..cn {
+                let d = (dx[i] * dx[i] + dy[i] * dy[i]).sqrt();
+                if d > 1e-9 {
+                    let s = t.min(d) / d;
+                    lx[i] += dx[i] * s;
+                    ly[i] += dy[i] * s;
+                }
+            }
+            t *= cool;
+            if t < 0.01 {
+                t = 0.01;
+            }
+        }
+
+        // ----- crossing-count hill climb for small components -----
+        // For small graphs we can afford to optimise the actual objective:
+        // repeatedly move one node and keep the move if the number of
+        // crossings on its incident edges does not increase.
+        let ledges: Vec<(u32, u32)> = {
+            let mut es = Vec::new();
+            for v in 0..cn {
+                for &w in &ladj[loff[v]..loff[v + 1]] {
+                    if (w as usize) > v {
+                        es.push((v as u32, w));
+                    }
+                }
+            }
+            es
+        };
+        let me_cnt = ledges.len();
+        if cn >= 4 && me_cnt >= 4 && cn <= 150 && me_cnt <= 800 {
+            fn crosses(
+                a: (f64, f64),
+                b: (f64, f64),
+                c: (f64, f64),
+                d: (f64, f64),
+            ) -> bool {
+                fn orient(p: (f64, f64), q: (f64, f64), r: (f64, f64)) -> i32 {
+                    let v = (q.0 - p.0) * (r.1 - p.1) - (q.1 - p.1) * (r.0 - p.0);
+                    if v.abs() < 1e-12 {
+                        0
+                    } else if v > 0.0 {
+                        1
+                    } else {
+                        -1
+                    }
+                }
+                orient(a, b, c) != orient(a, b, d) && orient(c, d, a) != orient(c, d, b)
+            }
+            // crossings on edges incident to v vs. all other edges
+            let inc_cross = |v: usize, lx: &[f64], ly: &[f64]| -> u32 {
+                let mut c = 0u32;
+                for &w in &ladj[loff[v]..loff[v + 1]] {
+                    let w = w as usize;
+                    let p = (lx[v], ly[v]);
+                    let q = (lx[w], ly[w]);
+                    for &(e0, e1) in &ledges {
+                        let (e0, e1) = (e0 as usize, e1 as usize);
+                        if e0 == v || e1 == v || e0 == w || e1 == w {
+                            continue;
+                        }
+                        if crosses(p, q, (lx[e0], ly[e0]), (lx[e1], ly[e1])) {
+                            c += 1;
+                        }
+                    }
+                }
+                c
+            };
+            let mut bminx = f64::INFINITY;
+            let mut bminy = f64::INFINITY;
+            let mut bmaxx = f64::NEG_INFINITY;
+            let mut bmaxy = f64::NEG_INFINITY;
+            for i in 0..cn {
+                bminx = bminx.min(lx[i]);
+                bmaxx = bmaxx.max(lx[i]);
+                bminy = bminy.min(ly[i]);
+                bmaxy = bmaxy.max(ly[i]);
+            }
+            let bw = (bmaxx - bminx).max(k);
+            let bh = (bmaxy - bminy).max(k);
+            let hc_deadline = {
+                let el = start.elapsed().as_secs_f64();
+                (el + 2.0).min(budget_secs + 3.0)
+            };
+            let mut moves = 0u64;
+            loop {
+                moves += 1;
+                if moves % 64 == 0 && start.elapsed().as_secs_f64() > hc_deadline {
+                    break;
+                }
+                if moves > 200_000 {
+                    break;
+                }
+                let v = (rng.next() as usize) % cn;
+                if ldeg[v] == 0 {
+                    continue;
+                }
+                let before = inc_cross(v, &lx, &ly);
+                let (ox, oy) = (lx[v], ly[v]);
+                let big_jump = rng.f64() < 0.4;
+                if big_jump {
+                    lx[v] = bminx + rng.f64() * bw;
+                    ly[v] = bminy + rng.f64() * bh;
+                } else {
+                    lx[v] = ox + (rng.f64() - 0.5) * k * 2.0;
+                    ly[v] = oy + (rng.f64() - 0.5) * k * 2.0;
+                }
+                let after = inc_cross(v, &lx, &ly);
+                let accept = after < before || (after == before && !big_jump && rng.f64() < 0.3);
+                if !accept {
+                    lx[v] = ox;
+                    ly[v] = oy;
+                }
+            }
+        }
+
+        // write back and compute bbox
+        let mut minx = f64::INFINITY;
+        let mut miny = f64::INFINITY;
+        let mut maxx = f64::NEG_INFINITY;
+        let mut maxy = f64::NEG_INFINITY;
+        for (li, &g) in members.iter().enumerate() {
+            px[g as usize] = lx[li];
+            py[g as usize] = ly[li];
+            if lx[li] < minx {
+                minx = lx[li]
+            }
+            if lx[li] > maxx {
+                maxx = lx[li]
+            }
+            if ly[li] < miny {
+                miny = ly[li]
+            }
+            if ly[li] > maxy {
+                maxy = ly[li]
+            }
+        }
+        bboxes.push((minx, miny, maxx, maxy));
+    }
+
+    // ---------- pack components into a grid ----------
+    if comps.len() > 1 {
+        // sort components by area descending for slightly nicer packing
+        let mut idxs: Vec<usize> = (0..comps.len()).collect();
+        idxs.sort_by(|&a, &b| {
+            let aa = (bboxes[a].2 - bboxes[a].0) * (bboxes[a].3 - bboxes[a].1);
+            let bb = (bboxes[b].2 - bboxes[b].0) * (bboxes[b].3 - bboxes[b].1);
+            bb.partial_cmp(&aa).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let cols = (comps.len() as f64).sqrt().ceil() as usize;
+        let pad = 2.0;
+        let mut cur_x = 0.0f64;
+        let mut cur_y = 0.0f64;
+        let mut row_h = 0.0f64;
+        for (ci, &c) in idxs.iter().enumerate() {
+            let (minx, miny, maxx, maxy) = bboxes[c];
+            let w = maxx - minx;
+            let h = maxy - miny;
+            if ci > 0 && ci % cols == 0 {
+                cur_x = 0.0;
+                cur_y += row_h + pad;
+                row_h = 0.0;
+            }
+            let ox = cur_x - minx;
+            let oy = cur_y - miny;
+            for &g in &comps[c] {
+                px[g as usize] += ox;
+                py[g as usize] += oy;
+            }
+            cur_x += w + pad;
+            if h > row_h {
+                row_h = h;
+            }
+        }
+    }
+
+    // ---------- output ----------
+    let mut out = String::with_capacity(n * 24);
+    for i in 0..n {
+        // 4 decimal places is plenty of precision at this scale
+        out.push_str(&format!("{:.4} {:.4}\n", px[i], py[i]));
+    }
+    let stdout = io::stdout();
+    let mut lock = stdout.lock();
+    lock.write_all(out.as_bytes()).expect("write stdout");
+}

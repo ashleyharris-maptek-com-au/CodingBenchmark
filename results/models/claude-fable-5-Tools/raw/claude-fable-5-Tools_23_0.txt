@@ -1,0 +1,482 @@
+// Lunar Lander real-time controller.
+//
+// Architecture:
+//   - Main thread: owns stdin. Parses header, streams the (possibly multi-GB) map
+//     into compact per-column arrays (topmost obstacle per column), then loops
+//     reading state updates as fast as they arrive.
+//   - Control thread: started immediately at launch, writes "thrust turn" at 50 Hz
+//     no matter what (so the engine never sees a stall), using whatever information
+//     is available so far (nothing -> zeros; header only -> hover; full state ->
+//     guidance + control law).
+//
+// Guidance: climb to a safe cruise altitude (min topmost-obstacle over the
+// remaining route to the pad, precomputed as a prefix/suffix min in O(width)),
+// translate horizontally over the pad, then descend on a braking-curve velocity
+// profile and touch down upright at ~0.5 m/s.
+
+use std::io::{self, Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
+
+#[derive(Clone, Copy)]
+struct Cfg {
+    g: f64,
+    mt: f64, // max thrust accel, m/s^2
+}
+
+#[derive(Clone, Copy)]
+struct State {
+    x: f64,
+    y: f64,
+    vx: f64,
+    vy: f64,
+    ang: f64,
+    angv: f64,
+    #[allow(dead_code)]
+    fuel: f64,
+}
+
+struct Terrain {
+    top: Vec<u32>,       // per column: topmost solid cell row (u32::MAX = none)
+    route_min: Vec<u32>, // per column: min(top) over every column between it and the pad
+    tx: f64,             // aim point x, meters
+    pad_y: f64,          // y of pad top surface, meters
+    pad_l: f64,
+    pad_r: f64,
+    height: f64,
+}
+
+struct Shared {
+    cfg: Mutex<Option<Cfg>>,
+    terrain: Mutex<Option<Arc<Terrain>>>,
+    state: Mutex<Option<State>>,
+    done: AtomicBool,
+}
+
+// ---------------------------------------------------------------- stdin lexer
+
+struct Lexer {
+    buf: Vec<u8>,
+    pos: usize,
+    len: usize,
+}
+
+impl Lexer {
+    fn new() -> Self {
+        Lexer { buf: vec![0u8; 1 << 20], pos: 0, len: 0 }
+    }
+
+    fn refill(&mut self) -> bool {
+        self.pos = 0;
+        let stdin = io::stdin();
+        let mut lock = stdin.lock();
+        loop {
+            match lock.read(&mut self.buf) {
+                Ok(0) => {
+                    self.len = 0;
+                    return false;
+                }
+                Ok(n) => {
+                    self.len = n;
+                    return true;
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(_) => {
+                    self.len = 0;
+                    return false;
+                }
+            }
+        }
+    }
+
+    fn next_f64(&mut self) -> Option<f64> {
+        // skip whitespace
+        loop {
+            if self.pos >= self.len {
+                if !self.refill() {
+                    return None;
+                }
+            }
+            let b = self.buf[self.pos];
+            if b == b' ' || b == b'\n' || b == b'\r' || b == b'\t' {
+                self.pos += 1;
+            } else {
+                break;
+            }
+        }
+        let mut tok = [0u8; 64];
+        let mut tl = 0usize;
+        loop {
+            if self.pos >= self.len {
+                if !self.refill() {
+                    break;
+                }
+            }
+            let b = self.buf[self.pos];
+            if b == b' ' || b == b'\n' || b == b'\r' || b == b'\t' {
+                break;
+            }
+            if tl < tok.len() {
+                tok[tl] = b;
+                tl += 1;
+            }
+            self.pos += 1;
+        }
+        std::str::from_utf8(&tok[..tl]).ok()?.parse::<f64>().ok()
+    }
+}
+
+// ----------------------------------------------------------------- control
+
+fn control(c: Cfg, t: &Terrain, s: State) -> (f64, f64) {
+    let g = c.g;
+    let mt = c.mt.max(1e-6);
+    let a_up = (mt - g).max(0.25); // net upward decel available when thrusting up
+    let a_h = 0.5 * mt; // usable horizontal accel (tilted flight)
+    let w = t.top.len();
+    let col = (s.x.floor() as i64).clamp(0, (w - 1) as i64) as usize;
+
+    // Safe cruise ceiling: min topmost obstacle over the remaining route
+    // (route_min) plus a small local window around the lander.
+    let mut ceilv = t.route_min[col];
+    let lo = col.saturating_sub(2);
+    let hi = (col + 2).min(w - 1);
+    for cc in lo..=hi {
+        if t.top[cc] < ceilv {
+            ceilv = t.top[cc];
+        }
+    }
+    let ceil_y = if ceilv == u32::MAX { t.height } else { ceilv as f64 };
+    let cruise_y = (ceil_y - 4.0).max(1.5);
+
+    let y_land = t.pad_y - 0.5; // lander center when resting on the pad
+    let dx = t.tx - s.x;
+    let alt = y_land - s.y; // vertical distance still to descend (positive above pad)
+
+    // Ground clearance directly below (for emergency braking).
+    let mut gy = t.height + 5.0;
+    for cc in col.saturating_sub(1)..=(col + 1).min(w - 1) {
+        let tv = t.top[cc];
+        if tv != u32::MAX {
+            let f = tv as f64;
+            if f > s.y - 0.4 && f < gy {
+                gy = f;
+            }
+        }
+    }
+    let clearance = (gy - 0.5) - s.y;
+
+    // Emergency: falling fast enough that we can only just stop before impact.
+    // (vy <= 1.6 is already a survivable touchdown speed, so never triggers there.)
+    if s.vy > 1.6 {
+        let d_stop = s.vy * s.vy / (2.0 * a_up);
+        if clearance < d_stop * 1.2 + 0.5 {
+            let th_des = (-0.12 * s.vx).clamp(-0.5, 0.5);
+            let err = th_des - s.ang;
+            let turn = (5.0 * err - 0.5 * s.angv).clamp(-1.0, 1.0);
+            let thrust = if err.abs() < 1.2 { 1.0 } else { 0.5 };
+            return (thrust, turn);
+        }
+    }
+
+    // Map-top guard: if the free-fall apex of the current climb would come near
+    // the top of the world, cut thrust entirely so gravity can arrest the ascent.
+    if s.vy < -0.5 {
+        let apex = s.y - (s.vy * s.vy) / (2.0 * g.max(0.1));
+        if apex < 3.0 {
+            let err = -s.ang;
+            return (0.0, (4.0 * err - 0.5 * s.angv).clamp(-1.0, 1.0));
+        }
+    }
+
+    let half = ((t.pad_r - t.pad_l) * 0.5 - 0.4).clamp(0.6, 3.0);
+    let descend = dx.abs() < half && alt > -1.0 && s.y <= cruise_y + 6.0;
+
+    let vx_des: f64;
+    let vy_des: f64;
+    let low_mode: bool;
+    if descend {
+        vx_des = (0.7 * dx).clamp(-1.2, 1.2);
+        let a = alt.max(0.0);
+        let vcap = 0.8 * (2.0 * a_up * a).sqrt(); // braking-curve descent profile
+        let vy = vcap.min(6.0).min(0.5 + 0.35 * a);
+        vy_des = vy.max(0.45);
+        low_mode = alt < 3.0;
+    } else {
+        // Travel phase: hold cruise altitude, fly toward the pad with a
+        // stopping-distance-limited horizontal speed.
+        let vmax = (0.8 * (2.0 * a_h * dx.abs()).sqrt()).clamp(0.6, 22.0);
+        let mut vxd = (0.6 * dx).clamp(-vmax, vmax);
+        if s.y > cruise_y + 3.0 {
+            vxd *= 0.15; // too low: climb before translating
+        }
+        vx_des = vxd;
+        let dy = cruise_y - s.y; // negative => must climb
+        let mut vyd = 0.5 * dy;
+        if dy < 0.0 {
+            // Ascent can only be arrested by gravity (engine can't push down):
+            // cap climb rate by the gravity-limited stopping distance.
+            let cap = 0.7 * (2.0 * g.max(0.1) * (-dy)).sqrt();
+            vyd = vyd.max(-cap);
+        }
+        vy_des = vyd.clamp(-8.0, 5.0);
+        low_mode = false;
+    }
+
+    let ax = (2.0 * (vx_des - s.vx)).clamp(-0.9 * mt, 0.9 * mt);
+    let ay = 2.0 * (vy_des - s.vy);
+
+    if low_mode {
+        // Final touchdown: stay near upright, thrust sized to hit the vertical
+        // acceleration target through the current tilt.
+        let th_des = ax.atan2((g - ay).abs().max(0.5)).clamp(-0.30, 0.30);
+        let err = th_des - s.ang;
+        let need = (g - ay).max(0.0);
+        let mut thrust = (need / (mt * s.ang.cos().max(0.3))).clamp(0.0, 1.0);
+        if alt < 0.15 && s.vy.abs() < 1.2 {
+            thrust = 0.0; // settle onto the pad
+        }
+        let turn = (4.0 * err - 0.5 * s.angv).clamp(-1.0, 1.0);
+        return (thrust, turn);
+    }
+
+    // Convert desired total acceleration into an engine vector: engine = a - gravity.
+    let ex = ax;
+    let mut ey = ay - g;
+    if ey >= -0.02 * mt {
+        // Need net downward acceleration: the engine can only fight that.
+        if ex.abs() > 0.15 * mt {
+            // Significant horizontal demand: tilt hard and thrust just enough
+            // sideways, keeping the upward component small so we still descend.
+            let th_des = 1.25_f64.copysign(ex);
+            let err = th_des - s.ang;
+            let mut thrust = (ex.abs() / (mt * 1.25_f64.sin())).clamp(0.0, 1.0);
+            if err.abs() > 0.9 {
+                thrust *= 0.15;
+            }
+            return (thrust, (4.0 * err - 0.5 * s.angv).clamp(-1.0, 1.0));
+        }
+        // No horizontal need: free-fall upright and let gravity work.
+        let err = -s.ang;
+        return (0.0, (4.0 * err - 0.5 * s.angv).clamp(-1.0, 1.0));
+    }
+    if ey > -0.10 * mt {
+        ey = -0.10 * mt; // keep some upward component so tilt stays meaningful
+    }
+    // angle 0 = up, +clockwise; thrust direction = (sin a, -cos a)
+    let th_des = ex.atan2(-ey).clamp(-1.30, 1.30);
+    let err = th_des - s.ang;
+    let mut thrust = ((ex * ex + ey * ey).sqrt() / mt).clamp(0.0, 1.0);
+    if err.abs() > 0.9 {
+        thrust *= 0.15; // pointing the wrong way: rotate first
+    }
+    let turn = (4.0 * err - 0.5 * s.angv).clamp(-1.0, 1.0);
+    (thrust, turn)
+}
+
+fn control_loop(sh: Arc<Shared>) {
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    loop {
+        if sh.done.load(Ordering::Relaxed) {
+            break;
+        }
+        let cfg = *sh.cfg.lock().unwrap();
+        let st = *sh.state.lock().unwrap();
+        let ter = sh.terrain.lock().unwrap().clone();
+        let (thr, turn) = match (cfg, st, ter) {
+            (Some(c), Some(s), Some(t)) => control(c, &t, s),
+            (Some(c), _, _) => ((c.g / c.mt).clamp(0.0, 1.0), 0.0), // hover while map loads
+            _ => (0.0, 0.0),
+        };
+        let thr = if thr.is_finite() { thr.clamp(0.0, 1.0) } else { 0.0 };
+        let turn = if turn.is_finite() { turn.clamp(-1.0, 1.0) } else { 0.0 };
+        let _ = writeln!(out, "{:.4} {:.4}", thr, turn);
+        let _ = out.flush();
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+// ------------------------------------------------------------------- main
+
+fn main() {
+    let shared = Arc::new(Shared {
+        cfg: Mutex::new(None),
+        terrain: Mutex::new(None),
+        state: Mutex::new(None),
+        done: AtomicBool::new(false),
+    });
+
+    // Start emitting commands immediately so the engine never sees a stall,
+    // even while a huge map is still streaming in.
+    {
+        let sh = shared.clone();
+        thread::spawn(move || control_loop(sh));
+    }
+
+    let mut lx = Lexer::new();
+
+    // Header
+    let mut hdr = [0.0f64; 9];
+    for v in hdr.iter_mut() {
+        match lx.next_f64() {
+            Some(f) => *v = f,
+            None => {
+                park_forever(&shared);
+                return;
+            }
+        }
+    }
+    let w = hdr[0].max(1.0) as usize;
+    let h = hdr[1].max(1.0) as usize;
+    let g = hdr[2];
+    let mt = hdr[3];
+    let txh = hdr[7];
+    let tyh = hdr[8];
+    *shared.cfg.lock().unwrap() = Some(Cfg { g, mt });
+
+    // Stream the map: only per-column summaries are kept, O(width) memory.
+    let total = w.saturating_mul(h);
+    let mut top = vec![u32::MAX; w];
+    let mut padt = vec![u32::MAX; w];
+    {
+        let mut col: usize = 0;
+        let mut row: u32 = 0;
+        let mut cnt: usize = 0;
+        'outer: while cnt < total {
+            if lx.pos >= lx.len {
+                if !lx.refill() {
+                    break;
+                }
+            }
+            while lx.pos < lx.len {
+                let b = lx.buf[lx.pos];
+                lx.pos += 1;
+                match b {
+                    b' ' | b'\n' | b'\r' | b'\t' => {}
+                    _ => {
+                        if b == b'#' {
+                            if top[col] == u32::MAX {
+                                top[col] = row;
+                            }
+                        } else if b == b'L' || b == b'T' {
+                            if padt[col] == u32::MAX {
+                                padt[col] = row;
+                            }
+                            if top[col] == u32::MAX {
+                                top[col] = row;
+                            }
+                        }
+                        cnt += 1;
+                        col += 1;
+                        if col == w {
+                            col = 0;
+                            row += 1;
+                        }
+                        if cnt == total {
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Locate the landing pad near the stated target column.
+    let tcol0 = (txh.floor() as i64).clamp(0, w as i64 - 1) as usize;
+    let mut pcol: Option<usize> = None;
+    let search = w.min(100_000);
+    for d in 0..search {
+        let a = tcol0 + d;
+        if a < w && padt[a] != u32::MAX {
+            pcol = Some(a);
+            break;
+        }
+        if d <= tcol0 {
+            let b = tcol0 - d;
+            if padt[b] != u32::MAX {
+                pcol = Some(b);
+                break;
+            }
+        }
+    }
+
+    let (tx, pad_y, pad_l, pad_r);
+    if let Some(pc) = pcol {
+        let py = padt[pc];
+        let mut l = pc;
+        while l > 0 && padt[l - 1] != u32::MAX && padt[l - 1].abs_diff(py) <= 1 {
+            l -= 1;
+        }
+        let mut r = pc;
+        while r + 1 < w && padt[r + 1] != u32::MAX && padt[r + 1].abs_diff(py) <= 1 {
+            r += 1;
+        }
+        pad_l = l as f64;
+        pad_r = (r + 1) as f64;
+        tx = 0.5 * (pad_l + pad_r);
+        pad_y = py as f64;
+    } else {
+        // No pad cells found: trust the header coordinates.
+        tx = txh;
+        pad_y = tyh;
+        pad_l = tx - 1.5;
+        pad_r = tx + 1.5;
+    }
+    drop(padt);
+
+    // route_min[c] = min top over all columns between c and the pad column.
+    let tc = (tx.floor() as i64).clamp(0, w as i64 - 1) as usize;
+    let mut route_min = top.clone();
+    for c in (0..tc).rev() {
+        route_min[c] = route_min[c].min(route_min[c + 1]);
+    }
+    for c in tc + 1..w {
+        route_min[c] = route_min[c].min(route_min[c - 1]);
+    }
+
+    *shared.terrain.lock().unwrap() = Some(Arc::new(Terrain {
+        top,
+        route_min,
+        tx,
+        pad_y,
+        pad_l,
+        pad_r,
+        height: h as f64,
+    }));
+
+    // State update loop: drain stdin as fast as it arrives.
+    'updates: loop {
+        let mut v = [0.0f64; 7];
+        for slot in v.iter_mut() {
+            match lx.next_f64() {
+                Some(f) => *slot = f,
+                None => break 'updates, // EOF: episode over
+            }
+        }
+        if v[0].is_finite() && v[1].is_finite() {
+            *shared.state.lock().unwrap() = Some(State {
+                x: v[0],
+                y: v[1],
+                vx: v[2],
+                vy: v[3],
+                ang: v[4],
+                angv: v[5],
+                fuel: v[6],
+            });
+        }
+    }
+
+    shared.done.store(true, Ordering::Relaxed);
+    thread::sleep(Duration::from_millis(100));
+}
+
+// If the header never parses, keep the command stream alive until stdin closes.
+fn park_forever(shared: &Arc<Shared>) {
+    let mut lx = Lexer::new();
+    while lx.next_f64().is_some() {}
+    shared.done.store(true, Ordering::Relaxed);
+    thread::sleep(Duration::from_millis(100));
+}
